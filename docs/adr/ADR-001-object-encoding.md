@@ -39,7 +39,7 @@ P1 需要一个**规范对象身份**：同样的字节在任何位置、任何�
 | D8 | 核心命名空间**区分大小写**，名称是原始字节 | 决策（T3 实施） |
 | D9 | `ObjectId`（内容身份）与 `FileId`（逻辑文件身份）严格分离 | 决策（T3 实施） |
 | D10 | 一次操作、不重试；失败返回精确、可分类的错误，不静默兜底 | 已实现（本 crate 范围） |
-| D11 | `payload_len` 在 v1 恒为 0，仅为未来内容布局预留；写出非零值需新版 ADR | 已实现（恒 0） |
+| D11 | `payload_len` 在 v1 恒为 0，仅为未来内容布局预留；**构造与解码两侧都拒绝非零值**，启用需新版 ADR + 版本提升 | 已实现（边界强制） |
 | D12 | 读取默认整对象重算 BLAKE3 校验 | 决策（T2 实施） |
 
 ## 3. ObjectId
@@ -88,9 +88,14 @@ ObjectId           := BLAKE3( "wcas/object/v1\x00" ‖ canonical_envelope )   //
   字节分片及空值）；
 - 不驻留整对象，内存为哈希状态加调用方切片；
 - `update_envelope` 会拒绝超过上界的声明长度；
-- 未实现的检查：`finish()` 目前**不验证**"实际喂入字节数 == 声明 `value_len`"。调用方
-  必须自行保证；完整帧的解码路径由 `Object::decode` 的长度校验兜底。T2 若需要更强的
-  流式保证，应在此处补充计数校验（属实现改进，不改格式）。
+- **`finish()` 核对字节数**：`update_envelope` 记录声明的 `value_len`，`update_value`
+  累计实际喂入字节数；`finish()` 在两者不等时返回
+  `EnvelopeError::ValueLengthMismatch { declared, fed }` 而**不返回身份**。因此少喂、
+  多喂或根本没有声明信封都会失败，一个被截断的流不可能产出一个看似合法的身份
+  （测试 `streaming_finish_rejects_too_few_value_bytes`、
+  `streaming_finish_rejects_too_many_value_bytes`、
+  `streaming_finish_rejects_a_declared_zero_with_bytes_fed`、
+  `streaming_finish_rejects_a_missing_envelope`）。
 
 ## 4. 对象信封
 
@@ -101,7 +106,7 @@ ObjectId           := BLAKE3( "wcas/object/v1\x00" ‖ canonical_envelope )   //
 | 0 | 4 | `magic` | 固定 `WCAS` |
 | 4 | 1 | `version` | v1 = `1`；其它值拒绝 |
 | 5 | 1 | `role` | 见 §4.2 |
-| 6 | 4 | `payload_len` | v1 恒为 0（D11） |
+| 6 | 4 | `payload_len` | v1 恒为 0；非零值在构造与解码两侧都被拒绝（D11） |
 | 10 | 4 | `value_len` | `value` 的字节数 |
 | 14 | n | `value` | 规范值字节 |
 
@@ -144,11 +149,31 @@ role 是**闭集**：编号 0、9–255 一律解码失败（`UnknownRole`）。
 2. 前 4 字节 ≠ `WCAS` → `BadMagic { found }`
 3. `version` ≠ 1 → `UnsupportedVersion { found }`
 4. `role` 不在 1–8 → `UnknownRole { found }`
-5. 声明帧长 > `MAX_OBJECT_LEN` → `TooLarge { declared, limit }`
-6. 声明帧长 ≠ 输入长度（含**截断**与**尾随字节**两种情况）→ `LengthMismatch { declared, actual }`
+5. `payload_len` ≠ 0 → `NonZeroPayload { found }`
+6. 声明帧长 > `MAX_OBJECT_LEN` → `TooLarge { declared, limit }`
+7. 声明帧长 ≠ 输入长度（含**截断**与**尾随字节**两种情况）→ `LengthMismatch { declared, actual }`
+
+第 5 步与 6/7 步的顺序是刻意的：`payload_len` 是格式规则，先于长度算术判定。因此一个
+`payload_len=3`、`value_len=1`、且真的带了 3 字节 payload 的自洽帧（总长恰好等于声明）
+同样被拒绝——否则那 3 字节会被静默跳过（测试
+`decode_rejects_a_self_consistent_nonzero_payload`、`read_header_rejects_a_nonzero_payload`）。
 
 因此"多一个尾字节"与"少一个值字节"都是硬错误，解码器不会默默忽略尾部内容——这一点
 直接防止了拼接攻击与旧版本尾部填充。
+
+### 4.4.1 `payload_len` 恒 0 是边界强制，不是纸面约定
+
+v1 的 `payload_len` 在**两个方向**都被拒绝，而不只是"我们不写它"：
+
+| 方向 | 行为 | 测试 |
+| --- | --- | --- |
+| 构造 | `Object::from_parts` 遇到非零 `payload_len` 返回 `NonZeroPayload`，不再"校验后丢弃" | `construction_rejects_a_nonzero_payload` |
+| 解码 | 头部 `payload_len` 非零返回 `NonZeroPayload` | `decode_rejects_a_self_consistent_nonzero_payload`、`read_header_rejects_a_nonzero_payload` |
+
+`Object::new(role, value)` 等价于 `from_parts(role, value, 0)`，因此正常构造路径从不触及
+非零值；`from_parts` 保留显式的 0 参数只是为了在签名上标明该字段存在（测试
+`construction_accepts_an_explicit_zero_payload`）。未来若要让 `payload_len` 承载真实
+payload 字节，必须提升 `version`（D11），而不是放开这个检查。
 
 ### 4.5 身份校验（读路径）
 
@@ -254,7 +279,7 @@ spec §6 P1-1（"100 个路径引用相同内容 → 只有一个内容对象，
 | 目录页 / inode 表对象化（路线 B） | 未定 | 需新 ADR |
 | 加密 / 压缩后去重收益 | 非目标 | 不做收益保证 |
 | 跨机 / 分布式 CAS | 非目标 | 不做 |
-| 流式 `finish()` 的字节数校验 | T2 可选改进 | 见 §3.4 |
+| 非零 `payload_len` 的实际载荷字节 | 未来版本 | v1 两侧强制拒绝，见 §4.4.1 |
 
 ## 9. 公开 API 示例
 
@@ -280,13 +305,13 @@ assert_eq!(decoded.role(), Role::Bytes);
 // 4) 读路径校验：身份不符即报损坏
 verify_id(id, &frame).unwrap();
 
-// 5) 流式身份：分片喂入，不必驻留整对象
+// 5) 流式身份：分片喂入，不必驻留整对象；字节数不符时 finish 返回错误
 let mut stream = ObjectIdHasher::start();
 stream.update_envelope(Role::Bytes, 12).unwrap();
 for chunk in b"hello, world".chunks(5) {
     stream.update_value(chunk);
 }
-assert_eq!(stream.finish(), id);
+assert_eq!(stream.finish().unwrap(), id);
 
 // 6) 十六进制往返（64 个小写字符）
 let text = id.to_string();
@@ -298,7 +323,7 @@ assert_eq!(text.parse::<ObjectId>().unwrap(), id);
 
 ```sh
 cargo build --workspace
-cargo test --workspace            # 28 个测试
+cargo test --workspace            # 37 个测试
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -313,17 +338,20 @@ cargo fmt --all -- --check
    承载版本。
 3. **只校验长度不校验语义**：`cas-core` 不知道 role 对应的值应当是什么结构（例如
    `filesystem-root` 的字段布局）。语义校验归 T3 的命名空间层，本 crate 明确不做。
-4. **`payload_len` 恒 0**：任何写出非零值的代码路径都是错误；未来启用它需要新 ADR
-   与版本提升。
-5. **流式 `finish()` 不核对字节数**：见 §3.4，属已知缺口，非格式问题。
-6. **未做模糊测试**：当前用 26 个定向用例覆盖畸形输入。随机模糊（如 `cargo-fuzz`）
+4. **`payload_len` 恒 0**：构造（`from_parts`）与解码（`read_header`）两侧都拒绝非零值，
+   见 §4.4.1。未来启用它需要新 ADR 与版本提升。
+5. **流式调用顺序由断言强制**：`update_envelope` 重复调用、或在声明信封前调用
+   `update_value` 会 panic（属编程错误，不是可恢复的输入错误）；喂入字节数与声明不符则
+   由 `finish()` 返回 `ValueLengthMismatch`。
+6. **未做模糊测试**：当前用 34 个定向用例覆盖畸形输入。随机模糊（如 `cargo-fuzz`）
    尚未接入，属 T5 可选增强；**在接入前不得宣称"已通过模糊测试"**。
 7. **未做性能测试**：本 ADR 不含任何延迟或吞吐数字。
 
 ## 11. 测试清单（对照验收标准）
 
-`crates/cas-core/tests/object_format.rs`（26 个集成测试）与
-`crates/cas-core/src/error.rs`（1 个单元测试）、`cas-core` 文档测试（1 个）。
+`crates/cas-core/tests/object_format.rs`（34 个集成测试）、
+`crates/cas-core/tests/adr_example.rs`（1 个）、`crates/cas-core/src/error.rs`
+（1 个单元测试）与 `cas-core` 文档测试（1 个）。
 
 | 验收项 | 测试 |
 | --- | --- |
@@ -331,21 +359,24 @@ cargo fmt --all -- --check
 | 错 magic | `decode_rejects_wrong_magic` |
 | 错版本 | `decode_rejects_wrong_version` |
 | 错 role | `decode_rejects_unknown_role` |
-| 长度不符（截断 / 尾随字节 / 声明载荷） | `decode_rejects_truncated_value`、`decode_rejects_a_trailing_byte`、`decode_rejects_a_declared_payload`、`decode_rejects_empty_and_short_input` |
+| 长度不符（截断 / 尾随字节） | `decode_rejects_truncated_value`、`decode_rejects_a_trailing_byte`、`decode_rejects_empty_and_short_input` |
+| 非零 payload（自洽与不自洽两路） | `decode_rejects_a_self_consistent_nonzero_payload`、`decode_rejects_a_declared_payload_before_checking_length`、`read_header_rejects_a_nonzero_payload`、`construction_rejects_a_nonzero_payload`、`construction_accepts_an_explicit_zero_payload` |
 | 超上界 | `decode_rejects_declared_value_beyond_the_cap`、`construction_rejects_a_value_beyond_the_cap`、`construction_accepts_a_value_exactly_at_the_cap`、`streaming_envelope_refuses_an_oversized_value` |
 | 跨 role 相同值身份不同 | `same_value_under_different_roles_has_different_identity`、`verify_id_reports_a_role_substitution` |
 | 流式与整体一致 | `streaming_identity_matches_whole_buffer_identity`、`streaming_identity_matches_an_empty_value`、`streaming_identity_matches_the_framed_object_identity` |
+| 流式字节数不符 | `streaming_finish_rejects_too_few_value_bytes`、`streaming_finish_rejects_too_many_value_bytes`、`streaming_finish_rejects_a_declared_zero_with_bytes_fed`、`streaming_finish_rejects_a_missing_envelope` |
 | 身份校验 | `verify_id_accepts_the_matching_object`、`verify_id_reports_a_content_substitution` |
 | 幂等/稳定身份 | `same_role_and_value_has_identical_identity`、`decoded_object_hashes_to_the_same_identity` |
 | hex 呈现与解析 | `identity_is_lowercase_hex_and_parses_back`、`id_parse_rejects_wrong_length_and_non_hex` |
+| ADR 示例可运行 | `adr_section_9_example_compiles_and_passes` |
 | 错误信息可诊断 | `error::tests::displays_name_the_failing_rule` |
 
 执行结果（Rust 1.92.0，Windows x86_64）：
 
 ```text
 cargo build --workspace                                        -> Finished, 0 warnings
-cargo test --workspace                                         -> 28 passed, 0 failed
-   (cas-core lib 1, object_format 26, doc-tests 1)
+cargo test --workspace                                         -> 37 passed, 0 failed
+   (cas-core lib 1, object_format 34, adr_example 1, doc-tests 1)
 cargo clippy --workspace --all-targets -- -D warnings           -> Finished, no warnings
 cargo fmt --all -- --check                                     -> clean
 ```

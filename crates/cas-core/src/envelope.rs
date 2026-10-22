@@ -98,20 +98,24 @@ impl<'a> Object<'a> {
 
     /// Frames `value` under `role` with a raw payload length of `payload_len`.
     ///
-    /// A non-zero `payload_len` is accepted only so that a future content
-    /// layout can construct such objects deliberately; no code in this crate
-    /// passes a non-zero value, and a version-1 physical object never contains
-    /// payload bytes.
+    /// Version 1 pins `payload_len` to zero, so a non-zero value is refused
+    /// rather than accepted and then silently dropped: an object framed with it
+    /// would hash as if the payload were absent. A future content layout that
+    /// writes payload bytes must raise the format version first (ADR-001 D11).
     ///
     /// # Errors
     ///
-    /// Returns [`EnvelopeError::TooLarge`] when the framed object would exceed
+    /// Returns [`EnvelopeError::NonZeroPayload`] for a non-zero `payload_len`,
+    /// [`EnvelopeError::TooLarge`] when the framed object would exceed
     /// [`MAX_OBJECT_LEN`] or when `value` exceeds [`MAX_VALUE_LEN`].
     pub fn from_parts(
         role: Role,
         value: &'a [u8],
         payload_len: u32,
     ) -> Result<Self, EnvelopeError> {
+        if payload_len != 0 {
+            return Err(EnvelopeError::NonZeroPayload { found: payload_len });
+        }
         if value.len() > MAX_VALUE_LEN {
             return Err(EnvelopeError::TooLarge {
                 declared: value.len() as u64,
@@ -200,9 +204,10 @@ impl<'a> Object<'a> {
     /// # Errors
     ///
     /// Returns the first rule that fails, in this order: header length, magic,
-    /// version, role, declared size against [`MAX_OBJECT_LEN`], declared length
-    /// against the bytes present, and the version-1 requirement that the
-    /// payload is empty.
+    /// version, role, non-zero `payload_len`
+    /// ([`EnvelopeError::NonZeroPayload`]), declared size against
+    /// [`MAX_OBJECT_LEN`], and declared length against the bytes present
+    /// (which rejects both a truncated value and trailing bytes).
     pub fn decode(bytes: &'a [u8]) -> Result<Self, EnvelopeError> {
         let envelope = Self::read_header(bytes)?;
         let total = envelope.framed_len();
@@ -246,6 +251,9 @@ impl<'a> Object<'a> {
             Role::from_tag(bytes[5]).ok_or(EnvelopeError::UnknownRole { found: bytes[5] })?;
         let payload_len = u32::from_be_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
         let value_len = u32::from_be_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
+        if payload_len != 0 {
+            return Err(EnvelopeError::NonZeroPayload { found: payload_len });
+        }
         let envelope = Envelope {
             role,
             value_len: value_len as usize,

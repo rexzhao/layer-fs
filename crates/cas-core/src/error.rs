@@ -46,6 +46,22 @@ pub enum EnvelopeError {
         /// The largest accepted length for that field.
         limit: u64,
     },
+    /// `payload_len` is not zero, which version 1 forbids.
+    ///
+    /// Version 1 reserves the field so that a later content layout can use it,
+    /// and pins it to zero until then: no version-1 object may declare raw
+    /// payload bytes, whether it is being constructed or decoded.
+    NonZeroPayload {
+        /// The `payload_len` that was requested or read.
+        found: u32,
+    },
+    /// Fewer or more value bytes were hashed than the envelope declared.
+    ValueLengthMismatch {
+        /// The `value_len` given to the envelope.
+        declared: usize,
+        /// Bytes actually passed to `update_value`.
+        fed: usize,
+    },
     /// The bytes decode, but their identity is not the one that was expected.
     IdentityMismatch {
         /// The identity the caller looked up.
@@ -78,6 +94,13 @@ impl fmt::Display for EnvelopeError {
             EnvelopeError::TooLarge { declared, limit } => {
                 write!(f, "declared length {declared} exceeds the limit {limit}")
             }
+            EnvelopeError::NonZeroPayload { found } => {
+                write!(f, "version 1 requires payload_len 0, found {found}")
+            }
+            EnvelopeError::ValueLengthMismatch { declared, fed } => write!(
+                f,
+                "envelope declares a value of {declared} bytes but {fed} bytes were hashed"
+            ),
             EnvelopeError::IdentityMismatch { expected, actual } => write!(
                 f,
                 "object identity mismatch: expected {expected}, bytes hash to {actual}"

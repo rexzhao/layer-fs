@@ -30,7 +30,7 @@ fn adr_section_9_example_compiles_and_passes() {
     for chunk in b"hello, world".chunks(5) {
         stream.update_value(chunk);
     }
-    assert_eq!(stream.finish(), id);
+    assert_eq!(stream.finish().unwrap(), id);
 
     // 6) 十六进制往返（64 个小写字符）
     let text = id.to_string();

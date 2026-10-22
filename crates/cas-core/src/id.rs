@@ -57,15 +57,14 @@ impl ObjectId {
         &self.0
     }
 
-    /// A new hasher to feed a domain, an envelope and the object's value.
+    /// A new hasher with the domain separator already mixed in.
     ///
     /// Feed data in exactly the order [`ObjectIdHasher::finish`] expects; see
-    /// [`ObjectIdHasher`] for the streaming contract.
+    /// [`ObjectIdHasher`] for the streaming contract. Callers that only want
+    /// [`ObjectIdHasher::start`] do not need this entry point.
     #[must_use]
     pub fn hasher() -> ObjectIdHasher {
-        let mut hasher = Hasher::new();
-        hasher.update(DOMAIN);
-        ObjectIdHasher { hasher }
+        ObjectIdHasher::start()
     }
 
     /// The identity of one complete object, hashed in a single pass.
@@ -76,7 +75,7 @@ impl ObjectId {
         let mut hasher = Self::hasher();
         hasher.update_envelope(role, value.len())?;
         hasher.update_value(value);
-        Ok(hasher.finish())
+        hasher.finish()
     }
 }
 
@@ -142,32 +141,53 @@ fn hex_digit(byte: u8) -> Option<u8> {
 /// stream.update_envelope(Role::Bytes, value.len()).unwrap();
 /// stream.update_value(&value[..2]);
 /// stream.update_value(&value[2..]);
-/// assert_eq!(stream.finish(), ObjectId::hash(Role::Bytes, value).unwrap());
+/// assert_eq!(stream.finish().unwrap(), ObjectId::hash(Role::Bytes, value).unwrap());
 /// ```
 ///
 /// [`update_envelope`](Self::update_envelope) may be called only once and
 /// before any value bytes; [`update_value`](Self::update_value) may be called
 /// any number of times. The value bytes fed must total exactly the length given
-/// to `update_envelope`; [`finish`](Self::finish) checks that and returns the
-/// error instead of an identity when they do not. No whole-object buffer is
-/// retained, so the memory used is the digest state plus the caller's chunk.
+/// to `update_envelope`; [`finish`](Self::finish) checks that and returns
+/// [`EnvelopeError::ValueLengthMismatch`] instead of an identity when they do
+/// not, so a truncated or over-long stream can never produce an identity. No
+/// whole-object buffer is retained, so the memory used is the digest state plus
+/// the caller's chunk.
 #[derive(Debug)]
 pub struct ObjectIdHasher {
     hasher: Hasher,
+    declared: Option<usize>,
+    fed: usize,
 }
 
 impl ObjectIdHasher {
     /// Starts a hasher with the domain separator already mixed in.
     #[must_use]
     pub fn start() -> Self {
-        ObjectId::hasher()
+        let mut hasher = Hasher::new();
+        hasher.update(DOMAIN);
+        Self {
+            hasher,
+            declared: None,
+            fed: 0,
+        }
     }
 
     /// Mixes in the envelope fields: magic, version, role and both lengths.
     ///
     /// `value_len` is the total length of the value that
     /// [`update_value`](Self::update_value) will supply.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeError::TooLarge`] when `value_len` would put the framed
+    /// object past [`MAX_OBJECT_LEN`]. Calling it twice is a programming error
+    /// and panics, because the second header would be hashed into the same
+    /// stream and no valid identity could result.
     pub fn update_envelope(&mut self, role: Role, value_len: usize) -> Result<(), EnvelopeError> {
+        assert!(
+            self.declared.is_none(),
+            "update_envelope may be called only once per ObjectIdHasher"
+        );
         let envelope = crate::Envelope {
             role,
             value_len,
@@ -186,21 +206,44 @@ impl ObjectIdHasher {
             });
         }
         self.hasher.update(&envelope.header_bytes());
+        self.declared = Some(value_len);
         Ok(())
     }
 
     /// Mixes in the next slice of the object's value.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called before [`update_envelope`](Self::update_envelope),
+    /// which would hash value bytes ahead of the header they belong to.
     pub fn update_value(&mut self, bytes: &[u8]) {
+        assert!(
+            self.declared.is_some(),
+            "update_envelope must be called before update_value"
+        );
         self.hasher.update(bytes);
+        self.fed += bytes.len();
     }
 
     /// Finishes the hash and returns the object's identity.
     ///
-    /// An empty name is intentional: the arithmetic is checked by
-    /// [`Object::frame`](crate::Object::frame) and by
-    /// [`Object::decode`](crate::Object::decode) on the bytes that were hashed.
-    #[must_use]
-    pub fn finish(self) -> ObjectId {
-        ObjectId(*self.hasher.finalize().as_bytes())
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeError::ValueLengthMismatch`] when the value bytes fed
+    /// do not total the length declared to
+    /// [`update_envelope`](Self::update_envelope), and
+    /// [`EnvelopeError::Truncated`] when no envelope was declared at all.
+    pub fn finish(self) -> Result<ObjectId, EnvelopeError> {
+        let declared = self.declared.ok_or(EnvelopeError::Truncated {
+            needed: crate::ENVELOPE_HEADER_LEN,
+            actual: 0,
+        })?;
+        if self.fed != declared {
+            return Err(EnvelopeError::ValueLengthMismatch {
+                declared,
+                fed: self.fed,
+            });
+        }
+        Ok(ObjectId(*self.hasher.finalize().as_bytes()))
     }
 }

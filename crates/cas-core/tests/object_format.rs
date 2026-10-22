@@ -164,7 +164,11 @@ fn streaming_identity_matches_whole_buffer_identity() {
         for chunk in value.chunks(chunk_size) {
             stream.update_value(chunk);
         }
-        assert_eq!(stream.finish(), whole, "chunk size {chunk_size}");
+        assert_eq!(
+            stream.finish().expect("complete stream"),
+            whole,
+            "chunk size {chunk_size}"
+        );
     }
 }
 
@@ -175,7 +179,7 @@ fn streaming_identity_matches_an_empty_value() {
         .update_envelope(Role::Bytes, 0)
         .expect("envelope accepted");
     assert_eq!(
-        stream.finish(),
+        stream.finish().expect("complete stream"),
         ObjectId::hash(Role::Bytes, b"").expect("hashed")
     );
 }
@@ -190,7 +194,10 @@ fn streaming_identity_matches_the_framed_object_identity() {
         .expect("envelope accepted");
     stream.update_value(&value[..4]);
     stream.update_value(&value[4..]);
-    assert_eq!(stream.finish(), object.id().expect("hashed"));
+    assert_eq!(
+        stream.finish().expect("complete stream"),
+        object.id().expect("hashed")
+    );
 }
 
 #[test]
@@ -201,6 +208,66 @@ fn streaming_envelope_refuses_an_oversized_value() {
         Err(EnvelopeError::TooLarge {
             declared: MAX_OBJECT_LEN + 1,
             limit: MAX_OBJECT_LEN,
+        })
+    );
+}
+
+#[test]
+fn streaming_finish_rejects_too_few_value_bytes() {
+    let mut stream = ObjectIdHasher::start();
+    stream
+        .update_envelope(Role::Bytes, 10)
+        .expect("envelope accepted");
+    stream.update_value(b"short");
+    assert_eq!(
+        stream.finish(),
+        Err(EnvelopeError::ValueLengthMismatch {
+            declared: 10,
+            fed: 5,
+        })
+    );
+}
+
+#[test]
+fn streaming_finish_rejects_too_many_value_bytes() {
+    let mut stream = ObjectIdHasher::start();
+    stream
+        .update_envelope(Role::Bytes, 2)
+        .expect("envelope accepted");
+    stream.update_value(b"three");
+    assert_eq!(
+        stream.finish(),
+        Err(EnvelopeError::ValueLengthMismatch {
+            declared: 2,
+            fed: 5,
+        })
+    );
+}
+
+#[test]
+fn streaming_finish_rejects_a_declared_zero_with_bytes_fed() {
+    let mut stream = ObjectIdHasher::start();
+    stream
+        .update_envelope(Role::Bytes, 0)
+        .expect("envelope accepted");
+    stream.update_value(b"x");
+    assert_eq!(
+        stream.finish(),
+        Err(EnvelopeError::ValueLengthMismatch {
+            declared: 0,
+            fed: 1,
+        })
+    );
+}
+
+#[test]
+fn streaming_finish_rejects_a_missing_envelope() {
+    let stream = ObjectIdHasher::start();
+    assert_eq!(
+        stream.finish(),
+        Err(EnvelopeError::Truncated {
+            needed: ENVELOPE_HEADER_LEN,
+            actual: 0,
         })
     );
 }
@@ -301,15 +368,64 @@ fn decode_rejects_declared_value_beyond_the_cap() {
 }
 
 #[test]
-fn decode_rejects_a_declared_payload() {
-    // A payload_len of 3 with only the header present is a length mismatch.
+fn decode_rejects_a_self_consistent_nonzero_payload() {
+    // payload_len=3, value_len=1, with all 3 payload bytes present: the total
+    // matches the declared length, so only the version-1 payload rule can
+    // refuse it. Without that rule the payload bytes would be silently skipped.
+    let mut bytes = frame(Role::Bytes.tag(), 3, 1, b"v");
+    bytes.extend_from_slice(b"raw");
+    assert_eq!(bytes.len() as u64, ENVELOPE_HEADER_LEN as u64 + 1 + 3);
+    assert_eq!(
+        Object::decode(&bytes),
+        Err(EnvelopeError::NonZeroPayload { found: 3 })
+    );
+}
+
+#[test]
+fn decode_rejects_a_declared_payload_before_checking_length() {
+    // The payload rule is checked in the header, so an inconsistent payload
+    // length is reported as a non-zero payload rather than a length mismatch.
     let bytes = frame(Role::Bytes.tag(), 3, 1, b"v");
     assert_eq!(
         Object::decode(&bytes),
-        Err(EnvelopeError::LengthMismatch {
-            declared: ENVELOPE_HEADER_LEN as u64 + 1 + 3,
-            actual: ENVELOPE_HEADER_LEN as u64 + 1,
-        })
+        Err(EnvelopeError::NonZeroPayload { found: 3 })
+    );
+}
+
+#[test]
+fn read_header_rejects_a_nonzero_payload() {
+    let mut bytes = frame(Role::FilesystemRoot.tag(), 0, 0, b"");
+    bytes[6..10].copy_from_slice(&7u32.to_be_bytes());
+    assert_eq!(
+        Object::read_header(&bytes),
+        Err(EnvelopeError::NonZeroPayload { found: 7 })
+    );
+}
+
+#[test]
+fn construction_rejects_a_nonzero_payload() {
+    // `from_parts` would otherwise frame and hash as if no payload existed, so
+    // it refuses the request instead of dropping the argument.
+    assert_eq!(
+        Object::from_parts(Role::Bytes, b"v", 1),
+        Err(EnvelopeError::NonZeroPayload { found: 1 })
+    );
+    assert_eq!(
+        Object::from_parts(Role::Bytes, b"v", u32::MAX),
+        Err(EnvelopeError::NonZeroPayload { found: u32::MAX })
+    );
+}
+
+#[test]
+fn construction_accepts_an_explicit_zero_payload() {
+    let object = Object::from_parts(Role::Bytes, b"v", 0).expect("zero payload");
+    assert_eq!(object.envelope().payload_len, 0);
+    assert_eq!(
+        object.id().expect("hashed"),
+        Object::new(Role::Bytes, b"v")
+            .expect("framed")
+            .id()
+            .expect("hashed")
     );
 }
 
