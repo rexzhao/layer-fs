@@ -102,7 +102,7 @@ pub struct RootRecord {
 #[derive(Debug)]
 pub struct Namespace {
     db: NamespaceDb,
-    name: String,
+    pub(crate) name: String,
 }
 
 impl Namespace {
@@ -145,14 +145,23 @@ impl Namespace {
         self.db.connection()
     }
 
+    /// The connection, for planting a deterministic fault in tests.
+    ///
+    /// Available only with `failure-injection` (ADR-003 §12.2), so a consumer
+    /// cannot reach the raw connection.
+    #[cfg(feature = "failure-injection")]
+    pub fn connection_for_tests(&self) -> &Connection {
+        self.db.connection()
+    }
+
     /// Creates the empty tree: a root directory record, the first publication
     /// and the identity allocator.
     fn initialize(&self) -> NamespaceResult<()> {
         let now = now_ns();
         self.conn().execute(
-            "INSERT INTO file (file_id, kind, size, content_root, created_ns, modified_ns)
-             VALUES (0, ?1, 0, NULL, ?2, ?2)",
-            (Kind::Directory as i64, now),
+            "INSERT INTO file (namespace, file_id, kind, size, content_root, created_ns, modified_ns)
+             VALUES (?1, 0, ?2, 0, NULL, ?3, ?3)",
+            (&self.name, Kind::Directory as i64, now),
         )?;
         self.conn().execute(
             "INSERT INTO file_id_allocator (namespace, next_serial) VALUES (?1, 1)",
@@ -166,10 +175,32 @@ impl Namespace {
         Ok(())
     }
 
+    /// Runs `body` inside one immediate write transaction (ADR-003 §6).
+    ///
+    /// `BEGIN IMMEDIATE` matches `cas-store`'s choice: the write lock is taken up
+    /// front, so two concurrent writers serialise instead of interleaving their
+    /// statements. Any error from `body` drops the transaction, which rolls back
+    /// — so a failed operation leaves no partial rows and no root record.
+    ///
+    /// This is the only way a mutating operation touches the database.
+    pub(crate) fn with_write_tx<T>(
+        &self,
+        body: impl FnOnce(&Connection) -> NamespaceResult<T>,
+    ) -> NamespaceResult<T> {
+        // The connection was set to `Immediate` at open (`db::NamespaceDb`), so
+        // this takes the write lock up front; `unchecked_transaction` borrows
+        // `&self` and still rolls back on drop.
+        let transaction = self.conn().unchecked_transaction()?;
+        let value = body(&transaction)?;
+        transaction.commit()?;
+        Ok(value)
+    }
+
     /// The only place a root record is appended (ADR-003 §4.1, §6).
     ///
     /// Returns the new root serial. Every mutating operation calls this exactly
-    /// once inside its transaction; read-only and no-op paths never call it.
+    /// once, inside its [`with_write_tx`](Self::with_write_tx) body; read-only
+    /// and no-op paths never call it.
     pub(crate) fn publish_tx(&self, op: &str, parent: Option<u64>) -> NamespaceResult<u64> {
         let conn = self.conn();
         let head: i64 = conn.query_row(
@@ -182,14 +213,25 @@ impl Namespace {
         } else {
             Some(head as u64)
         });
+        // Per namespace: the root table is shared, so `head_root` names the
+        // current publication and each namespace's chain is closed by its own
+        // parent links. `root_id` is a global surrogate key so rows stay unique
+        // across namespaces (ADR-003 §4.1, multi-namespace).
         let root_id: i64 = conn.query_row(
             "SELECT COALESCE(MAX(root_id) + 1, 0) FROM root",
             [],
             |row| row.get(0),
         )?;
         conn.execute(
-            "INSERT INTO root (root_id, parent_root_id, op, created_ns) VALUES (?1, ?2, ?3, ?4)",
-            (root_id, parent.map(|value| value as i64), op, now_ns()),
+            "INSERT INTO root (root_id, namespace, parent_root_id, op, created_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                root_id,
+                &self.name,
+                parent.map(|value| value as i64),
+                op,
+                now_ns(),
+            ),
         )?;
         conn.execute(
             "UPDATE namespace SET head_root = ?1 WHERE name = ?2",
@@ -241,8 +283,9 @@ impl Namespace {
     pub fn root_record(&self, root_id: u64) -> Option<RootRecord> {
         self.conn()
             .query_row(
-                "SELECT root_id, parent_root_id, op, created_ns FROM root WHERE root_id = ?1",
-                [root_id as i64],
+                "SELECT root_id, parent_root_id, op, created_ns
+                 FROM root WHERE namespace = ?1 AND root_id = ?2",
+                (&self.name, root_id as i64),
                 |row| {
                     Ok(RootRecord {
                         root_id: row.get::<_, i64>(0)? as u64,
@@ -261,7 +304,11 @@ impl Namespace {
     #[must_use]
     pub fn root_count(&self) -> u64 {
         self.conn()
-            .query_row("SELECT COUNT(*) FROM root", [], |row| row.get::<_, i64>(0))
+            .query_row(
+                "SELECT COUNT(*) FROM root WHERE namespace = ?1",
+                [&self.name],
+                |row| row.get::<_, i64>(0),
+            )
             .unwrap_or(0) as u64
     }
 
@@ -283,8 +330,9 @@ impl Namespace {
         let id: Option<i64> = self
             .conn()
             .query_row(
-                "SELECT child_id FROM directory_entry WHERE parent_id = ?1 AND name = ?2",
-                (parent.serial() as i64, name.as_bytes()),
+                "SELECT child_id FROM directory_entry
+                 WHERE namespace = ?1 AND parent_id = ?2 AND name = ?3",
+                (&self.name, parent.serial() as i64, name.as_bytes()),
                 |row| row.get(0),
             )
             .optional()?;
@@ -295,8 +343,8 @@ impl Namespace {
         let tag: Option<i64> = self
             .conn()
             .query_row(
-                "SELECT kind FROM file WHERE file_id = ?1",
-                [id.serial() as i64],
+                "SELECT kind FROM file WHERE namespace = ?1 AND file_id = ?2",
+                (&self.name, id.serial() as i64),
                 |row| row.get(0),
             )
             .optional()?;

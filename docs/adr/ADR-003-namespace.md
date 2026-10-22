@@ -221,6 +221,26 @@ T3 卡的措辞"root 不可变：写前 root 的完整视图在写后逐项不�
 3. **P2 演进路径**：对象式 CoW 命名空间——目录页/inode 表成为 CAS 对象（ADR-001 已预留
    role 5–8），届时另立 ADR。
 
+#### 多命名空间语义（F-T3-3）
+
+`root`、`file`、`directory_entry` 三张表**跨命名空间共享**，每行带 `namespace` 列：
+
+| 概念 | 作用域 | 说明 |
+| --- | --- | --- |
+| `namespace.head_root` | 每命名空间 | 当前发布指针；不同命名空间的链互相不可见 |
+| `file.file_id` | 每命名空间 | `PRIMARY KEY (namespace, file_id)`：两个命名空间都有 serial 0 的根 |
+| `directory_entry` | 每命名空间 | `PRIMARY KEY (namespace, parent_id, name)` |
+| `root.root_id` | **全局** | 全局 surrogate key，仅保证行唯一；不是"某命名空间的第几个 root" |
+| `root.parent_root_id` | 每命名空间 | 链**按命名空间闭合**：沿 parent 回溯必达该命名空间的 `NULL` 头 |
+
+所有读取入口（`head_root` / `root_record` / `root_count` / 每个操作的每次查询）都以
+`namespace` 限定，因此一个命名空间既看不到别的命名空间的条目，也数不到它们的 root。
+
+> **这是实现期间发现的缺陷**：初版把 `file_id` 作为全局主键、`root_id` 用全局 `MAX+1`，
+> 结果第二个命名空间的初始化与第一个的 serial 0 相撞（`UNIQUE constraint failed`）。
+> `namespaces_keep_separate_root_chains` 测试抓到了它。多命名空间本身虽超出 T3 卡面，
+> 但 `Namespace::open` 按名字取命名空间已是 API 形状，文档必须显式化而不是靠读者推断。
+
 #### 发布规则
 
 | 情形 | 是否追加 root 记录 |
@@ -353,8 +373,8 @@ CREATE TABLE namespace_policy (
 每次命名空间操作：
 
 ```text
-BEGIN IMMEDIATE
-  1. 解析并校验路径（纯计算，校验失败 → 回滚）
+with_write_tx:  BEGIN IMMEDIATE
+  1. 解析并校验路径（纯计算；校验失败 → 不开事务直接返回）
   2. 读取所需行（当前 head 与父/目标条目）
   3. 计算新状态（新 FileId）
   4. 写入变更行
@@ -362,10 +382,22 @@ BEGIN IMMEDIATE
 COMMIT
 ```
 
-**任何失败都不暴露部分更新**：步骤 1–5 全在一个事务里；异常路径直接 `ROLLBACK`。
+**任何失败都不暴露部分更新**：步骤 2–5 全在一个 `BEGIN IMMEDIATE` 事务里；`body` 返回错误
+时事务被 drop，rusqlite 自动 `ROLLBACK`，旧 root 仍是当前 root（§3.5 X1）。
+
+步骤 1 的纯校验（路径合法性、父目录存在、目标是否存在）在**开事务之前**完成，这是刻意的：
+无效输入不应占用写锁。
+
+**`with_write_tx` 是所有变更操作的唯一入口**，四个操作（`mkdir`/`rmdir`/`unlink`/`rename`）
+全部经它执行；只读操作（`stat`/`read_dir`）与 no-op 路径不开启事务。
 
 **`publish_tx` 是唯一接缝**：D+ 下它只追加一行 root 记录并推进 head；P2 改 C 时只替换这一步，
 路径校验、行读写、操作语义、测试都不随之变化。
+
+> **这是实现期间被 review 抓到的缺陷（F-T3-1）**：初版四个变更操作各自执行多条 autocommit
+> 语句——`mkdir` 实际是 6 条独立事务。ADR 写了"单事务"、`publish_tx` 文档写了 "inside its
+> transaction"，但代码里**没有那个事务**。表现是文档与代码的矛盾，本质与 T2 的"测试副本"同类：
+> 声明先行，实现未跟上。修复引入 `with_write_tx`，并由 §12.2 的失败注入测试钉住。
 
 **root 发布与对象写入的边界**：若一次操作需要新对象（T4 的 `write_at`），对象**先**经
 `Store::put` 发布（ADR-002 的序列），**再**在命名空间事务里引用它的 ObjectId。这样崩溃时
@@ -464,6 +496,35 @@ COMMIT
 | D3 | root 链 `parent_root_id` **完整无断裂** | 从 head 沿 parent 回溯必达 `NULL` 头，且每条 parent 都存在 |
 | D4 | 变更型操作恰好追加**一行** root 记录 | 计数差 == 1 |
 | D5 | no-op（rename 自身）与只读操作**不追加** | 计数差 == 0 |
+
+### 12.2 事务原子性失败注入（F-T3-2）
+
+确定性故障注入，编译在 `failure-injection` feature 下（默认关闭，dev-dependency 自引用使
+`cargo test` 启用）。三种故障都通过**真实 SQL 失败**制造，不是模拟标志：
+
+| 故障 | 制造方式 | 落在事务的哪个阶段 |
+| --- | --- | --- |
+| `BeforeMutation` | 删除 `file_id_allocator` 行 | `mkdir` 事务体第一条语句 |
+| `AfterMutation` | 把分配器指向已占用的 serial | 目录条目已写入、file 行插入时 |
+| `BeforePublication` | 在 `root` 上建 `BEFORE INSERT` 触发器 `RAISE(ABORT)` | 所有四个操作的最后一步，行变更已完成 |
+
+对应测试（`tests/atomicity.rs`）与 §3.5 的映射：
+
+| §3.5 | 测试 |
+| --- | --- |
+| X1 行变更前失败 | `failure_before_the_mutation_leaves_everything_unchanged` |
+| X1 行变更后失败（回滚已写行） | `failure_after_the_mutation_rolls_the_rows_back` |
+| X1 四个操作统一回滚 | `failure_rolls_back_every_mutating_operation` |
+| X2 已发布 root 不变 | `failed_operation_leaves_published_roots_intact` |
+| X3 未知 serial 无记录 | `root_record_of_an_unknown_serial_is_absent` |
+| X4 命名空间隔离 | `namespaces_keep_separate_root_chains` |
+
+每个失败用例都断言三件事：**树逐项不变**（名称、类型、FileId 全等）、**root 计数不变**、
+**head 不变**。
+
+**变异证据**：把 `with_write_tx` 改回"不开事务"（即 F-T3-1 的原缺陷），
+`failure_after_the_mutation_rolls_the_rows_back` 与
+`failure_rolls_back_every_mutating_operation` 立即失败。这两个测试是真在测原子性，不是恒真。
 
 具体测试名在提交说明中与每条声明配对列出（本卡新格式要求）。
 

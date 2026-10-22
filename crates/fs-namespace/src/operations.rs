@@ -27,15 +27,19 @@ impl Namespace {
                 path: path.display(),
             });
         }
-        let id = self.next_serial()?;
-        let now = now_ns();
-        self.insert_entry(parent, name, FileId::from_serial(id))?;
-        self.conn().execute(
-            "INSERT INTO file (file_id, kind, size, content_root, created_ns, modified_ns)
-             VALUES (?1, ?2, 0, NULL, ?3, ?3)",
-            (id as i64, Kind::Directory as i64, now),
-        )?;
-        self.publish_tx("mkdir", None)?;
+        let id = self.with_write_tx(|_tx| {
+            let id = self.next_serial()?;
+            let now = now_ns();
+            self.insert_entry(parent, name, FileId::from_serial(id))?;
+            self.conn().execute(
+                "INSERT INTO file (namespace, file_id, kind, size, content_root, created_ns, modified_ns)
+                 VALUES (?1, ?2, ?3, 0, NULL, ?4, ?4)",
+                (&self.name, id as i64, Kind::Directory as i64, now),
+            )?;
+            self.publish_tx("mkdir", None)?;
+            Ok(id)
+        })?;
+        let _ = id;
         Ok(())
     }
 
@@ -63,8 +67,9 @@ impl Namespace {
             });
         }
         let children: i64 = self.conn().query_row(
-            "SELECT COUNT(*) FROM directory_entry WHERE parent_id = ?1",
-            [id.serial() as i64],
+            "SELECT COUNT(*) FROM directory_entry
+                     WHERE namespace = ?1 AND parent_id = ?2",
+            (&self.name, id.serial() as i64),
             |row| row.get(0),
         )?;
         if children > 0 {
@@ -72,11 +77,15 @@ impl Namespace {
                 path: path.display(),
             });
         }
-        self.delete_entry(parent, name)?;
-        self.conn()
-            .execute("DELETE FROM file WHERE file_id = ?1", [id.serial() as i64])?;
-        self.publish_tx("rmdir", None)?;
-        Ok(())
+        self.with_write_tx(|_tx| {
+            self.delete_entry(parent, name)?;
+            self.conn().execute(
+                "DELETE FROM file WHERE namespace = ?1 AND file_id = ?2",
+                (&self.name, id.serial() as i64),
+            )?;
+            self.publish_tx("rmdir", None)?;
+            Ok(())
+        })
     }
 
     /// Removes a regular file.
@@ -109,11 +118,15 @@ impl Namespace {
             }
             Some(Kind::File) => {}
         }
-        self.delete_entry(parent, name)?;
-        self.conn()
-            .execute("DELETE FROM file WHERE file_id = ?1", [id.serial() as i64])?;
-        self.publish_tx("unlink", None)?;
-        Ok(())
+        self.with_write_tx(|_tx| {
+            self.delete_entry(parent, name)?;
+            self.conn().execute(
+                "DELETE FROM file WHERE namespace = ?1 AND file_id = ?2",
+                (&self.name, id.serial() as i64),
+            )?;
+            self.publish_tx("unlink", None)?;
+            Ok(())
+        })
     }
 
     /// Renames `from` to `to` (ADR-003 §3.3 R1–R12).
@@ -158,43 +171,46 @@ impl Namespace {
             });
         }
 
-        if let Some(existing) = self.lookup(target_parent, to_name)? {
-            let existing_kind = self
-                .kind_of(existing)?
-                .ok_or_else(|| NamespaceError::NotFound { path: to.display() })?;
-            match (source_kind, existing_kind) {
-                // R3: file over file replaces it.
-                (Kind::File, Kind::File) => {}
-                // R4/R5: a directory is never replaced by a file, and a file is
-                // never replaced by a directory.
-                (Kind::File, Kind::Directory) | (Kind::Directory, Kind::File) => {
-                    return Err(NamespaceError::AlreadyExists { path: to.display() })
-                }
-                // R6: a non-empty directory blocks the move.
-                (Kind::Directory, Kind::Directory) => {
-                    let children: i64 = self.conn().query_row(
-                        "SELECT COUNT(*) FROM directory_entry WHERE parent_id = ?1",
-                        [existing.serial() as i64],
-                        |row| row.get(0),
-                    )?;
-                    if children > 0 {
-                        return Err(NamespaceError::DirectoryNotEmpty { path: to.display() });
+        self.with_write_tx(|_tx| {
+            if let Some(existing) = self.lookup(target_parent, to_name)? {
+                let existing_kind = self
+                    .kind_of(existing)?
+                    .ok_or_else(|| NamespaceError::NotFound { path: to.display() })?;
+                match (source_kind, existing_kind) {
+                    // R3: file over file replaces it.
+                    (Kind::File, Kind::File) => {}
+                    // R4/R5: a directory is never replaced by a file, and a file
+                    // is never replaced by a directory.
+                    (Kind::File, Kind::Directory) | (Kind::Directory, Kind::File) => {
+                        return Err(NamespaceError::AlreadyExists { path: to.display() });
                     }
-                    // R7: an empty directory is replaced.
-                    self.delete_entry(target_parent, to_name)?;
-                    self.conn().execute(
-                        "DELETE FROM file WHERE file_id = ?1",
-                        [existing.serial() as i64],
-                    )?;
+                    // R6: a non-empty directory blocks the move.
+                    (Kind::Directory, Kind::Directory) => {
+                        let children: i64 = self.conn().query_row(
+                            "SELECT COUNT(*) FROM directory_entry
+                     WHERE namespace = ?1 AND parent_id = ?2",
+                            (&self.name, existing.serial() as i64),
+                            |row| row.get(0),
+                        )?;
+                        if children > 0 {
+                            return Err(NamespaceError::DirectoryNotEmpty { path: to.display() });
+                        }
+                        // R7: an empty directory is replaced.
+                        self.delete_entry(target_parent, to_name)?;
+                        self.conn().execute(
+                            "DELETE FROM file WHERE namespace = ?1 AND file_id = ?2",
+                            (&self.name, existing.serial() as i64),
+                        )?;
+                    }
                 }
+                self.delete_entry(target_parent, to_name)?;
             }
-            self.delete_entry(target_parent, to_name)?;
-        }
 
-        self.delete_entry(source_parent, from_name)?;
-        self.insert_entry(target_parent, to_name, source)?;
-        self.publish_tx("rename", None)?;
-        Ok(())
+            self.delete_entry(source_parent, from_name)?;
+            self.insert_entry(target_parent, to_name, source)?;
+            self.publish_tx("rename", None)?;
+            Ok(())
+        })
     }
 
     /// Reports one entry.
@@ -208,8 +224,8 @@ impl Namespace {
             .conn()
             .query_row(
                 "SELECT kind, size, content_root, created_ns, modified_ns
-                 FROM file WHERE file_id = ?1",
-                [id.serial() as i64],
+                 FROM file WHERE namespace = ?1 AND file_id = ?2",
+                (&self.name, id.serial() as i64),
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -263,11 +279,12 @@ impl Namespace {
         }
         let mut statement = self.conn().prepare(
             "SELECT e.name, e.child_id, f.kind
-             FROM directory_entry e JOIN file f ON f.file_id = e.child_id
-             WHERE e.parent_id = ?1
+             FROM directory_entry e
+             JOIN file f ON f.namespace = e.namespace AND f.file_id = e.child_id
+             WHERE e.namespace = ?1 AND e.parent_id = ?2
              ORDER BY e.name",
         )?;
-        let rows = statement.query_map([id.serial() as i64], |row| {
+        let rows = statement.query_map((&self.name, id.serial() as i64), |row| {
             let name: Vec<u8> = row.get(0)?;
             let child: i64 = row.get(1)?;
             let kind: i64 = row.get(2)?;
@@ -295,8 +312,10 @@ impl Namespace {
 
     fn insert_entry(&self, parent: FileId, name: &str, child: FileId) -> NamespaceResult<()> {
         self.conn().execute(
-            "INSERT INTO directory_entry (parent_id, name, child_id) VALUES (?1, ?2, ?3)",
+            "INSERT INTO directory_entry (namespace, parent_id, name, child_id)
+             VALUES (?1, ?2, ?3, ?4)",
             (
+                &self.name,
                 parent.serial() as i64,
                 name.as_bytes(),
                 child.serial() as i64,
@@ -307,8 +326,8 @@ impl Namespace {
 
     fn delete_entry(&self, parent: FileId, name: &str) -> NamespaceResult<()> {
         self.conn().execute(
-            "DELETE FROM directory_entry WHERE parent_id = ?1 AND name = ?2",
-            (parent.serial() as i64, name.as_bytes()),
+            "DELETE FROM directory_entry WHERE namespace = ?1 AND parent_id = ?2 AND name = ?3",
+            (&self.name, parent.serial() as i64, name.as_bytes()),
         )?;
         Ok(())
     }
@@ -323,8 +342,9 @@ impl Namespace {
             let parent: Option<i64> = self
                 .conn()
                 .query_row(
-                    "SELECT parent_id FROM directory_entry WHERE child_id = ?1",
-                    [current.serial() as i64],
+                    "SELECT parent_id FROM directory_entry
+                     WHERE namespace = ?1 AND child_id = ?2",
+                    (&self.name, current.serial() as i64),
                     |row| row.get(0),
                 )
                 .optional()?;

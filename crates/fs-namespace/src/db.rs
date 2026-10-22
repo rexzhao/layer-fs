@@ -35,6 +35,10 @@ impl NamespaceDb {
         };
         let mut connection = Connection::open_with_flags(store.metadata_path(), flags)?;
         crate::configure(&connection)?;
+        // Every write transaction takes the write lock up front, matching
+        // `cas-store`'s BEGIN IMMEDIATE (ADR-003 §7): two writers serialise
+        // instead of interleaving their statements.
+        connection.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
 
         let present = schema::is_present(&connection)?;
         match (present, mode) {

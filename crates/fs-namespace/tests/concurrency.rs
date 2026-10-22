@@ -106,10 +106,11 @@ fn concurrent_mkdir_of_different_paths_all_succeed() {
     assert_eq!(namespace.root_count(), 1 + created as u64);
 }
 
-/// The same path from several threads: whatever wins, the tree holds one entry
-/// and the losers report `AlreadyExists` (ADR-003 §7: last write wins, no CAS).
+/// The same path from several threads: exactly one wins, and the losers leave
+/// **no** side effect — which the transaction now makes assertable
+/// (ADR-003 §7, F-T3-1).
 #[test]
-fn concurrent_mkdir_of_the_same_path_leaves_one_entry() {
+fn concurrent_mkdir_of_the_same_path_leaves_exactly_one_winner() {
     let root = TempRoot::new("threads-same");
     {
         let store = Store::open(root.path(), OpenMode::Create).expect("store");
@@ -146,7 +147,29 @@ fn concurrent_mkdir_of_the_same_path_leaves_one_entry() {
 
     let store = Store::open(root.path(), OpenMode::ReadWrite).expect("store");
     let namespace = Namespace::open(&store, "default", OpenMode::ReadWrite).expect("ns");
-    assert_eq!(namespace.read_dir(&p("/")).expect("read_dir").len(), 1);
+    let entries = namespace.read_dir(&p("/")).expect("read_dir");
+    assert_eq!(entries.len(), 1);
+
+    // Atomicity: one init root plus exactly one successful mkdir. A losing
+    // writer that had already inserted its directory entry before failing would
+    // show up here as an extra entry or a torn root chain.
+    assert_eq!(
+        namespace.root_count(),
+        2,
+        "only the winner published a root"
+    );
+    let mut current = namespace.head_root().expect("head");
+    let mut chained = 0;
+    loop {
+        let record = namespace.root_record(current).expect("record");
+        chained += 1;
+        match record.parent_root_id {
+            Some(parent) => current = parent,
+            None => break,
+        }
+        assert!(chained < 100, "chain did not terminate");
+    }
+    assert_eq!(chained, 2, "the chain has no gaps and no extra nodes");
 }
 
 /// A second process writing the same Store (ADR-003 §7, cross-process case).

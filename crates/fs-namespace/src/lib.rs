@@ -38,6 +38,12 @@
 
 mod db;
 mod error;
+/// A deterministic mid-operation failure for this crate's atomicity tests.
+///
+/// Compiled only with the `failure-injection` feature, which the crate enables
+/// for its own tests and no consumer receives by default.
+#[cfg(feature = "failure-injection")]
+pub mod inject;
 mod namespace;
 mod operations;
 mod path;

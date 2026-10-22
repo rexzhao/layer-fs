@@ -35,25 +35,30 @@ CREATE TABLE file_id_allocator (
     next_serial INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE file (
-    file_id INTEGER PRIMARY KEY,
+    namespace TEXT NOT NULL,
+    file_id INTEGER NOT NULL,
     kind INTEGER NOT NULL,
     size INTEGER NOT NULL,
     content_root TEXT,
     created_ns INTEGER NOT NULL,
-    modified_ns INTEGER NOT NULL
+    modified_ns INTEGER NOT NULL,
+    PRIMARY KEY (namespace, file_id)
 ) STRICT;
 CREATE TABLE directory_entry (
+    namespace TEXT NOT NULL,
     parent_id INTEGER NOT NULL,
     name BLOB NOT NULL,
     child_id INTEGER NOT NULL,
-    PRIMARY KEY (parent_id, name)
+    PRIMARY KEY (namespace, parent_id, name)
 ) STRICT;
 CREATE TABLE root (
     root_id INTEGER PRIMARY KEY,
+    namespace TEXT NOT NULL,
     parent_root_id INTEGER,
     op TEXT NOT NULL,
     created_ns INTEGER NOT NULL
 ) STRICT;
+CREATE INDEX root_by_namespace ON root (namespace, root_id);
 ";
 
 /// Creates the namespace tables and records their version and DDL.
