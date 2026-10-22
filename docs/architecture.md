@@ -22,8 +22,8 @@ fs-cli ──► fs-api ──► fs-namespace ──► cas-store ──► cas
 | 模块 | 拥有 | 禁止知道 |
 |---|---|---|
 | cas-core | 对象身份、信封、编解码（纯计算） | 存储、路径、命名空间、平台、SQLite |
-| cas-store | 对象文件布局、durable 发布、恢复、校验、元数据 schema | 目录语义、文件身份、CLI、句柄 |
-| fs-namespace | FileId、目录条目、root 发布事务、路径操作 | 对象物理布局、CLI、Windows 语义 |
+| cas-store | 对象文件布局、durable 发布、恢复、校验、Store 级元数据 schema（对象索引与 store_policy） | 目录语义、文件身份、CLI、句柄、命名空间表 |
+| fs-namespace | FileId、目录条目、root 发布事务、路径操作、命名空间表 schema（namespace_policy 自治版本） | 对象物理布局、CLI、Windows 语义、对象文件名 |
 | fs-api | 对外稳定语义（spec §3 trait 落地）、操作组合 | 算法实现（不得出现编码/存储细节） |
 | fs-cli | 参数解析与输出（薄命令面） | 一切业务逻辑 |
 | fs-winfsp（P3） | Windows 语义适配（share mode、ACL、句柄生命周期） | 去重算法、直接修改 CAS 对象、自行管理 Commit（spec §3 原则） |
@@ -48,3 +48,10 @@ fs-cli ──► fs-api ──► fs-namespace ──► cas-store ──► cas
 5. 平台红线与工程上限合规？
 6. 公共 API 面最小、文档化、测试钩子门控？
 7. 与既有 ADR 决策冲突？（冲突即退回，除非先修订 ADR 并经 manager 批准）
+
+### 同库双连接（2026-10-22 裁决）
+
+store.sqlite 是唯一元数据库，但 cas-store 与 fs-namespace 各持一条连接、各治理自己的表
+（各自 policy 表 + DDL 自校验；PRAGMA user_version 保留不用）。跨连接无事务是文档化不变量：
+对象先 put 再在命名空间事务里引用（崩溃留孤儿，容忍）。fs-namespace 经 Store::metadata_path()
+获得库路径，不自带文件名知识。
