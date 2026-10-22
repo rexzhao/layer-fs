@@ -362,6 +362,32 @@ fn opening_refuses_a_store_whose_recorded_ddl_was_changed() {
 }
 
 #[test]
+fn opening_refuses_a_store_whose_recorded_policy_was_changed() {
+    // T2-QA-1 reproduction: tamper `store_policy.max_object_len` from an
+    // external SQLite connection, then reopen read-write. The value is written
+    // at creation, so it must be enforced on open like every other recorded
+    // constant.
+    let root = TempRoot::new("policy");
+    drop(Store::open(root.path(), OpenMode::Create).expect("create"));
+    let connection = rusqlite::Connection::open(root.path().join("store.sqlite")).expect("db");
+    connection
+        .execute(
+            "UPDATE store_policy SET value = '999' WHERE key = 'max_object_len'",
+            [],
+        )
+        .expect("tamper");
+    drop(connection);
+
+    match Store::open(root.path(), OpenMode::ReadWrite) {
+        Err(StoreError::SchemaMismatch { what }) => {
+            assert_eq!(what, "store_policy.max_object_len");
+        }
+        Err(other) => panic!("expected SchemaMismatch, got {other}"),
+        Ok(_) => panic!("opened a store whose recorded max_object_len was changed"),
+    }
+}
+
+#[test]
 fn read_only_open_refuses_writes_but_allows_reads() {
     let root = TempRoot::new("readonly");
     let oid = {

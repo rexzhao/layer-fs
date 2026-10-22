@@ -100,6 +100,21 @@ CREATE TABLE object_location (
 - `store_policy` 存放打开时也要校验的常量：`format_profile`（对象域串与格式版本）、
   `max_object_len`、`schema_version`。它们是**数据**而不是代码常量，以便将来版本拒绝时
   能给出精确诊断。
+
+  **每一个键在打开时都被强制执行**，比对基准是当前构建的编译期常量：
+
+  | 键 | 比对基准 |
+  | --- | --- |
+  | `format_profile` | `schema::FORMAT_PROFILE`（`wcas/object/v1`） |
+  | `max_object_len` | `cas_core::MAX_OBJECT_LEN` |
+  | `schema_version` | `schema::SCHEMA_VERSION` |
+
+  任一不符（或键被删除）→ `SchemaMismatch`，拒绝打开、不修复。
+
+  > 这条规则由 T2-QA-1 确立：`max_object_len` 曾被写入却从不读取，ADR 声称"打开时校验"
+  > 而代码只校验了另外两个键。**写入库中的常量必须被强制执行**——一个只写不读的声明比
+  > 没有更糟，它会误导后来的读者。`every_recorded_policy_key_is_checked_on_open` 测试
+  > 逐个键验证该性质，防止将来新增 policy 键时重犯。
 - `object_location.oid` 是主键，因此**同一对象只能有一行**——这就是"不产生重复物理副本"的
   索引层保证，配合 S7 之后，`put` 的幂等性由主键冲突裁决，而不是靠"先查再写"的竞态窗口。
 - `location` 存相对路径而不是绝对路径，Store 目录可整体搬移。

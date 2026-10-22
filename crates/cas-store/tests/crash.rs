@@ -11,7 +11,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -28,8 +28,30 @@ fn crash_child() {
     let root = PathBuf::from(parts.next().expect("root"));
     let step = parts.next().expect("step").to_owned();
 
+    if step == "hold-write-lock" {
+        hold_write_lock(&root);
+    }
+
     let store = cas_store::testing::open_for_child(&root).expect("child open");
     cas_store::testing::put_with_crash_point(&store, Role::Bytes, b"crash payload", &step);
+}
+
+/// Opens the Store's database, takes the write lock and keeps it until killed.
+///
+/// Used to construct a *deterministic* cross-process `Busy`: the parent only
+/// proceeds once this process announces that the transaction is open.
+fn hold_write_lock(root: &Path) {
+    let connection = rusqlite::Connection::open(root.join("store.sqlite")).expect("child db");
+    // `BEGIN IMMEDIATE` takes the write lock now rather than at first write.
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("child write lock");
+    eprintln!("STEP WriteLockHeld");
+    use std::io::Write as _;
+    let _ = std::io::stderr().flush();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// A directory that removes itself when dropped.
@@ -109,7 +131,20 @@ fn kill_child_at(root: &Path, step: &str) {
         other => panic!("unknown step {other}"),
     };
 
-    let mut child = Command::new(std::env::current_exe().expect("test binary"))
+    let mut child = spawn_child(root, step);
+    wait_for_signal(&mut child, announced, step);
+    // The child is about to abort on its own; reap it and confirm it died
+    // abnormally rather than completing the put.
+    let status = child.wait().expect("wait for child");
+    assert!(
+        !status.success(),
+        "the child exited normally at {step}; the crash did not happen"
+    );
+}
+
+/// Starts a child running the `crash_child` test with a `root|step` spec.
+fn spawn_child(root: &Path, step: &str) -> Child {
+    Command::new(std::env::current_exe().expect("test binary"))
         .arg("crash_child")
         .arg("--exact")
         .arg("--nocapture")
@@ -120,28 +155,22 @@ fn kill_child_at(root: &Path, step: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn child");
+        .expect("spawn child")
+}
 
+/// Waits until the child prints `signal`, or panics.
+fn wait_for_signal(child: &mut Child, signal: &str, step: &str) {
     let stderr = child.stderr.take().expect("child stderr");
     let reader = BufReader::new(stderr);
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut reached = false;
     for line in reader.lines() {
         let line = line.expect("child line");
-        if line.trim() == announced {
-            reached = true;
-            break;
+        if line.trim() == signal {
+            return;
         }
         assert!(Instant::now() < deadline, "child did not reach {step}");
     }
-    assert!(reached, "child never reported {announced}");
-    // The child is about to abort on its own; reap it and confirm it died
-    // abnormally rather than completing the put.
-    let status = child.wait().expect("wait for child");
-    assert!(
-        !status.success(),
-        "the child exited normally at {step}; the crash did not happen"
-    );
+    panic!("child never reported {signal} for {step}");
 }
 
 fn assert_recovered(root: &Path, expect_published: bool, step: &str) {
@@ -326,6 +355,46 @@ fn the_crash_path_observes_the_production_sequence() {
             "crash point {name} names a step the production put never reaches"
         );
     }
+}
+
+#[test]
+fn a_cross_process_writer_reports_busy_without_retrying() {
+    // ADR-002 §8: one writer at a time, `busy_timeout = 0`, no busy handler and
+    // no retry. A second process holding the write lock must make this process's
+    // put fail with a typed Busy rather than silently waiting or retrying.
+    let root = TempRoot::new("busy");
+    drop(Store::open(root.path(), OpenMode::Create).expect("create"));
+
+    let mut child = spawn_child(root.path(), "hold-write-lock");
+    wait_for_signal(&mut child, "STEP WriteLockHeld", "hold-write-lock");
+
+    let store = Store::open(root.path(), OpenMode::ReadWrite).expect("parent open");
+    let started = Instant::now();
+    let result = store.put(Role::Bytes, b"blocked");
+    let elapsed = started.elapsed();
+
+    // Read the answer before releasing the child so the assertion is about the
+    // contended call, not about a race with its teardown.
+    child.kill().expect("kill lock holder");
+    let _ = child.wait();
+
+    match result {
+        Err(cas_store::StoreError::Busy) => {}
+        Err(other) => panic!("expected Busy, got {other}"),
+        Ok(_) => panic!("a put succeeded while another process held the write lock"),
+    }
+    // `busy_timeout = 0` means it fails promptly; a bounded sanity check that it
+    // did not wait for a handler that should not exist.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the contended put took {elapsed:?}; it should fail at once"
+    );
+
+    // With the lock released the same put succeeds.
+    let store = Store::open(root.path(), OpenMode::ReadWrite).expect("reopen");
+    store
+        .put(Role::Bytes, b"blocked")
+        .expect("put after release");
 }
 
 #[test]

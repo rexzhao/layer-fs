@@ -108,6 +108,16 @@ pub(crate) fn validate(connection: &Connection) -> StoreResult<()> {
             what: "store_policy.schema_version",
         });
     }
+    // Every constant recorded at creation is enforced here, not merely stored:
+    // a policy key that is written but never read would silently stop being a
+    // guarantee (T2-QA-1). The reference is the object format's own limit from
+    // cas_core, so a Store that disagrees with this build is refused.
+    let recorded_max: String = policy_value(connection, "max_object_len")?;
+    if recorded_max != cas_core::MAX_OBJECT_LEN.to_string() {
+        return Err(StoreError::SchemaMismatch {
+            what: "store_policy.max_object_len",
+        });
+    }
     Ok(())
 }
 
@@ -189,5 +199,63 @@ mod tests {
                 what: "store_policy.format_profile"
             })
         ));
+    }
+
+    #[test]
+    fn validate_rejects_a_tampered_max_object_len() {
+        // T2-QA-1: the key is written at creation, so it must also be enforced.
+        let mut connection = Connection::open_in_memory().expect("open");
+        create(&mut connection).expect("create");
+        connection
+            .execute(
+                "UPDATE store_policy SET value = '999' WHERE key = 'max_object_len'",
+                [],
+            )
+            .expect("tamper");
+        assert!(matches!(
+            validate(&connection),
+            Err(StoreError::SchemaMismatch {
+                what: "store_policy.max_object_len"
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_a_removed_policy_key() {
+        let mut connection = Connection::open_in_memory().expect("open");
+        create(&mut connection).expect("create");
+        connection
+            .execute("DELETE FROM store_policy WHERE key = 'max_object_len'", [])
+            .expect("tamper");
+        assert!(matches!(
+            validate(&connection),
+            Err(StoreError::SchemaMismatch {
+                what: "max_object_len"
+            })
+        ));
+    }
+
+    #[test]
+    fn every_recorded_policy_key_is_checked_on_open() {
+        // Guards the class of defect QA found rather than the one instance: each
+        // key create() writes must be rejected when its value changes, so a new
+        // key cannot be added without a validator.
+        for key in ["format_profile", "max_object_len", "schema_version"] {
+            let mut connection = Connection::open_in_memory().expect("open");
+            create(&mut connection).expect("create");
+            connection
+                .execute(
+                    "UPDATE store_policy SET value = value || '-tampered' WHERE key = ?1",
+                    [key],
+                )
+                .expect("tamper");
+            assert!(
+                matches!(
+                    validate(&connection),
+                    Err(StoreError::SchemaMismatch { .. })
+                ),
+                "policy key {key} is written by create() but not enforced by validate()"
+            );
+        }
     }
 }
