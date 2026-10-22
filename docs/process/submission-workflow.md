@@ -48,3 +48,8 @@ ame@other-project） |
 
 - manager 的流程/架构文档提交经临时 worktree F:\work\layer-fs-main（基于 main）进行，不占用共享工作树。
 - 该路径存在时**任何会话不得删除、prune 或改动**；manager 用毕即删。QA 的独立验证工作树请用各自独立命名（如 F:\work\qa-*），同样互不触碰。
+### 会话重启后的身份恢复（经验记录，2026-10-22）
+
+DSH 会话重启后，manager 会话的默认邮箱身份可能漂移为 dispatch（最近登录者优先）。
+后果：内部邮件列表显示为空或错乱、回信以 dispatch 身份发出。恢复步骤：重启后先
+mailbox_connect as='manager' 再处理任何内部邮件；若需处理外部邮件再以 s='dispatch' 操作。
