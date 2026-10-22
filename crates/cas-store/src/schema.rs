@@ -129,9 +129,24 @@ fn policy_value(connection: &Connection, key: &'static str) -> StoreResult<Strin
             |row| row.get(0),
         )
         .map_err(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => StoreError::SchemaMismatch { what: key },
+            // A missing key reports the same qualified name a changed value does
+            // (T3 backlog): `what` always names table.column, so a caller can
+            // point at the row and the two failure shapes stay comparable.
+            rusqlite::Error::QueryReturnedNoRows => StoreError::SchemaMismatch {
+                what: qualified_policy_key(key),
+            },
             other => StoreError::Sqlite(other),
         })
+}
+
+/// The `what` label for a policy key: `store_policy.<key>`.
+fn qualified_policy_key(key: &'static str) -> &'static str {
+    match key {
+        "format_profile" => "store_policy.format_profile",
+        "max_object_len" => "store_policy.max_object_len",
+        "schema_version" => "store_policy.schema_version",
+        _ => "store_policy.<unknown>",
+    }
 }
 
 #[cfg(test)]
@@ -227,10 +242,12 @@ mod tests {
         connection
             .execute("DELETE FROM store_policy WHERE key = 'max_object_len'", [])
             .expect("tamper");
+        // T3 backlog: a removed key reports the same qualified label a changed
+        // value does, so the two failure shapes are comparable.
         assert!(matches!(
             validate(&connection),
             Err(StoreError::SchemaMismatch {
-                what: "max_object_len"
+                what: "store_policy.max_object_len"
             })
         ));
     }

@@ -92,6 +92,7 @@ impl Published {
 pub struct Store {
     database: Database,
     layout: Layout,
+    metadata_path: std::path::PathBuf,
     read_only: bool,
     opened: Opened,
 }
@@ -111,9 +112,11 @@ impl Store {
     /// [`StoreError::Sqlite`] for database failures.
     pub fn open(root: impl AsRef<Path>, mode: OpenMode) -> StoreResult<Self> {
         let (database, layout, opened) = open::open(root.as_ref(), mode)?;
+        let metadata_path = layout.database();
         Ok(Self {
             database,
             layout,
+            metadata_path,
             read_only: mode == OpenMode::ReadOnly,
             opened,
         })
@@ -130,6 +133,18 @@ impl Store {
     #[must_use]
     pub fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    /// The path of this Store's metadata database.
+    ///
+    /// Exposed so that a layer above this crate can open the same file on its
+    /// own connection without knowing the file name itself: which file holds the
+    /// metadata is this crate's knowledge, not theirs (ADR-003 §4.2.1).
+    #[must_use]
+    pub fn metadata_path(&self) -> &std::path::Path {
+        // The database path is derived from the layout, so a borrowed return
+        // needs it cached; store it at open time instead of recomputing.
+        &self.metadata_path
     }
 
     /// Whether this handle is read-only.

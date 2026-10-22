@@ -1,0 +1,12 @@
+[package]
+name = "fs-namespace"
+description = "Immutable namespace roots over the content-addressed store: directories, file ids and path operations."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cas-core.workspace = true
+cas-store.workspace = true
+rusqlite.workspace = true

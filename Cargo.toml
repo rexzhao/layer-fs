@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cas-core",
     "crates/cas-store",
+    "crates/fs-namespace",
     "crates/fs-cli",
 ]
 
@@ -15,6 +16,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 cas-core = { path = "crates/cas-core" }
 cas-store = { path = "crates/cas-store" }
+fs-namespace = { path = "crates/fs-namespace" }
 blake3 = "1.8.7"
 # Bundled SQLite: one version everywhere, no system-library dependency.
 rusqlite = { version = "0.40.2", features = ["bundled"] }
