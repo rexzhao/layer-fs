@@ -6,9 +6,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Compiles the crash-point helpers used by this crate's own tests. Off by
+# default: a consumer of `cas-store` never gets the abort hooks (ADR-002 §13.1).
+crash-points = []
+
 [dependencies]
 cas-core.workspace = true
 rusqlite.workspace = true
+
+[dev-dependencies]
+# Self-reference so `cargo test -p cas-store` compiles the crash-point module.
+cas-store = { path = ".", features = ["crash-points"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

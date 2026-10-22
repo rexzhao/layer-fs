@@ -42,7 +42,15 @@ mod layout;
 mod object;
 mod open;
 mod schema;
+
+/// Crash-point helpers for this crate's own crash-injection tests.
+///
+/// Compiled only with the `crash-points` feature, which the crate enables for
+/// its own tests and no consumer receives by default (ADR-002 §13.1).
+#[cfg(feature = "crash-points")]
 pub mod testing;
+
+pub use object::{NoObservation, PublishObserver, PublishStep};
 
 use std::path::Path;
 
@@ -151,13 +159,33 @@ impl Store {
     /// leftover file for this object does not match what would be written, and
     /// [`StoreError::Io`]/[`StoreError::Sqlite`] for storage failures.
     pub fn put(&self, role: Role, value: &[u8]) -> StoreResult<Published> {
+        let mut observer = object::NoObservation;
+        self.put_observed(role, value, &mut observer)
+    }
+
+    /// [`Store::put`], reporting each publication step to `observer`.
+    ///
+    /// This is the one implementation of the publication sequence: [`Store::put`]
+    /// is this call with a no-op observer, and the crash-injection tests pass an
+    /// observer that aborts (ADR-002 §13.1). The observer cannot change what is
+    /// written, or in what order.
+    ///
+    /// # Errors
+    ///
+    /// The same failures as [`Store::put`].
+    pub fn put_observed(
+        &self,
+        role: Role,
+        value: &[u8],
+        observer: &mut dyn object::PublishObserver,
+    ) -> StoreResult<Published> {
         if self.read_only {
             return Err(StoreError::ReadOnly);
         }
         let object = Object::new(role, value)?;
         let oid = object.id()?;
         let frame = object.to_vec();
-        let outcome = object::put(&self.database, &self.layout, role, value)?;
+        let outcome = object::put_observed(&self.database, &self.layout, role, value, observer)?;
         Ok(Published {
             oid,
             frame,

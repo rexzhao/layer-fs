@@ -45,6 +45,7 @@ name = "cas-store"
 version = "0.1.0"
 dependencies = [
  "cas-core",
+ "cas-store",
  "rusqlite",
  "windows-sys",
 ]

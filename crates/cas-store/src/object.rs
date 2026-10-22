@@ -33,15 +33,63 @@ impl PutOutcome {
 
 /// Publishes `role`/`value` under its identity (ADR-002 §5).
 ///
+/// The observable steps of one `put`, in the order they happen.
+///
+/// This enum is the single description of the publication sequence: the
+/// production path and the crash-injection tests both run the same observed put
+/// and differ only in the observer they pass, so a change to the order cannot
+/// leave the tests behind (ADR-002 §13.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishStep {
+    /// The staging file has been written inside `tmp/` but not synced.
+    Staged,
+    /// The staging file has been synced; its bytes are durable.
+    StagedSynced,
+    /// The staging file has been renamed into `objects/`.
+    Renamed,
+    /// The parent directory has been synced after the rename.
+    DirectorySynced,
+    /// The index row has been committed: the object is now published.
+    Committed,
+}
+
+/// Receives each [`PublishStep`] as it happens.
+///
+/// Production passes [`NoObservation`], which does nothing; the crash tests pass
+/// a closure that terminates the process when its step arrives.
+pub trait PublishObserver {
+    /// Called immediately after `step` has completed.
+    fn step(&mut self, step: PublishStep);
+}
+
+/// The production observer: records nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoObservation;
+
+impl PublishObserver for NoObservation {
+    fn step(&mut self, _step: PublishStep) {}
+}
+
+impl<F: FnMut(PublishStep)> PublishObserver for F {
+    fn step(&mut self, step: PublishStep) {
+        self(step);
+    }
+}
+
 /// Idempotent: putting an already-published object writes nothing and reports
 /// [`PutOutcome::AlreadyPresent`]. The order of operations is the contract —
 /// object bytes are durable before any index row can point at them — so a
 /// crash at any step leaves either "not published" or "fully published".
-pub(crate) fn put(
+///
+/// [`Store::put`](crate::Store::put) passes [`NoObservation`]; the crash tests
+/// pass an observer that aborts. This is the single implementation of the
+/// sequence for both.
+pub(crate) fn put_observed(
     database: &Database,
     layout: &Layout,
     role: Role,
     value: &[u8],
+    observer: &mut dyn PublishObserver,
 ) -> StoreResult<PutOutcome> {
     let object = Object::new(role, value)?;
     let oid = object.id()?;
@@ -63,7 +111,7 @@ pub(crate) fn put(
         verify_leftover(oid, &target, &frame)?;
         PutOutcome::AdoptedOrphan
     } else {
-        match stage_and_publish(layout, &frame, &target) {
+        match stage(layout, &frame, &target, observer) {
             Ok(()) => PutOutcome::Inserted,
             // A concurrent writer of the same object raced our rename. On
             // Windows the loser sees either NotFound (its staging file was
@@ -85,22 +133,32 @@ pub(crate) fn put(
     };
 
     record(database, oid, role, relative, frame.len())?;
+    observer.step(PublishStep::Committed);
     Ok(outcome)
 }
 
 /// Writes the frame to `tmp/`, makes it durable, then renames it into place.
-fn stage_and_publish(layout: &Layout, frame: &[u8], target: &Path) -> StoreResult<()> {
+fn stage(
+    layout: &Layout,
+    frame: &[u8],
+    target: &Path,
+    observer: &mut dyn PublishObserver,
+) -> StoreResult<()> {
     let staged = layout.temporaries().join(temporary_name());
     {
         let mut file = File::create(&staged)?;
         file.write_all(frame)?;
+        observer.step(PublishStep::Staged);
         // The bytes must be on stable storage before any name points at them.
         sync_file(&file)?;
+        observer.step(PublishStep::StagedSynced);
     }
     rename_replace(&staged, target)?;
+    observer.step(PublishStep::Renamed);
     // Best effort on platforms without a documented directory flush; see the
     // durability module for exactly what this does and does not promise.
     sync_directory(target.parent().unwrap_or(layout.objects().as_path()))?;
+    observer.step(PublishStep::DirectorySynced);
     Ok(())
 }
 

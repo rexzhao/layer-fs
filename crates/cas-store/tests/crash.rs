@@ -102,9 +102,10 @@ fn kill_child_at(root: &Path, step: &str) {
     // The step names map to the `CrashPoint` debug spelling the child prints.
     let announced = match step {
         "staged" => "STEP Staged",
-        "synced" => "STEP Synced",
+        "synced" => "STEP StagedSynced",
         "renamed" => "STEP Renamed",
-        "before-commit" => "STEP BeforeCommit",
+        "dirsynced" => "STEP DirectorySynced",
+        "committed" => "STEP Committed",
         other => panic!("unknown step {other}"),
     };
 
@@ -202,11 +203,39 @@ fn crash_after_the_rename_leaves_an_invisible_orphan() {
 
 #[test]
 fn crash_before_the_index_commit_leaves_it_unpublished() {
+    // `dirsynced` is the last step before the index row is committed: the file
+    // is fully durable in objects/ and nothing points at it yet. This is the
+    // "before index commit" fault point of spec §4-8, as distinct from `renamed`
+    // which fires while the directory entry may still be unflushed.
     let root = TempRoot::new("precommit");
     drop(Store::open(root.path(), OpenMode::Create).expect("create"));
-    kill_child_at(root.path(), "before-commit");
+    kill_child_at(root.path(), "dirsynced");
     assert_eq!(count_files(&root.path().join("objects")), 1);
-    assert_recovered(root.path(), false, "before-commit");
+    assert_recovered(root.path(), false, "dirsynced");
+
+    // The orphan is adopted by the next put, which publishes it.
+    let store = Store::open(root.path(), OpenMode::ReadWrite).expect("reopen");
+    let outcome = store.put(Role::Bytes, VALUE).expect("adopting put");
+    assert_eq!(outcome.outcome, PutOutcome::AdoptedOrphan);
+    assert_eq!(store.object_count().expect("count"), 1);
+}
+
+#[test]
+fn crash_after_the_index_commit_leaves_it_published() {
+    // The "after index commit" fault point: the commit happened, so a crash
+    // right after it must leave the object readable, with no staging file and
+    // no second copy.
+    let root = TempRoot::new("postcommit");
+    drop(Store::open(root.path(), OpenMode::Create).expect("create"));
+    kill_child_at(root.path(), "committed");
+    assert_eq!(count_files(&root.path().join("objects")), 1);
+    assert_recovered(root.path(), true, "committed");
+
+    // Re-putting it is a no-op, and no second file appears.
+    let store = Store::open(root.path(), OpenMode::ReadWrite).expect("reopen");
+    let again = store.put(Role::Bytes, VALUE).expect("repeat put");
+    assert_eq!(again.outcome, PutOutcome::AlreadyPresent);
+    assert_eq!(count_files(&root.path().join("objects")), 1);
 }
 
 #[test]
@@ -240,6 +269,63 @@ fn a_crash_between_two_puts_keeps_the_first() {
         store.get(oid()),
         Err(cas_store::StoreError::NotFound { .. })
     ));
+}
+
+#[test]
+fn the_crash_path_observes_the_production_sequence() {
+    // F-T2-1: the crash path must not carry its own copy of the publication
+    // sequence. This test drives `Store::put` itself with a recording observer
+    // and asserts the exact order; the crash child uses the same entry point, so
+    // a sequence change shows up here and in the crash tests together.
+    use cas_store::{NoObservation, PublishObserver, PublishStep};
+
+    let root = TempRoot::new("sequence");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+
+    let mut steps = Vec::new();
+    store
+        .put_observed(Role::Bytes, VALUE, &mut |step: PublishStep| {
+            steps.push(step)
+        })
+        .expect("observed put");
+    assert_eq!(
+        steps,
+        vec![
+            PublishStep::Staged,
+            PublishStep::StagedSynced,
+            PublishStep::Renamed,
+            PublishStep::DirectorySynced,
+            PublishStep::Committed,
+        ],
+        "the production sequence, in order"
+    );
+
+    // `put` is the same call with the no-op observer: identical outcome, no
+    // extra steps, and the object is published exactly once.
+    let plain = store.put(Role::Bytes, VALUE).expect("plain put");
+    assert_eq!(plain.outcome, PutOutcome::AlreadyPresent);
+    // The no-op observer accepts every step and does nothing, which is what
+    // makes `put` and `put_observed` the same sequence.
+    let mut none = NoObservation;
+    for step in steps.iter().copied() {
+        PublishObserver::step(&mut none, step);
+    }
+
+    // Every crash point maps onto a step of that sequence.
+    for (name, expected) in [
+        ("staged", PublishStep::Staged),
+        ("synced", PublishStep::StagedSynced),
+        ("renamed", PublishStep::Renamed),
+        ("dirsynced", PublishStep::DirectorySynced),
+        ("committed", PublishStep::Committed),
+    ] {
+        let point = cas_store::testing::CrashPoint::parse(name).expect("known point");
+        assert_eq!(point.step(), expected, "crash point {name}");
+        assert!(
+            steps.contains(&expected),
+            "crash point {name} names a step the production put never reaches"
+        );
+    }
 }
 
 #[test]

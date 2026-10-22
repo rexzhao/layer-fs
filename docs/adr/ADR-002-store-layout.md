@@ -327,19 +327,64 @@ Windows 侧的 `FlushFileBuffers` 来自 `windows-sys 0.61.2`（微软官方 Rus
 
 ### 13.1 崩溃测试的实现方式
 
+**序列只有一份。** `Store::put` 与崩溃测试调用同一个入口：
+
+```text
+Store::put(role, value)                    // 生产
+  = put_observed(role, value, NoObservation)
+
+Store::put_observed(role, value, observer) // 唯一的序列实现
+  observer.step(Staged) ... Committed
+```
+
+`PublishStep` 枚举是序列的唯一描述；`put_observed` 在每一步之后回调 observer。生产传
+`NoObservation`（空实现），崩溃测试传"观察到点名步骤就 abort"的闭包。因此 staging /
+rename / 目录刷写 / 索引提交的**顺序变更会自动被崩溃测试覆盖**，不存在"测试副本与生产
+实现漂移"的可能。
+
+步骤与故障点（`crash-points` feature 内的 `CrashPoint` 一一映射到 `PublishStep`）：
+
+| 故障点 | 对应步骤 | 崩溃时磁盘状态 |
+| --- | --- | --- |
+| `staged` | `Staged` | tmp/ 有未 sync 的半截文件 |
+| `synced` | `StagedSynced` | tmp/ 有完整文件 |
+| `renamed` | `Renamed` | objects/ 有文件，目录项可能未刷 |
+| `dirsynced` | `DirectorySynced` | objects/ 有文件且目录已刷，**索引未提交** |
+| `committed` | `Committed` | **索引已提交，对象已发布** |
+
+`dirsynced` 与 `committed` 分别是 spec §4-8 要求的"索引提交前/后"两个故障点。
+
+其余机制：
+
 - 子进程是测试二进制自身（`crash_child` 测试 + 仅在该子进程环境中的变量）；
-- 子进程执行与生产 `Store::put` **相同**的持久化原语与路径（`testing` 模块复用
-  `durability` 与 `layout`），只在指定步骤调用 `std::process::abort`；
+- 子进程在被点名的步骤调用 `std::process::abort`——真实进程死亡，不跑析构；
 - 父进程读到子进程在 stderr 上的 `STEP <点>` 信号后 `wait`，并断言**退出状态非成功**
   ——若子进程正常退出，说明崩溃点没有生效，测试直接失败。用 stderr 是因为 `abort`
   不跑析构、stdout 的缓冲内容会丢失；
-- 父进程随后重新打开 Store 并校验：发布状态、`tmp/` 为空、`verify()` 干净。
+- 父进程随后重新打开 Store 并校验：发布状态、`tmp/` 为空、`verify()` 干净；
+- `the_crash_path_observes_the_production_sequence` 直接对 `Store::put_observed` 记录
+  实际步骤序列并断言其等于上表顺序，且每个 `CrashPoint` 都能映射到序列中的一步——这是
+  "单一序列来源"的机器可验证证据。
+
+**feature gate。** 崩溃钩子编译在 `crash-points` feature 下（默认关闭）：
+
+```toml
+[features]
+crash-points = []
+[dev-dependencies]
+cas-store = { path = ".", features = ["crash-points"] }
+```
+
+自引用使 `cargo test -p cas-store` 仍跑全部崩溃测试，而**外部默认构建完全不含该模块**
+（`cargo doc -p cas-store --no-deps` 不生成 `CrashPoint`，加 `--features crash-points`
+才生成——已实测双向验证）。
 
 **变体验证**：为确认测试不是恒真，曾把 `renamed` 崩溃点临时移到 rename **之前**，
 `crash_after_the_rename_leaves_an_invisible_orphan` 立即失败；恢复后重新通过。
 
 **稳定性验证**：并发用例曾因 §7.0/§8.1 的两个竞态在并行回归中约 15% 概率失败；修复后
-连续 **50 次**全量 `cargo test --workspace` 零失败。
+连续 **50 次**全量 `cargo test --workspace` 零失败。observer 重构后重跑 30 次全量，
+结果记录在提交说明中。
 
 ## 14. 下一步
 
