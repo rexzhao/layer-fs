@@ -58,3 +58,8 @@ mailbox_connect as='manager' 再处理任何内部邮件；若需处理外部邮
 凡需负责人（user）参与决策的事项（规格歧义裁决、阶段边界变更、影响规格的取舍），
 在直接询问负责人的同时，必须以 dispatch 身份向 qclaw@2qcuc12p 抄送一份完整自洽的
 决策请求（含选项、manager 建议、不答复时的默认行为）。
+### 推送到 GitHub（负责人指示，2026-10-22）
+
+远端：origin = https://github.com/rexzhao/layer-fs（私有仓库）。
+每次卡片走完"批准合入 main"后，manager 随即 git push origin main；流程/架构文档的
+main 直提同样推送。特性分支默认不推（本地保留审阅历史即可）；需要时按需推。
