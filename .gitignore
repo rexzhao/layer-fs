@@ -1,0 +1,8 @@
+# LayerFS reference checkout (upstream source, kept for consultation only)
+/reference/
+
+# Rust build artifacts
+/target/
+
+# DSH session state (mailbox, harness)
+/.pi/
