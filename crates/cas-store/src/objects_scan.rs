@@ -49,8 +49,6 @@ fn walk(root: &Path, directory: &Path, bad: &mut Vec<BadObjectName>) -> StoreRes
         let file_type = entry.file_type()?;
         let relative = relative_name(root, &path);
         if file_type.is_dir() {
-            // The two prefix levels have their own naming rule; anything deeper
-            // is still walked so a misplaced file is reported, not skipped.
             walk(root, &path, bad)?;
             continue;
         }
@@ -62,6 +60,17 @@ fn walk(root: &Path, directory: &Path, bad: &mut Vec<BadObjectName>) -> StoreRes
             continue;
         };
         if let Some(reason) = name_defect(name) {
+            bad.push(BadObjectName {
+                path: relative,
+                reason,
+            });
+            continue;
+        }
+        // The name is a valid id; the *location* must be the two prefix levels
+        // its own id implies. A correctly named file in the wrong place is just
+        // as invisible to a lookup as a badly named one — and a garbage
+        // collector would never find it either — so it is reported too.
+        if let Some(reason) = placement_defect(root, &path, name) {
             bad.push(BadObjectName {
                 path: relative,
                 reason,
@@ -84,6 +93,19 @@ fn name_defect(name: &str) -> Option<&'static str> {
     // same object exist twice on a case-insensitive filesystem.
     if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
         return Some("object file name is not lowercase");
+    }
+    None
+}
+
+/// Checks that a correctly named file sits in the two prefix directories its own
+/// id implies (`objects/<name[0..2]>/<name[2..4]>/<name>`).
+fn placement_defect(root: &Path, path: &Path, name: &str) -> Option<&'static str> {
+    let Some(parent) = path.parent() else {
+        return Some("object file has no parent directory");
+    };
+    let expected = root.join(&name[0..2]).join(&name[2..4]);
+    if parent != expected {
+        return Some("object file is not under its id's two prefix directories");
     }
     None
 }

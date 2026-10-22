@@ -532,6 +532,49 @@ fn verify_reports_an_uppercase_object_name() {
 }
 
 #[test]
+fn verify_reports_a_valid_name_in_the_wrong_place() {
+    // cov-F1: a correctly named file outside its own prefix directories is as
+    // invisible to a lookup as a badly named one, and a collector would never
+    // find it. Both the flat and the wrong-prefix cases must be reported.
+    let root = TempRoot::new("misplaced");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+    let objects = root.path().join("objects");
+    let oid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let other = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    // Flat: a valid name directly under objects/.
+    std::fs::write(objects.join(oid), b"x").expect("flat");
+    // Wrong prefix: valid name under prefix directories its id does not imply.
+    let wrong = objects.join("32").join("75").join("deep");
+    std::fs::create_dir_all(&wrong).expect("dirs");
+    std::fs::write(wrong.join(other), b"x").expect("misplaced");
+
+    let report = store.verify().expect("verify");
+    assert_eq!(
+        report.bad_names.len(),
+        2,
+        "both misplaced names are reported: {:?}",
+        report.bad_names
+    );
+    for bad in &report.bad_names {
+        assert!(
+            bad.reason.contains("prefix directories"),
+            "reason names the placement rule: {}",
+            bad.reason
+        );
+    }
+}
+
+#[test]
+fn verify_accepts_a_correctly_placed_object() {
+    let root = TempRoot::new("misplaced-ok");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+    store.put(Role::Bytes, b"placed").expect("put");
+    let report = store.verify().expect("verify");
+    assert!(report.is_clean(), "{:?}", report.bad_names);
+}
+
+#[test]
 fn read_only_open_refuses_writes_but_allows_reads() {
     let root = TempRoot::new("readonly");
     let oid = {
