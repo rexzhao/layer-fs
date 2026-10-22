@@ -11,7 +11,7 @@ worker 开发（特性分支 t<N>/<slug>，不断 main）
    ▼
 worker 提交申请（mailbox_reply 原任务邮件：分支、提交哈希、测试输出、ADR/文档路径）
    ▼
-manager review（代码 + 规格 §8 提交说明 + 约束红线）
+manager review（代码 + 架构准则 docs/architecture.md + 规格 §8 提交说明 + 约束红线；不符合架构的修改退回）
    ├─ 不通过 → 退回 worker 修改（同一邮件线程）
    ▼
 manager 转交 qa 测试（附：任务说明原文、验收标准、review 关注点、分支/提交）
@@ -44,3 +44,7 @@ ame@other-project） |
 - 回复外部来件时用 s='dispatch'；内部流程一律 s='manager'。
 - manager 会话需定期检查 dispatch 收件箱（mailbox_list as='dispatch'）以免漏收外部邮件。
 - 身份规则发生变更时更新本节（负责人指示优先）。
+## manager 对 main 的文档直提与 worktree 约定（2026-10-22）
+
+- manager 的流程/架构文档提交经临时 worktree F:\work\layer-fs-main（基于 main）进行，不占用共享工作树。
+- 该路径存在时**任何会话不得删除、prune 或改动**；manager 用毕即删。QA 的独立验证工作树请用各自独立命名（如 F:\work\qa-*），同样互不触碰。
