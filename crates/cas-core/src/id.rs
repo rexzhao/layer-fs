@@ -193,6 +193,12 @@ impl ObjectIdHasher {
             value_len,
             payload_len: 0,
         };
+        // `checked_add` cannot fail on a 64-bit target (`usize` cannot exceed
+        // `u64`, and adding the 14-byte header cannot overflow `u64` for any
+        // value `usize` can hold), so the error arm is defensive and
+        // unreachable there. It is kept rather than removed because a 128-bit
+        // target would make it live, and the annotation stops anyone reading it
+        // as a covered branch.
         let len = (crate::ENVELOPE_HEADER_LEN as u64)
             .checked_add(value_len as u64)
             .ok_or(EnvelopeError::TooLarge {

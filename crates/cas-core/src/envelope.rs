@@ -128,6 +128,12 @@ impl<'a> Object<'a> {
             payload_len,
         };
         let framed = envelope.framed_len();
+        // Defensive, and unreachable while version 1 pins `payload_len` to zero:
+        // with a zero payload, `framed` is header + value, and the value check
+        // above already bounds it. Kept because a future version that allows
+        // payload bytes would otherwise be able to construct an oversized frame
+        // on this path; it is annotated, not removed, so nobody reads it as a
+        // live branch.
         if framed > MAX_OBJECT_LEN {
             return Err(EnvelopeError::TooLarge {
                 declared: framed,

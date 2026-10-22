@@ -40,6 +40,7 @@ mod durability;
 mod error;
 mod layout;
 mod object;
+mod objects_scan;
 mod open;
 mod schema;
 
@@ -59,6 +60,7 @@ use cas_core::{Object, ObjectId, Role};
 pub use error::{CorruptCause, StoreError, StoreResult};
 pub use layout::Layout;
 pub use object::{PutOutcome, VerificationFailure, VerificationReport};
+pub use objects_scan::BadObjectName;
 pub use open::{OpenMode, Opened};
 
 use open::Database;
@@ -221,11 +223,16 @@ impl Store {
 
     /// Checks every published object and reports what failed.
     ///
+    /// Also reports entries under `objects/` whose name is not a valid object id
+    /// (ADR-002 §3). Correctly named files with no index row are orphans and are
+    /// allowed, so they are not failures (ADR-002 §10).
+    ///
     /// Read-only: it repairs, deletes and quarantines nothing.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Sqlite`] when the index cannot be read.
+    /// [`StoreError::Sqlite`] when the index cannot be read, [`StoreError::Io`]
+    /// when `objects/` cannot be walked.
     pub fn verify(&self) -> StoreResult<VerificationReport> {
         object::verify_all(&self.database, &self.layout)
     }

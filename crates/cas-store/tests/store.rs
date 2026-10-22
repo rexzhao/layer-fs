@@ -388,6 +388,150 @@ fn opening_refuses_a_store_whose_recorded_policy_was_changed() {
 }
 
 #[test]
+fn identify_matches_the_object_identity_without_writing() {
+    let root = TempRoot::new("identify");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+    let oid = Store::identify(Role::Bytes, b"hello").expect("identify");
+    assert_eq!(
+        oid,
+        Object::new(Role::Bytes, b"hello")
+            .expect("framed")
+            .id()
+            .expect("hashed")
+    );
+    // Identifying is pure: nothing was published.
+    assert!(!store.exists(oid).expect("exists"));
+    assert_eq!(store.object_count().expect("count"), 0);
+}
+
+#[test]
+fn identify_preserves_the_put_error_classification() {
+    // `identify` runs the same framing checks `put` does, so the error variants
+    // must match; a caller may rely on classifying before writing.
+    let oversized = vec![0u8; cas_core::MAX_VALUE_LEN + 1];
+    assert!(matches!(
+        Store::identify(Role::Bytes, &oversized),
+        Err(StoreError::TooLarge { .. })
+    ));
+    let root = TempRoot::new("identify-err");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+    assert!(matches!(
+        store.put(Role::Bytes, &oversized),
+        Err(StoreError::TooLarge { .. })
+    ));
+}
+
+#[test]
+fn get_reports_an_object_whose_file_disappeared() {
+    // The index has a row but the file is gone: a published object that can no
+    // longer be read is corrupt, not missing.
+    let root = TempRoot::new("vanished");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+    let published = store.put(Role::Bytes, b"soon deleted").expect("put");
+    std::fs::remove_file(store.layout().object_path(published.oid)).expect("delete object file");
+
+    match store.get(published.oid) {
+        Err(StoreError::Corrupt {
+            cause: CorruptCause::LengthMismatch { expected, actual },
+            ..
+        }) => {
+            assert_eq!(expected, published.frame.len() as u64);
+            assert_eq!(actual, 0);
+        }
+        other => panic!("expected Corrupt(LengthMismatch), got {other:?}"),
+    }
+    // `verify` reports it too, and does not repair it.
+    let report = store.verify().expect("verify");
+    assert!(!report.is_clean());
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].oid, published.oid);
+    // `exists` still answers from the index: publication happened.
+    assert!(store.exists(published.oid).expect("exists"));
+}
+
+#[test]
+fn create_on_an_existing_store_reuses_it() {
+    let root = TempRoot::new("create-twice");
+    let oid = {
+        let store = Store::open(root.path(), OpenMode::Create).expect("first create");
+        assert!(store.opened().created);
+        store.put(Role::Bytes, b"kept").expect("put").oid
+    };
+    let store = Store::open(root.path(), OpenMode::Create).expect("second create");
+    assert!(!store.opened().created, "the existing store is reused");
+    assert_eq!(
+        Object::decode(&store.get(oid).expect("get"))
+            .expect("decode")
+            .value(),
+        b"kept"
+    );
+    assert_eq!(store.object_count().expect("count"), 1);
+}
+
+#[test]
+fn verify_reports_a_file_whose_name_is_not_an_object_id() {
+    // ADR-002 §3: objects/ holds object files only. A stray name is damaged
+    // state; a correctly named orphan is not.
+    let root = TempRoot::new("bad-name");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+    store.put(Role::Bytes, b"legit").expect("put");
+
+    let objects = root.path().join("objects");
+    std::fs::write(objects.join("README.txt"), b"not an object").expect("stray file");
+    let nested = objects.join("ab").join("cd");
+    std::fs::create_dir_all(&nested).expect("dirs");
+    std::fs::write(nested.join("SHORT"), b"x").expect("bad name");
+
+    let report = store.verify().expect("verify");
+    assert!(!report.is_clean());
+    assert!(report.failures.is_empty(), "published objects are intact");
+    let paths: Vec<&str> = report
+        .bad_names
+        .iter()
+        .map(|bad| bad.path.as_str())
+        .collect();
+    assert_eq!(paths.len(), 2, "both stray names are reported: {paths:?}");
+    assert!(paths.contains(&"objects/README.txt"));
+    assert!(paths.iter().any(|path| path.ends_with("/SHORT")));
+}
+
+#[test]
+fn verify_does_not_report_correctly_named_orphans() {
+    let root = TempRoot::new("orphan-ok");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+    let value = b"orphan but well named";
+    let oid = oid_of(Role::Bytes, value);
+    let path = store.layout().object_path(oid);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+    std::fs::write(
+        &path,
+        Object::new(Role::Bytes, value).expect("framed").to_vec(),
+    )
+    .expect("write orphan");
+
+    let report = store.verify().expect("verify");
+    assert!(report.bad_names.is_empty(), "an orphan is not a bad name");
+    assert!(report.is_clean(), "and it is not a failure either");
+}
+
+#[test]
+fn verify_reports_an_uppercase_object_name() {
+    // Parsing an id accepts uppercase, so the on-disk rule needs its own check:
+    // on a case-insensitive filesystem two spellings would be one file with two
+    // identities.
+    let root = TempRoot::new("uppercase");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+    let nested = root.path().join("objects").join("ab").join("cd");
+    std::fs::create_dir_all(&nested).expect("dirs");
+    let name = "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef";
+    std::fs::write(nested.join(name), b"x").expect("write");
+
+    let report = store.verify().expect("verify");
+    assert_eq!(report.bad_names.len(), 1);
+    assert!(report.bad_names[0].reason.contains("lowercase"));
+}
+
+#[test]
 fn read_only_open_refuses_writes_but_allows_reads() {
     let root = TempRoot::new("readonly");
     let oid = {

@@ -9,6 +9,7 @@ use cas_core::{verify_id, Object, ObjectId, Role};
 use crate::durability::{rename_replace, sync_directory, sync_file};
 use crate::error::{CorruptCause, StoreError, StoreResult};
 use crate::layout::{temporary_name, Layout};
+use crate::objects_scan;
 use crate::open::Database;
 
 /// What a `put` did.
@@ -352,20 +353,28 @@ pub struct VerificationReport {
     pub checked: usize,
     /// The objects that failed, in id order.
     pub failures: Vec<VerificationFailure>,
+    /// Entries under `objects/` whose name is not a valid object id.
+    ///
+    /// ADR-002 §3: that directory holds object files only, so a stray name is
+    /// damaged state. Correctly named files with no index row are orphans and
+    /// are allowed (ADR-002 §10), so they are not listed here.
+    pub bad_names: Vec<objects_scan::BadObjectName>,
 }
 
 impl VerificationReport {
-    /// Whether every published object was readable and intact.
+    /// Whether every published object was readable and intact and every entry
+    /// under `objects/` had a valid object name.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.failures.is_empty()
+        self.failures.is_empty() && self.bad_names.is_empty()
     }
 }
 
 /// Read-only check of every published object (ADR-002 §6, §10).
 ///
 /// Repairs and deletes nothing: it reports. Orphans (files with no index row)
-/// are out of scope because they are not published.
+/// are out of scope because they are not published; files whose *name* is not an
+/// object id are reported separately.
 pub(crate) fn verify_all(database: &Database, layout: &Layout) -> StoreResult<VerificationReport> {
     let mut statement = database
         .connection
@@ -386,5 +395,10 @@ pub(crate) fn verify_all(database: &Database, layout: &Layout) -> StoreResult<Ve
             });
         }
     }
-    Ok(VerificationReport { checked, failures })
+    let bad_names = objects_scan::scan_names(&layout.objects())?;
+    Ok(VerificationReport {
+        checked,
+        failures,
+        bad_names,
+    })
 }
