@@ -1,0 +1,276 @@
+//! The typed failures a `cas-store` operation can report.
+//!
+//! Every variant names the exact condition. Callers classify programmatically;
+//! no variant exists for "something went wrong", and no operation retries or
+//! repairs on its own (ADR-002 §11, ADR-001 D10).
+
+use std::fmt;
+use std::io;
+
+use cas_core::{EnvelopeError, IdParseError, ObjectId};
+
+/// Why a Store operation failed.
+#[derive(Debug)]
+pub enum StoreError {
+    /// The Store's filesystem could not be read or written.
+    Io(io::Error),
+    /// SQLite reported a failure (statement, transaction or pragma).
+    Sqlite(rusqlite::Error),
+    /// A concurrent writer held the Store's single write lane.
+    ///
+    /// The operation did not take effect. ADR-002 §8: no busy handler and no
+    /// automatic retry, so the caller decides whether to try again.
+    Busy,
+    /// `get`/`verify` was asked for an object the Store has not published.
+    NotFound {
+        /// The requested object.
+        oid: ObjectId,
+    },
+    /// The object file or its index row failed validation.
+    ///
+    /// The object is published, but its bytes cannot be trusted. Never
+    /// substituted with zeros or returned partially.
+    Corrupt {
+        /// The object whose bytes failed validation.
+        oid: ObjectId,
+        /// What exactly failed.
+        cause: CorruptCause,
+    },
+    /// The Store was opened on disk with a schema version this build does not
+    /// support.
+    UnsupportedSchemaVersion {
+        /// The version recorded in the Store.
+        found: u32,
+        /// The version this build implements.
+        supported: u32,
+    },
+    /// The database's recorded DDL or policy is not what this build creates.
+    SchemaMismatch {
+        /// Which part disagreed.
+        what: &'static str,
+    },
+    /// A write was attempted on a Store opened read-only.
+    ReadOnly,
+    /// The value exceeds the object format's limit.
+    TooLarge {
+        /// Declared length in bytes.
+        declared: u64,
+        /// The largest accepted length.
+        limit: u64,
+    },
+    /// `put` was given a `payload_len` the format forbids, or another envelope
+    /// rule rejected the requested object.
+    InvalidObject(EnvelopeError),
+    /// A stored index row holds a value the Store cannot interpret.
+    InvalidRecord {
+        /// The column or field at fault.
+        field: &'static str,
+        /// A short description of what was found.
+        detail: String,
+    },
+    /// An object file's name is not the 64-character hex form of an id.
+    InvalidObjectName {
+        /// The offending file name.
+        name: String,
+    },
+}
+
+/// What specifically made an object's bytes untrustworthy.
+#[derive(Debug)]
+pub enum CorruptCause {
+    /// The file's size differs from the length recorded in the index.
+    LengthMismatch {
+        /// Bytes the index recorded.
+        expected: u64,
+        /// Bytes actually on disk.
+        actual: u64,
+    },
+    /// The bytes are not a valid version-1 object envelope.
+    Envelope(EnvelopeError),
+    /// The bytes decode, but hash to a different identity than their path and
+    /// index row claim.
+    IdentityMismatch {
+        /// The identity the path and index claim.
+        expected: ObjectId,
+        /// The identity the bytes actually hash to.
+        actual: ObjectId,
+    },
+    /// The index row's role does not match the role in the object's envelope.
+    RoleMismatch {
+        /// Role recorded in the index.
+        recorded: i64,
+        /// Role found in the envelope.
+        actual: u8,
+    },
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoreError::Io(error) => write!(f, "store i/o error: {error}"),
+            StoreError::Sqlite(error) => write!(f, "store database error: {error}"),
+            StoreError::Busy => f.write_str(
+                "store is busy: another writer holds the write lane; the operation did not take effect",
+            ),
+            StoreError::NotFound { oid } => write!(f, "object {oid} is not in the store"),
+            StoreError::Corrupt { oid, cause } => write!(f, "object {oid} is corrupt: {cause}"),
+            StoreError::UnsupportedSchemaVersion { found, supported } => write!(
+                f,
+                "store schema version {found} is not supported (this build reads {supported})"
+            ),
+            StoreError::SchemaMismatch { what } => {
+                write!(f, "store schema mismatch in {what}")
+            }
+            StoreError::ReadOnly => f.write_str("store is open read-only"),
+            StoreError::TooLarge { declared, limit } => {
+                write!(f, "object of {declared} bytes exceeds the limit {limit}")
+            }
+            StoreError::InvalidObject(error) => write!(f, "invalid object: {error}"),
+            StoreError::InvalidRecord { field, detail } => {
+                write!(f, "invalid store record in {field}: {detail}")
+            }
+            StoreError::InvalidObjectName { name } => {
+                write!(f, "invalid object file name {name:?}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for CorruptCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CorruptCause::LengthMismatch { expected, actual } => write!(
+                f,
+                "index records {expected} bytes but the file has {actual}"
+            ),
+            CorruptCause::Envelope(error) => write!(f, "{error}"),
+            CorruptCause::IdentityMismatch { expected, actual } => {
+                write!(f, "bytes hash to {actual}, not {expected}")
+            }
+            CorruptCause::RoleMismatch { recorded, actual } => {
+                write!(
+                    f,
+                    "index records role {recorded} but the envelope says {actual}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for StoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StoreError::Io(error) => Some(error),
+            StoreError::Sqlite(error) => Some(error),
+            StoreError::InvalidObject(error) => Some(error),
+            StoreError::Corrupt {
+                cause: CorruptCause::Envelope(error),
+                ..
+            } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for StoreError {
+    fn from(error: io::Error) -> Self {
+        StoreError::Io(error)
+    }
+}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(error: rusqlite::Error) -> Self {
+        map_sqlite(error)
+    }
+}
+
+impl From<EnvelopeError> for StoreError {
+    fn from(error: EnvelopeError) -> Self {
+        match error {
+            EnvelopeError::TooLarge { declared, limit } => StoreError::TooLarge { declared, limit },
+            other => StoreError::InvalidObject(other),
+        }
+    }
+}
+
+impl From<IdParseError> for StoreError {
+    fn from(error: IdParseError) -> Self {
+        StoreError::InvalidRecord {
+            field: "object_location.oid",
+            detail: error.to_string(),
+        }
+    }
+}
+
+/// Maps a contended SQLite failure to [`StoreError::Busy`].
+///
+/// SQLite reports contention as `SQLITE_BUSY` / `SQLITE_LOCKED`. Everything
+/// else keeps its own variant so the cause is never hidden behind "busy".
+fn map_sqlite(error: rusqlite::Error) -> StoreError {
+    use rusqlite::ffi::ErrorCode;
+    match &error {
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+            ) =>
+        {
+            StoreError::Busy
+        }
+        _ => StoreError::Sqlite(error),
+    }
+}
+
+/// The result of a Store operation.
+pub type StoreResult<T> = Result<T, StoreError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn displays_name_the_failing_condition() {
+        let oid = cas_core::ObjectId::from_bytes([7u8; 32]);
+        assert!(StoreError::Busy.to_string().contains("busy"));
+        assert!(StoreError::ReadOnly.to_string().contains("read-only"));
+        assert!(StoreError::NotFound { oid }
+            .to_string()
+            .contains("not in the store"));
+        assert!(StoreError::UnsupportedSchemaVersion {
+            found: 9,
+            supported: 1
+        }
+        .to_string()
+        .contains('9'));
+        assert!(StoreError::Corrupt {
+            oid,
+            cause: CorruptCause::LengthMismatch {
+                expected: 10,
+                actual: 4
+            }
+        }
+        .to_string()
+        .contains("corrupt"));
+        assert!(StoreError::InvalidRecord {
+            field: "object_location.oid",
+            detail: "bad".into()
+        }
+        .to_string()
+        .contains("object_location.oid"));
+        assert!(StoreError::InvalidObjectName { name: "x".into() }
+            .to_string()
+            .contains("\"x\""));
+    }
+
+    #[test]
+    fn envelope_errors_split_into_too_large_and_invalid() {
+        let too_large = StoreError::from(cas_core::EnvelopeError::TooLarge {
+            declared: 99,
+            limit: 10,
+        });
+        assert!(matches!(too_large, StoreError::TooLarge { .. }));
+
+        let invalid = StoreError::from(cas_core::EnvelopeError::UnknownRole { found: 42 });
+        assert!(matches!(invalid, StoreError::InvalidObject(_)));
+    }
+}

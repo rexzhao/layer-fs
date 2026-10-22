@@ -101,7 +101,7 @@ impl FromStr for ObjectId {
         let bytes = s.as_bytes();
         if bytes.len() != ID_HEX_LEN {
             return Err(IdParseError::Length {
-                actual: s.chars().count(),
+                actual: bytes.len(),
             });
         }
         let mut digest = [0u8; ID_BYTES];

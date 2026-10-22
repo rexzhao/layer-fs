@@ -112,6 +112,54 @@ fn id_parse_rejects_wrong_length_and_non_hex() {
 }
 
 #[test]
+fn id_parse_reports_a_length_in_bytes_not_characters() {
+    // 64 multi-byte characters: 64 characters but 128 bytes. The old message
+    // read "expected 64, found 64 characters" while failing, which was
+    // misleading; the length is a byte rule.
+    let text = "é".repeat(64);
+    assert_eq!(text.chars().count(), 64);
+    assert_eq!(text.len(), 128);
+    assert_eq!(
+        text.parse::<ObjectId>(),
+        Err(IdParseError::Length { actual: 128 })
+    );
+
+    // A too-short multi-byte string reports its byte count too.
+    assert_eq!(
+        "é".parse::<ObjectId>(),
+        Err(IdParseError::Length { actual: 2 })
+    );
+
+    // The message names the rule and the unit it measured.
+    let message = IdParseError::Length { actual: 128 }.to_string();
+    assert!(message.contains("64 ASCII hex characters"), "{message}");
+    assert!(message.contains("128 bytes"), "{message}");
+}
+
+#[test]
+fn id_parse_checks_length_before_content() {
+    // A multi-byte character swapped in for one ASCII digit changes the byte
+    // length (64 -> 65), so the byte-length rule fires first. This documents
+    // the order: length, then hex content.
+    let mut text = "0".repeat(64);
+    text.replace_range(0..1, "é");
+    assert_eq!(
+        text.parse::<ObjectId>(),
+        Err(IdParseError::Length { actual: 65 })
+    );
+
+    // Every byte of a correctly sized string is then checked.
+    for offset in [0usize, 31, 63] {
+        let mut text = "0".repeat(64);
+        text.replace_range(offset..offset + 1, "z");
+        assert_eq!(
+            text.parse::<ObjectId>(),
+            Err(IdParseError::NotHex { offset, found: 'z' })
+        );
+    }
+}
+
+#[test]
 fn same_value_under_different_roles_has_different_identity() {
     let value = b"identical payload";
     let mut ids = Vec::new();

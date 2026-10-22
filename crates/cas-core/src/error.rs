@@ -114,16 +114,23 @@ impl std::error::Error for EnvelopeError {}
 /// Why a string is not a hex-encoded [`crate::ObjectId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdParseError {
-    /// The string does not have exactly 64 characters.
+    /// The string is not 64 bytes long.
+    ///
+    /// The length rule is a byte rule: a valid id is 64 ASCII hex characters,
+    /// so for any accepted input the byte count and the character count agree.
+    /// Reporting bytes keeps the number comparable with the limit, which the
+    /// previous character count did not (64 multi-byte characters are 64
+    /// characters but far more than 64 bytes, and the message read as though
+    /// the input had the expected length yet failed).
     Length {
-        /// Characters found.
+        /// Bytes found.
         actual: usize,
     },
-    /// A character was not a hex digit.
+    /// A byte was not an ASCII hex digit.
     NotHex {
-        /// Byte offset of the offending character.
+        /// Byte offset of the offending byte.
         offset: usize,
-        /// The offending character.
+        /// The offending byte, as a character when it is ASCII.
         found: char,
     },
 }
@@ -133,11 +140,12 @@ impl fmt::Display for IdParseError {
         match self {
             IdParseError::Length { actual } => write!(
                 f,
-                "object id must be 64 hex characters, found {actual} characters"
+                "object id must be 64 ASCII hex characters (64 bytes), found {actual} bytes"
             ),
-            IdParseError::NotHex { offset, found } => {
-                write!(f, "object id has a non-hex character {found:?} at {offset}")
-            }
+            IdParseError::NotHex { offset, found } => write!(
+                f,
+                "object id has a non-hex byte {found:?} at offset {offset}"
+            ),
         }
     }
 }
