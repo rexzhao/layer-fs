@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cas-core",
+    "crates/cas-store",
+    "crates/fs-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/workspace-cas-fs"
+
+[workspace.dependencies]
+cas-core = { path = "crates/cas-core" }
+cas-store = { path = "crates/cas-store" }
+blake3 = "1.8.7"

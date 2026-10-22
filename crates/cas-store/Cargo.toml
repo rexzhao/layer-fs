@@ -1,0 +1,11 @@
+[package]
+name = "cas-store"
+description = "Persistent content-addressed store: object files, index and transactions (not implemented in P1/T1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cas-core.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "cas-core"
+description = "Object identity and canonical object envelope for the Workspace CAS filesystem."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3.workspace = true

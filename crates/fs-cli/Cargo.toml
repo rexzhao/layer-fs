@@ -1,0 +1,16 @@
+[package]
+name = "fs-cli"
+description = "Command line interface for the Workspace CAS filesystem (not implemented in P1/T1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fs-cli"
+path = "src/main.rs"
+
+[dependencies]
+cas-core.workspace = true
+cas-store.workspace = true
