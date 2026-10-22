@@ -68,11 +68,6 @@ pub enum StoreError {
         /// A short description of what was found.
         detail: String,
     },
-    /// An object file's name is not the 64-character hex form of an id.
-    InvalidObjectName {
-        /// The offending file name.
-        name: String,
-    },
 }
 
 /// What specifically made an object's bytes untrustworthy.
@@ -128,9 +123,6 @@ impl fmt::Display for StoreError {
             StoreError::InvalidObject(error) => write!(f, "invalid object: {error}"),
             StoreError::InvalidRecord { field, detail } => {
                 write!(f, "invalid store record in {field}: {detail}")
-            }
-            StoreError::InvalidObjectName { name } => {
-                write!(f, "invalid object file name {name:?}")
             }
         }
     }
@@ -257,9 +249,6 @@ mod tests {
         }
         .to_string()
         .contains("object_location.oid"));
-        assert!(StoreError::InvalidObjectName { name: "x".into() }
-            .to_string()
-            .contains("\"x\""));
     }
 
     #[test]

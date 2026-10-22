@@ -23,11 +23,18 @@ pub struct BadObjectName {
     pub reason: &'static str,
 }
 
-/// Walks `objects/` and reports every entry whose name is not an object id.
+/// Walks `objects/` and reports every entry that breaks the §3 layout rule.
 ///
-/// Returns the offending entries in path order. An empty vector means every
-/// entry is a correctly named object file (which may still be an unpublished
-/// orphan, which is allowed).
+/// Reports, in path order:
+/// - directories at depth 1 or 2 whose name is not two lowercase hex digits
+///   (`objects/junk/`, `objects/ZZ/`, `objects/01/QW/`), including empty ones —
+///   a stray directory holds nothing a lookup could ever want;
+/// - files whose name is not a 64-character lowercase hex id;
+/// - files with a valid name that are not under the two prefix directories their
+///   own id implies.
+///
+/// Correctly named and correctly placed files are accepted even without an
+/// index row: those are orphans, which are legitimate (ADR-002 §10).
 ///
 /// # Errors
 ///
@@ -37,22 +44,49 @@ pub(crate) fn scan_names(objects: &Path) -> StoreResult<Vec<BadObjectName>> {
     if !objects.is_dir() {
         return Ok(bad);
     }
-    walk(objects, objects, &mut bad)?;
+    walk(objects, objects, 0, &mut bad)?;
     bad.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(bad)
 }
 
-fn walk(root: &Path, directory: &Path, bad: &mut Vec<BadObjectName>) -> StoreResult<()> {
+/// `depth` is the depth below `objects/` of the entries being listed: 1 lists
+/// `objects/*`, 2 lists `objects/ab/*`, and so on.
+fn walk(
+    root: &Path,
+    directory: &Path,
+    depth: u32,
+    bad: &mut Vec<BadObjectName>,
+) -> StoreResult<()> {
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
         let relative = relative_name(root, &path);
+        let name = path.file_name().and_then(|name| name.to_str());
+
         if file_type.is_dir() {
-            walk(root, &path, bad)?;
+            // The two prefix levels have their own rule. A directory outside it
+            // is reported whether or not it is empty: it is not a place this
+            // Store ever writes, so anything under it is unreachable.
+            if depth < 2 {
+                let name_ok = name.is_some_and(|name| prefix_defect(name).is_none());
+                if !name_ok {
+                    bad.push(BadObjectName {
+                        path: relative,
+                        reason: "prefix directory name is not two lowercase hex digits",
+                    });
+                }
+            } else {
+                bad.push(BadObjectName {
+                    path: relative,
+                    reason: "unexpected directory below the two prefix levels",
+                });
+            }
+            walk(root, &path, depth + 1, bad)?;
             continue;
         }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+
+        let Some(name) = name else {
             bad.push(BadObjectName {
                 path: relative,
                 reason: "file name is not valid UTF-8",
@@ -78,6 +112,20 @@ fn walk(root: &Path, directory: &Path, bad: &mut Vec<BadObjectName>) -> StoreRes
         }
     }
     Ok(())
+}
+
+/// Checks a prefix directory name: exactly two lowercase hex digits.
+fn prefix_defect(name: &str) -> Option<&'static str> {
+    if name.len() != 2 {
+        return Some("prefix directory name is not two characters long");
+    }
+    if !name
+        .bytes()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Some("prefix directory name is not two lowercase hex digits");
+    }
+    None
 }
 
 /// Checks one file name against the object-id rule.

@@ -550,19 +550,31 @@ fn verify_reports_a_valid_name_in_the_wrong_place() {
     std::fs::write(wrong.join(other), b"x").expect("misplaced");
 
     let report = store.verify().expect("verify");
-    assert_eq!(
-        report.bad_names.len(),
-        2,
-        "both misplaced names are reported: {:?}",
-        report.bad_names
+    let paths: Vec<&str> = report
+        .bad_names
+        .iter()
+        .map(|bad| bad.path.as_str())
+        .collect();
+    // Three entries are reported: the flat file, the unexpected deep directory,
+    // and the misplaced file inside it. Reporting the directory as well as its
+    // contents is deliberate — the directory is not a place this Store writes.
+    assert_eq!(paths.len(), 3, "all three are reported: {paths:?}");
+    assert!(
+        paths.contains(&format!("objects/{oid}").as_str()),
+        "{paths:?}"
     );
-    for bad in &report.bad_names {
-        assert!(
-            bad.reason.contains("prefix directories"),
-            "reason names the placement rule: {}",
-            bad.reason
-        );
-    }
+    assert!(paths.contains(&"objects/32/75/deep"), "{paths:?}");
+    assert!(
+        paths.iter().any(|path| path.ends_with(other)),
+        "the misplaced file is reported: {paths:?}"
+    );
+    assert!(
+        report
+            .bad_names
+            .iter()
+            .any(|bad| bad.reason.contains("prefix directories")),
+        "reason names the placement rule"
+    );
 }
 
 #[test]
@@ -570,6 +582,65 @@ fn verify_accepts_a_correctly_placed_object() {
     let root = TempRoot::new("misplaced-ok");
     let store = Store::open(root.path(), OpenMode::Create).expect("open");
     store.put(Role::Bytes, b"placed").expect("put");
+    let report = store.verify().expect("verify");
+    assert!(report.is_clean(), "{:?}", report.bad_names);
+}
+
+#[test]
+fn verify_reports_a_directory_whose_name_is_not_a_prefix() {
+    // A directory outside the two-hex-digit rule is not somewhere this Store
+    // ever writes, so anything under it is unreachable — report it whether or
+    // not it is empty.
+    let root = TempRoot::new("bad-dir");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+    let objects = root.path().join("objects");
+    let oid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    std::fs::create_dir_all(objects.join("junk")).expect("junk dir");
+    std::fs::create_dir_all(objects.join("ZZ")).expect("uppercase dir");
+    std::fs::write(objects.join("ZZ").join(oid), b"x").expect("nested file");
+    std::fs::create_dir_all(objects.join("01").join("QW")).expect("bad depth-2 dir");
+
+    let report = store.verify().expect("verify");
+    let paths: Vec<&str> = report
+        .bad_names
+        .iter()
+        .map(|bad| bad.path.as_str())
+        .collect();
+    assert!(paths.contains(&"objects/junk"), "empty junk dir: {paths:?}");
+    assert!(paths.contains(&"objects/ZZ"), "uppercase prefix: {paths:?}");
+    assert!(
+        paths.contains(&"objects/01/QW"),
+        "bad depth-2 dir: {paths:?}"
+    );
+    assert!(
+        report
+            .bad_names
+            .iter()
+            .any(|bad| bad.reason.contains("two lowercase hex digits")),
+        "reason names the prefix rule"
+    );
+}
+
+#[test]
+fn verify_reports_a_directory_below_the_prefix_levels() {
+    let root = TempRoot::new("deep-dir");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+    let objects = root.path().join("objects");
+    std::fs::create_dir_all(objects.join("ab").join("cd").join("deeper")).expect("dirs");
+    let report = store.verify().expect("verify");
+    assert_eq!(report.bad_names.len(), 1, "{:?}", report.bad_names);
+    assert!(report.bad_names[0]
+        .reason
+        .contains("unexpected directory below the two prefix levels"));
+}
+
+#[test]
+fn verify_accepts_the_normal_two_level_layout() {
+    let root = TempRoot::new("layout-ok");
+    let store = Store::open(root.path(), OpenMode::Create).expect("open");
+    store.put(Role::Bytes, b"one").expect("put");
+    store.put(Role::Bytes, b"two").expect("put");
     let report = store.verify().expect("verify");
     assert!(report.is_clean(), "{:?}", report.bad_names);
 }
