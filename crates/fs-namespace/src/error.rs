@@ -190,12 +190,6 @@ impl From<StoreError> for NamespaceError {
     }
 }
 
-impl From<rusqlite::Error> for NamespaceError {
-    fn from(error: rusqlite::Error) -> Self {
-        NamespaceError::Store(StoreError::from(error))
-    }
-}
-
 /// The result of a namespace operation.
 pub type NamespaceResult<T> = Result<T, NamespaceError>;
 

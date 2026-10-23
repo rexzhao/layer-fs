@@ -100,6 +100,21 @@ impl MainDb {
         if exists {
             return validate(&connection);
         }
+        // A store written by P1 has the namespace tables and no workspace tables. There is
+        // no migration (ADR-006 §14): say which schema was found, and refuse even when the
+        // caller asked to create — writing a second schema over a P1 store would leave one
+        // database describing two different filesystems.
+        let legacy: bool = connection.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'namespace_policy'",
+            [],
+            |row| row.get(0),
+        )?;
+        if legacy {
+            return Err(WorkspaceError::SchemaMismatch {
+                expected: "workspace_policy (schema 3)".to_owned(),
+                found: "schema 1/2 (namespace_policy); rebuild the store".to_owned(),
+            });
+        }
         if !create {
             return Err(WorkspaceError::NotInitialised);
         }

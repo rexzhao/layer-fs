@@ -1,94 +1,64 @@
-//! The immutable namespace layer over the content-addressed Store.
+//! The path rules and the storage contract they are written against (ADR-006 §7.1).
 //!
-//! This crate owns logical file identity ([`FileId`]), directory entries, path
-//! operations and root publication. It knows nothing about where object bytes
-//! live: objects go through [`cas_store::Store`], and the namespace tables live
-//! in that Store's metadata file on this crate's own connection (ADR-003
-//! §4.2.1).
+//! This crate is the part of the filesystem that is **independent of how a tree is
+//! stored**: the vocabulary ([`FileId`], [`Kind`], [`Entry`], [`Stat`]), the path syntax
+//! ([`Path`]), the operations and their rules ([`Rules`], R1–R12), and the two traits a
+//! backend implements ([`TreeRead`]/[`TreeWrite`] and [`TreeStore`]).
 //!
 //! ```no_run
-//! use cas_store::{OpenMode, Store};
-//! use fs_namespace::{Namespace, Path};
+//! use fs_namespace::{Path, Rules};
 //!
-//! let store = Store::open("my-store", OpenMode::Create)?;
-//! let namespace = Namespace::open(&store, "default", OpenMode::Create)?;
-//! namespace.mkdir(&Path::parse("/docs")?)?;
-//! namespace.mkdir(&Path::parse("/docs/api")?)?;
-//! assert_eq!(namespace.read_dir(&Path::parse("/docs")?)?.len(), 1);
-//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # fn run<S: fs_namespace::TreeStore>(store: S) -> Result<(), Box<dyn std::error::Error>> {
+//! let rules = Rules::new(store);
+//! rules.mkdir(&Path::parse("/docs")?)?;
+//! assert_eq!(rules.read_dir(&Path::parse("/docs")?)?.len(), 0);
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! # Roots (ADR-003 §4.1, D+)
+//! # Why there is no storage here
 //!
-//! The current tree is mutable; every mutating operation appends exactly one row
-//! to an append-only publication chain. **P1 does not provide historical tree
-//! views** — reading an old root's contents is P2 Snapshot work. What P1
-//! guarantees is: the chain is append-only, publication is atomic with the
-//! operation, and the chain's parent links are unbroken.
+//! There used to be: a SQLite table backend (`namespace`/`file`/`directory_entry`/
+//! `file_extent`/`root`) with its own DDL, connection profile and append-only root chain.
+//! ADR-006 retired it (§14): a workspace keeps its changes in an overlay file and reads
+//! its base from a snapshot, so no table of ours describes a tree any more. What remains
+//! is the part that was worth keeping — the rules — and the traits that let both backends
+//! run them unchanged. That is what P2a-3 set out to prove, and the overlay backend is
+//! now the only implementation.
 //!
 //! # What this crate does not do
 //!
-//! No file content operations (`create`/`read_at`/`write_at`/`truncate` — T4), no
-//! CLI (T4), no recursive delete, no hard or symbolic links, no branches or
-//! snapshots (P2), and no Windows semantics (P3).
+//! No file content operations (the overlay's pages and the snapshot's extents are each
+//! backend's own — ADR-006 §7.1), no storage, no branches or snapshots (fs-workspace),
+//! and no Windows semantics (P3).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 
-mod content;
-mod db;
 mod error;
-/// A deterministic mid-operation failure for this crate's atomicity tests.
-///
-/// Compiled only with the `failure-injection` feature, which the crate enables
-/// for its own tests and no consumer receives by default.
-#[cfg(feature = "failure-injection")]
-pub mod inject;
 /// The inode view the path rules see (ADR-006 §7.1).
 mod inode_view;
-mod namespace;
-
+mod model;
 mod path;
 mod rules;
-mod schema;
-mod sql_tree;
-mod sql_tree_store;
 mod tree_store;
 
-use rusqlite::Connection;
-
-pub use content::{ContentState, Extent};
-pub use db::NamespaceDb;
 pub use error::{InvalidPath, NamespaceError, NamespaceResult, MAX_DEPTH, MAX_NAME_BYTES};
 pub use inode_view::InodeView;
-pub use namespace::{Entry, FileId, Kind, Namespace, RootRecord, Stat};
+pub use model::{Entry, FileId, Kind, Stat};
 pub use path::Path;
-/// The path rules, for a second backend to run unchanged (ADR-006 W6).
+/// The path rules, for a backend to run unchanged (ADR-006 W6).
 ///
 /// `Rules` is what makes P2a-3 worth anything: a backend implements [`TreeStore`] and
 /// gets every path rule — R1–R12, the violation forms, the ordering of checks — without
-/// copying or re-deriving any of it. `Namespace` is the table backend's binding of it.
+/// copying or re-deriving any of it.
 pub use rules::Rules;
 /// The path walks, for a backend that must resolve inside its own transaction.
 ///
-/// A backend whose content operations live outside [`TreeStore`] (the overlay's pages,
-/// the table backend's extent rows) has to resolve a path **in the same transaction**
-/// that writes, or it reintroduces a check-then-use window. Re-exported so it can do
-/// that without duplicating the walk or opening a nested read scope.
+/// A backend whose content operations live outside [`TreeStore`] (the overlay's pages)
+/// has to resolve a path **in the same transaction** that writes, or it reintroduces a
+/// check-then-use window. Re-exported so it can do that without duplicating the walk or
+/// opening a nested read scope.
 pub use rules::{resolve_in, resolve_parent_in};
-pub use sql_tree::{SqlRead, SqlTree, SqlWrite};
 pub use tree_store::{OpLabel, TreeRead, TreeStore, TreeWrite};
-
-/// Applies the connection settings the namespace connection needs.
-///
-/// Mirrors the choices `cas-store` makes for its own connection (ADR-002 §9):
-/// WAL so both connections coexist, `synchronous = FULL` so a committed root
-/// publication is durable, and no busy handler so contention is a typed failure
-/// rather than a wait (ADR-003 §7).
-fn configure(connection: &Connection) -> Result<(), NamespaceError> {
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.pragma_update(None, "synchronous", "FULL")?;
-    connection.pragma_update(None, "busy_timeout", 0)?;
-    Ok(())
-}

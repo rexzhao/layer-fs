@@ -1,11 +1,14 @@
-//! Namespace-to-store closure verification (ADR-004 §7).
+//! `verify`, `stats`, and the refusal to open a P1 store.
+//!
+//! These cover the two commands the CLI gained in P2a-7b and the one place where a store
+//! from an older schema must be named rather than silently reinterpreted.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use cas_store::OpenMode;
-use fs_api::{Fs, FsError};
+use fs_api::{ApiError, Repo};
 
+/// A temp directory that cleans itself up.
 struct TempRoot {
     path: PathBuf,
 }
@@ -14,16 +17,19 @@ impl TempRoot {
     fn new(label: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "fs-api-verify-{label}-{}-{}-{sequence}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0)
-        ));
+        let path = std::env::var_os("WCAS_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "fs-api-verify-{label}-{}-{sequence}",
+                std::process::id()
+            ));
         std::fs::create_dir_all(&path).expect("temp root");
         Self { path }
+    }
+
+    fn store(&self) -> PathBuf {
+        self.path.join("store")
     }
 }
 
@@ -33,130 +39,133 @@ impl Drop for TempRoot {
     }
 }
 
-fn fixture(label: &str) -> (TempRoot, Fs) {
-    let root = TempRoot::new(label);
-    let fs = Fs::open(&root.path, "default", OpenMode::Create).expect("open");
-    (root, fs)
-}
-
-#[test]
-fn a_healthy_namespace_verifies_clean() {
-    let (_root, fs) = fixture("clean");
-    fs.create("/a").expect("create");
-    fs.write_at("/a", 0, b"hello").expect("write");
-    fs.create("/b").expect("create");
-    fs.write_at("/b", 0, b"world").expect("write");
-
-    let report = fs.verify().expect("verify");
-    assert!(report.is_clean());
-    assert_eq!(report.references, 2, "two distinct contents, two objects");
-}
-
-/// An empty file references nothing, so it must not be reported as dangling.
-#[test]
-fn an_empty_file_contributes_no_reference() {
-    let (_root, fs) = fixture("empty");
-    fs.create("/a").expect("create");
-    let report = fs.verify().expect("verify");
-    assert!(report.is_clean());
-    assert_eq!(report.references, 0);
-}
-
-/// Identical content is one object, counted once.
-#[test]
-fn identical_contents_are_counted_once() {
-    let (_root, fs) = fixture("dedup");
-    for name in ["/a", "/b", "/c"] {
-        fs.create(name).expect("create");
-        fs.write_at(name, 0, b"same bytes").expect("write");
+fn put(workspace: &fs_api::Workspace, path: &str, bytes: &[u8]) {
+    if workspace.stat(path).is_err() {
+        workspace.create(path).expect("create");
     }
-    let report = fs.verify().expect("verify");
-    assert!(report.is_clean());
-    assert_eq!(report.references, 1);
+    workspace.write_at(path, 0, bytes).expect("write");
+    workspace
+        .truncate(path, u64::try_from(bytes.len()).expect("fits"))
+        .expect("truncate");
 }
 
-/// A reference that cannot be satisfied is reported, not hidden.
+/// A clean repository verifies at both levels, and `stats` agrees with what exists.
 #[test]
-fn a_dangling_reference_is_reported() {
-    let (root, fs) = fixture("dangling");
-    fs.create("/a").expect("create");
-    fs.write_at("/a", 0, b"payload").expect("write");
-    let object = {
-        let report = fs.verify().expect("verify");
-        assert_eq!(report.references, 1);
-        // Recover the referenced id from the stat, which is the same object.
-        fs.stat("/a")
-            .expect("stat")
-            .content_root
-            .expect("content root")
-    };
-    drop(fs);
+fn verify_and_stats_agree_with_a_clean_repository() {
+    let root = TempRoot::new("clean");
+    let repo = Repo::create(root.store()).expect("create");
+    let mut workspace = repo.workspace_create("w1", "main").expect("workspace");
+    put(&workspace, "/a", b"payload");
+    workspace.mkdir("/dir").expect("mkdir");
+    put(&workspace, "/dir/b", b"more");
+    workspace.commit("first", false).expect("commit");
+    workspace.close().expect("close");
 
-    // Remove the object file behind the namespace's back, the way a damaged
-    // store would lose it.
-    let layout_object = root
-        .path
-        .join("objects")
-        .join(&object.to_string()[..2])
-        .join(&object.to_string()[2..4])
-        .join(object.to_string());
-    assert!(layout_object.exists(), "the object should be on disk first");
-    std::fs::remove_file(&layout_object).expect("remove object");
+    let shallow = repo.verify(false).expect("verify");
+    assert!(shallow.is_clean(), "got {shallow:?}");
+    assert!(shallow.objects >= 4, "objects: {}", shallow.objects);
+    assert_eq!(shallow.roots_checked, 2, "the genesis and the commit");
+    assert_eq!(shallow.inodes_checked, 0, "shallow verify walks no inodes");
 
-    let fs = Fs::open(&root.path, "default", OpenMode::ReadWrite).expect("reopen");
-    let report = fs.verify().expect("verify");
-    assert!(!report.is_clean(), "the missing object must be reported");
-    assert_eq!(report.dangling.len(), 1);
-    assert_eq!(report.dangling[0].object, object.to_string());
+    let deep = repo.verify(true).expect("deep verify");
+    assert!(deep.is_clean(), "got {deep:?}");
+    // Two roots are walked: the genesis tree (its root directory) and the commit's tree
+    // (root directory + /a + /dir + /dir/b).
+    assert_eq!(deep.inodes_checked, 5, "got {deep:?}");
 
-    // Reading the file surfaces the same condition as a typed error.
-    let mut buffer = [0u8; 7];
-    assert!(matches!(
-        fs.read_at("/a", 0, &mut buffer),
-        Err(FsError::DanglingReference { .. })
-    ));
+    let stats = repo.stats().expect("stats");
+    assert_eq!(stats.branches, 1);
+    assert_eq!(stats.commits, 2, "genesis + first");
+    assert_eq!(stats.workspaces, 1);
+    assert_eq!(stats.snapshots, 0);
+    assert_eq!(stats.branch_log_entries, 2, "init + commit");
+    assert!(stats.objects >= 4);
 }
 
-/// A large file's extents are all covered by the closure check.
+/// A verified snapshot keeps verifying after a workspace is discarded, because the commit
+/// — not the workspace — is what holds the tree.
 #[test]
-fn extents_are_verified_too() {
-    let (root, fs) = fixture("extents");
-    // Distinct block contents, so all three blocks reference distinct objects;
-    // identical blocks would dedupe and prove less.
-    let block = fs_api::BLOCK_BYTES as usize;
-    let mut big = Vec::with_capacity(block * 3);
-    big.extend(vec![1u8; block]);
-    big.extend(vec![2u8; block]);
-    big.extend(vec![3u8; block]);
-    fs.create("/big").expect("create");
-    fs.write_at("/big", 0, &big).expect("write");
+fn verify_still_passes_after_the_workspace_is_gone() {
+    let root = TempRoot::new("after-discard");
+    let repo = Repo::create(root.store()).expect("create");
+    let mut workspace = repo.workspace_create("w1", "main").expect("workspace");
+    put(&workspace, "/f", b"kept");
+    workspace.snapshot().expect("snapshot");
+    workspace.commit("committed", false).expect("commit");
+    workspace.close().expect("close");
+    repo.workspace_discard("w1").expect("discard");
 
-    let report = fs.verify().expect("verify");
-    assert!(report.is_clean());
-    assert_eq!(report.references, 3, "three distinct blocks, three objects");
+    let report = repo.verify(true).expect("verify");
+    assert!(report.is_clean(), "got {report:?}");
+    assert_eq!(report.roots_checked, 2, "the snapshot row and the commit");
+}
 
-    let mut probe = vec![0xAAu8; block];
-    fs.read_at("/big", 0, &mut probe).expect("read");
-    assert!(probe.iter().all(|byte| *byte == 1));
+/// **A P1 store is refused by name**, not silently reinterpreted as an empty one.
+#[test]
+fn a_previous_schema_is_named_and_refused() {
+    let root = TempRoot::new("legacy");
+    let store = root.store();
+    std::fs::create_dir_all(&store).expect("store dir");
+    // The shape P1 left behind: a metadata database with `namespace_policy` and no
+    // workspace tables.
+    // A real cas-store first: the metadata database is shared, so a P1 store has
+    // cas-store's tables *and* the namespace tables.
+    drop(cas_store::Store::open(&store, cas_store::OpenMode::Create).expect("cas store"));
+    let path = store.join("store.sqlite");
+    let connection = rusqlite::Connection::open(&path).expect("open");
+    connection
+        .execute_batch(
+            "CREATE TABLE namespace_policy (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL) STRICT;
+             INSERT INTO namespace_policy (key, value) VALUES ('schema_version', '2');",
+        )
+        .expect("create P1 tables");
+    drop(connection);
 
-    // Find the on-disk object files and remove them all, the way a damaged
-    // store would lose them.
-    let mut removed = 0usize;
-    let objects = root.path.join("objects");
-    for level1 in std::fs::read_dir(&objects).expect("objects dir") {
-        for level2 in std::fs::read_dir(level1.expect("dir").path()).expect("level2") {
-            for file in std::fs::read_dir(level2.expect("dir").path()).expect("level3") {
-                let file = file.expect("file");
-                std::fs::remove_file(file.path()).expect("remove block");
-                removed += 1;
-            }
+    match Repo::open(&store) {
+        Err(ApiError::Workspace(fs_workspace::WorkspaceError::SchemaMismatch {
+            found, ..
+        })) => {
+            assert!(found.contains("namespace_policy"), "got {found}");
         }
+        other => panic!("expected a schema mismatch naming the P1 tables, got {other:?}"),
     }
-    assert_eq!(removed, 3, "three block objects on disk");
-    drop(fs);
+    // And it is not silently created over.
+    assert!(Repo::create(&store).is_err(), "create must not migrate");
+}
 
-    let fs = Fs::open(&root.path, "default", OpenMode::ReadWrite).expect("reopen");
-    let report = fs.verify().expect("verify");
-    assert!(!report.is_clean());
-    assert_eq!(report.dangling.len(), 3, "every removed block is reported");
+/// **A damaged store is reported, not hidden.**
+///
+/// This is the part of the retired `fs-api/tests/consistency.rs` that still means
+/// something: when something referenced is missing, `verify` must name it. The old suite
+/// damaged namespace *rows*; there are no rows any more, so the equivalent damage is a
+/// deleted object file.
+#[test]
+fn verify_names_an_object_that_is_gone() {
+    let root = TempRoot::new("damaged");
+    let repo = Repo::create(root.store()).expect("create");
+    let mut workspace = repo.workspace_create("w1", "main").expect("workspace");
+    put(&workspace, "/f", b"payload that will lose its object");
+    let commit = workspace.commit("first", false).expect("commit");
+    workspace.close().expect("close");
+
+    // Remove the commit's root object from the object tree, leaving the index row behind.
+    let info = repo.commit_info(&commit).expect("info");
+    let object = root
+        .store()
+        .join("objects")
+        .join(&info.root[0..2])
+        .join(&info.root[2..4])
+        .join(&info.root);
+    assert!(object.is_file(), "expected {} to exist", object.display());
+    std::fs::remove_file(&object).expect("remove the root object");
+
+    let report = repo.verify(false).expect("verify");
+    assert!(!report.is_clean(), "a missing object must be reported");
+    assert!(
+        report
+            .dangling
+            .iter()
+            .any(|entry| entry.object == info.root),
+        "the report must name the missing root: {report:?}"
+    );
 }

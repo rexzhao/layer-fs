@@ -11,7 +11,7 @@ use fs_namespace::{
 };
 use fs_snapshot::{Content, InodeRecord, Profile, SnapshotError, SnapshotReader};
 
-use crate::api_error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult};
 
 /// A read-only view of one commit's tree.
 ///

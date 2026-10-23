@@ -123,6 +123,7 @@ name = "fs-cli"
 version = "0.1.0"
 dependencies = [
  "fs-api",
+ "fs-workspace",
 ]
 
 [[package]]
@@ -131,8 +132,6 @@ version = "0.1.0"
 dependencies = [
  "cas-core",
  "cas-store",
- "fs-namespace",
- "rusqlite",
 ]
 
 [[package]]

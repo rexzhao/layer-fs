@@ -1,336 +1,249 @@
-//! The command surface, end to end (ADR-004).
+//! The CLI end to end: one command sequence that exercises every command.
+//!
+//! These drive the real binary, so what is tested is exactly what a user runs — argument
+//! parsing, the current-workspace file, exit codes, and the fact that every command opens
+//! and closes what it needs.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-struct Sandbox {
-    root: PathBuf,
+/// A temp directory that cleans itself up.
+struct TempRoot {
+    path: PathBuf,
 }
 
-impl Sandbox {
+impl TempRoot {
     fn new(label: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "fs-cli-{label}-{}-{}-{sequence}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&root).expect("sandbox");
-        Self { root }
+        let path = std::env::var_os("WCAS_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("fs-cli-{label}-{}-{sequence}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("temp root");
+        Self { path }
     }
 
     fn store(&self) -> PathBuf {
-        self.root.join("store")
+        self.path.join("store")
     }
 
+    fn file(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+
+    /// Runs the CLI with `--store` pointing at this root's store.
     fn run(&self, arguments: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fs-cli"));
-        command.arg("--store").arg(self.store());
-        command.args(arguments);
-        command.output().expect("run fs-cli")
+        Command::new(env!("CARGO_BIN_EXE_fs-cli"))
+            .arg("--store")
+            .arg(self.store())
+            .args(arguments)
+            .output()
+            .expect("run the CLI")
     }
 
+    /// Runs a command that must succeed and returns its stdout.
     fn ok(&self, arguments: &[&str]) -> String {
         let output = self.run(arguments);
         assert!(
             output.status.success(),
-            "command {arguments:?} failed: {}",
+            "{arguments:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        String::from_utf8(output.stdout).expect("utf-8 output")
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Runs a command that must fail and returns its stderr.
+    fn fails(&self, arguments: &[&str]) -> String {
+        let output = self.run(arguments);
+        assert!(
+            !output.status.success(),
+            "{arguments:?} should have failed but printed {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// Creates the repository through the binary itself.
+    fn init(&self) {
+        let output = Command::new(env!("CARGO_BIN_EXE_fs-cli"))
+            .arg("init")
+            .arg(self.store())
+            .output()
+            .expect("init");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("initialised"));
+    }
+
+    /// The id a `commit` printed.
+    fn commit(&self, message: &str) -> String {
+        let output = self.ok(&["commit", "-m", message]);
+        output
+            .split_whitespace()
+            .last()
+            .expect("commit id")
+            .to_owned()
     }
 }
 
-impl Drop for Sandbox {
+impl Drop for TempRoot {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
+/// **Acceptance: the whole command set in one round trip.**
 #[test]
-fn init_creates_the_store() {
-    let sandbox = Sandbox::new("init");
-    let output = sandbox.ok(&["init"]);
-    assert!(output.contains("initialised"), "{output}");
-    assert!(sandbox.store().join("store.sqlite").exists());
-}
+fn the_full_command_sequence_round_trips() {
+    let root = TempRoot::new("round-trip");
+    std::fs::write(root.file("a.txt"), b"hello from a").expect("host file");
+    std::fs::write(root.file("b.txt"), b"second file").expect("host file");
+    root.init();
 
-#[test]
-fn put_then_get_round_trips_through_host_files() {
-    let sandbox = Sandbox::new("put-get");
-    sandbox.ok(&["init"]);
+    // branch list / create
+    let branches = root.ok(&["branch"]);
+    assert!(branches.contains("main"), "got {branches}");
+    root.ok(&["branch", "feature", "--from", "main"]);
+    assert_eq!(root.ok(&["branch"]).lines().count(), 2);
 
-    let source = sandbox.root.join("source.bin");
-    let destination = sandbox.root.join("destination.bin");
-    let payload = b"the quick brown fox jumps over the lazy dog";
-    std::fs::write(&source, payload).expect("write source");
+    // checkout makes a workspace current
+    let checkout = root.ok(&["checkout", "main"]);
+    assert!(checkout.contains("workspace main"), "got {checkout}");
 
-    sandbox.ok(&["put", "/doc.txt", source.to_str().expect("utf8")]);
-    sandbox.ok(&["get", "/doc.txt", destination.to_str().expect("utf8")]);
+    // mkdir / put / ls / stat / get
+    root.ok(&["mkdir", "/docs"]);
+    let a = root.file("a.txt").display().to_string();
+    root.ok(&["put", &a, "/docs/a"]);
+    let b = root.file("b.txt").display().to_string();
+    root.ok(&["put", &b, "/docs/b"]);
+    assert_eq!(root.ok(&["ls", "/docs"]).lines().count(), 2);
+    assert!(root.ok(&["stat", "/docs/a"]).contains("size:      12"));
+    let out = root.file("out.txt");
+    root.ok(&["get", "/docs/a", &out.display().to_string()]);
+    assert_eq!(std::fs::read(&out).expect("read back"), b"hello from a");
 
-    let read = std::fs::read(&destination).expect("read destination");
-    assert_eq!(read, payload);
-}
+    // status before and after the first commit
+    assert!(root.ok(&["status"]).contains("dirty:     yes"));
+    let first = root.commit("first");
+    assert_eq!(first.len(), 64, "a commit id is 64 hex characters");
+    let log = root.ok(&["log"]);
+    assert_eq!(log.lines().count(), 2, "genesis + first: {log}");
+    assert!(log.contains(&first));
+    assert!(root.ok(&["status"]).contains("dirty:     no"));
 
-#[test]
-fn get_without_a_target_writes_to_stdout() {
-    let sandbox = Sandbox::new("get-stdout");
-    sandbox.ok(&["init"]);
-    let source = sandbox.root.join("s.bin");
-    std::fs::write(&source, b"stdout payload").expect("write");
-    sandbox.ok(&["put", "/f", source.to_str().expect("utf8")]);
+    // mv / rm, then a second commit
+    root.ok(&["mv", "/docs/b", "/docs/c"]);
+    root.ok(&["rm", "/docs/c"]);
+    let second = root.commit("second");
 
-    let output = sandbox.run(&["get", "/f"]);
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"stdout payload");
-}
-
-#[test]
-fn ls_lists_a_directory() {
-    let sandbox = Sandbox::new("ls");
-    sandbox.ok(&["init"]);
-    sandbox.ok(&["mkdir", "/dir"]);
-    let source = sandbox.root.join("s.bin");
-    std::fs::write(&source, b"x").expect("write");
-    sandbox.ok(&["put", "/dir/file.txt", source.to_str().expect("utf8")]);
-
-    let output = sandbox.ok(&["ls", "/dir"]);
-    assert!(output.contains("file.txt"), "{output}");
-}
-
-#[test]
-fn stat_reports_size_and_kind() {
-    let sandbox = Sandbox::new("stat");
-    sandbox.ok(&["init"]);
-    let source = sandbox.root.join("s.bin");
-    std::fs::write(&source, b"12345").expect("write");
-    sandbox.ok(&["put", "/f", source.to_str().expect("utf8")]);
-
-    let output = sandbox.ok(&["stat", "/f"]);
-    assert!(output.contains("size:      5"), "{output}");
-    assert!(output.contains("File"), "{output}");
-}
-
-#[test]
-fn mkdir_rm_and_mv_work_together() {
-    let sandbox = Sandbox::new("tree");
-    sandbox.ok(&["init"]);
-    sandbox.ok(&["mkdir", "/a"]);
-    let source = sandbox.root.join("s.bin");
-    std::fs::write(&source, b"move me").expect("write");
-    sandbox.ok(&["put", "/a/f", source.to_str().expect("utf8")]);
-
-    sandbox.ok(&["mv", "/a/f", "/a/g"]);
-    let listing = sandbox.ok(&["ls", "/a"]);
-    assert!(listing.contains('g') && !listing.contains('f'), "{listing}");
-
-    sandbox.ok(&["rm", "/a/g"]);
-    assert!(sandbox.ok(&["ls", "/a"]).trim().is_empty());
-
-    sandbox.ok(&["rm", "/a"]);
-    assert!(!sandbox.ok(&["ls", "/"]).contains('a'));
-}
-
-#[test]
-fn verify_reports_a_healthy_store() {
-    let sandbox = Sandbox::new("verify");
-    sandbox.ok(&["init"]);
-    let source = sandbox.root.join("s.bin");
-    std::fs::write(&source, b"payload").expect("write");
-    sandbox.ok(&["put", "/f", source.to_str().expect("utf8")]);
-
-    let output = sandbox.ok(&["verify"]);
-    assert!(output.contains("ok"), "{output}");
-}
-
-#[test]
-fn stats_reports_counts() {
-    let sandbox = Sandbox::new("stats");
-    sandbox.ok(&["init"]);
-    let source = sandbox.root.join("s.bin");
-    std::fs::write(&source, b"payload").expect("write");
-    sandbox.ok(&["put", "/f", source.to_str().expect("utf8")]);
-
-    let output = sandbox.ok(&["stats"]);
-    assert!(output.contains("objects:"), "{output}");
-    assert!(output.contains("root records:"), "{output}");
-}
-
-#[test]
-fn a_missing_store_is_an_error_not_a_new_one() {
-    let sandbox = Sandbox::new("missing-store");
-    // No `init`: the other commands must not silently create a store.
-    let output = sandbox.run(&["ls", "/"]);
-    assert!(!output.status.success(), "expected a failure");
-    assert!(
-        !sandbox.store().join("store.sqlite").exists(),
-        "a typo must not materialise a store"
+    // History reads a commit, not the workspace.
+    assert_eq!(
+        root.ok(&["cat", &format!("{first}:/docs/a")]),
+        "hello from a"
     );
-}
-
-#[test]
-fn unknown_command_and_missing_options_fail() {
-    let sandbox = Sandbox::new("usage");
-    sandbox.ok(&["init"]);
-    let output = sandbox.run(&["frobnicate"]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown command"));
-
-    let output = Command::new(env!("CARGO_BIN_EXE_fs-cli"))
-        .arg("ls")
-        .arg("/")
-        .output()
-        .expect("run");
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--store"));
-}
-
-#[test]
-fn help_is_printed() {
-    let output = Command::new(env!("CARGO_BIN_EXE_fs-cli"))
-        .arg("--help")
-        .output()
-        .expect("run");
-    assert!(output.status.success());
-    let text = String::from_utf8_lossy(&output.stdout);
-    for command in [
-        "init", "put", "get", "ls", "stat", "mkdir", "rm", "mv", "verify", "stats",
-    ] {
-        assert!(text.contains(command), "help omits {command}");
-    }
-}
-
-#[test]
-fn put_overwrites_an_existing_file() {
-    let sandbox = Sandbox::new("overwrite");
-    sandbox.ok(&["init"]);
-    let source = sandbox.root.join("s.bin");
-    std::fs::write(&source, b"first version").expect("write");
-    sandbox.ok(&["put", "/f", source.to_str().expect("utf8")]);
-
-    std::fs::write(&source, b"second").expect("write");
-    sandbox.ok(&["put", "/f", source.to_str().expect("utf8")]);
-
-    let output = sandbox.run(&["get", "/f"]);
-    assert_eq!(output.stdout, b"second");
-}
-
-#[test]
-fn a_name_with_spaces_round_trips() {
-    let sandbox = Sandbox::new("spaces");
-    sandbox.ok(&["init"]);
-    let source = sandbox.root.join("s.bin");
-    std::fs::write(&source, b"spaced").expect("write");
-    sandbox.ok(&[
-        "put",
-        "/a file with spaces.txt",
-        source.to_str().expect("utf8"),
-    ]);
-
-    let output = sandbox.run(&["get", "/a file with spaces.txt"]);
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"spaced");
-}
-
-#[test]
-fn a_namespace_option_selects_an_isolated_tree() {
-    let sandbox = Sandbox::new("namespace");
-    sandbox.ok(&["init"]);
-    let output = Command::new(env!("CARGO_BIN_EXE_fs-cli"))
-        .arg("--store")
-        .arg(sandbox.store())
-        .arg("--namespace")
-        .arg("other")
-        .arg("init")
-        .output()
-        .expect("run");
-    assert!(output.status.success());
-
-    let source = sandbox.root.join("s.bin");
-    std::fs::write(&source, b"payload").expect("write");
-    sandbox.ok(&["put", "/only-in-default", source.to_str().expect("utf8")]);
-
-    let listing = sandbox.ok(&["ls", "/"]);
-    assert!(listing.contains("only-in-default"));
-
-    let other = Command::new(env!("CARGO_BIN_EXE_fs-cli"))
-        .arg("--store")
-        .arg(sandbox.store())
-        .arg("--namespace")
-        .arg("other")
-        .arg("ls")
-        .arg("/")
-        .output()
-        .expect("run");
-    assert!(other.status.success());
-    assert!(
-        String::from_utf8_lossy(&other.stdout).trim().is_empty(),
-        "the other namespace is empty"
+    assert_eq!(
+        root.ok(&["ls", &format!("{first}:/docs")]).lines().count(),
+        2
     );
-}
+    assert_eq!(root.ok(&["ls"]).lines().count(), 1);
+    assert_eq!(root.ok(&["log", "1"]).lines().count(), 1);
 
-#[test]
-fn a_large_file_round_trips_through_the_cli() {
-    let sandbox = Sandbox::new("large");
-    sandbox.ok(&["init"]);
-    let payload: Vec<u8> = (0..(fs_api::BLOCK_BYTES as usize * 3 + 123))
-        .map(|index| (index % 251) as u8)
-        .collect();
-    let source = sandbox.root.join("big.bin");
-    std::fs::write(&source, &payload).expect("write");
-
-    sandbox.ok(&["put", "/big", source.to_str().expect("utf8")]);
-    let destination = sandbox.root.join("back.bin");
-    sandbox.ok(&["get", "/big", destination.to_str().expect("utf8")]);
-
-    let read = std::fs::read(&destination).expect("read back");
-    assert_eq!(read, payload);
-}
-
-/// Guard against the binary being replaced by another placeholder.
-#[test]
-fn the_binary_reports_its_own_errors_with_a_nonzero_exit() {
-    let sandbox = Sandbox::new("errors");
-    sandbox.ok(&["init"]);
-    let output = sandbox.run(&["stat", "/nope"]);
-    assert!(!output.status.success());
-    let text = String::from_utf8_lossy(&output.stderr);
-    assert!(text.contains("fs-cli:"), "{text}");
-    assert!(text.contains("/nope"), "{text}");
-    let _ = Path::new("");
-}
-
-/// T4-QA-1: a file with a hole must round-trip through the CLI with zeros, and
-/// the hole must come from the file, not from a pre-zeroed buffer.
-#[test]
-fn a_file_with_a_hole_round_trips_as_zeros() {
-    let sandbox = Sandbox::new("hole");
-    sandbox.ok(&["init"]);
-
-    // Build the file through the library so the hole is real.
-    let store = sandbox.store();
-    let fs = fs_api::Fs::open(&store, "default", fs_api::OpenMode::ReadWrite).expect("open");
-    let block = fs_api::BLOCK_BYTES;
-    fs.create("/holed").expect("create");
-    fs.write_at("/holed", 0, b"head").expect("write head");
-    fs.write_at("/holed", block * 2, b"tail")
-        .expect("write tail");
-    drop(fs);
-
-    let destination = sandbox.root.join("out.bin");
-    sandbox.ok(&["get", "/holed", destination.to_str().expect("utf8")]);
-    let bytes = std::fs::read(&destination).expect("read back");
-
-    assert_eq!(bytes.len() as u64, block * 2 + 4);
-    assert_eq!(&bytes[..4], b"head");
-    assert_eq!(&bytes[block as usize * 2..], b"tail");
+    // restore replaces the view; the branch does not move.
+    root.ok(&["restore", &first]);
+    assert_eq!(root.ok(&["ls", "/docs"]).lines().count(), 2);
     assert!(
-        bytes[4..block as usize * 2].iter().all(|byte| *byte == 0),
-        "the hole must be zeros in the output file"
+        root.ok(&["log"]).contains(&second),
+        "restore moves no branch"
     );
+
+    // revert undoes the head with a new commit.
+    let reverted = root.ok(&["revert"]);
+    assert!(reverted.contains("revert"), "got {reverted}");
+
+    // reset moves the head back without growing history.
+    root.ok(&["reset", &second]);
+    assert_eq!(root.ok(&["log"]).lines().count(), 3);
+
+    // verify, deep verify, stats
+    assert!(root.ok(&["verify"]).contains("ok"));
+    let deep = root.ok(&["verify", "--deep"]);
+    assert!(deep.contains("inodes:"), "got {deep}");
+    let stats = root.ok(&["stats"]);
+    assert!(stats.contains("branches:           2"), "got {stats}");
+    assert!(stats.contains("commits:            4"), "got {stats}");
+}
+
+/// **Failure paths** — every "you cannot do that" is a non-zero exit with a message.
+#[test]
+fn failures_are_reported() {
+    let root = TempRoot::new("failures");
+    root.init();
+
+    assert!(root.fails(&["ls"]).contains("no current workspace"));
+    root.ok(&["checkout", "main"]);
+
+    assert!(root.fails(&["get", "/nope"]).contains("no such path"));
+    assert!(root
+        .fails(&["commit", "-m", "empty"])
+        .contains("already equals its base"));
+    assert!(root.fails(&["checkout", "nope"]).contains("not found"));
+    assert!(root.fails(&["cat", "00:/x"]).contains("not found"));
+    assert!(root.fails(&["frobnicate"]).contains("unknown command"));
+}
+
+/// **A dirty workspace needs `--discard`** before `restore` replaces it.
+#[test]
+fn restore_refuses_to_drop_uncommitted_work() {
+    let root = TempRoot::new("restore");
+    std::fs::write(root.file("a.txt"), b"one").expect("host file");
+    root.init();
+    root.ok(&["checkout", "main"]);
+
+    let a = root.file("a.txt").display().to_string();
+    root.ok(&["put", &a, "/one"]);
+    let head = root.commit("first");
+    let genesis = root.ok(&["log", "2"]);
+    let genesis = genesis
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().next())
+        .expect("genesis id")
+        .to_owned();
+
+    root.ok(&["put", &a, "/two"]);
+    assert!(root.fails(&["restore", &genesis]).contains("changes"));
+    root.ok(&["restore", &genesis, "--discard"]);
+    assert_eq!(
+        root.ok(&["ls"]).lines().count(),
+        0,
+        "back to the empty tree"
+    );
+    assert!(root.ok(&["log"]).contains(&head), "restore moved no branch");
+}
+
+/// A branch created from a commit inherits its tree.
+#[test]
+fn a_branch_can_start_from_a_commit() {
+    let root = TempRoot::new("from-commit");
+    std::fs::write(root.file("a.txt"), b"payload").expect("host file");
+    root.init();
+    root.ok(&["checkout", "main"]);
+    let a = root.file("a.txt").display().to_string();
+    root.ok(&["put", &a, "/f"]);
+    let first = root.commit("first");
+
+    root.ok(&["branch", "side", "--from", &first]);
+    root.ok(&["checkout", "side"]);
+    assert_eq!(
+        root.ok(&["ls"]).lines().count(),
+        1,
+        "side starts at `first`"
+    );
+    assert_eq!(root.ok(&["cat", &format!("{first}:/f")]), "payload");
 }

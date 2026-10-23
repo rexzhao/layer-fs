@@ -1,24 +1,43 @@
-//! Counters the API exposes (ADR-004 §6).
+//! What the store and the repository hold, for `layerfs stats`.
 
-/// Read-amplification counters for one [`crate::Fs`].
-///
-/// This is a **production metric**, not a test hook: spec §5.6 requires a read
-/// amplification measure, and the number of object fetches a small read causes
-/// is its smallest useful form. T5 reuses it directly, so there is no feature
-/// gate around it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ReadStats {
-    /// How many object fetches have happened since the handle opened.
-    ///
-    /// A range read should touch only the blocks its range intersects.
-    pub object_gets: u64,
+use cas_store::{OpenMode as StoreMode, Store};
+
+use crate::error::ApiResult;
+use crate::repo::Repo;
+
+/// Object and repository counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stats {
+    /// Objects in the CAS index.
+    pub objects: u64,
+    /// Branches that exist.
+    pub branches: u64,
+    /// Commits recorded.
+    pub commits: u64,
+    /// Workspaces registered.
+    pub workspaces: u64,
+    /// Named snapshot roots recorded.
+    pub snapshots: u64,
+    /// Reflog entries: every head move, including forced ones.
+    pub branch_log_entries: u64,
 }
 
-/// Storage and namespace totals.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Stats {
-    /// Published object count.
-    pub objects: u64,
-    /// Publication records in this namespace.
-    pub root_records: u64,
+impl Repo {
+    /// Reads the counts.
+    ///
+    /// # Errors
+    ///
+    /// Store or main-database failures.
+    pub fn stats(&self) -> ApiResult<Stats> {
+        let store = Store::open(self.store_dir(), StoreMode::ReadOnly)?;
+        let repo = self.inner.stats()?;
+        Ok(Stats {
+            objects: store.object_count()?,
+            branches: repo.branches,
+            commits: repo.commits,
+            workspaces: repo.workspaces,
+            snapshots: repo.snapshots,
+            branch_log_entries: repo.branch_log_entries,
+        })
+    }
 }

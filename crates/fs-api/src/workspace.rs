@@ -4,7 +4,7 @@ use std::path::Path as HostPath;
 
 use fs_namespace::{Entry, Kind, Path, Rules, Stat};
 
-use crate::api_error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult};
 use crate::repo::WorkspaceStatus;
 
 /// One workspace: a mutable view of a snapshot, published with `commit`.

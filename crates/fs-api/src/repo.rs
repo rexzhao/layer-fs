@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 pub use fs_workspace::{BranchInfo, CommitInfo, WorkspaceSummary};
 
-use crate::api_error::ApiResult;
+use crate::error::ApiResult;
 use crate::read_view::ReadView;
 use crate::workspace::Workspace;
 
@@ -15,7 +15,7 @@ use crate::workspace::Workspace;
 /// hand out [`Workspace`] handles for editing and [`ReadView`]s for reading history.
 #[derive(Debug)]
 pub struct Repo {
-    inner: Arc<fs_workspace::Repo>,
+    pub(crate) inner: Arc<fs_workspace::Repo>,
 }
 
 impl Repo {

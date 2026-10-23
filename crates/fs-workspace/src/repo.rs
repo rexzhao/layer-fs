@@ -55,6 +55,20 @@ pub struct BranchInfo {
     pub scope_id: String,
 }
 
+/// Counts the repository keeps, reported by `stats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepoStats {
+    /// Branches that exist.
+    pub branches: u64,
+    /// Commits recorded.
+    pub commits: u64,
+    /// Workspaces registered.
+    pub workspaces: u64,
+    /// Named snapshot roots recorded.
+    pub snapshots: u64,
+    /// Reflog entries: every head move, including forced ones.
+    pub branch_log_entries: u64,
+}
 /// A store plus the branches, commits and workspaces recorded in it.
 pub struct Repo {
     store_dir: PathBuf,
@@ -643,6 +657,53 @@ impl Repo {
                 what: format!("a branch_log entry for {commit}"),
             })
     }
+    /// Counts of what the main database records, for `stats`.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures.
+    pub fn stats(&self) -> WorkspaceResult<RepoStats> {
+        let connection = self.db.lock();
+        let count = |table: &str| -> WorkspaceResult<u64> {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            let value: i64 = connection.query_row(&sql, [], |row| row.get(0))?;
+            Ok(u64::try_from(value).unwrap_or(0))
+        };
+        Ok(RepoStats {
+            branches: count("branch")?,
+            commits: count("\"commit\"")?,
+            workspaces: count("workspace")?,
+            snapshots: count("snapshot")?,
+            branch_log_entries: count("branch_log")?,
+        })
+    }
+
+    /// Every snapshot root the repository records.
+    ///
+    /// All commits, all named snapshots, and every workspace's current base. `verify` walks
+    /// them; P2b's GC will need the same set (ADR-006 §15).
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures, or [`WorkspaceError::Inconsistent`] for a stored value that is not
+    /// an object id.
+    pub fn roots(&self) -> WorkspaceResult<Vec<ObjectId>> {
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
+            "SELECT root_oid FROM \"commit\"
+             UNION SELECT root_oid FROM snapshot
+             UNION SELECT base_root FROM workspace",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut roots = Vec::new();
+        for row in rows {
+            roots.push(parse_oid(&row?)?);
+        }
+        roots.sort();
+        roots.dedup();
+        Ok(roots)
+    }
+
     /// The root a commit publishes.
     pub(crate) fn commit_root(&self, id: &str) -> WorkspaceResult<ObjectId> {
         let connection = self.db.lock();

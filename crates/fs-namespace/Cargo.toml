@@ -1,21 +1,11 @@
 [package]
 name = "fs-namespace"
-description = "Immutable namespace roots over the content-addressed store: directories, file ids and path operations."
+description = "Path rules and the tree-store contract: the storage-independent half of the filesystem."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[features]
-# Compiles the deterministic fault-planting helper used by this crate's
-# atomicity tests. Off by default (ADR-003 §12.2).
-failure-injection = []
-
 [dependencies]
 cas-core.workspace = true
 cas-store.workspace = true
-rusqlite.workspace = true
-
-[dev-dependencies]
-# Self-reference so `cargo test -p fs-namespace` compiles the injection helper.
-fs-namespace = { path = ".", features = ["failure-injection"] }
