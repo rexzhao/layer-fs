@@ -63,3 +63,8 @@ mailbox_connect as='manager' 再处理任何内部邮件；若需处理外部邮
 远端：origin = https://github.com/rexzhao/layer-fs（私有仓库）。
 每次卡片走完"批准合入 main"后，manager 随即 git push origin main；流程/架构文档的
 main 直提同样推送。特性分支默认不推（本地保留审阅历史即可）；需要时按需推。
+## 角色分工（owner 指示，2026-10-23）
+
+- **architect**：架构设计与分析归口——阶段设计、架构问题咨询、ADR 设计输入。不写产品代码、不合入、不 push；验证用 Git Bash + arch-* 前缀隔离 worktree。
+- **manager**：任务分配与验收（含架构合规 review），架构问题转 architect。
+- **worker / qa**：职责不变（实现 / 独立验收）。
