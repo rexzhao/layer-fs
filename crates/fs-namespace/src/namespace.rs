@@ -300,6 +300,35 @@ impl Namespace {
             .flatten()
     }
 
+    /// Every publication record in this namespace, oldest first.
+    ///
+    /// The acceptance matrix (S4) needs the whole chain to assert that earlier
+    /// records are byte-for-byte unchanged after later writes.
+    ///
+    /// # Errors
+    ///
+    /// Store failures while reading the table.
+    pub fn root_records(&self) -> NamespaceResult<Vec<RootRecord>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT root_id, parent_root_id, op, created_ns
+             FROM root WHERE namespace = ?1 ORDER BY root_id",
+        )?;
+        let rows = statement.query_map([&self.name], |row| {
+            Ok(RootRecord {
+                root_id: row.get::<_, i64>(0)? as u64,
+                parent_root_id: row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
+                op: row.get(2)?,
+                created_ns: row.get(3)?,
+            })
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
     /// How many publication records exist, for tests and T5 hooks.
     #[must_use]
     pub fn root_count(&self) -> u64 {
@@ -339,6 +368,11 @@ impl Namespace {
         Ok(id.map(|value| FileId::from_serial(value as u64)))
     }
 
+    /// The kind of a file row, or `None` when there is no row.
+    ///
+    /// A row whose tag is not a known kind is **not** `None`: reporting it as
+    /// "missing" would turn a corrupted record into a `NotFound` and hide it from
+    /// the caller (QA round 2, C3).
     pub(crate) fn kind_of(&self, id: FileId) -> NamespaceResult<Option<Kind>> {
         let tag: Option<i64> = self
             .conn()
@@ -348,7 +382,17 @@ impl Namespace {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(tag.and_then(Kind::from_tag))
+        match tag {
+            Some(unknown) => {
+                Kind::from_tag(unknown)
+                    .map(Some)
+                    .ok_or_else(|| NamespaceError::InvalidRecord {
+                        field: "file.kind",
+                        detail: format!("unknown kind tag {unknown}"),
+                    })
+            }
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn resolve(&self, path: &Path) -> NamespaceResult<FileId> {

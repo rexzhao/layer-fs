@@ -88,3 +88,54 @@ impl std::fmt::Display for Role {
         f.write_str(self.name())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Role;
+
+    const ALL: [Role; 8] = [
+        Role::Bytes,
+        Role::Chunk,
+        Role::ExtentLeaf,
+        Role::ExtentBranch,
+        Role::DirectoryLeaf,
+        Role::DirectoryBranch,
+        Role::InodeTable,
+        Role::FilesystemRoot,
+    ];
+
+    /// QA round 2, C5: every arm has a distinct, non-empty diagnostic name and
+    /// `Display` repeats it. Enumerating the arms is the point — a spot check of
+    /// two roles cannot see an unnamed seventh.
+    #[test]
+    fn every_role_has_a_distinct_name_that_display_repeats() {
+        let mut names = Vec::new();
+        for role in ALL {
+            let name = role.name();
+            assert!(!name.is_empty(), "{role:?} has an empty name");
+            assert_eq!(
+                role.to_string(),
+                name,
+                "{role:?}: Display disagrees with name"
+            );
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                "{role:?}: name {name:?} is not lowercase kebab-case"
+            );
+            names.push(name);
+        }
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "role names must be distinct");
+    }
+
+    /// Every role survives a round trip through its numeric tag.
+    #[test]
+    fn every_role_round_trips_through_its_tag() {
+        for role in ALL {
+            let tag = role.tag();
+            assert_eq!(Role::from_tag(tag), Some(role), "{role:?} lost its tag");
+        }
+    }
+}

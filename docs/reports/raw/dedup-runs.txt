@@ -1,0 +1,3 @@
+dedup,run=0,paths=100,logical_bytes=52428800,unique_canonical_bytes=524288,objects=1,stored_bytes=65550,dedup_saved_bytes=51904512,dedup_ratio=100.00
+dedup,run=1,paths=100,logical_bytes=52428800,unique_canonical_bytes=524288,objects=1,stored_bytes=65550,dedup_saved_bytes=51904512,dedup_ratio=100.00
+dedup,run=2,paths=100,logical_bytes=52428800,unique_canonical_bytes=524288,objects=1,stored_bytes=65550,dedup_saved_bytes=51904512,dedup_ratio=100.00

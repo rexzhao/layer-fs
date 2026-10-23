@@ -591,6 +591,30 @@ impl Fs {
         crate::verify::run(&self.store, &self.namespace)
     }
 
+    /// The current publication serial (ADR-003 §4.1).
+    #[must_use]
+    pub fn head_root(&self) -> Option<u64> {
+        self.namespace.head_root()
+    }
+
+    /// One publication record by serial.
+    #[must_use]
+    pub fn root_record(&self, root_id: u64) -> Option<fs_namespace::RootRecord> {
+        self.namespace.root_record(root_id)
+    }
+
+    /// Every publication record in this namespace, oldest first.
+    ///
+    /// The acceptance matrix's S4 scenario uses this to assert that earlier
+    /// records are byte-for-byte unchanged after later writes.
+    ///
+    /// # Errors
+    ///
+    /// Namespace failures while reading the chain.
+    pub fn root_records(&self) -> FsResult<Vec<fs_namespace::RootRecord>> {
+        Ok(self.namespace.root_records()?)
+    }
+
     /// The identity behind a path, for callers that want it.
     ///
     /// # Errors

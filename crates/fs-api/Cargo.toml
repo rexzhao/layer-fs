@@ -10,3 +10,7 @@ license.workspace = true
 cas-core.workspace = true
 cas-store.workspace = true
 fs-namespace.workspace = true
+
+[dev-dependencies]
+# Tests tamper with the namespace tables directly to reach corruption guards.
+rusqlite.workspace = true

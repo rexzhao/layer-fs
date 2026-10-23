@@ -262,4 +262,110 @@ mod tests {
         let invalid = StoreError::from(cas_core::EnvelopeError::UnknownRole { found: 42 });
         assert!(matches!(invalid, StoreError::InvalidObject(_)));
     }
+
+    /// QA round 2, C5: every variant produces a non-empty, diagnosable message, and
+    /// the data-carrying ones surface their data. Enumerating all of them replaces
+    /// spot-checks of the few that happened to be convenient to build.
+    #[test]
+    fn every_variant_has_a_diagnosable_message() {
+        let oid = cas_core::ObjectId::from_bytes([0xAB; 32]);
+        let id = oid.to_string();
+
+        let errors = vec![
+            StoreError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone")),
+            StoreError::Busy,
+            StoreError::NotFound { oid },
+            StoreError::Corrupt {
+                oid,
+                cause: CorruptCause::LengthMismatch {
+                    expected: 10,
+                    actual: 4,
+                },
+            },
+            StoreError::UnsupportedSchemaVersion {
+                found: 9,
+                supported: 1,
+            },
+            StoreError::SchemaMismatch {
+                what: "store_policy.max_object_len",
+            },
+            StoreError::ReadOnly,
+            StoreError::TooLarge {
+                declared: 99,
+                limit: 10,
+            },
+            StoreError::InvalidObject(cas_core::EnvelopeError::UnknownRole { found: 42 }),
+            StoreError::InvalidRecord {
+                field: "object_location.oid",
+                detail: "bad".to_owned(),
+            },
+        ];
+
+        for error in &errors {
+            let text = error.to_string();
+            assert!(!text.is_empty(), "{error:?} has an empty message");
+            assert!(
+                text.chars().any(|c| c.is_ascii_alphabetic()),
+                "{error:?} message {text:?} has no words"
+            );
+        }
+
+        // The object-id-carrying variants must name the id, or the report cannot be
+        // acted on.
+        assert!(StoreError::NotFound { oid }.to_string().contains(&id));
+        assert!(StoreError::Corrupt {
+            oid,
+            cause: CorruptCause::LengthMismatch {
+                expected: 10,
+                actual: 4
+            }
+        }
+        .to_string()
+        .contains(&id));
+
+        // Limits and schema details must be visible.
+        let too_large = StoreError::TooLarge {
+            declared: 4242,
+            limit: 1111,
+        }
+        .to_string();
+        assert!(too_large.contains("4242") && too_large.contains("1111"));
+
+        let version = StoreError::UnsupportedSchemaVersion {
+            found: 77,
+            supported: 33,
+        }
+        .to_string();
+        assert!(version.contains("77") && version.contains("33"));
+    }
+
+    /// Every `CorruptCause` arm has a distinct, non-empty message.
+    #[test]
+    fn every_corruption_cause_is_described() {
+        let oid = cas_core::ObjectId::from_bytes([1u8; 32]);
+        let causes = vec![
+            CorruptCause::LengthMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            CorruptCause::IdentityMismatch {
+                expected: oid,
+                actual: cas_core::ObjectId::from_bytes([2u8; 32]),
+            },
+            CorruptCause::Envelope(cas_core::EnvelopeError::Truncated {
+                needed: 14,
+                actual: 1,
+            }),
+        ];
+        let mut messages = Vec::new();
+        for cause in causes {
+            let text = StoreError::Corrupt { oid, cause }.to_string();
+            assert!(!text.is_empty());
+            messages.push(text);
+        }
+        let mut sorted = messages.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), messages.len(), "causes read identically");
+    }
 }

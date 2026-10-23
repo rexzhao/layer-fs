@@ -116,6 +116,32 @@ one command (`rm`) covers both cases the CLI needs. The namespace layer still ke
 > 这与 F-T4-1 同族但更隐蔽：那次是**状态转移**漏测，这次是**前提泄漏**——测试与实现共享了
 > 一个没人写下来的假设。
 
+#### 4.1.1 对象短于 extent 声明时：钳制并补零，而不是报 Corrupt
+
+**语义决策**（T5，QA 第 2 轮 C2 提出，manager 要求显式记录）。
+
+当 `file_extent.length` 记录的字节数超过其 `object_id` 所指对象的实际长度时，读取**钳制到
+对象的真实长度，其余部分读为零**，返回请求的完整长度；**不**返回 `Corrupt`。
+
+理由：
+
+1. **`size` 是唯一权威边界。** §4.1 已规定文件大小 `size` 决定可读范围，`size` 之内的字节
+   "存在"。extent 行只是**定位手段**，与 `size` 不一致时以 `size` 为准，缺的部分按"未写"
+   处理，与洞区间同构。
+2. **越界读是安全边界，短读不是。** 钳制保证绝不读到对象之外（这是真错误），而"该位置没有
+   内容"在本设计中合法地等于零（洞、EOF 之外的补零、稀疏扩展都已经是零）。
+3. **报错会让单点损坏升级为整文件不可读。** 一行 extent 的长度被写坏，钳制后其余部分仍可读，
+   坏引用由 `verify`（§7）报告并修复；报 `Corrupt` 则读路径整体失败，用户连没坏的部分也拿
+   不到。
+4. **诊断信息不丢。** `verify` 遍历全部 `object_id` 与对象长度；长度不一致在闭包校验层可见，
+   不需要在每次读里中断。
+
+代价与限制（如实记录）：**读路径不会主动报告长度损坏**，只有 `verify` 会。若未来需要"读时
+即报"，应作为可选的严格模式，而不是改变默认语义。
+
+对应测试：`c2_an_over_long_extent_reports_corrupt` 钉住的是**当前行为**（钳制 + 补零 + 返回
+完整长度），测试名沿用 QA 的编号是为了可追溯；其文档注释已写明实际断言。
+
 ### 4.2 `write_at(path, offset, bytes) -> usize`
 
 - 返回**实际写入字节数**（短写允许）；P1 的实现总是全写（内存内操作），但签名允许短写，
@@ -322,7 +348,7 @@ impl Fs { pub fn read_stats(&self) -> ReadStats; }
 | **洞区间与毒化缓冲**（T4-QA-1） | `a_multi_block_hole_reads_as_zeros_not_stale_buffer`、`a_read_inside_a_hole_reports_the_full_length_and_zeroes_it`、`reusing_a_buffer_does_not_leak_between_reads`、`bytes_past_eof_are_not_reported_and_not_claimed`、`a_request_longer_than_the_file_reports_only_the_file_part`、`an_empty_request_writes_nothing` |
 | schema 治理（v1 拒绝、policy 键、DDL） | `a_version_1_store_is_refused`、`a_removed_policy_key_reports_the_qualified_key_name`、`every_recorded_ddl_table_exists` |
 | CLI 全命令 | `tests/cli.rs`（16 个） |
-| 1 GiB 确认 | `a_gi_b_file_answers_a_random_read_from_one_block`（`#[ignore]`，T5 跑） |
+| 1 GiB 去重上界 | `a_one_gibibyte_file_of_identical_blocks_dedups_to_one_object_and_reads_one_block`（`#[ignore]`，T5 跑）。**测量的是全去重上界，不是写吞吐**——真实写吞吐见 `acceptance_scale.rs` 的 S3（互异块，192s，~5 MiB/s） |
 
 具体测试名在提交说明中与每条声明配对列出。
 
@@ -336,6 +362,7 @@ T3 起引入，T4 两轮 review 各补一条。**三条都是"枚举"而非"抽�
 | 1 | **枚举所有违反形式** | T3（名称→位置→目录三次漏检） | 只测想到的违规类型，就会漏掉同一规则的其他违规形式 |
 | 2 | **枚举所有状态转移** | T4 F-T4-1（blob↔extent 转换丢数据） | 状态各自正确不代表转移正确；我按"实现了哪些功能"而非"状态之间怎么转移"枚举 |
 | 3 | **读路径测试的输出缓冲区默认毒化** | T4-QA-1（洞读返回陈旧内存） | 测试夹具与生产调用方共享未声明前提时，缺陷被整体掩盖；毒化让任何"没写满"立刻暴露 |
+| 4 | **每个性能数字旁注明它的载荷特征** | T5 KI-3（1 GiB 数字被当成写吞吐） | 同内容块会被去重成 1 个对象；不注明载荷特征，一个测量结果的标签就会在传递中失义，而数字本身看起来依然精确 |
 
 第 3 条的实践含义：任何接收调用方缓冲区的 API，测试**不得**用零初始化缓冲区。用 `0xAA`
 等哨兵填充，并断言"返回值覆盖的每个字节都被写过"。T4 的 `tests/holes.rs` 与

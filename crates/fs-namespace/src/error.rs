@@ -222,4 +222,111 @@ mod tests {
             .to_string()
             .contains("/d"));
     }
+
+    /// QA round 2, C5: every `InvalidPath` and `NamespaceError` variant produces a
+    /// non-empty message, and the ones carrying data surface it. Enumerating the
+    /// arms is deliberate: a spot check of five variants cannot see an empty sixth.
+    #[test]
+    fn every_variant_has_a_diagnosable_message() {
+        let invalid_paths = [
+            InvalidPath::NotAbsolute,
+            InvalidPath::EmptySegment,
+            InvalidPath::DotSegment,
+            InvalidPath::DotDotSegment,
+            InvalidPath::NameTooLong { len: 300 },
+            InvalidPath::ForbiddenByte { byte: 0 },
+            InvalidPath::TooDeep { len: 65 },
+            InvalidPath::NotUtf8,
+        ];
+        for error in invalid_paths {
+            let text = error.to_string();
+            assert!(!text.is_empty(), "{error:?} has an empty message");
+            assert!(
+                text.chars().any(|c| c.is_ascii_alphabetic()),
+                "{error:?} message {text:?} has no words"
+            );
+        }
+
+        let path = |value: &str| value.to_owned();
+        let errors = [
+            NamespaceError::InvalidPath(InvalidPath::DotSegment),
+            NamespaceError::NotFound {
+                path: path("/gone"),
+            },
+            NamespaceError::AlreadyExists {
+                path: path("/here"),
+            },
+            NamespaceError::NotADirectory {
+                path: path("/file"),
+            },
+            NamespaceError::IsADirectory { path: path("/dir") },
+            NamespaceError::DirectoryNotEmpty {
+                path: path("/full"),
+            },
+            NamespaceError::IsRoot,
+            NamespaceError::IntoOwnSubtree {
+                from: path("/src"),
+                to: path("/src/in"),
+            },
+            NamespaceError::NamespaceNotFound { name: path("ns1") },
+            NamespaceError::SchemaMismatch {
+                what: "namespace_policy.ddl",
+            },
+            NamespaceError::ReadOnly,
+            NamespaceError::InvalidRecord {
+                field: "file.kind",
+                detail: path("unknown tag 9"),
+            },
+        ];
+        for error in &errors {
+            let text = error.to_string();
+            assert!(!text.is_empty(), "{error:?} has an empty message");
+        }
+
+        // Data-carrying variants must surface their data.
+        let carrying: [(NamespaceError, &str); 8] = [
+            (
+                NamespaceError::NotFound {
+                    path: path("/needle"),
+                },
+                "/needle",
+            ),
+            (
+                NamespaceError::AlreadyExists {
+                    path: path("/taken"),
+                },
+                "/taken",
+            ),
+            (NamespaceError::NotADirectory { path: path("/nd") }, "/nd"),
+            (NamespaceError::IsADirectory { path: path("/id") }, "/id"),
+            (
+                NamespaceError::DirectoryNotEmpty { path: path("/dn") },
+                "/dn",
+            ),
+            (
+                NamespaceError::NamespaceNotFound { name: path("myns") },
+                "myns",
+            ),
+            (
+                NamespaceError::SchemaMismatch {
+                    what: "namespace_policy.ddl",
+                },
+                "namespace_policy.ddl",
+            ),
+            (
+                NamespaceError::InvalidRecord {
+                    field: "file.kind",
+                    detail: path("tag 9"),
+                },
+                "tag 9",
+            ),
+        ];
+        for (error, needle) in carrying {
+            let text = error.to_string();
+            assert!(
+                text.contains(needle),
+                "{error:?} message {text:?} omits {needle:?}"
+            );
+        }
+    }
 }

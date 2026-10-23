@@ -1,0 +1,15 @@
+# S2 full acceptance run (spec §6 item 2)
+# Command: WCAS_TEST_ROOT=/f/fs-bench WCAS_ACCEPT_FILES=100000 \
+#          cargo test -p fs-api --test acceptance_scale --release -- --ignored --nocapture
+# Date: 2026-10-23, machine+toolchain: see p1-baseline.md §1
+# Budget declared: create 600s, total 1200s (sustained 3.9ms/pair basis)
+
+S2 create: 100000 files in 546.4s (183 files/s)
+S2 rename+delete: 10 renamed, 10 deleted in 0.0s
+S2 total: 553.8s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 567.36s
+
+# Earlier run on the same machine (same code path, before the budget was
+# re-derived from sustained writes) — kept because it is the run that showed the
+# short-probe estimate was wrong:
+# S2 create: 100000 files in 744.0s (134 files/s)

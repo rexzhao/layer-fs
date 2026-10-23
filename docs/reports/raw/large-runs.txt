@@ -1,0 +1,16 @@
+# scenario=large repeat=3
+large.sequential_write,run=0,bytes=1073741824,seconds=105.315,mib_per_s=9.7
+large.random_write,run=0,ops=64,seconds=1.408,ops_per_s=45.5
+large.random_read,run=0,ops=500
+large.storage,run=0,objects=16510
+large.sequential_write,run=1,bytes=1073741824,seconds=170.634,mib_per_s=6.0
+large.random_write,run=1,ops=64,seconds=1.107,ops_per_s=57.8
+large.random_read,run=1,ops=500
+large.storage,run=1,objects=16510
+large.sequential_write,run=2,bytes=1073741824,seconds=146.710,mib_per_s=7.0
+large.random_write,run=2,ops=64,seconds=1.187,ops_per_s=53.9
+large.random_read,run=2,ops=500
+large.storage,run=2,objects=16510
+large.sequential_write_seconds,n=3,mean=140.8861,min=105.3151,p50=146.7096,p95=170.6337,p99=170.6337,max=170.6337
+large.random_write_seconds,n=3,mean=1.2342,min=1.1073,p50=1.1871,p95=1.4081,p99=1.4081,max=1.4081
+large.random_read_us,n=1500,mean=928.0409,min=261.9000,p50=866.7000,p95=1661.2000,p99=2040.0000,max=2964.8000

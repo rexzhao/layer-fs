@@ -112,6 +112,7 @@ dependencies = [
  "cas-core",
  "cas-store",
  "fs-namespace",
+ "rusqlite",
 ]
 
 [[package]]

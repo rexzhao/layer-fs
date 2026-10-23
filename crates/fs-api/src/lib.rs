@@ -50,5 +50,6 @@ pub use verify::{DanglingReference, VerifyReport};
 // Re-exported so entry points (the CLI) can name the open mode without taking a
 // dependency on `cas-store`, which is an implementation detail of this layer
 // (`docs/architecture.md` §1: entry points depend on the API, not on what it is
-// built from).
+// built from). The metadata types are re-exported for the same reason.
 pub use cas_store::OpenMode;
+pub use fs_namespace::{Entry, Kind, RootRecord, Stat};

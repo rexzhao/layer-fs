@@ -1,0 +1,20 @@
+# scenario=small repeat=3
+small.create,run=0,files=100000,seconds=576.165,files_per_s=174
+small.read,run=0,reads=10000,seconds=2.735,ops_per_s=3656
+small.rename,run=0,ops=2000,seconds=4.345,ops_per_s=460
+small.delete,run=0,ops=2000,seconds=4.020,ops_per_s=497
+small.storage,run=0,objects=24347,logical_sampled=16496
+small.create,run=1,files=100000,seconds=576.917,files_per_s=173
+small.read,run=1,reads=10000,seconds=2.503,ops_per_s=3996
+small.rename,run=1,ops=2000,seconds=4.352,ops_per_s=460
+small.delete,run=1,ops=2000,seconds=4.037,ops_per_s=495
+small.storage,run=1,objects=24347,logical_sampled=16496
+small.create,run=2,files=100000,seconds=563.921,files_per_s=177
+small.read,run=2,reads=10000,seconds=2.681,ops_per_s=3730
+small.rename,run=2,ops=2000,seconds=4.498,ops_per_s=445
+small.delete,run=2,ops=2000,seconds=4.045,ops_per_s=494
+small.storage,run=2,objects=24347,logical_sampled=16496
+small.create_seconds,n=3,mean=572.3345,min=563.9208,p50=576.1653,p95=576.9173,p99=576.9173,max=576.9173
+small.read_seconds,n=3,mean=2.6394,min=2.5027,p50=2.6808,p95=2.7349,p99=2.7349,max=2.7349
+small.rename_seconds,n=3,mean=4.3983,min=4.3452,p50=4.3517,p95=4.4980,p99=4.4980,max=4.4980
+small.delete_seconds,n=3,mean=4.0342,min=4.0205,p50=4.0373,p95=4.0450,p99=4.0450,max=4.0450
