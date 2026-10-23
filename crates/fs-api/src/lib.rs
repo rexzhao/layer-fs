@@ -45,7 +45,7 @@ mod verify;
 pub use error::{FsError, FsResult};
 pub use file_system::{Fs, BLOCK_BYTES};
 pub use stats::{ReadStats, Stats};
-pub use verify::{DanglingReference, VerifyReport};
+pub use verify::{DanglingReference, Inconsistency, VerifyReport};
 
 // Re-exported so entry points (the CLI) can name the open mode without taking a
 // dependency on `cas-store`, which is an implementation detail of this layer

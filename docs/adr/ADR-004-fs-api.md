@@ -86,8 +86,27 @@ one command (`rm`) covers both cases the CLI needs. The namespace layer still ke
    但 D+ 的历史树不可读（ADR-003 §4.1），没有可读取的快照。硬做只能退化成"句柄只记 FileId"。
 2. **退化后的句柄不提供任何路径式 API 给不了的保证**：FileId 在改名后不变、在删除后才失效，
    而这两点路径式 API 同样能表达。
-3. **无 TOCTOU**：路径式 + 每操作一事务意味着"解析路径"与"变更/读取"在**同一个事务内**完成，
-   不存在"检查后使用"的窗口。带句柄的实现反而要额外论证这一点。
+3. **TOCTOU：只消除了目录结构层面的窗口，内容层面仍有窗口。**
+   路径式 + 每操作一事务让"解析路径"与"变更"在同一事务内完成，因此名字层面的检查-使用窗口
+   不存在（`mkdir`/`rename`/`unlink` 的名字检查在事务内由主键再次裁定，冲突翻译为
+   `AlreadyExists`）。
+
+   **但本 ADR 初稿写的"无 TOCTOU"是不准确的**，P2-0b 已证实并更正此处：
+   `write_at` 在事务**外**读取文件的 size 与 extent 布局，据此算出新布局，再在一个事务里提交。
+   两个并发 `write_at` 会读到同一个起始 size，后提交者用自己的布局覆盖前者，
+   **丢失先提交者的块**——这是真实的数据丢失窗口，不是理论风险。
+
+   复现：`crates/fs-api/tests/b1_races.rs`（`b1_1_*`，40 轮中约 25 轮触发）与
+   `tests/tree_store_contract_concurrency.rs::k3_concurrent_writes_to_different_blocks_keep_both`
+   （在表后端上按设计失败）。
+
+   **P1 不修**：表后端在 P2a 被 overlay 取代，overlay 的单写者规则让这个窗口**结构性消失**
+   而非被补丁修掉。上面那条契约测试保留为 overlay 后端的准入门槛——它在那边通过，才说明窗口
+   真的没了。
+
+   architect 预测的另外三类竞争（`truncate`×`write_at`、`write_at`×`unlink`、交叉 `rename`
+   成环）**未复现**；结论与对应契约测试一并记录在 `tree_store_contract_concurrency.rs` 的
+   模块注释里。
 
 ### 3.2 与规格的偏差，以及推迟了什么
 
@@ -325,8 +344,11 @@ impl Fs { pub fn read_stats(&self) -> ReadStats; }
 
 1. **64 KiB 块对大文件写入不经济**：改写一个字节也要 `put` 整个 64 KiB 块（内容寻址会去重
    未变块,但受影响块必然重写）。CDC 归 P2。
-2. **写路径是块级读-改-写**：只读取与重写受影响的块（§5.4），代价 O(受影响块)。并发同文件写是
-   "后写生效"，不会产生交错损坏，但可能丢失一方的更新（P1 语义，ADR-003 §7）。
+2. **写路径是块级读-改-写**：只读取与重写受影响的块（§5.4），代价 O(受影响块)。
+   **并发同文件写会丢数据**：`write_at` 在事务外读取 size 与布局（§3.1 第 3 点），两个并发写者
+   会以同一个起始状态各自计算出完整布局，后提交者覆盖前者——**先提交者的块丢失**，不只是
+   "后写生效"。P2-0b 已复现（40 轮约 25 轮触发），契约测试
+   `k3_concurrent_writes_to_different_blocks_keep_both` 钉住它，P2a 的 overlay 单写者消除此窗口。
 3. **闭包校验是 O(引用数)**：大 Store 上线性，无增量模式。
 4. **`flush` no-op** 可能让从 POSIX 语义来的调用方误以为有持久化保证；文档已明示，但这是
    真实的语义陷阱。

@@ -395,6 +395,87 @@ impl Namespace {
         Ok(extents)
     }
 
+    /// Inode rows that no directory entry reaches (P2-0a).
+    ///
+    /// The root inode is reached implicitly, so it is never reported.
+    ///
+    /// # Errors
+    ///
+    /// Store errors from reading the tables.
+    pub fn unreachable_inodes(&self) -> NamespaceResult<Vec<u64>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT f.file_id FROM file f
+             WHERE f.namespace = ?1
+               AND f.file_id != 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM directory_entry e
+                   WHERE e.namespace = f.namespace AND e.child_id = f.file_id
+               )
+             ORDER BY f.file_id",
+        )?;
+        let rows = statement.query_map([&self.name], |row| row.get::<_, i64>(0))?;
+        let mut found = Vec::new();
+        for row in rows {
+            found.push(row? as u64);
+        }
+        Ok(found)
+    }
+
+    /// Directory entries whose child has no inode row (P2-0a).
+    ///
+    /// # Errors
+    ///
+    /// Store errors from reading the tables.
+    pub fn entries_without_inode(&self) -> NamespaceResult<Vec<(u64, String)>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT e.parent_id, e.name FROM directory_entry e
+             WHERE e.namespace = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM file f
+                   WHERE f.namespace = e.namespace AND f.file_id = e.child_id
+               )
+             ORDER BY e.parent_id, e.name",
+        )?;
+        let rows = statement.query_map([&self.name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut found = Vec::new();
+        for row in rows {
+            let (parent, name) = row?;
+            found.push((parent as u64, String::from_utf8_lossy(&name).into_owned()));
+        }
+        Ok(found)
+    }
+
+    /// Extent rows whose owning inode does not exist (P2-0a).
+    ///
+    /// # Errors
+    ///
+    /// Store errors from reading the tables.
+    pub fn extents_without_inode(&self) -> NamespaceResult<Vec<(u64, u64)>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT x.file_id, x.logical_start FROM file_extent x
+             WHERE x.namespace = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM file f
+                   WHERE f.namespace = x.namespace AND f.file_id = x.file_id
+               )
+             ORDER BY x.file_id, x.logical_start",
+        )?;
+        let rows = statement.query_map([&self.name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut found = Vec::new();
+        for row in rows {
+            let (file, start) = row?;
+            found.push((file as u64, start as u64));
+        }
+        Ok(found)
+    }
+
     /// Every object this namespace references, deduplicated (ADR-004 §7).
     ///
     /// # Errors

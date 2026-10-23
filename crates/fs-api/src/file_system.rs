@@ -14,6 +14,11 @@ use crate::stats::{ReadStats, Stats};
 /// Must match `fs_namespace::schema::BLOCK_BYTES`, which is frozen in
 /// `namespace_policy` and validated on open; this constant is the API layer's
 /// copy so it does not have to reach into the schema module.
+///
+/// **This constant is defined twice during P1** (here and in `fs-namespace`) and
+/// P2a-1 unifies it into the storage profile — a block size that can drift between
+/// the writer and the reader silently changes the meaning of every extent row, so
+/// the duplication is temporary and known (ADR-005).
 pub const BLOCK_BYTES: u64 = 64 * 1024;
 
 /// A file-system handle bound to one Store, one namespace and one connection
@@ -317,6 +322,37 @@ impl Fs {
                 );
             }
         }
+
+        // KI-1: an exact multiple of the block size has no boundary block — the
+        // file ends where the previous block ends. Publishing a zero-length object
+        // for it wasted space and left a pointless extent row. Drop everything at
+        // or past `boundary_start` and reuse the surviving rows as they are.
+        if block_len == 0 {
+            let mut replaced = Vec::new();
+            for extent in &rows {
+                if extent.logical_start + extent.length <= boundary_start {
+                    replaced.push(extent.clone());
+                } else if extent.logical_start < boundary_start {
+                    replaced.push(Extent {
+                        logical_start: extent.logical_start,
+                        length: boundary_start - extent.logical_start,
+                        object_id: extent.object_id,
+                        source_offset: extent.source_offset,
+                    });
+                }
+            }
+            replaced.sort_by_key(|extent| extent.logical_start);
+            self.namespace.replace_extents(
+                &path,
+                "truncate",
+                size,
+                None,
+                &replaced,
+                Some(boundary_start),
+            )?;
+            return Ok(());
+        }
+
         let existing = rows.iter().find(|extent| {
             extent.logical_start <= boundary_start
                 && boundary_start < extent.logical_start + extent.length

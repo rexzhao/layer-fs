@@ -356,21 +356,21 @@ fn c4_truncating_to_a_block_boundary_keeps_surviving_bytes() {
     assert_eq!(read_poisoned(&fs, "/f"), content[..block].to_vec());
     assert_eq!(fs.stat("/f").expect("stat").size, block as u64);
 
-    // Observed behaviour: one extra zero-length object (known limitation).
+    // KI-1 (fixed in P2-0a): dropping whole blocks publishes nothing. Before the
+    // fix this was `objects_before + 1`, from a zero-length object created for a
+    // boundary block that does not exist.
     let objects_after = fs.stats().expect("stats").objects;
     assert_eq!(
-        objects_after,
-        objects_before + 1,
-        "an aligned truncate is known to publish one empty object; \
-         if this changed, update docs/reports/known-issues.md too"
+        objects_after, objects_before,
+        "an aligned truncate must not publish any object"
     );
 
-    // Growth is bounded by content addressing: repeating it adds nothing further.
+    // Growing back reuses the surviving block, so nothing new is created.
     fs.truncate("/f", (block * 2) as u64).expect("grow");
     fs.truncate("/f", block as u64).expect("truncate again");
     assert_eq!(
         fs.stats().expect("stats").objects,
         objects_after,
-        "the empty object is deduplicated, so repetition does not accumulate"
+        "repeated aligned trims stay object-neutral"
     );
 }

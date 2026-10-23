@@ -83,10 +83,7 @@ impl Namespace {
         }
         self.with_write_tx(|_tx| {
             self.delete_entry(parent, name)?;
-            self.conn().execute(
-                "DELETE FROM file WHERE namespace = ?1 AND file_id = ?2",
-                (&self.name, id.serial() as i64),
-            )?;
+            self.delete_inode(id)?;
             self.publish_tx("rmdir", None)?;
             Ok(())
         })
@@ -124,10 +121,7 @@ impl Namespace {
         }
         self.with_write_tx(|_tx| {
             self.delete_entry(parent, name)?;
-            self.conn().execute(
-                "DELETE FROM file WHERE namespace = ?1 AND file_id = ?2",
-                (&self.name, id.serial() as i64),
-            )?;
+            self.delete_inode(id)?;
             self.publish_tx("unlink", None)?;
             Ok(())
         })
@@ -181,7 +175,9 @@ impl Namespace {
                     .kind_of(existing)?
                     .ok_or_else(|| NamespaceError::NotFound { path: to.display() })?;
                 match (source_kind, existing_kind) {
-                    // R3: file over file replaces it.
+                    // R3: file over file replaces it. The replaced inode and its
+                    // extent rows go with the name, or they stay behind as rows
+                    // nothing points at (P2-0a A1).
                     (Kind::File, Kind::File) => {}
                     // R4/R5: a directory is never replaced by a file, and a file
                     // is never replaced by a directory.
@@ -199,15 +195,12 @@ impl Namespace {
                         if children > 0 {
                             return Err(NamespaceError::DirectoryNotEmpty { path: to.display() });
                         }
-                        // R7: an empty directory is replaced.
-                        self.delete_entry(target_parent, to_name)?;
-                        self.conn().execute(
-                            "DELETE FROM file WHERE namespace = ?1 AND file_id = ?2",
-                            (&self.name, existing.serial() as i64),
-                        )?;
                     }
                 }
+                // R3 and R7 both replace the destination: remove its name and its
+                // inode, and any extent rows the inode owned.
                 self.delete_entry(target_parent, to_name)?;
+                self.delete_inode(existing)?;
             }
 
             self.delete_entry(source_parent, from_name)?;
@@ -337,6 +330,28 @@ impl Namespace {
         self.conn().execute(
             "DELETE FROM directory_entry WHERE namespace = ?1 AND parent_id = ?2 AND name = ?3",
             (&self.name, parent.serial() as i64, name.as_bytes()),
+        )?;
+        Ok(())
+    }
+
+    /// Removes an inode and everything that hangs off it.
+    ///
+    /// Removing an inode without its `file_extent` rows leaves block records
+    /// pointing at an id nothing references: the bytes stay in the store and the
+    /// namespace can never reach them again. Every removal path goes through here
+    /// so the cascade cannot be forgotten in one of them (P2-0a A1).
+    ///
+    /// Callers must already have deleted the inode's directory entries; this does
+    /// not check for them, because `rmdir` and `rename` verify emptiness first and
+    /// `unlink` only ever sees files.
+    pub(crate) fn delete_inode(&self, id: FileId) -> NamespaceResult<()> {
+        self.conn().execute(
+            "DELETE FROM file_extent WHERE namespace = ?1 AND file_id = ?2",
+            (&self.name, id.serial() as i64),
+        )?;
+        self.conn().execute(
+            "DELETE FROM file WHERE namespace = ?1 AND file_id = ?2",
+            (&self.name, id.serial() as i64),
         )?;
         Ok(())
     }
