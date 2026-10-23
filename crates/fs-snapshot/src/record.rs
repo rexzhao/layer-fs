@@ -1,0 +1,157 @@
+//! The records a snapshot is built from (ADR-005 §3.2, §3.3, §3.4).
+//!
+//! These are the intermediate representation the encoder consumes and the decoder
+//! produces. They are deliberately free of any storage or path concept: a snapshot
+//! is a tree of records plus object references, nothing else.
+
+use cas_core::ObjectId;
+
+/// What an inode is (ADR-005 §3.2; the numeric values match P1's `Kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A directory.
+    Directory = 1,
+    /// A regular file.
+    File = 2,
+}
+
+impl Kind {
+    /// The tag byte for this kind.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        self as u8
+    }
+
+    /// The kind for a tag, or `None` when the tag is not one of the two.
+    #[must_use]
+    pub const fn from_tag(tag: u8) -> Option<Kind> {
+        match tag {
+            1 => Some(Kind::Directory),
+            2 => Some(Kind::File),
+            _ => None,
+        }
+    }
+}
+
+/// Where an inode's bytes live (ADR-005 §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Content {
+    /// No object: a zero-length file, or a file whose bytes are all zero, or an
+    /// empty directory.
+    Empty,
+    /// One whole object whose value length equals the file's size.
+    Blob(ObjectId),
+    /// An extent tree root.
+    Extents(ObjectId),
+    /// A directory tree root (at least one entry).
+    Dir(ObjectId),
+}
+
+impl Content {
+    /// The tag byte.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Content::Empty => 0,
+            Content::Blob(_) => 1,
+            Content::Extents(_) => 2,
+            Content::Dir(_) => 3,
+        }
+    }
+}
+
+/// One inode (ADR-005 §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InodeRecord {
+    /// The inode's serial within the snapshot's scope.
+    pub serial: u64,
+    /// Directory or file.
+    pub kind: Kind,
+    /// Logical size; zero for directories.
+    pub size: u64,
+    /// Creation time, Unix epoch nanoseconds.
+    pub created_ns: i64,
+    /// Last modification time, Unix epoch nanoseconds.
+    pub modified_ns: i64,
+    /// Where the bytes are.
+    pub content: Content,
+}
+
+impl InodeRecord {
+    /// Checks the kind/content combination table of ADR-005 §3.2.
+    ///
+    /// Returns the reason the combination is illegal, or `None` when it is legal.
+    #[must_use]
+    pub fn illegal_reason(&self, block_bytes: u64) -> Option<&'static str> {
+        match (self.kind, self.content) {
+            (Kind::Directory, Content::Empty) | (Kind::Directory, Content::Dir(_)) => {
+                if self.size == 0 {
+                    None
+                } else {
+                    Some("a directory's size must be 0")
+                }
+            }
+            (Kind::Directory, _) => Some("a directory's content must be Empty or Dir"),
+            (Kind::File, Content::Dir(_)) => Some("a file's content may not be Dir"),
+            (Kind::File, Content::Empty) => {
+                // Empty is only canonical when the content is all zero: size 0, or a
+                // size whose blocks are all zero (ADR-005 §3.2 normalisation).
+                if self.size == 0 || self.size >= block_bytes {
+                    None
+                } else {
+                    Some("a file smaller than one block must be a Blob")
+                }
+            }
+            (Kind::File, Content::Blob(_)) => {
+                if self.size > 0 && self.size < block_bytes {
+                    None
+                } else if self.size == 0 {
+                    Some("a zero-length file must be Empty")
+                } else {
+                    Some("a file at or above one block must be Extents or Empty")
+                }
+            }
+            (Kind::File, Content::Extents(_)) => {
+                if self.size >= block_bytes {
+                    None
+                } else {
+                    Some("a file smaller than one block must be a Blob")
+                }
+            }
+        }
+    }
+}
+
+/// One directory entry: a name bound to a serial (ADR-005 §3.3).
+///
+/// Values live in the inode table, not here, so changing a file never rewrites a
+/// directory page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    /// The name, raw bytes, strictly increasing within a directory.
+    pub name: Vec<u8>,
+    /// The child's serial.
+    pub child_serial: u64,
+}
+
+/// One extent: a run of a file's bytes held by one object (ADR-005 §3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    /// First logical byte.
+    pub logical_start: u64,
+    /// Length in bytes; must be positive.
+    pub length: u64,
+    /// The object holding them.
+    pub object: ObjectId,
+    /// Offset within that object's value.
+    pub source_offset: u64,
+}
+
+/// A snapshot root's contents (ADR-005 §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootValue {
+    /// The serial scope this tree belongs to.
+    pub scope_id: [u8; 32],
+    /// The inode table root; never empty.
+    pub inode_table: ObjectId,
+}

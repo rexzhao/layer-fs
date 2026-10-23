@@ -133,6 +133,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-snapshot"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cas-core",
+ "cas-store",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

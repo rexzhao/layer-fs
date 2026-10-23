@@ -1,0 +1,12 @@
+[package]
+name = "fs-snapshot"
+description = "Snapshot format: encodes a file-system tree as an immutable CAS object graph (ADR-005)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cas-core.workspace = true
+cas-store.workspace = true
+blake3.workspace = true

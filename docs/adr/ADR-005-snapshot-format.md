@@ -1,8 +1,8 @@
 # ADR-005：快照格式——不可变文件系统对象图
 
-- 状态：**草案（Proposed）**——architect 初稿，作为 P2a-1 卡的设计输入；worker 按"先写后码"核对、补测试清单后提交定稿，manager 批准后转 Accepted
+- 状态：**接受（Accepted）**——architect 初稿，P2a-1 由 worker 实现并补全测试名配对表（§13），manager 批准于 2026-10-23
 - 日期：2026-10-23
-- 起草：architect（P2a 架构设计，mailbox 线程 `manager/3yinqic7xe`）
+- 起草：architect（P2a 架构设计，mailbox 线程 `manager/3yinqic7xe`）；实现与定稿：worker（P2a-1）
 - 依据：spec §2 P2.7/P2.8、§3 逻辑数据模型、§4；Root 审查 `docs/research/2026-10-22-root-model-review.md` Q2 三条 P2 约束；ADR-001 §4.2（role 5–8 预留）/§4.3（16 MiB 上限）/§5.3（D9）；ADR-003 §4.3（serial 永不复用）、§5.1（名字 = 原始字节、≤255 B）
 - 相关：ADR-006（workspace / overlay / snapshot 发布协议，本 ADR 只定**格式**，不定**何时、由谁**生成）
 
@@ -261,3 +261,75 @@ S7 的完整表述，`verify --deep <root>` 从根遍历逐条检查：
 7. V1–V6 每条构造一个违反并被 `verify --deep` 报出；
 8. 规模：10 万 inode、单目录 10 万条目、1 GiB 文件 16 384 个 extent——页数、深度、编码耗时、
    峰值内存（三次重复，报 P50，注明载荷特征，见 ADR-004 §13 收尾清单第 4 条）。
+
+---
+
+## 13. 定稿：测试名配对表与实现说明（P2a-1）
+
+### 13.1 测试名配对（§12 清单 → 实际测试）
+
+| §12 | 要求 | 测试 | 状态 |
+| --- | --- | --- | --- |
+| 1 | 四种树编码 → 解码往返 | `a_snapshot_round_trips_every_inode_field`、`directory_lookup_and_listing_agree`、`extents_in_range_returns_the_overlapping_runs`、`the_root_value_is_exactly_105_bytes` | 通过 |
+| 2 | 历史无关 | `the_root_id_is_independent_of_insertion_order`（200 次不同插入序列，根 id 全同） | 通过 |
+| 3a | 局部性：改 1 条值 | `changing_one_value_rewrites_only_its_path` | 通过 |
+| 3b | 局部性：插/删 1 条键 | `inserting_one_key_rewrites_only_its_neighbourhood`、`deleting_one_key_rewrites_only_its_neighbourhood` | 通过（见 §13.3 的实测说明） |
+| 4 | 解码拒绝逐类 | `a_root_of_the_wrong_role_is_refused`（错 role）、`a_wrong_format_byte_is_refused`（错 fmt）、`a_truncated_root_is_malformed`（截断）、`trailing_bytes_in_a_root_are_malformed`（尾随）、`unsorted_names_are_refused_rather_than_silently_sorted`（乱序）、`overlapping_extents_are_refused`（重叠）、`a_zero_length_extent_is_refused`（零长）、`an_illegal_kind_content_pair_is_refused`（非法 kind/content）、`no_page_exceeds_the_profile_limit`（超页长） | 通过 |
+| 5 | profile 不符 | `an_unknown_profile_is_refused` | 通过 |
+| 6 | 输入未排序 → `Unsorted` | `unsorted_names_are_refused_rather_than_silently_sorted`、`overlapping_extents_are_refused` | 通过 |
+| 7 | V1–V6 由 `verify --deep` 报出 | **未实现**：`verify --deep` 属于物化器与 P2a-6，P2a-1 是纯编解码库 | 推迟（见 §13.4） |
+| 8 | 规模基准 | `cargo run -p fs-snapshot --release --example scale`；数据见 `docs/reports/p2a-snapshot-bench.md` | 已记录 |
+
+补充（不在 §12 但实现需要）：`a_missing_serial_reads_as_none`、`listing_honours_after_and_limit`、
+`re_encoding_the_same_tree_yields_the_same_objects`、`a_multi_level_inode_table_encodes_to_a_branch_root`、
+`maximum_length_names_still_pack_several_per_page`、`an_empty_directory_is_represented_by_none_not_an_empty_page`、
+`an_empty_inode_table_is_refused`、`names_compare_bytewise_so_case_is_significant`、
+`a_small_inode_table_encodes_to_one_leaf_page`、`a_directory_round_trips_its_names_and_serials`、
+`extents_round_trip_and_gaps_are_legal`。
+
+### 13.2 实现中发现的草案缺口（三处，均已按草案本意修正）
+
+1. **§3 的键重复问题**。§3.2 的 inode 叶格式是 `fmt | node | count | count × inode_record`，
+   而 `inode_record` 的首字段就是 `serial`；§3.4 的 extent 叶同理（首字段 `logical_start`）。
+   实现时若把"页键"和"记录首字段"都写一遍，解码器会读到重复的 serial（首次实测报
+   `unknown inode kind 0`）。已明确：inode 与 extent 叶**不额外写键**，记录首字段即键；
+   目录叶的键是 `name`（含长度前缀），无重复。
+2. **§4 字节护栏的时机**。草案写"当前页编码长度 ≥ `max_page_bytes − max_entry_bytes`（字节护栏）"，
+   是**追加之前**的判断。初版实现写成追加之后判断是否 `> max_page_bytes`，实测出现 16 440 字节的页
+   超出 16 384 上限。已改为追加前判断，`no_page_exceeds_the_profile_limit` 钉住。
+3. **目录键的排序语义**。目录页的键是带长度前缀的 `name`，但排序与切页哈希必须用**裸名字字节**
+   （否则会先按长度排序，违反 §3.3 的"逐字节比较"）。实现已分离 `key`（排序/哈希）与
+   `page_key`（写入）。
+
+### 13.3 局部性的实测结论（重要，修正草案的一个说法）
+
+草案 §4 的反例说明写"按固定条目数切页。插入一条会让其后所有页错位，全量物化 = 全量重写"。
+**这句在全量重编码下不成立**，实测数据：
+
+| 规模 | 固定 8 条/页，中间插入 | 内容分页，中间插入 |
+| --- | --- | --- |
+| 1 000 inode | 新增 3 页 | 新增 ≤ 3 页 |
+| 20 000 inode | 新增 3 页 | 新增 ≤ 3 页 |
+
+原因是页独立编码：插入只改变它落入的那一页，其后各页内容不变、共享同一 oid。**两种规则的
+全量重编码都是确定性的、都历史无关。**
+
+草案的说法对的是**增量物化**（复用旧树页）：固定计数下插入会移动后续所有页的边界，导致无法复用；
+内容分页则能复用。P2a 采用全量重编码（§2 决策与 owner"初版全量物化"），所以这个优势目前不体现。
+
+**结论**：选定内容分页仍然正确——它使将来的增量物化成为可能，且不增加成本——但**"固定计数会
+导致全量重写"这句话应理解为"会导致无法增量复用"**。已按实测修正表述。
+
+变异证据：把切页改为固定 8 条后，`deleting_one_key_rewrites_only_its_neighbourhood` **失败**；
+`inserting_*` 与 `changing_one_value_*` 在两种规则下都通过（原因如上）。这是本卡能提供的
+诚实证据范围，不夸大。
+
+### 13.4 推迟项
+
+- **V1–V6 的 `verify --deep`（§12 第 7 条）**：需要从根遍历整棵对象图并判定拓扑不变量，属于
+  物化器/校验器（P2a-6）的职责。P2a-1 提供了解码与定向读取所需的全部原语（`inode`、`lookup`、
+  `read_dir`、`extents_in_range`），`verify --deep` 可在其上直接实现。
+- **峰值内存**（§12 第 8 条要求）：`examples/scale.rs` 只记录编码耗时与页数。编码器按设计
+  不整份驻留输入（§8 要求 O(N/64)），但当前实现为了简化把条目先收集进 `Vec`——**实际的输入
+  驻留是 O(N)**。这与 §8 的"1 GiB 文件的 extent 流与 10 万 inode 流都不需要整份驻留"不符，
+  记为已知偏差，见 `docs/reports/known-issues.md` 的 KI-4。
