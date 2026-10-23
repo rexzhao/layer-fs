@@ -574,3 +574,101 @@ fn directories_report_as_directories() {
     assert_eq!(stat.kind, Kind::Directory);
     assert_eq!(stat.size, 0);
 }
+
+// ============================================================================
+// §18 item 3 — ten workspaces over one base do not see each other
+//
+// The isolation claim follows from the design (one overlay file per workspace, opened
+// exclusively, composed with an immutable base), but "follows from the design" is not
+// evidence. This runs ten real workspaces and checks that each sees only its own work.
+// ============================================================================
+
+#[test]
+fn ten_workspaces_over_one_base_stay_isolated() {
+    let root = TempRoot::new("ten");
+    let (store, base_root) = empty_base(&root.path);
+    drop(store);
+
+    let count = 10usize;
+    let mut workspaces = Vec::new();
+    for index in 0..count {
+        let member = Store::open(root.path.join("base"), OpenMode::ReadWrite).expect("base");
+        let overlay = OverlayStore::open(
+            root.path.join(format!("overlay-{index}.sqlite")),
+            member,
+            &OverlayOptions {
+                base_root,
+                profile: Profile::V1,
+                serial_first: 1,
+                serial_end: 1 << 20,
+            },
+        )
+        .expect("open workspace");
+        workspaces.push(Rules::new(overlay));
+    }
+
+    // Each workspace writes under its own name, so any leakage shows up as an entry that
+    // this workspace never created.
+    for (index, rules) in workspaces.iter().enumerate() {
+        let dir = format!("/w{index}");
+        rules.mkdir(&p(&dir)).expect("mkdir");
+        rules
+            .backend()
+            .create_file(&p(&format!("{dir}/f")))
+            .expect("create");
+        rules
+            .backend()
+            .write_at(
+                &p(&format!("{dir}/f")),
+                0,
+                format!("payload-{index}").as_bytes(),
+            )
+            .expect("write");
+    }
+
+    for (index, rules) in workspaces.iter().enumerate() {
+        let found = rules.read_dir(&p("/")).expect("list");
+        for other in 0..count {
+            let name = format!("w{other}");
+            let present = found.iter().any(|entry| entry.name == name);
+            assert_eq!(
+                present,
+                other == index,
+                "workspace {index} must see its own entry and nothing of {name}"
+            );
+        }
+        let body = format!("payload-{index}");
+        assert_eq!(
+            rules
+                .backend()
+                .read_at(&p(&format!("/w{index}/f")), 0, body.len())
+                .expect("read"),
+            body.as_bytes()
+        );
+    }
+
+    // Closing them all and reopening one shows that a workspace's file carries its own
+    // work and only its own: a shared or leaked file would make the reopen ambiguous.
+    drop(workspaces);
+    let store = Store::open(root.path.join("base"), OpenMode::ReadWrite).expect("base");
+    let reopened = Rules::new(
+        OverlayStore::open(
+            root.path.join("overlay-0.sqlite"),
+            store,
+            &OverlayOptions {
+                base_root,
+                profile: Profile::V1,
+                serial_first: 1,
+                serial_end: 1 << 20,
+            },
+        )
+        .expect("reopen"),
+    );
+    let entries = reopened.read_dir(&p("/")).expect("list");
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, vec!["w0"], "only workspace 0's own entry is there");
+    assert_eq!(
+        reopened.backend().read_at(&p("/w0/f"), 0, 9).expect("read"),
+        b"payload-0"
+    );
+}
