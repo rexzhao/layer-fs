@@ -477,9 +477,7 @@ fn a_held_main_database_lock_ends_in_a_typed_busy() {
         .execute_batch("BEGIN IMMEDIATE")
         .expect("take the write lock");
 
-    // A pure main-database write: materialisation would hit cas-store's own connection
-    // first, which still uses `busy_timeout = 0` (reported as a deviation — ADR-002 §8's
-    // test asserts that value, and ADR-006 §11.1 asks for 5000 on the same connection).
+    // A pure main-database write, so this isolates the metadata connection's wait.
     let started = Instant::now();
     let outcome = repo.branch_create("side", None);
     let waited = started.elapsed();
@@ -612,4 +610,112 @@ fn a_rejected_rule_leaves_the_view_unchanged() {
     let refused = Rules::new(workspace.store()).mkdir(&p("/a"));
     assert!(refused.is_err(), "mkdir of an existing name must fail");
     assert_eq!(names(&workspace, "/"), before);
+}
+
+/// **§11.1 / KI-7** — contention on the CAS index is the same typed `Busy`, after the same wait.
+///
+/// Before the KI-7 ruling the CAS connection kept `busy_timeout = 0`, so a workspace whose
+/// publication collided with another writer failed **immediately**, and with a different
+/// error shape (`Store(Busy)`) than the metadata path. Now both connections read one number
+/// from `workspace_policy`, and the caller cannot tell which of the two was blocked.
+#[test]
+fn a_blocked_cas_index_also_waits_boundedly() {
+    let (_root, repo) = repository("cas-busy");
+    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    put_file(&workspace, "/f", b"x");
+
+    let blocker = rusqlite::Connection::open(repo.metadata_path()).expect("second connection");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("take the write lock");
+
+    let started = Instant::now();
+    // Materialisation publishes objects, so this reaches cas-store's connection first.
+    let outcome = workspace.commit("blocked", false);
+    let waited = started.elapsed();
+    let _ = blocker.execute_batch("ROLLBACK");
+
+    match outcome {
+        Err(WorkspaceError::Busy { waited_ms }) => {
+            assert_eq!(waited_ms, fs_workspace::MAIN_BUSY_TIMEOUT_MS);
+        }
+        other => panic!("expected a typed Busy from the CAS connection, got {other:?}"),
+    }
+    assert!(
+        waited >= Duration::from_secs(4),
+        "the CAS connection must wait too, measured {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(30),
+        "and the wait must still be bounded, measured {waited:?}"
+    );
+    // The failed attempt left the work in the overlay, and the same call now succeeds.
+    assert!(workspace.is_dirty().expect("dirty"));
+    workspace
+        .commit("after the lock", false)
+        .expect("the publication succeeds once the lock is released");
+}
+
+/// Fills a workspace with `count` one-byte files, the payload §11.1's acceptance uses.
+fn fill(workspace: &Workspace, prefix: char, count: usize) {
+    let store = workspace.store();
+    for index in 0..count {
+        let path = p(&format!("/{prefix}{index:04}"));
+        store.create_file(&path).expect("create file");
+        store.write_at(&path, 0, b"x").expect("write");
+    }
+}
+
+/// **§11.1 acceptance (F2)** — two workspaces publish 1000 files each, at the same time.
+///
+/// Both must succeed: the point of the bounded wait is that correct concurrent use does not
+/// fail at random. The durations are printed as the margin evidence the architect asked
+/// for — if a contended publication of this size finished anywhere near the 5 s wait, the
+/// wait would be a routinely-hit path rather than a safety net.
+///
+/// The architect's other question — whether the per-object fsync happens while the index
+/// write lane is held — is answered by `cas-store`'s publication sequence: `stage()` writes,
+/// syncs and renames the object before `record()` opens the single index INSERT. No lock is
+/// held across an fsync, so a batch publisher (ADR-006 §12, P2a-5) can keep the same
+/// discipline: fsync the chunk first, then one short index transaction.
+#[test]
+fn two_workspaces_publish_a_thousand_files_concurrently() {
+    const FILES: usize = 1000;
+
+    let (_root, repo) = repository("concurrent");
+    let base = repo.branch_head("main").expect("head");
+    repo.branch_create("side", Some(&base)).expect("branch");
+    let left = repo.workspace_create("left", "main").expect("create");
+    let right = repo.workspace_create("right", "side").expect("create");
+    fill(&left, 'l', FILES);
+    fill(&right, 'r', FILES);
+
+    let left_thread = std::thread::spawn(move || {
+        let mut left = left;
+        let started = Instant::now();
+        let outcome = left.commit("left", false);
+        (started.elapsed(), outcome)
+    });
+    let right_thread = std::thread::spawn(move || {
+        let mut right = right;
+        let started = Instant::now();
+        let outcome = right.commit("right", false);
+        (started.elapsed(), outcome)
+    });
+
+    let (left_time, left_outcome) = left_thread.join().expect("left thread");
+    let (right_time, right_outcome) = right_thread.join().expect("right thread");
+    let left = left_outcome.expect("the left publication must survive contention");
+    let right = right_outcome.expect("the right publication must survive contention");
+
+    assert_ne!(left.root, right.root, "different content, different roots");
+    assert_ne!(left.commit, right.commit);
+    for (label, elapsed) in [("left", left_time), ("right", right_time)] {
+        eprintln!("§11.1 concurrent snapshot of {FILES} files: {label} {elapsed:?}");
+    }
+    let worst = left_time.max(right_time);
+    assert!(
+        worst < Duration::from_secs(120),
+        "a concurrent publication must not be starved, took {worst:?}"
+    );
 }

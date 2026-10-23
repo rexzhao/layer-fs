@@ -160,7 +160,15 @@ impl From<fs_snapshot::SnapshotError> for WorkspaceError {
 
 impl From<cas_store::StoreError> for WorkspaceError {
     fn from(error: cas_store::StoreError) -> Self {
-        WorkspaceError::Store(error)
+        // Contention on the CAS index is the same situation as contention on the metadata
+        // database, and §11.1 says the caller sees one typed `Busy` either way — the fix
+        // must not leak which of the two connections happened to be blocked.
+        match error {
+            cas_store::StoreError::Busy => WorkspaceError::Busy {
+                waited_ms: MAIN_BUSY_TIMEOUT_MS,
+            },
+            other => WorkspaceError::Store(other),
+        }
     }
 }
 

@@ -26,7 +26,6 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::ids::{self, commit_id, parse_oid, SerialSegment};
 use crate::main_db::{hex, now_ns, unhex_32, MainDb};
-use crate::materialize::StoreSink;
 use crate::schema;
 use crate::workspace::{Workspace, WorkspaceSummary};
 
@@ -88,8 +87,16 @@ impl Repo {
         } else {
             OpenMode::ReadWrite
         };
-        let store = Store::open(&store_dir, mode)?;
-        let db = MainDb::open(store.metadata_path(), create)?;
+        // The busy timeout that should configure the CAS connection lives in the store's
+        // own policy, so the store has to be opened once to find that file and read the
+        // value, and then again with it. Two opens at startup, both cheap; the alternative
+        // would be two sources for one number (ADR-006 §11.1).
+        let probe = Store::open(&store_dir, mode)?;
+        let metadata_path = probe.metadata_path().to_path_buf();
+        drop(probe);
+        let db = MainDb::open(&metadata_path, create)?;
+        let busy_timeout = db.busy_timeout();
+        let store = Store::open_with(&store_dir, mode, cas_store::StoreOptions { busy_timeout })?;
         let repo = Self {
             store_dir,
             db,
@@ -122,6 +129,14 @@ impl Repo {
 
     pub(crate) fn db(&self) -> &MainDb {
         &self.db
+    }
+
+    /// The bounded wait this repository's main-database connections use (ADR-006 §11.1).
+    ///
+    /// One number, read from `workspace_policy`, handed to every connection to the main
+    /// database that can take the write lane.
+    pub(crate) fn busy_timeout(&self) -> std::time::Duration {
+        self.db.busy_timeout()
     }
 
     /// Creates the first commit: an empty tree with only a root directory.
@@ -672,7 +687,7 @@ impl Repo {
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut sink = StoreSink { store: &store };
+        let mut sink = crate::materialize::StoreSink::new(&store);
         let now = now_ns();
         let records = [InodeRecord {
             serial: 0,
@@ -682,15 +697,19 @@ impl Repo {
             modified_ns: now,
             content: Content::Empty,
         }];
-        let table = encode_inode_table(&profile, records.into_iter(), &mut sink)?;
-        Ok(encode_root(
-            &profile,
-            &RootValue {
-                scope_id: scope,
-                inode_table: table,
-            },
-            &mut sink,
-        )?)
+        let table = crate::materialize::publish(&mut sink, |sink| {
+            encode_inode_table(&profile, records.into_iter(), sink)
+        })?;
+        crate::materialize::publish(&mut sink, |sink| {
+            encode_root(
+                &profile,
+                &RootValue {
+                    scope_id: scope,
+                    inode_table: table,
+                },
+                sink,
+            )
+        })
     }
 
     /// The serial scope a published tree was allocated in.

@@ -61,7 +61,7 @@ pub use error::{CorruptCause, StoreError, StoreResult};
 pub use layout::Layout;
 pub use object::{PutOutcome, VerificationFailure, VerificationReport};
 pub use objects_scan::BadObjectName;
-pub use open::{OpenMode, Opened};
+pub use open::{OpenMode, Opened, StoreOptions};
 
 use open::Database;
 
@@ -111,7 +111,24 @@ impl Store {
     /// when the Store on disk is not one this build understands, and
     /// [`StoreError::Sqlite`] for database failures.
     pub fn open(root: impl AsRef<Path>, mode: OpenMode) -> StoreResult<Self> {
-        let (database, layout, opened) = open::open(root.as_ref(), mode)?;
+        Self::open_with(root, mode, StoreOptions::default())
+    }
+
+    /// [`Store::open`] with an explicit connection profile.
+    ///
+    /// The only knob today is the bounded busy wait (ADR-006 §11.1). `open` is this call
+    /// with [`StoreOptions::default`], so ADR-002 §8's "no busy handler" remains the
+    /// default behaviour and the existing callers are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// The same failures as [`Store::open`].
+    pub fn open_with(
+        root: impl AsRef<Path>,
+        mode: OpenMode,
+        options: StoreOptions,
+    ) -> StoreResult<Self> {
+        let (database, layout, opened) = open::open(root.as_ref(), mode, options)?;
         let metadata_path = layout.database();
         Ok(Self {
             database,

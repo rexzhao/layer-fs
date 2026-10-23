@@ -19,6 +19,24 @@ pub enum OpenMode {
     ReadOnly,
 }
 
+/// How a Store's SQLite connection is configured.
+///
+/// The default is ADR-002 §8's semantics: **no busy handler** — a competing writer is
+/// reported immediately as a typed `Busy` and the caller decides whether to redo the
+/// operation. Every existing caller gets that from [`Store::open`](crate::Store::open).
+///
+/// A layer that legitimately shares the store between concurrent writers opts into a
+/// bounded wait instead of a retry loop: ADR-006 §11.1 (F2) revised §8 for exactly one
+/// such case — the main database connections of a workspace repository. The wait is still
+/// SQLite waiting inside one statement, not this crate re-running anything, and the
+/// timeout still surfaces as `Busy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StoreOptions {
+    /// How long a statement waits for a competing writer before failing.
+    ///
+    /// `Duration::ZERO` (the default) means "do not wait".
+    pub busy_timeout: std::time::Duration,
+}
 impl OpenMode {
     fn may_write(self) -> bool {
         !matches!(self, OpenMode::ReadOnly)
@@ -69,7 +87,11 @@ impl std::fmt::Debug for Database {
 /// Order (ADR-002 §7): open/create the directory shape, open SQLite, validate
 /// the schema and policy, clear `tmp/`. Orphaned object files are left alone
 /// (ADR-002 §10).
-pub(crate) fn open(root: &Path, mode: OpenMode) -> StoreResult<(Database, Layout, Opened)> {
+pub(crate) fn open(
+    root: &Path,
+    mode: OpenMode,
+    options: StoreOptions,
+) -> StoreResult<(Database, Layout, Opened)> {
     let layout = Layout::new(root);
     let already_present = layout.database().is_file();
 
@@ -88,7 +110,7 @@ pub(crate) fn open(root: &Path, mode: OpenMode) -> StoreResult<(Database, Layout
         })?;
 
     let mut connection = Connection::open_with_flags(layout.database(), mode.sqlite_flags())?;
-    configure(&connection)?;
+    configure(&connection, options)?;
 
     if already_present {
         schema::validate(&connection)?;
@@ -127,10 +149,14 @@ pub(crate) fn open(root: &Path, mode: OpenMode) -> StoreResult<(Database, Layout
 /// `synchronous=FULL` is chosen deliberately: ADR-002 §9 requires a committed
 /// index change to be durable, which is what makes "index commit == publish"
 /// meaningful across a process crash.
-fn configure(connection: &Connection) -> StoreResult<()> {
+fn configure(connection: &Connection, options: StoreOptions) -> StoreResult<()> {
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
-    connection.pragma_update(None, "busy_timeout", 0)?;
+    // Zero by default: ADR-002 §8. A caller that shares the store between writers passes
+    // a bounded wait (ADR-006 §11.1), which is SQLite waiting inside the statement — never
+    // this crate replaying an operation.
+    let wait_ms = i64::try_from(options.busy_timeout.as_millis()).unwrap_or(i64::MAX);
+    connection.pragma_update(None, "busy_timeout", wait_ms)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
 }

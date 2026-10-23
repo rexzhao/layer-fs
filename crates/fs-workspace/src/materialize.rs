@@ -55,18 +55,56 @@ use crate::error::{WorkspaceError, WorkspaceResult};
 const PAGE_LIMIT: usize = 256;
 
 /// Publishes pages into a CAS store.
+///
+/// [`PageSink`] forces the snapshot error type, but a store failure is not a malformed
+/// tree: flattening it into a message would erase the one thing ADR-006 §11.1 promises the
+/// caller — a typed `Busy`. So the failure is kept aside and substituted by [`publish`],
+/// which is what every encoder call goes through.
 pub(crate) struct StoreSink<'a> {
     pub(crate) store: &'a Store,
+    failure: Option<cas_store::StoreError>,
+}
+
+impl<'a> StoreSink<'a> {
+    pub(crate) fn new(store: &'a Store) -> Self {
+        Self {
+            store,
+            failure: None,
+        }
+    }
+
+    /// The store failure that stopped this sink, if any.
+    fn take_failure(&mut self) -> Option<cas_store::StoreError> {
+        self.failure.take()
+    }
 }
 
 impl PageSink for StoreSink<'_> {
     fn put(&mut self, role: Role, value: &[u8]) -> SnapshotResult<ObjectId> {
-        self.store
-            .put(role, value)
-            .map(|published| published.oid)
-            .map_err(|error| SnapshotError::Malformed {
-                detail: error.to_string(),
-            })
+        match self.store.put(role, value) {
+            Ok(published) => Ok(published.oid),
+            Err(error) => {
+                self.failure = Some(error);
+                Err(SnapshotError::Malformed {
+                    detail: "the store refused an object; the cause is reported separately"
+                        .to_owned(),
+                })
+            }
+        }
+    }
+}
+
+/// Runs one encoder step, preferring the store's own failure over the encoder's sentinel.
+pub(crate) fn publish<T>(
+    sink: &mut StoreSink<'_>,
+    body: impl FnOnce(&mut StoreSink<'_>) -> SnapshotResult<T>,
+) -> WorkspaceResult<T> {
+    match body(sink) {
+        Ok(value) => Ok(value),
+        Err(error) => match sink.take_failure() {
+            Some(store) => Err(WorkspaceError::from(store)),
+            None => Err(WorkspaceError::from(error)),
+        },
     }
 }
 
@@ -143,6 +181,7 @@ pub(crate) fn encode(
     scope_id: [u8; 32],
     read_block: impl Fn(&Path, u64, usize) -> WorkspaceResult<Vec<u8>>,
 ) -> WorkspaceResult<ObjectId> {
+    let mut sink = StoreSink::new(store);
     let mut records: BTreeMap<u64, InodeRecord> = BTreeMap::new();
     for (index, node) in nodes.iter().enumerate() {
         // ADR-006 §9.4: a crash after some objects are published and before any row names
@@ -151,9 +190,9 @@ pub(crate) fn encode(
             crate::publish::crash_point("during-materialise");
         }
         let content = if node.is_dir {
-            encode_dir(store, node, profile)?
+            encode_dir(&mut sink, node, profile)?
         } else {
-            encode_file(store, node, profile, &read_block)?
+            encode_file(&mut sink, node, profile, &read_block)?
         };
         records.insert(
             node.serial,
@@ -171,35 +210,39 @@ pub(crate) fn encode(
             },
         );
     }
-    let mut sink = StoreSink { store };
-    let table = encode_inode_table(&profile, records.into_values(), &mut sink)?;
-    Ok(encode_root(
-        &profile,
-        &RootValue {
-            scope_id,
-            inode_table: table,
-        },
-        &mut sink,
-    )?)
+    let table = publish(&mut sink, |sink| {
+        encode_inode_table(&profile, records.into_values(), sink)
+    })?;
+    publish(&mut sink, |sink| {
+        encode_root(
+            &profile,
+            &RootValue {
+                scope_id,
+                inode_table: table,
+            },
+            sink,
+        )
+    })
 }
 
-fn encode_dir(store: &Store, node: &Node, profile: Profile) -> WorkspaceResult<Content> {
+fn encode_dir(sink: &mut StoreSink<'_>, node: &Node, profile: Profile) -> WorkspaceResult<Content> {
     if node.children.is_empty() {
         return Ok(Content::Empty);
     }
-    let mut sink = StoreSink { store };
     let entries = node.children.iter().map(|(name, child)| DirEntry {
         name: name.clone(),
         child_serial: *child,
     });
-    Ok(match encode_directory(&profile, entries, &mut sink)? {
-        Some(oid) => Content::Dir(oid),
-        None => Content::Empty,
-    })
+    Ok(
+        match publish(sink, |sink| encode_directory(&profile, entries, sink))? {
+            Some(oid) => Content::Dir(oid),
+            None => Content::Empty,
+        },
+    )
 }
 
 fn encode_file(
-    store: &Store,
+    sink: &mut StoreSink<'_>,
     node: &Node,
     profile: Profile,
     read_block: &impl Fn(&Path, u64, usize) -> WorkspaceResult<Vec<u8>>,
@@ -215,7 +258,7 @@ fn encode_file(
         if bytes.iter().all(|byte| *byte == 0) {
             return Ok(Content::Empty);
         }
-        let object = StoreSink { store }.put(Role::Bytes, &bytes)?;
+        let object = publish(sink, |sink| sink.put(Role::Bytes, &bytes))?;
         return Ok(Content::Blob(object));
     }
     let mut extents = Vec::new();
@@ -227,7 +270,7 @@ fn encode_file(
         // All-zero blocks are omitted: "wrote zeros" and "did not write" must produce the
         // same tree, or history independence fails (ADR-005 §3.4).
         if bytes.iter().any(|byte| *byte != 0) {
-            let object = StoreSink { store }.put(Role::Bytes, &bytes)?;
+            let object = publish(sink, |sink| sink.put(Role::Bytes, &bytes))?;
             extents.push(Extent {
                 logical_start: start,
                 length: end - start,
@@ -240,9 +283,10 @@ fn encode_file(
     if extents.is_empty() {
         return Ok(Content::Empty);
     }
-    let mut sink = StoreSink { store };
     Ok(
-        match encode_extents(&profile, extents.into_iter(), &mut sink)? {
+        match publish(sink, |sink| {
+            encode_extents(&profile, extents.into_iter(), sink)
+        })? {
             Some(oid) => Content::Extents(oid),
             None => Content::Empty,
         },

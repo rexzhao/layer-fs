@@ -246,3 +246,39 @@ cas-store 的连接。
 
 **去向**：P2a-8 度量（1k/10k/100k 文件、变更 1 文件/1%/100% 的 snapshot 耗时与新增对象数），
 再决定是否需要增量物化。
+---
+
+## KI-7 处置：**按 ADR-006 §11.1 修订关闭**（P2a-6 补充提交）
+
+architect 裁决方案 (c)——**参数化，不改默认**：
+
+- `cas-store` 新增 `StoreOptions { busy_timeout }` 与 `Store::open_with(root, mode, options)`；
+  `Store::open` 保持 `busy_timeout = 0`（ADR-002 §8 原语义），既有测试
+  `a_cross_process_writer_reports_busy_without_retrying` **一字未改**。
+- `fs-workspace` 从 `workspace_policy.main_busy_timeout_ms` 读出这一个数，同时用于**自己的元数据
+  连接**与**发对象用的 cas-store 连接**（`open_with`），所以不会出现两份配置。
+- `WorkspaceError` 把 `StoreError::Busy` 与 `rusqlite` 的 `DatabaseBusy/DatabaseLocked` **归一到同一个**
+  `WorkspaceError::Busy { waited_ms }`：调用方看不出是哪个连接被阻塞（§11.1 要求"错误类型与 P1 相同"）。
+
+**钉住它的测试**：
+
+| 测试 | 证明 |
+| --- | --- |
+| `cas-store::store::open_with_a_bounded_wait_reports_busy_after_roughly_that_long` | 200 ms 参数生效、约 200 ms 后 `Busy`、对象未发布 |
+| `cas-store::store::the_default_open_does_not_wait` | 默认仍是 0：立即失败（ADR-002 §8 未退让） |
+| `fs-workspace::core::a_held_main_database_lock_ends_in_a_typed_busy` | 元数据连接有界等待，锁释放后同一操作成功 |
+| `fs-workspace::core::a_blocked_cas_index_also_waits_boundedly` | cas-store 连接同样有界等待，且错误类型与前一条相同 |
+| `fs-workspace::core::two_workspaces_publish_a_thousand_files_concurrently` | §11.1 验收场景：两 workspace 各 1000 文件并发发布，均成功 |
+
+**余量证据**（同一台机器，F:，debug 构建）：并发发布 1000 文件耗时 **left 401 ms / right 322 ms**，
+相对 5000 ms 的等待上限有 12 倍以上余量——有界等待是安全网，不是常态路径。
+
+**architect 的附加风险核对（批量发布 §12 的 fsync 持锁）**：核对结论是**当前实现不存在该风险**，且
+`§12` 必须保持同一纪律。`cas-store` 的发布序列是
+`published()`（只读索引）→ `stage()`（写 tmp、`sync_file`、rename、`sync_directory`，**全程不持有索引写锁**）
+→ `record()`（单条 `INSERT`，隐式事务只覆盖这一条语句）。也就是说**对象 fsync 本来就在索引事务之外**。
+批量发布要保住的性质是：先完成一块的对象写盘，再开**一个短**索引事务写这一块的行；不要把 fsync 搬进事务。
+
+**顺带修正的一处**：物化器的 `PageSink` 实现原先把 `StoreError` 压成
+`SnapshotError::Malformed { detail }`，这会把 `Busy` 的类型信息抹掉。改为把 store 失败暂存于 sink、
+由 `materialize::publish` 还原成 `WorkspaceError`（因此上面那条 cas-store Busy 测试才能断言类型）。

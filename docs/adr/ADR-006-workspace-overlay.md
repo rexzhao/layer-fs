@@ -420,6 +420,11 @@ spec P2.9 要求的 revert 与 reset 区别：revert **生成**逆向提交（�
 **测试**：两个 workspace 并发 snapshot 各 1000 个文件，均成功；人为持有主库写锁 > 5 s 时，发布方
 在约 5 s 后得到 `Busy`（断言等待时长有界，而不是立即失败或无限等待）。
 
+- **对 ADR-002 §8 的修订（同一次 F2 裁决）**：ADR-002 §8 的“`busy_timeout` 保持 0”对**默认调用方**
+  不变。主库上的两条连接（cas-store 的索引连接、fs-workspace 的元数据连接）通过
+  `Store::open_with(..., StoreOptions { busy_timeout })` 显式选择有界等待，两者取**同一个参数源**
+  （`workspace_policy.main_busy_timeout_ms`），因此不会出现两份配置。ADR-002 §8 的原文与其既有测试
+  （`a_cross_process_writer_reports_busy_without_retrying`）一字不改。
 - 替代方案（未采纳）：[LFS] 式进程内 FIFO 准入 + 跨进程目录锁 + 发布通道——复杂度高，P2a 不需要。
 
 ## 12. 批量发布（ADR-002 §5 修订）**[F7 已确认]**

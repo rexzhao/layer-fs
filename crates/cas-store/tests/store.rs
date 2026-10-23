@@ -755,3 +755,91 @@ fn different_objects_keep_separate_files_under_distinct_directories() {
     assert_eq!(files_under(&root.path().join("objects")).len(), 32);
     assert!(store.verify().expect("verify").is_clean());
 }
+
+/// **ADR-006 §11.1 (F2)** — `open_with` waits a bounded time, then reports `Busy`.
+///
+/// `Store::open` keeps ADR-002 §8's "no busy handler"; this is the opt-in that ADR-006
+/// §11.1 added for the one caller that shares the main database between workspaces. The
+/// wait must be SQLite waiting inside the statement: the object is not published and the
+/// error type is the same `Busy` a zero-timeout store reports.
+#[test]
+fn open_with_a_bounded_wait_reports_busy_after_roughly_that_long() {
+    use std::time::{Duration, Instant};
+
+    use cas_store::StoreOptions;
+
+    let root = TempRoot::new("bounded-wait");
+    let first = Store::open(root.path(), OpenMode::Create).expect("create");
+    first.put(Role::Bytes, b"before").expect("put");
+    drop(first);
+
+    // A second connection takes the write lane and holds it longer than the wait.
+    let blocker =
+        rusqlite::Connection::open(root.path().join("store.sqlite")).expect("second connection");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("take the write lane");
+
+    let waiter = Store::open_with(
+        root.path(),
+        OpenMode::ReadWrite,
+        StoreOptions {
+            busy_timeout: Duration::from_millis(200),
+        },
+    )
+    .expect("open with a wait");
+
+    let started = Instant::now();
+    let outcome = waiter.put(Role::Bytes, b"during");
+    let waited = started.elapsed();
+    let _ = blocker.execute_batch("ROLLBACK");
+
+    match outcome {
+        Err(StoreError::Busy) => {}
+        other => panic!("expected Busy, got {other:?}"),
+    }
+    assert!(
+        waited >= Duration::from_millis(150),
+        "the wait must be the configured ~200 ms, measured {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(10),
+        "the wait must be bounded, measured {waited:?}"
+    );
+    // Nothing was published: a waited-for lock still ends in a typed failure, not a
+    // half-applied write.
+    let during = oid_of(Role::Bytes, b"during");
+    assert!(matches!(
+        waiter.get(during),
+        Err(StoreError::NotFound { .. })
+    ));
+}
+
+/// **ADR-002 §8 unchanged** — the default has no busy handler at all.
+#[test]
+fn the_default_open_does_not_wait() {
+    use std::time::{Duration, Instant};
+
+    let root = TempRoot::new("no-wait");
+    let first = Store::open(root.path(), OpenMode::Create).expect("create");
+    first.put(Role::Bytes, b"before").expect("put");
+    drop(first);
+
+    let blocker =
+        rusqlite::Connection::open(root.path().join("store.sqlite")).expect("second connection");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("take the write lane");
+    let waiter = Store::open(root.path(), OpenMode::ReadWrite).expect("open");
+
+    let started = Instant::now();
+    let outcome = waiter.put(Role::Bytes, b"during");
+    let waited = started.elapsed();
+    let _ = blocker.execute_batch("ROLLBACK");
+
+    assert!(matches!(outcome, Err(StoreError::Busy)), "got {outcome:?}");
+    assert!(
+        waited < Duration::from_millis(150),
+        "the default must not wait, measured {waited:?}"
+    );
+}

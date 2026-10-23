@@ -56,7 +56,15 @@ impl Workspace {
         // A second handle on the store, for publishing objects during materialisation. The
         // overlay owns its own; keeping them separate is what stops a `put` from happening
         // while the overlay holds a read scope (TX4).
-        let store = Store::open(repo.store_dir(), cas_store::OpenMode::ReadWrite)?;
+        let store = Store::open_with(
+            repo.store_dir(),
+            cas_store::OpenMode::ReadWrite,
+            // The same number as the repository's metadata connection: publishing contends
+            // for the CAS index, and ADR-006 §11.1 asks for one bounded wait, not two.
+            cas_store::StoreOptions {
+                busy_timeout: repo.busy_timeout(),
+            },
+        )?;
         Ok(Self {
             name,
             id,

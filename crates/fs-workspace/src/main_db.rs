@@ -22,6 +22,8 @@ use crate::schema;
 pub struct MainDb {
     connection: Mutex<Connection>,
     metadata_path: PathBuf,
+    /// How long a statement waits, read back from `workspace_policy` on open.
+    busy_timeout_ms: u64,
 }
 
 impl MainDb {
@@ -41,11 +43,17 @@ impl MainDb {
         connection.busy_timeout(std::time::Duration::from_millis(
             schema::MAIN_BUSY_TIMEOUT_MS,
         ))?;
-        let db = Self {
+        let mut db = Self {
             connection: Mutex::new(connection),
             metadata_path,
+            // The initial value only has to be long enough for this handle to read the
+            // policy that decides the real one, which is applied immediately below.
+            busy_timeout_ms: schema::MAIN_BUSY_TIMEOUT_MS,
         };
-        db.prepare(create)?;
+        let busy_timeout_ms = db.prepare(create)?;
+        db.busy_timeout_ms = busy_timeout_ms;
+        db.lock()
+            .busy_timeout(std::time::Duration::from_millis(busy_timeout_ms))?;
         Ok(db)
     }
 
@@ -53,6 +61,16 @@ impl MainDb {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.metadata_path
+    }
+
+    /// How long this connection waits for a competing writer (ADR-006 §11.1).
+    ///
+    /// The value comes from `workspace_policy.main_busy_timeout_ms`, so the repository can
+    /// hand the same number to cas-store instead of configuring the two connections
+    /// separately.
+    #[must_use]
+    pub fn busy_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.busy_timeout_ms)
     }
 
     /// Takes the connection lock.
@@ -71,7 +89,8 @@ impl MainDb {
         policy(&self.lock(), key)
     }
 
-    fn prepare(&self, create: bool) -> WorkspaceResult<()> {
+    /// Creates or validates the tables, returning the busy timeout the policy states.
+    fn prepare(&self, create: bool) -> WorkspaceResult<u64> {
         let connection = self.lock();
         let exists: bool = connection.query_row(
             "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'workspace_policy'",
@@ -102,7 +121,7 @@ impl MainDb {
                 (key, value),
             )?;
         }
-        Ok(())
+        Ok(schema::MAIN_BUSY_TIMEOUT_MS)
     }
 }
 
@@ -122,7 +141,7 @@ pub(crate) fn policy(connection: &Connection, key: &str) -> WorkspaceResult<Stri
 }
 
 /// Checks that the tables on disk are the ones this build writes.
-fn validate(connection: &Connection) -> WorkspaceResult<()> {
+fn validate(connection: &Connection) -> WorkspaceResult<u64> {
     let version = policy(connection, "schema_version")?;
     if version != schema::SCHEMA_VERSION.to_string() {
         return Err(WorkspaceError::SchemaMismatch {
@@ -146,15 +165,23 @@ fn validate(connection: &Connection) -> WorkspaceResult<()> {
         });
     }
     // §11.1: the wait is recorded in the database, so a handle opened by a build with a
-    // different policy is refused instead of quietly behaving differently.
+    // different policy is refused instead of quietly behaving differently. The value is
+    // parsed rather than merely compared as text, because it is what configures both this
+    // connection and cas-store's.
     let busy = policy(connection, "main_busy_timeout_ms")?;
-    if busy != schema::MAIN_BUSY_TIMEOUT_MS.to_string() {
+    let busy_ms = busy
+        .parse::<u64>()
+        .map_err(|_| WorkspaceError::SchemaMismatch {
+            expected: "main_busy_timeout_ms as a number".to_owned(),
+            found: busy.clone(),
+        })?;
+    if busy_ms != schema::MAIN_BUSY_TIMEOUT_MS {
         return Err(WorkspaceError::SchemaMismatch {
             expected: format!("main_busy_timeout_ms {}", schema::MAIN_BUSY_TIMEOUT_MS),
             found: busy,
         });
     }
-    Ok(())
+    Ok(busy_ms)
 }
 
 /// Lowercase hex, the form every id in this layer is stored in.
