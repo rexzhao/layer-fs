@@ -79,6 +79,9 @@ impl<'a> SnapshotReader<'a> {
             let page = fetch(self.store, pointer, Role::InodeTable, "inode table")?;
             let mut reader = Reader::new(&page);
             reader.format(self.profile.fmt)?;
+            // The fourth and last caller: `lookup`, `read_dir` and `extents_in_range`
+            // already bound the page, and this one was missed (P2a-1-QA-2).
+            check_page_size(&page, &self.profile)?;
             let node = reader.u8()?;
             match node {
                 0 => return self.find_inode_in_leaf(&mut reader, serial),
@@ -391,6 +394,16 @@ impl<'a> SnapshotReader<'a> {
                     previous_end = Some(start + length);
                     let object = reader.oid()?;
                     let source_offset = reader.u64()?;
+                    // The companion of the length bound above: a run may not read past
+                    // the largest legal object value. Checked against the syntax only,
+                    // without fetching the object (ADR-005 §3.4).
+                    if source_offset.saturating_add(length) > self.profile.max_object_value {
+                        return Err(malformed(format!(
+                            "extent at {start} reads {} bytes past the object value limit {}",
+                            source_offset.saturating_add(length),
+                            self.profile.max_object_value
+                        )));
+                    }
                     if start < to && start + length > from {
                         out.push(Extent {
                             logical_start: start,

@@ -587,3 +587,103 @@ fn reading_an_oversized_page_is_refused() {
         .expect_err("an oversized page must be refused when read");
     assert!(matches!(error, SnapshotError::Malformed { .. }), "{error}");
 }
+
+// ------------------------------------------------- P2a-1-QA-2: two read gaps
+
+/// **QA ①** — the inode-table read path must bound the page size too.
+///
+/// `lookup`, `read_dir` and `extents_in_range` already checked it; the inode path did
+/// not, so a forged inode page could be arbitrarily large.
+#[test]
+fn reading_an_oversized_inode_page_is_refused() {
+    let root = TempRoot::new("inode-bound");
+    let store = store_at(&root);
+    let profile = Profile::V1;
+    let mut sink = StoreSink { store: &store };
+
+    // A leaf that declares far more records than fit in a page. Each record is
+    // serial + kind + size + two times + content tag = 34 bytes minimum.
+    let count = (profile.max_page_bytes / 34 + 1) as u32;
+    let mut value = Vec::new();
+    value.push(profile.fmt);
+    value.push(0); // node = leaf
+    value.extend_from_slice(&count.to_be_bytes());
+    for serial in 0..count {
+        value.extend_from_slice(&(serial as u64).to_be_bytes());
+        value.push(2); // Kind::File
+        value.extend_from_slice(&0u64.to_be_bytes());
+        value.extend_from_slice(&0i64.to_be_bytes());
+        value.extend_from_slice(&0i64.to_be_bytes());
+        value.push(0); // Content::Empty
+    }
+    assert!(
+        value.len() > profile.max_page_bytes,
+        "the forged page must exceed the limit"
+    );
+    let table = sink.put(Role::InodeTable, &value).expect("put leaf");
+    let root_oid = fs_snapshot::encode_root(
+        &profile,
+        &RootValue {
+            scope_id: [6u8; 32],
+            inode_table: table,
+        },
+        &mut sink,
+    )
+    .expect("encode root");
+
+    let reader = SnapshotReader::open(&store, root_oid, profile).expect("open");
+    let error = reader
+        .inode(1)
+        .expect_err("an oversized inode page must be refused when read");
+    assert!(matches!(error, SnapshotError::Malformed { .. }), "{error}");
+}
+
+/// **QA ②** — the read path must reject `source_offset + length` past the largest
+/// legal object value.
+///
+/// The length bound alone does not cover this: a one-block extent can still start at
+/// an offset beyond anything an object may hold.
+#[test]
+fn reading_an_extent_past_the_object_value_limit_is_refused() {
+    let root = TempRoot::new("source-bound");
+    let store = store_at(&root);
+    let profile = Profile::V1;
+    let mut sink = StoreSink { store: &store };
+
+    let mut value = Vec::new();
+    value.push(profile.fmt);
+    value.extend_from_slice(&1u32.to_be_bytes());
+    value.extend_from_slice(&0u64.to_be_bytes()); // logical_start
+    value.extend_from_slice(&profile.block_bytes.to_be_bytes()); // legal length
+    value.extend_from_slice(ObjectId::from_bytes([1u8; 32]).as_bytes());
+    // A source offset past the largest legal object value.
+    value.extend_from_slice(&(profile.max_object_value + 1).to_be_bytes());
+    let leaf = sink.put(Role::ExtentLeaf, &value).expect("put leaf");
+
+    let records = vec![InodeRecord {
+        serial: 0,
+        kind: Kind::File,
+        size: profile.block_bytes,
+        created_ns: 0,
+        modified_ns: 0,
+        content: Content::Extents(leaf),
+    }];
+    let table = fs_snapshot::encode_inode_table(&profile, records.into_iter(), &mut sink)
+        .expect("encode table");
+    let root_oid = fs_snapshot::encode_root(
+        &profile,
+        &RootValue {
+            scope_id: [7u8; 32],
+            inode_table: table,
+        },
+        &mut sink,
+    )
+    .expect("encode root");
+
+    let reader = SnapshotReader::open(&store, root_oid, profile).expect("open");
+    let file = reader.inode(0).expect("read").expect("present");
+    let error = reader
+        .extents_in_range(&file, 0, 1)
+        .expect_err("an extent reading past the object limit must be refused");
+    assert!(matches!(error, SnapshotError::Malformed { .. }), "{error}");
+}
