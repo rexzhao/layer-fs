@@ -1,13 +1,13 @@
 # ADR-006：Workspace、Overlay、flush 与 Branch/Commit
 
-- 状态：**草案（Proposed）**——architect 初稿，作为 P2a-2 卡的设计输入。标 **[待 F#]** 的条目
-  等 owner 对分叉 F1–F7 的答复（mailbox 线程 `manager/3yinqic7xe` §4）；答复前按"建议（默认）"写
+- 状态：**草案（Proposed），分叉已决**——architect 起草，作为 P2a-2 卡的设计输入；owner 已于
+  2026-10-23 确认分叉 F1–F7 全部按建议执行（经 manager 转达，§2.1）。worker 落地核对后转 Accepted
 - 日期：2026-10-23
 - 起草：architect
 - 依据：spec §2 P2.1–P2.4、P2.8–P2.11、§4、§5、§6 P2；owner P2 决定六条（workspace-only、overlay
   不做每操作落盘、CLI 显式风格、P2a/P2b 两波、快照 = 纯 CAS 对象图、无乐观并发 + 全量物化）；
   Root 审查 Q2/Q3/Q4；ADR-001 D9/D10；ADR-002 §5/§8；ADR-003 §3/§4.3；ADR-004 §3；ADR-005
-- 修订：本 ADR **修订 ADR-001 D10**（§11，待 F2）与 **ADR-002 §5**（§12，批量发布）；**取代**
+- 修订：本 ADR **修订 ADR-001 D10**（§11，F2）与 **ADR-002 §5**（§12，批量发布，F7）；**取代**
   ADR-003 §4（表存储与 D+ root 链）与 ADR-004 §3/§5（直写路径）。ADR-003 §3 的违反形式枚举与
   ADR-004 §4 的读写语义**保留**，换到 workspace 视图上执行
 
@@ -33,20 +33,35 @@ P1 只有一棵可变的"当前树"，每个操作直接改表、发一条 root 
 | # | 决策 |
 | --- | --- |
 | W1 | 每个 workspace 一个独立 overlay 文件 `workspaces/<id>/overlay.sqlite`；主库只放低频全局表 |
-| W2 | **单写者**：overlay 以 `locking_mode=EXCLUSIVE` 打开，第二个打开者得到 `WorkspaceInUse` **[待 F5]** |
-| W3 | 每个变更操作 = overlay 上的**一个不 fsync 的事务**（WAL + `synchronous=NORMAL`）；`flush` = 一次 `synchronous=FULL` 的提交，使此前全部事务持久 **[待 F4]** |
+| W2 | **单写者**：overlay 以 `locking_mode=EXCLUSIVE` 打开，第二个打开者得到 `WorkspaceInUse` **[F5 已确认]** |
+| W3 | 每个变更操作 = overlay 上的**一个不 fsync 的事务**（WAL + `synchronous=NORMAL`）；`flush` = 一次 `synchronous=FULL` 的提交，使此前全部事务持久 **[F4 已确认]** |
 | W4 | 崩溃合约：恢复后的状态是操作序列的一个**前缀**，且包含最后一次成功 `flush` 之前的全部操作 |
 | W5 | overlay 按 **serial** 键控（不按路径）；目录改名只写两条名字行；落回 base 只按 serial 进行 |
 | W6 | 路径规则只有一份：`fs-namespace` 的规则改写为针对 `TreeStore` trait 的算法；overlay 实现该 trait |
-| W7 | snapshot = 全量物化（ADR-005）**[待 F6]** + `pending_root` 意图标记 + 主库单事务 + overlay 重置 |
-| W8 | commit 的 branch head 更新带期望值（期望 = workspace 的 `base_commit`）；不符 → `BranchMoved` **[待 F1]** |
-| W9 | `revert` 只撤销 head **[待 F3]**；`reset` 移动指针；`restore` 改 workspace 内容 |
-| W10 | 主库短事务有界等待锁（5 s），修订 D10 **[待 F2]** |
-| W11 | cas-store 增加批量发布：对象文件逐个 durable，索引分块提交 **[待 F7]** |
+| W7 | snapshot = 全量物化（ADR-005）**[F6 已确认]** + `pending_root` 意图标记 + 主库单事务 + overlay 重置 |
+| W8 | commit 的 branch head 更新带期望值（期望 = workspace 的 `base_commit`）；不符 → `BranchMoved` **[F1 已确认]** |
+| W9 | `revert` 只撤销 head **[F3 已确认]**；`reset` 移动指针；`restore` 改 workspace 内容 |
+| W10 | 主库短事务有界等待锁（5 s），修订 D10 **[F2 已确认]** |
+| W11 | cas-store 增加批量发布：对象文件逐个 durable，索引分块提交 **[F7 已确认]** |
 | W12 | serial 由主库 `scope_allocator` 按 1024 一段预留，全 scope 唯一、永不复用 |
 | W13 | 直写路径与 P1 命名空间表在 P2a 末删除；新 schema 拒绝 P1 Store（不迁移） |
 
-> **相对于设计信件（3yinqic7xe §2.5）的修订**：信件曾设计"内存层 + 隐式 flush 的内存预算"。
+### 2.1 owner 决策记录（2026-10-23 14:02，经 manager 转达，mailbox `manager/l2vye0vx8b`）
+
+| 分叉 | owner 结论 | 落在本 ADR |
+| --- | --- | --- |
+| F1 同一 branch 先后 commit | **(b)**：后者得到类型化 `BranchMoved{expected, actual}`，workspace 原样保留；`--force` 显式覆盖并在 `branch_log` 记录被取代的 head | W8、§10.2、§10.3 |
+| F2 Busy 处理 | **主库短事务有界等待 5 s**，作为对 ADR-001 D10 的显式修订；超时仍返回 `Busy` | W10、§11 |
+| F3 revert 范围 | **只撤销 head**；任意提交的 revert 待有 merge 时再议 | W9、§10.2 |
+| F4 flush 粒度 | **workspace 级**；`flush(path)` 等价于 `flush()` | W3、§8 |
+| F5 同一 workspace 多进程写 | **单写者**；snapshot 期间本 workspace 写入阻塞 | W2、§9.1 |
+| F6 物化方式 | **全量物化**（未变部分按 ADR-005 S3 不写盘）；增量以后做，格式不变 | W7、§9.2 |
+| F7 物化写盘成本 | **先做 cas-store 批量发布并实测**；不达标再在 P2b 引入 pack | W11、§12 |
+
+与 owner 既有决定的关系：F1 不与 Q4"不加乐观锁"冲突——Q4 的原语境是文件级写入；branch head 的
+期望值检查是 spec §4 明文要求（"不静默覆盖"），令牌 = 快照根（Root 审查 Q2）。
+
+> **相对于设计信件（3yinqic7xe §2.5）的修订（manager 已批准，`manager/zma4rr53ik`）**：信件曾设计"内存层 + 隐式 flush 的内存预算"。
 > 本 ADR 改为 W3——每个操作写进 overlay 库、但不 fsync。理由：
 > ① 少一层（读路径只有 overlay 库 + base 两层，没有"内存 / 已 flush / base"三层合成）；
 > ② 内存上界自动成立（SQLite 页缓存），不需要预算与隐式 flush；
@@ -78,7 +93,8 @@ fs-cli ─► fs-api ─► fs-workspace ─┬─► fs-overlay ─┬─► fs
 
 ```sql
 CREATE TABLE workspace_policy (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL) STRICT;
-  -- schema_version=3, ddl=<本 DDL 原文>, snapshot_profile=<ADR-005 profile_id>, overlay_page_bytes=4096
+  -- schema_version=3, ddl=<本 DDL 原文>, snapshot_profile=<ADR-005 profile_id>, overlay_page_bytes=4096,
+  -- main_busy_timeout_ms=5000（§11.1）
 CREATE TABLE scope_allocator (
     scope_id TEXT NOT NULL PRIMARY KEY,      -- 32 B hex
     next_serial INTEGER NOT NULL             -- 下一个未预留的 serial（≥1；0 = 根目录）
@@ -232,7 +248,7 @@ pub trait TreeStore {
 每个变更操作是 overlay 上的一个事务；规则判定、读取与写入都在该事务内（K3）。workspace 句柄内部一把
 互斥锁串行化同进程多线程调用。
 
-## 8. flush 合约 **[待 F4]**
+## 8. flush 合约 **[F4 已确认]**
 
 | 调用 | 保证 |
 | --- | --- |
@@ -254,7 +270,7 @@ pub trait TreeStore {
 
 ```text
 snapshot(ws) / commit(ws, msg):
-  0. 取 workspace 锁（本 workspace 的写操作在此期间阻塞 [待 F5]）；flush
+  0. 取 workspace 锁（本 workspace 的写操作在此期间阻塞 [F5 已确认]）；flush
   1. 物化（§9.2），得到根 R；commit 时若 R == root(base_commit) → 返回 NothingToCommit，
      不执行 2–4 步（overlay 与主库都不变；R 的新对象若有则成为孤儿）
   2. overlay 事务：ov_meta.pending_root = R                                  （FULL）
@@ -311,42 +327,79 @@ message_len(BE u32) || message))`。git 式，CLI 友好；含时间，所以同
 | --- | --- | --- |
 | `init` | 建 scope、空根（只有根目录）、首个提交、branch `main` | — |
 | `branch create <b> [--from <b\|commit>]` | 新 branch 指向来源提交，继承 scope | 名字已存在 → `AlreadyExists` |
-| `commit` | §9.1 | head == `workspace.base_commit`，否则 `BranchMoved{expected, actual}` **[待 F1]** |
-| `commit --force` | 不做期望值检查，覆盖 head；`branch_log` 记录被取代的 head **[待 F1]** | — |
+| `commit` | §9.1 | head == `workspace.base_commit`，否则 `BranchMoved{expected, actual}` **[F1 已确认]** |
+| `commit --force` | 不做期望值检查，覆盖 head；`branch_log` 记录被取代的 head **[F1 已确认]** | — |
 | `reset <b> <commit> [--expect <c>]` | 只移动 branch 指针，不产生提交；旧 head 留在 `branch_log` | 给了 `--expect` 就检查 |
-| `revert <b>` | 新提交：root = head 父提交的 root，parent = head。**只撤销 head** **[待 F3]** | 期望 = 读到的 head |
+| `revert <b>` | 新提交：root = head 父提交的 root，parent = head。**只撤销 head** **[F3 已确认]** | 期望 = 读到的 head |
 | `restore <ws> <commit> [--discard]` | 把 workspace 的 `base_root` 换成该提交的根；`base_commit` **不变**，所以随后 commit 产生一个"把内容恢复成该提交"的新提交。overlay 非空且无 `--discard` → `WorkspaceDirty` | — |
 | `log <b>` | 沿 parent 链列提交 | — |
 
 spec P2.9 要求的 revert 与 reset 区别：revert **生成**逆向提交（历史增长）；reset **移动**引用
 （历史不增长，旧提交只经 `branch_log` 可达）。
 
-### 10.3 F1 对比（owner 待定）
+### 10.3 `BranchMoved` 语义（F1，owner 已确认 (b)）
 
-两个 workspace 基于同一 head H 先后 commit 到同一 branch：
+**判定**：第 3 步主库事务内读到 `branch.head_commit ≠ workspace.base_commit` → 返回
+`BranchMoved { branch, expected: base_commit, actual: head_commit }`，事务回滚。
 
-| | (a) 后者覆盖 | **(b) 后者 `BranchMoved`（建议）** |
+**失败后的状态（精确失败保管，ADR-001 D10 第 2 条）**：
+
+| 对象 | 状态 |
+| --- | --- |
+| branch / commit / branch_log | 不变（事务回滚） |
+| overlay | 不变；第 2 步写入的 `pending_root` 在同一调用内清回 NULL（overlay 事务）；若此时崩溃，§9.3 第三行处理，结果相同 |
+| workspace 行 | 不变（`base_commit` 仍是旧 head，下一次 commit 仍会得到同一错误，直到用户处理） |
+| 已物化的对象 | 留作孤儿（无害；同一视图再次物化时 `AlreadyPresent` 复用） |
+
+**用户出路**（P2 不做 merge）：
+
+1. `branch create <b2> --from <base_commit>` 后把 workspace 改挂 `b2` 再提交（P2a-6 提供
+   `workspace rebind <w> <b2>`，只允许改挂到 head == `base_commit` 的 branch）；
+2. `restore` 到新 head 后手工重做改动；
+3. `commit --force`：跳过期望值检查。新提交的 parent = `workspace.base_commit`（不是被取代的 head），
+   head 被覆盖；`branch_log` 追加一行 `op = commit-force`，`old_commit` = 被取代的 head——被取代
+   的提交仍经 `branch_log` 可达（GC 根，§15），不丢数据，只是不在 branch 的 parent 链上。
+
+**决策依据（owner 于 2026-10-23 14:02 确认 (b) 前的对照，留档）**：
+
+| | (a) 后者覆盖 | **(b) 后者 `BranchMoved`（已采纳）** |
 | --- | --- | --- |
 | 结果 | 前者的提交 C1 从 branch 历史消失，只在 `branch_log` 留痕 | 后者失败，overlay 原样保留 |
-| 用户出路 | 无感知（静默丢失） | 另建 branch 提交，或 `restore` 到新 head 再重做，或 `--force` 显式覆盖 |
+| 用户出路 | 无感知（静默丢失） | 另建 branch、restore 重做，或 `--force` 显式覆盖 |
 | 规格 | 违反 spec §4"不静默覆盖" | 符合 spec §4 与 Root 审查 Q2（令牌 = 快照根） |
-| 与 owner Q4 决定 | Q4 原语境是文件级写入；branch head 不在其范围（manager 同此理解） | 同左 |
+| 与 owner Q4 决定 | Q4 原语境是文件级写入；branch head 不在其范围 | 同左 |
 | 先例 | — | [LFS] `HeadMoved` + force/displaced |
 
-## 11. 并发与 Busy **[待 F2]**
+## 11. 并发与 Busy **[F2 已确认]**
 
 - workspace 内：单写者（W2）；同进程多线程经句柄互斥锁串行；
 - workspace 之间：完全并发；共享的只有主库（短事务：serial 预留、发布、分配）与 cas-store 索引；
 - **新的竞争来源**：两个 workspace 同时 snapshot，都在批量发布，会争 cas-store 索引的写锁。
-  在 `busy_timeout=0` 下，大快照几乎必然中途 Busy；
-- **D10 修订（建议）**：主库连接（cas-store 与 fs-workspace 两条）设 `busy_timeout = 5000 ms`。
-  这是等锁，不是失败后重试（D10 禁止的是"一次操作执行多次"与"错误驱动的替代路径"）；超时仍返回
-  类型化 `Busy`；不把竞争错误翻译成成功。overlay 连接保持 0；
-- 修订理由：workspace 独占之后，Busy 的来源从"任意写竞争"缩窄为"跨 workspace 的发布竞争"，
-  这些事务短且可以等待；保持 0 会让正确的并发使用随机失败；
-- 替代方案（不推荐 P2a）：[LFS] 式进程内 FIFO 准入 + 跨进程目录锁 + 发布通道。
+  在 `busy_timeout=0` 下，大快照几乎必然中途 Busy。
 
-## 12. 批量发布（ADR-002 §5 修订）**[待 F7]**
+### 11.1 对 ADR-001 D10 的修订（F2，owner 已确认）
+
+**修订条文**：D10 第 1 条"不做 busy handler"增加一个例外——**主库（store.sqlite）上的连接**
+（cas-store 一条、fs-workspace 一条）设置 `busy_timeout = 5000 ms`。
+
+| 项 | 修订后 |
+| --- | --- |
+| 适用连接 | 仅主库的两条连接；overlay 连接保持 `busy_timeout = 0`（独占，W2，不存在竞争） |
+| 性质 | **等锁**：同一条语句在 SQLite 内部等待写锁释放。不是"操作失败后再执行一次"，不重放任何已执行的步骤 |
+| 超时 | 仍返回类型化 `Busy`（附等待上限），调用方看到的错误类型与 P1 相同 |
+| 不变的部分 | D10 第 1 条其余内容（不自动重试、不退避重试、不做错误驱动的替代路径）、第 2–5 条全部不变；不把竞争错误翻译成成功 |
+| 参数 | 5000 ms 写入 `workspace_policy`（`main_busy_timeout_ms`），打开时读回校验 |
+
+**修订理由**：P1 的 `busy_timeout = 0` 建立在"任意写竞争都应该立即暴露"的前提上。workspace 独占
+之后，主库上的竞争只剩跨 workspace 的发布与 serial 预留——短事务、正确使用下也必然发生。保持 0 会让
+正确的并发使用随机失败（大快照几乎必然失败），而等待一个短事务结束不改变任何操作的语义。
+
+**测试**：两个 workspace 并发 snapshot 各 1000 个文件，均成功；人为持有主库写锁 > 5 s 时，发布方
+在约 5 s 后得到 `Busy`（断言等待时长有界，而不是立即失败或无限等待）。
+
+- 替代方案（未采纳）：[LFS] 式进程内 FIFO 准入 + 跨进程目录锁 + 发布通道——复杂度高，P2a 不需要。
+
+## 12. 批量发布（ADR-002 §5 修订）**[F7 已确认]**
 
 ```rust
 let mut batch = store.batch();             // PageSink 的实现之一
@@ -369,7 +422,7 @@ Repo::open(store_dir, OpenMode) -> Repo
   .init() / .branch_create(name, from) / .branches() / .log(branch)
   .reset(branch, to, expect: Option<CommitId>) / .revert(branch)
   .workspace_create(name, branch) / .workspace_open(name) -> Workspace / .workspace_list()
-  .workspace_discard(name)
+  .workspace_discard(name) / .workspace_rebind(name, branch)   // rebind：§10.3 出路 1
   .view(commit_or_root) -> ReadView                      // read_at / stat / read_dir；零表依赖
   .verify() / .verify_deep(root) / .stats()
 Workspace
@@ -388,7 +441,7 @@ CLI（owner 定的 git 式）：
 ```text
 init
 branch [list | create <b> [--from <b|commit>]]
-workspace [create <w> --branch <b> | list | status <w> | discard <w>]
+workspace [create <w> --branch <b> | list | status <w> | discard <w> | rebind <w> <b>]
 --workspace <w> put|get|ls|stat|mkdir|rm|mv ...      # 每条命令退出前 flush
 commit --workspace <w> -m <msg> [--force]
 snapshot --workspace <w>
