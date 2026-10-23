@@ -9,7 +9,11 @@ use rusqlite::Connection;
 use crate::error::NamespaceError;
 
 /// The namespace schema version this build writes.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 adds `file_extent` (ADR-004 §5.2). Per-crate governance: a v1 Store
+/// is refused with `SchemaMismatch` rather than migrated (P1 has no deployed
+/// stores).
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 /// The `namespace_policy` key holding the version.
 const VERSION_KEY: &str = "schema_version";
@@ -59,20 +63,41 @@ CREATE TABLE root (
     created_ns INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX root_by_namespace ON root (namespace, root_id);
+CREATE TABLE file_extent (
+    namespace TEXT NOT NULL,
+    file_id INTEGER NOT NULL,
+    logical_start INTEGER NOT NULL,
+    length INTEGER NOT NULL,
+    object_id TEXT NOT NULL,
+    source_offset INTEGER NOT NULL,
+    PRIMARY KEY (namespace, file_id, logical_start)
+) STRICT;
+CREATE INDEX file_extent_by_file ON file_extent (namespace, file_id, logical_start);
 ";
 
-/// Creates the namespace tables and records their version and DDL.
+/// The fixed block size for large files, in bytes (ADR-004 §5.2).
+///
+/// Frozen in `namespace_policy` at creation and validated on open: changing it
+/// changes the meaning of every extent row, so it is a format change.
+pub(crate) const BLOCK_BYTES: u64 = 64 * 1024;
+
+/// The `namespace_policy` key holding the block size.
+const BLOCK_KEY: &str = "block_bytes";
+
+/// Creates the namespace tables and records their version, DDL and parameters.
 pub(crate) fn create(connection: &mut Connection) -> Result<(), NamespaceError> {
     let transaction = connection.transaction()?;
     transaction.execute_batch(DDL)?;
-    transaction.execute(
-        "INSERT INTO namespace_policy (key, value) VALUES (?1, ?2)",
+    for (key, value) in [
         (VERSION_KEY, SCHEMA_VERSION.to_string()),
-    )?;
-    transaction.execute(
-        "INSERT INTO namespace_policy (key, value) VALUES (?1, ?2)",
-        (DDL_KEY, DDL),
-    )?;
+        (DDL_KEY, DDL.to_owned()),
+        (BLOCK_KEY, BLOCK_BYTES.to_string()),
+    ] {
+        transaction.execute(
+            "INSERT INTO namespace_policy (key, value) VALUES (?1, ?2)",
+            (key, value),
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -89,6 +114,12 @@ pub(crate) fn validate(connection: &Connection) -> Result<(), NamespaceError> {
     if ddl != DDL {
         return Err(NamespaceError::SchemaMismatch {
             what: "namespace_policy.ddl",
+        });
+    }
+    let block = policy_value(connection, BLOCK_KEY)?;
+    if block != BLOCK_BYTES.to_string() {
+        return Err(NamespaceError::SchemaMismatch {
+            what: "namespace_policy.block_bytes",
         });
     }
     Ok(())
@@ -112,6 +143,18 @@ fn policy_value(connection: &Connection, key: &str) -> Result<String, NamespaceE
             |row| row.get(0),
         )
         .map_err(|_| NamespaceError::SchemaMismatch {
-            what: "namespace_policy",
+            // Qualified like the changed-value label, so a caller can point at
+            // the row whichever way the value went missing (T4, QA note 3).
+            what: qualified_policy_key(key),
         })
+}
+
+/// The `what` label for a namespace policy key: `namespace_policy.<key>`.
+fn qualified_policy_key(key: &str) -> &'static str {
+    match key {
+        "schema_version" => "namespace_policy.schema_version",
+        "ddl" => "namespace_policy.ddl",
+        "block_bytes" => "namespace_policy.block_bytes",
+        _ => "namespace_policy.<unknown>",
+    }
 }

@@ -1,0 +1,12 @@
+[package]
+name = "fs-api"
+description = "The public file-system semantics: path-addressed reads and writes over the content-addressed Store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cas-core.workspace = true
+cas-store.workspace = true
+fs-namespace.workspace = true

@@ -310,7 +310,12 @@ impl Namespace {
         Ok(entries)
     }
 
-    fn insert_entry(&self, parent: FileId, name: &str, child: FileId) -> NamespaceResult<()> {
+    pub(crate) fn insert_entry(
+        &self,
+        parent: FileId,
+        name: &str,
+        child: FileId,
+    ) -> NamespaceResult<()> {
         self.conn().execute(
             "INSERT INTO directory_entry (namespace, parent_id, name, child_id)
              VALUES (?1, ?2, ?3, ?4)",

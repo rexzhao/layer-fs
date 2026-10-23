@@ -31,7 +31,7 @@ spec §3 给出概念模型，spec §11 提出开放决策（大小写、事务�
 | # | 决策 | 状态 |
 | --- | --- | --- |
 | N1 | 扩表到同一 `store.sqlite`，`fs-namespace` 开**第二条连接** | 已实现 |
-| N2 | 版本**按 crate 治理**：`namespace_policy.schema_version = 1`；`user_version` 保持 0 | 已实现 |
+| N2 | 版本**按 crate 治理**：`namespace_policy.schema_version = 1`；`user_version` 由 `cas-store` 治理，本 crate 不使用 | 已实现 |
 | N3 | 表：`namespace_policy`、`namespace`、`file_id_allocator`、`file`、`directory_entry`、`root` | 已实现 |
 | N4 | FileId = (namespace, serial)，serial 由分配器单调发放，**永不复用** | 已实现 |
 | N5 | 每次命名空间操作 = 一个事务：改行 + 发布 root | 已实现 |
@@ -162,33 +162,56 @@ CREATE TABLE file_id_allocator (
 ) STRICT;
 
 CREATE TABLE file (
-    file_id INTEGER PRIMARY KEY,
+    namespace TEXT NOT NULL,
+    file_id INTEGER NOT NULL,
     kind INTEGER NOT NULL,
     size INTEGER NOT NULL,
     content_root TEXT,
     created_ns INTEGER NOT NULL,
-    modified_ns INTEGER NOT NULL
+    modified_ns INTEGER NOT NULL,
+    PRIMARY KEY (namespace, file_id)
 ) STRICT;
 
 CREATE TABLE directory_entry (
+    namespace TEXT NOT NULL,
     parent_id INTEGER NOT NULL,
     name BLOB NOT NULL,
     child_id INTEGER NOT NULL,
-    PRIMARY KEY (parent_id, name)
+    PRIMARY KEY (namespace, parent_id, name)
 ) STRICT;
 
 CREATE TABLE root (
     root_id INTEGER PRIMARY KEY,
+    namespace TEXT NOT NULL,
     parent_root_id INTEGER,
     op TEXT NOT NULL,
     created_ns INTEGER NOT NULL
 ) STRICT;
+
+CREATE INDEX root_by_namespace ON root (namespace, root_id);
+
+CREATE TABLE file_extent (
+    namespace TEXT NOT NULL,
+    file_id INTEGER NOT NULL,
+    logical_start INTEGER NOT NULL,
+    length INTEGER NOT NULL,
+    object_id TEXT NOT NULL,
+    source_offset INTEGER NOT NULL,
+    PRIMARY KEY (namespace, file_id, logical_start)
+) STRICT;
+
+CREATE INDEX file_extent_by_file ON file_extent (namespace, file_id, logical_start);
 ```
 
-**这两张表刻意不带 `root_id` 列。** 初稿按方案 A（整表按 root 复制）设计了 `(root_id, ...)`
+> 本节代码块与 `crates/fs-namespace/src/schema.rs` 的 `DDL` 常量**逐字一致**，那是打开时逐字
+> 比对的权威副本。QA 复验指出本节曾停留在 T3 首版形状（`file`/`directory_entry` 无
+> `namespace` 列、`root` 无 `namespace` 列与索引）——F-T3-3 改了实现与 §4.1，却没回头同步
+> 这里。**同一类"实现前进、文档未跟随"的缺陷**，已修正。
+
+**这些表刻意不带 `root_id` 列。** 初稿按方案 A（整表按 root 复制）设计了 `(root_id, ...)`
 复合主键；A 已被判定不可行（§4.1），而 B/C/D+ 都不需要把每行绑定到 root。因此这里采用
-**方案无关的中性形态**：当前树是单份可变的行集合。若 owner 最终选 C（对象化目录页），
-行会迁出 SQLite 成为 CAS 对象，届时走 schema 版本 3 + 新 ADR。
+**方案无关的中性形态**：当前树是单份可变的行集合。若将来选 C（对象化目录页），行会迁出
+SQLite 成为 CAS 对象，届时走 schema 版本 2 + 新 ADR。
 
 `root` 表的 `op` 列记录发布原因（`mkdir`/`rmdir`/`rename`/`unlink`/`create`），是 append-only
 发布记录的一部分；D+ 若还需 `parent` 链字段，在裁决后追加（属同版本的附加列，P1 零部署，
@@ -276,8 +299,10 @@ T3 卡的措辞"root 不可变：写前 root 的完整视图在写后逐项不�
 
 两 crate **互不校验对方的表**。
 
-**`PRAGMA user_version` 保持 0，不使用。** 保留给未来可能的全局格式断裂（例如整个文件不再是
-SQLite）。
+**`PRAGMA user_version` 由 `cas-store` 治理，`fs-namespace` 不使用它。** `cas-store` 在建库时
+把它设为 1，并在每次打开时按自己的版本策略校验（ADR-002 §4.2）；`fs-namespace` 既不读写也不
+校验它，只用自己的 `namespace_policy` 表。这两个版本载体互不相干，任一 crate 的版本演进都不
+影响对方。
 
 > **为什么不用 `user_version` 承载版本**（manager 裁决，我初稿曾这么设计）：
 > `user_version` 是**全库一个**。若 `cas-store` 严格校验它，而 `fs-namespace` 装表后把它 bump 到 2，
@@ -433,12 +458,13 @@ COMMIT
 | 部分读 | `read_at` 允许短读（返回实际字节数），EOF 时返回 0 |
 | 部分写 | `write_at` 允许短写，返回实际写入字节数；调用方负责重试剩余部分 |
 | 跨越 EOF 的写 | 自动扩展文件（补零），不是错误 |
-| 句柄所有权 | 句柄含 `FileId` + 打开的 root 快照；句柄在 root 变更后仍读**打开时**的视图 |
-| 关闭后使用 | `Handle` 消费式关闭，关闭后使用是编译期错误（所有权），不是运行时错误 |
+| **句柄所有权** | **P1 不用句柄**：`fs-api` 以路径寻址、无状态（ADR-004 §3）。初稿写的"句柄含打开时 root 快照"在 D+ 下不可兑现——历史树不可读——已由 ADR-004 修订 |
+| 关闭后使用 | 不适用（无句柄）。P3 的 WinFsp 层需要句柄，问题清单见 ADR-004 §3.2 |
 | `fsync` | P1 **不提供**显式 flush；每次写操作即一次事务 |
 
 最后一条特别说明：spec §3 草案含 `flush`，但 P1 每写一事务，没有"缓冲未刷"状态，因此
-`flush` 是 no-op。T4 若要暴露它，必须如实标注为"当前无操作"，不得暗示它有持久化含义。
+`flush` 是 no-op。T4 暴露它时必须如实标注为"当前无操作"，不得暗示它有持久化含义
+（ADR-004 §4.5 的措辞即为此）。
 
 ## 10. 未实现特性（明确清单）
 
@@ -464,14 +490,16 @@ COMMIT
 
 ## 11. 正确性风险与已知限制
 
-1. **root 不可变性的实现方式未定**（§4.1）：A 已被判定不可行，D+/B/C 待 owner 裁决。在裁决前
-   `publish` 接缝按 D+ 的最小形态实现；若改为 C，该步会被整体替换。
+1. **P1 的 root 不承载内容身份**（§4.1，D+ 已由 owner 确认）：root 记录是发布点标记，
+   不含内容身份；目录条目与 file 行属"当前树"，被后续操作覆盖。历史树视图归 P2 Snapshot。
+   （初版本节曾写"实现方式未定、待 owner 裁决"，是 D+ 确认后未同步的陈旧表述，已修正。）
 2. **serial 永不复用**意味着长时间运行的 Store 会持续消耗 serial；`u64` 在实践中足够。
 3. **时间戳用系统时钟**，可被外部调整；P1 不用它做任何判定。
 4. **root 记录无限增长**：没有 GC（P2.11）。每次操作新增一条发布记录。
 5. **并发只测到线程与单机跨进程**，不测分布式。
-6. **`user_version` 严格相等**意味着本 ADR 一旦实施，T2 时代的 Store 全部不可打开——这是
-   刻意的（§4.2）。
+6. **两个版本载体互不校验**：`cas-store` 的 `user_version` 与 `fs-namespace` 的
+   `namespace_policy.schema_version` 各管各的（§4.2）。一方演进不会因为另一方而失败，但
+   也意味着一方可能被旧二进制打开而另一方被拒绝——两个 crate 的拒绝各自独立生效。
 7. **无递归删除**：T3 只有空目录 `rmdir`，删非空目录需要调用方逐层清理。
 
 ## 12. 测试清单（对照验收标准）
@@ -528,8 +556,73 @@ COMMIT
 
 具体测试名在提交说明中与每条声明配对列出（本卡新格式要求）。
 
-## 13. 下一步
+## 13. Root 数据模型与事务协议（四问四答）
 
-- **待 owner**：§4.1 的 root 实现方式。裁决后替换 `publish` 接缝并补对应测试。
-- **T4**：`fs-api` + CLI，实现 §9 的语义草图与文件内容操作。
-- **T5**：规模与性能，用真实数据验证所选 root 方案。
+> 来源：`docs/research/2026-10-22-root-model-review.md`（owner 插入审查，2026-10-22）。
+> 本节把审查结论固化进 ADR——此前这些内容散落在各节的"局限"里，读者拼不出来。
+
+### Q1：目录条目、inode、文件内容引用如何对应一个确定 Root？
+
+**内容意义上不对应（D+ 的既定语义）。** Root 记录是发布点标记
+（`root_id`/`parent_root_id`/`op`/`created_ns`），**不含任何内容身份**；目录条目与 `file` 行
+是可变共享表，属于"当前树"而非任何 root；`file.content_root → ObjectId` 是不可变的内容身份，
+但"哪个 root 拥有哪些 content_root"的映射只存在于当前表。root N 与树状态的对应是**纯时序性**
+的（op N 之后、op N+1 之前），且被后续操作覆盖。
+
+spec §3 的 `FilesystemRoot { inode_table_root: ObjectId }` 描述的是**内容根形态**——即 P2
+Snapshot 的目标形态，不是 P1 的。
+
+### Q2：新版本产生后，旧 Root 如何在不依赖当前表状态的情况下读取？
+
+**P1 不能。** root 记录本身可独立读取（append-only 行 + parent 链），但其**树状态不可读**
+——已被可变表覆盖。这是 D+ 的既定局限（§4.1），不是缺陷。
+
+**P2 必须满足的三条约束**（本次审查确立，现在前置）：
+
+1. **Snapshot = 把当前树物化为纯 CAS 对象图**：目录页（role 5/6）、inode 表（role 7）、根对象
+   （role 8，ADR-001 已预留），旧快照经对象根读取，**零表依赖**。这是 LayerFS
+   overlay→commit 模式的等价物。
+2. **快照编码参数冻结进 Store Policy**（页尺寸、每条目数等），同 CDC profile 的先例。
+3. **P2 Branch 的 CAS 令牌是快照根（内容身份），不是 D+ 的 op 链 head**。op 链是**审计序列**，
+   不是版本语义。此点现在写明，防 P2 误用。
+
+### Q3：对象已写入 CAS，但 Namespace 事务失败时如何处理？
+
+**对象成为 store 级孤儿**：有索引行、无命名空间引用。处理：**容忍**——只读、不删，内容寻址
+天然幂等（后续同内容 `put` 直接复用）。回收归 P2.11 GC（根集合 = 各命名空间当前树 + 快照根）。
+
+**两条方向性不变量**：
+
+- 命名空间**绝不悬空引用**（失败方整体回滚，引用从未提交）——**永远成立**；
+- 对象**可以孤儿**（无害、可复用）——**可能成立**。
+
+反方向（悬空引用）**不存在**。
+
+**闭包校验**替代逐操作依赖验证：`Fs::verify` 遍历全部 `content_root` 与 extent 的
+`object_id`，确认存在于 store（ADR-004 §7）。逐操作验证在 D+ 下是 O(树)/op，不可接受；
+spec §4 的"发布 Root 前验证依赖"由 **put-先于-引用的定序 + 闭包校验**共同满足。
+
+### Q4：两个进程同时更新 Namespace，如何保证只有符合预期版本的更新成功？
+
+**P1 不保证"符合预期版本"——这是刻意的。** 并发防护分三层：
+
+| 层 | 机制 | 效果 |
+| --- | --- | --- |
+| ① | `BEGIN IMMEDIATE` 事务串行化 | 两个写者排队，不交错 |
+| ② | 同路径**创建**的 PK 约束 + 事务隔离 | 第二方见类型化 `AlreadyExists` |
+| ③ | 同路径**写** = 后写生效 | 与文件系统常态一致 |
+
+**没有 CAS（预期版本检查）。** spec §4 明文把 CAS 归 P2 Branch Head，且 P2 的令牌是**快照根**
+（Q2 第 3 条），不是 D+ 的 op-head。
+
+**开放选项（呈 owner，manager 建议不加）**：P1 若希望乐观并发，可让 `fs-api` 写操作带
+`expect_head` 参数，不符报类型化冲突（namespace 层事务内校验 `head_root`，约 20 行）。但 P1
+的消费方（单机 CLI、T5 基准）用不到，且 P2 的正确令牌是快照根而非 op-head——**现在加会引入
+错误的版本语义**。
+
+## 14. 下一步
+
+- **T4**：`fs-api` + CLI（ADR-004）。已实现；`file_extent` 表使本 crate 的
+  `namespace_policy.schema_version` 从 1 升到 2（第二个版本演进先例）。
+- **T5**：规模与性能，复用 ADR-004 §6 的读取放大计数；用真实 1 GiB 复测块路径。
+- **P2**：Snapshot（Q2 的三条约束）、Branch（CAS 令牌 = 快照根）、GC（Q3 的根集合）。

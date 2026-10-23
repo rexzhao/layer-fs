@@ -36,6 +36,7 @@
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 
+mod content;
 mod db;
 mod error;
 /// A deterministic mid-operation failure for this crate's atomicity tests.
@@ -51,6 +52,7 @@ mod schema;
 
 use rusqlite::Connection;
 
+pub use content::{ContentState, Extent};
 pub use db::NamespaceDb;
 pub use error::{InvalidPath, NamespaceError, NamespaceResult, MAX_DEPTH, MAX_NAME_BYTES};
 pub use namespace::{Entry, FileId, Kind, Namespace, RootRecord, Stat};
