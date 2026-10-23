@@ -99,6 +99,12 @@ pub enum NamespaceError {
     },
     /// The store reported a failure.
     Store(StoreError),
+    /// A store scope was entered while another one was still open on this thread.
+    ///
+    /// The callback only receives the transaction object, so this can only happen
+    /// when a rule captured the surrounding store and called back into it
+    /// (ADR-006 §7.1 TX4). Reported rather than deadlocking on the connection.
+    NestedTransaction,
 }
 
 impl fmt::Display for InvalidPath {
@@ -153,6 +159,9 @@ impl fmt::Display for NamespaceError {
                 write!(f, "invalid namespace record in {field}: {detail}")
             }
             NamespaceError::Store(error) => write!(f, "{error}"),
+            NamespaceError::NestedTransaction => {
+                f.write_str("a store scope was entered while another was still open on this thread")
+            }
         }
     }
 }

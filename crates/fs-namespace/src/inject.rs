@@ -29,10 +29,19 @@ pub enum Fault {
 
 /// Plants the fault described by `fault` on `connection`.
 ///
+/// Takes anything that dereferences to a connection, so a caller can pass either a
+/// plain `&Connection` or the `Ref<Connection>` a backend hands out (the table
+/// backend keeps its connection behind a `RefCell`, because a transaction borrows it
+/// mutably while `write(&self, …)` only has `&self`).
+///
 /// # Errors
 ///
 /// Propagates database failures from planting the fault itself.
-pub fn plant(connection: &Connection, fault: Fault) -> rusqlite::Result<()> {
+pub fn plant<C>(connection: C, fault: Fault) -> rusqlite::Result<()>
+where
+    C: std::ops::Deref<Target = Connection>,
+{
+    let connection: &Connection = &connection;
     match fault {
         Fault::BeforeMutation => {
             connection.execute("DELETE FROM file_id_allocator", [])?;

@@ -62,7 +62,12 @@ impl NamespaceDb {
         self.read_only
     }
 
-    pub(crate) fn connection(&self) -> &Connection {
-        &self.connection
+    /// Takes the connection out of this view.
+    ///
+    /// `SqlTree` wraps it in a `RefCell`: a `rusqlite::Transaction` borrows the
+    /// connection mutably for its lifetime while `write(&self, …)` only has
+    /// `&self`. Nothing else holds a reference, so ownership moves cleanly.
+    pub(crate) fn take_connection(self) -> Connection {
+        self.connection
     }
 }

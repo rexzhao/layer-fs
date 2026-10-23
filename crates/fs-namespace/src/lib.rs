@@ -45,18 +45,27 @@ mod error;
 /// for its own tests and no consumer receives by default.
 #[cfg(feature = "failure-injection")]
 pub mod inject;
+/// The inode view the path rules see (ADR-006 §7.1).
+mod inode_view;
 mod namespace;
-mod operations;
+
 mod path;
+mod rules;
 mod schema;
+mod sql_tree;
+mod sql_tree_store;
+mod tree_store;
 
 use rusqlite::Connection;
 
 pub use content::{ContentState, Extent};
 pub use db::NamespaceDb;
 pub use error::{InvalidPath, NamespaceError, NamespaceResult, MAX_DEPTH, MAX_NAME_BYTES};
+pub use inode_view::InodeView;
 pub use namespace::{Entry, FileId, Kind, Namespace, RootRecord, Stat};
 pub use path::Path;
+pub use sql_tree::{SqlRead, SqlTree, SqlWrite};
+pub use tree_store::{OpLabel, TreeRead, TreeStore, TreeWrite};
 
 /// Applies the connection settings the namespace connection needs.
 ///

@@ -6,13 +6,12 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension};
-
+use cas_core::ObjectId;
 use cas_store::Store;
 
-use crate::db::NamespaceDb;
-use crate::error::{NamespaceError, NamespaceResult};
+use crate::error::NamespaceResult;
 use crate::path::Path;
+use crate::{ContentState, Extent};
 
 /// What kind of entry a [`FileId`] names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,8 +100,7 @@ pub struct RootRecord {
 /// The namespace layer over one Store.
 #[derive(Debug)]
 pub struct Namespace {
-    db: NamespaceDb,
-    pub(crate) name: String,
+    rules: crate::rules::Rules<crate::sql_tree::SqlTree>,
 }
 
 impl Namespace {
@@ -111,319 +109,251 @@ impl Namespace {
     ///
     /// # Errors
     ///
-    /// See [`NamespaceDb::open`]; also [`NamespaceError::NamespaceNotFound`] when
-    /// opening an existing database without a matching namespace.
+    /// See [`NamespaceDb`]; also [`NamespaceError::NamespaceNotFound`] when opening
+    /// an existing database without a matching namespace.
     pub fn open(store: &Store, name: &str, mode: cas_store::OpenMode) -> NamespaceResult<Self> {
-        let db = NamespaceDb::open(store, mode)?;
-        let namespace = Self {
-            db,
-            name: name.to_owned(),
-        };
-        let exists: Option<i64> = namespace
-            .conn()
-            .query_row(
-                "SELECT head_root FROM namespace WHERE name = ?1",
-                [name],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match (exists, mode) {
-            (Some(_), _) => namespace.validate_root_chain()?,
-            (None, cas_store::OpenMode::Create) if !namespace.db.is_read_only() => {
-                namespace.initialize()?
-            }
-            (None, _) => {
-                return Err(NamespaceError::NamespaceNotFound {
-                    name: name.to_owned(),
-                })
-            }
-        }
-        Ok(namespace)
+        Ok(Self {
+            rules: crate::rules::Rules::new(crate::sql_tree::SqlTree::open(store, name, mode)?),
+        })
     }
 
-    pub(crate) fn conn(&self) -> &Connection {
-        self.db.connection()
+    /// The table backend, for its own capabilities.
+    #[must_use]
+    pub fn backend(&self) -> &crate::sql_tree::SqlTree {
+        self.rules.backend()
     }
 
-    /// The connection, for planting a deterministic fault in tests.
+    // ---------------------------------------------------------------- rules
+
+    /// Creates an empty directory (ADR-003 §3.2 T1).
     ///
-    /// Available only with `failure-injection` (ADR-003 §12.2), so a consumer
-    /// cannot reach the raw connection.
-    #[cfg(feature = "failure-injection")]
-    pub fn connection_for_tests(&self) -> &Connection {
-        self.db.connection()
-    }
-
-    /// Creates the empty tree: a root directory record, the first publication
-    /// and the identity allocator.
-    fn initialize(&self) -> NamespaceResult<()> {
-        let now = now_ns();
-        self.conn().execute(
-            "INSERT INTO file (namespace, file_id, kind, size, content_root, created_ns, modified_ns)
-             VALUES (?1, 0, ?2, 0, NULL, ?3, ?3)",
-            (&self.name, Kind::Directory as i64, now),
-        )?;
-        self.conn().execute(
-            "INSERT INTO file_id_allocator (namespace, next_serial) VALUES (?1, 1)",
-            [&self.name],
-        )?;
-        self.conn().execute(
-            "INSERT INTO namespace (name, head_root) VALUES (?1, 0)",
-            [&self.name],
-        )?;
-        self.publish_tx("init", None)?;
-        Ok(())
-    }
-
-    /// Runs `body` inside one immediate write transaction (ADR-003 §6).
+    /// # Errors
     ///
-    /// `BEGIN IMMEDIATE` matches `cas-store`'s choice: the write lock is taken up
-    /// front, so two concurrent writers serialise instead of interleaving their
-    /// statements. Any error from `body` drops the transaction, which rolls back
-    /// — so a failed operation leaves no partial rows and no root record.
-    ///
-    /// This is the only way a mutating operation touches the database.
-    pub(crate) fn with_write_tx<T>(
-        &self,
-        body: impl FnOnce(&Connection) -> NamespaceResult<T>,
-    ) -> NamespaceResult<T> {
-        // The connection was set to `Immediate` at open (`db::NamespaceDb`), so
-        // this takes the write lock up front; `unchecked_transaction` borrows
-        // `&self` and still rolls back on drop.
-        let transaction = self.conn().unchecked_transaction()?;
-        let value = body(&transaction)?;
-        transaction.commit()?;
-        Ok(value)
+    /// `IsRoot`, `NotFound`, `NotADirectory`, `InvalidPath`, `AlreadyExists`.
+    pub fn mkdir(&self, path: &Path) -> NamespaceResult<()> {
+        self.rules.mkdir(path)
     }
 
-    /// The only place a root record is appended (ADR-003 §4.1, §6).
+    /// Removes an empty directory.
     ///
-    /// Returns the new root serial. Every mutating operation calls this exactly
-    /// once, inside its [`with_write_tx`](Self::with_write_tx) body; read-only
-    /// and no-op paths never call it.
-    pub(crate) fn publish_tx(&self, op: &str, parent: Option<u64>) -> NamespaceResult<u64> {
-        let conn = self.conn();
-        let head: i64 = conn.query_row(
-            "SELECT head_root FROM namespace WHERE name = ?1",
-            [&self.name],
-            |row| row.get(0),
-        )?;
-        let parent = parent.or(if op == "init" {
-            None
-        } else {
-            Some(head as u64)
-        });
-        // Per namespace: the root table is shared, so `head_root` names the
-        // current publication and each namespace's chain is closed by its own
-        // parent links. `root_id` is a global surrogate key so rows stay unique
-        // across namespaces (ADR-003 §4.1, multi-namespace).
-        let root_id: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(root_id) + 1, 0) FROM root",
-            [],
-            |row| row.get(0),
-        )?;
-        conn.execute(
-            "INSERT INTO root (root_id, namespace, parent_root_id, op, created_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            (
-                root_id,
-                &self.name,
-                parent.map(|value| value as i64),
-                op,
-                now_ns(),
-            ),
-        )?;
-        conn.execute(
-            "UPDATE namespace SET head_root = ?1 WHERE name = ?2",
-            (root_id, &self.name),
-        )?;
-        Ok(root_id as u64)
+    /// # Errors
+    ///
+    /// `IsRoot`, `NotFound`, `NotADirectory`, `DirectoryNotEmpty`.
+    pub fn rmdir(&self, path: &Path) -> NamespaceResult<()> {
+        self.rules.rmdir(path)
     }
 
-    /// Checks that the publication chain is unbroken (ADR-003 §12.1 D3).
-    fn validate_root_chain(&self) -> NamespaceResult<()> {
-        let conn = self.conn();
-        let mut current: i64 = conn.query_row(
-            "SELECT head_root FROM namespace WHERE name = ?1",
-            [&self.name],
-            |row| row.get(0),
-        )?;
-        loop {
-            let next: Option<Option<i64>> = conn
-                .query_row(
-                    "SELECT parent_root_id FROM root WHERE root_id = ?1",
-                    [current],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match next.flatten() {
-                Some(parent) => current = parent,
-                // Either the head has no parent (empty history) or the chain
-                // reached its head: both are terminal.
-                None => return Ok(()),
-            }
-        }
+    /// Removes a file's name.
+    ///
+    /// # Errors
+    ///
+    /// `IsRoot`, `NotFound`, `IsADirectory`.
+    pub fn unlink(&self, path: &Path) -> NamespaceResult<()> {
+        self.rules.unlink(path)
     }
+
+    /// Moves `from` to `to` (ADR-003 §3.3 R1–R12).
+    ///
+    /// # Errors
+    ///
+    /// `IsRoot`, `NotFound`, `AlreadyExists`, `DirectoryNotEmpty`, `IntoOwnSubtree`.
+    pub fn rename(&self, from: &Path, to: &Path) -> NamespaceResult<()> {
+        self.rules.rename(from, to)
+    }
+
+    /// Resolves a path to an inode.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, `NotADirectory`, `InvalidPath`.
+    pub fn resolve(&self, path: &Path) -> NamespaceResult<FileId> {
+        self.rules.resolve(path)
+    }
+
+    /// Resolves a path's parent directory, with the final name.
+    ///
+    /// # Errors
+    ///
+    /// As [`Namespace::resolve`], plus `IsRoot` when `path` is `/`.
+    pub fn resolve_parent(&self, path: &Path) -> NamespaceResult<(FileId, String)> {
+        self.rules.resolve_parent(path)
+    }
+
+    /// Lists a directory.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, `NotADirectory`, `InvalidPath`.
+    pub fn read_dir(&self, path: &Path) -> NamespaceResult<Vec<Entry>> {
+        self.rules.read_dir(path)
+    }
+
+    /// Reports one entry, filling in the content root from the backend.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, `NotADirectory`, `InvalidPath`.
+    pub fn stat(&self, path: &Path) -> NamespaceResult<Stat> {
+        let mut stat = self.rules.stat(path)?;
+        // `content_root` is not part of the tree contract (ADR-006 §7.1), so the
+        // rules leave it `None` and the table backend supplies it here.
+        stat.content_root = self.backend().content_root_of(stat.id)?;
+        Ok(stat)
+    }
+
+    // ------------------------------------------------------- table backend
 
     /// The current publication serial, if any.
     #[must_use]
     pub fn head_root(&self) -> Option<u64> {
-        self.conn()
-            .query_row(
-                "SELECT head_root FROM namespace WHERE name = ?1",
-                [&self.name],
-                |row| row.get::<_, i64>(0),
-            )
-            .ok()
-            .map(|value| value as u64)
+        self.backend().head_root()
     }
 
     /// One publication record by serial.
     #[must_use]
     pub fn root_record(&self, root_id: u64) -> Option<RootRecord> {
-        self.conn()
-            .query_row(
-                "SELECT root_id, parent_root_id, op, created_ns
-                 FROM root WHERE namespace = ?1 AND root_id = ?2",
-                (&self.name, root_id as i64),
-                |row| {
-                    Ok(RootRecord {
-                        root_id: row.get::<_, i64>(0)? as u64,
-                        parent_root_id: row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
-                        op: row.get(2)?,
-                        created_ns: row.get(3)?,
-                    })
-                },
-            )
-            .optional()
-            .ok()
-            .flatten()
+        self.backend().root_record(root_id)
     }
 
     /// Every publication record in this namespace, oldest first.
-    ///
-    /// The acceptance matrix (S4) needs the whole chain to assert that earlier
-    /// records are byte-for-byte unchanged after later writes.
     ///
     /// # Errors
     ///
     /// Store failures while reading the table.
     pub fn root_records(&self) -> NamespaceResult<Vec<RootRecord>> {
-        let conn = self.conn();
-        let mut statement = conn.prepare(
-            "SELECT root_id, parent_root_id, op, created_ns
-             FROM root WHERE namespace = ?1 ORDER BY root_id",
-        )?;
-        let rows = statement.query_map([&self.name], |row| {
-            Ok(RootRecord {
-                root_id: row.get::<_, i64>(0)? as u64,
-                parent_root_id: row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
-                op: row.get(2)?,
-                created_ns: row.get(3)?,
-            })
-        })?;
-        let mut records = Vec::new();
-        for row in rows {
-            records.push(row?);
-        }
-        Ok(records)
+        self.backend().root_records()
     }
 
-    /// How many publication records exist, for tests and T5 hooks.
+    /// How many publication records exist.
     #[must_use]
     pub fn root_count(&self) -> u64 {
-        self.conn()
-            .query_row(
-                "SELECT COUNT(*) FROM root WHERE namespace = ?1",
-                [&self.name],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap_or(0) as u64
+        self.backend().root_count()
     }
 
-    pub(crate) fn next_serial(&self) -> NamespaceResult<u64> {
-        let conn = self.conn();
-        let serial: i64 = conn.query_row(
-            "SELECT next_serial FROM file_id_allocator WHERE namespace = ?1",
-            [&self.name],
-            |row| row.get(0),
-        )?;
-        conn.execute(
-            "UPDATE file_id_allocator SET next_serial = next_serial + 1 WHERE namespace = ?1",
-            [&self.name],
-        )?;
-        Ok(serial as u64)
+    /// The raw connection, for planting a fault in tests (ADR-003 §12.2).
+    #[cfg(feature = "failure-injection")]
+    #[must_use]
+    pub fn connection_for_tests(&self) -> std::cell::Ref<'_, rusqlite::Connection> {
+        self.backend().connection_for_tests()
     }
 
-    pub(crate) fn lookup(&self, parent: FileId, name: &str) -> NamespaceResult<Option<FileId>> {
-        let id: Option<i64> = self
-            .conn()
-            .query_row(
-                "SELECT child_id FROM directory_entry
-                 WHERE namespace = ?1 AND parent_id = ?2 AND name = ?3",
-                (&self.name, parent.serial() as i64, name.as_bytes()),
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(id.map(|value| FileId::from_serial(value as u64)))
-    }
-
-    /// The kind of a file row, or `None` when there is no row.
+    /// Creates an empty file.
     ///
-    /// A row whose tag is not a known kind is **not** `None`: reporting it as
-    /// "missing" would turn a corrupted record into a `NotFound` and hide it from
-    /// the caller (QA round 2, C3).
-    pub(crate) fn kind_of(&self, id: FileId) -> NamespaceResult<Option<Kind>> {
-        let tag: Option<i64> = self
-            .conn()
-            .query_row(
-                "SELECT kind FROM file WHERE namespace = ?1 AND file_id = ?2",
-                (&self.name, id.serial() as i64),
-                |row| row.get(0),
-            )
-            .optional()?;
-        match tag {
-            Some(unknown) => {
-                Kind::from_tag(unknown)
-                    .map(Some)
-                    .ok_or_else(|| NamespaceError::InvalidRecord {
-                        field: "file.kind",
-                        detail: format!("unknown kind tag {unknown}"),
-                    })
-            }
-            None => Ok(None),
-        }
+    /// # Errors
+    ///
+    /// `NotFound`, `NotADirectory`, `AlreadyExists`, `IsADirectory`.
+    pub fn create_file(&self, path: &Path) -> NamespaceResult<()> {
+        self.backend().create_file(path, &self.rules)
     }
 
-    pub(crate) fn resolve(&self, path: &Path) -> NamespaceResult<FileId> {
-        let mut current = FileId::ROOT;
-        for segment in path.segments() {
-            let Some(next) = self.lookup(current, segment)? else {
-                return Err(NamespaceError::NotFound {
-                    path: path.display(),
-                });
-            };
-            current = next;
-        }
-        Ok(current)
+    /// The content state of a path.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, `NotADirectory`.
+    pub fn content_state(&self, path: &Path) -> NamespaceResult<ContentState> {
+        self.backend().content_state(path, &self.rules)
     }
 
-    pub(crate) fn resolve_parent(&self, path: &Path) -> NamespaceResult<FileId> {
-        let mut current = FileId::ROOT;
-        for segment in path.parent_segments() {
-            let Some(next) = self.lookup(current, segment)? else {
-                return Err(NamespaceError::NotFound {
-                    path: path.display(),
-                });
-            };
-            if self.kind_of(next)? != Some(Kind::Directory) {
-                return Err(NamespaceError::NotADirectory {
-                    path: path.display(),
-                });
-            }
-            current = next;
-        }
-        Ok(current)
+    /// The `(size, content_root)` pair of a path.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, `NotADirectory`.
+    pub fn shape_of(&self, path: &Path) -> NamespaceResult<(u64, Option<ObjectId>)> {
+        self.backend().shape_of(path, &self.rules)
+    }
+
+    /// The extents overlapping a range.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, `NotADirectory`.
+    pub fn extents_in_range(
+        &self,
+        path: &Path,
+        from: u64,
+        to: u64,
+    ) -> NamespaceResult<Vec<Extent>> {
+        self.backend().extents_in_range(path, from, to, &self.rules)
+    }
+
+    /// Replaces a file's single-object content.
+    ///
+    /// `op` is the publication label (`"write_at"`, `"truncate"`, …); it is audit data
+    /// that the root chain records, so the strings P1 wrote are preserved.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, `IsADirectory`.
+    pub fn replace_content(
+        &self,
+        path: &Path,
+        op: &str,
+        state: &ContentState,
+    ) -> NamespaceResult<()> {
+        self.backend().replace_content(path, op, state, &self.rules)
+    }
+
+    /// Replaces a file's extent rows for the affected blocks.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, `IsADirectory`.
+    pub fn replace_extents(
+        &self,
+        path: &Path,
+        op: &str,
+        size: u64,
+        content_root: Option<ObjectId>,
+        replaced: &[Extent],
+        removed_from: Option<u64>,
+    ) -> NamespaceResult<()> {
+        self.backend().replace_extents(
+            path,
+            op,
+            size,
+            content_root,
+            replaced,
+            removed_from,
+            &self.rules,
+        )
+    }
+
+    /// Inodes no directory entry reaches (P2-0a).
+    ///
+    /// # Errors
+    ///
+    /// Store failures.
+    pub fn unreachable_inodes(&self) -> NamespaceResult<Vec<u64>> {
+        self.backend().unreachable_inodes()
+    }
+
+    /// Directory entries whose child has no inode.
+    ///
+    /// # Errors
+    ///
+    /// Store failures.
+    pub fn entries_without_inode(&self) -> NamespaceResult<Vec<(u64, String)>> {
+        self.backend().entries_without_inode()
+    }
+
+    /// Extent rows whose owning inode is gone.
+    ///
+    /// # Errors
+    ///
+    /// Store failures.
+    pub fn extents_without_inode(&self) -> NamespaceResult<Vec<(u64, u64)>> {
+        self.backend().extents_without_inode()
+    }
+
+    /// Every object the namespace references, deduplicated.
+    ///
+    /// # Errors
+    ///
+    /// Store failures.
+    pub fn referenced_objects(&self) -> NamespaceResult<Vec<ObjectId>> {
+        self.backend().referenced_objects()
     }
 }
 
