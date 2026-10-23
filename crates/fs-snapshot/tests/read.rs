@@ -687,3 +687,95 @@ fn reading_an_extent_past_the_object_value_limit_is_refused() {
         .expect_err("an extent reading past the object limit must be refused");
     assert!(matches!(error, SnapshotError::Malformed { .. }), "{error}");
 }
+
+// ============================================================================
+// P2a-4: shapes the reader used to reject
+//
+// ADR-005 §3.2 makes "an empty directory" and "a file whose bytes are all zero" legal
+// inode states backed by `Content::Empty`, and a file below one block is a `Blob`. The
+// reader assumed every directory had a page tree and every file an extent tree, so it
+// reported a *malformed value* for states the format explicitly allows. Both were found
+// while composing a base snapshot under the overlay backend; neither had a test here.
+// ============================================================================
+
+/// An empty directory lists nothing and looks nothing up — it is not malformed.
+#[test]
+fn an_empty_directory_lists_and_looks_up_as_empty() {
+    let root = TempRoot::new("empty-dir");
+    let store = store_at(&root);
+    let profile = Profile::V1;
+    let mut sink = StoreSink { store: &store };
+
+    let records = vec![InodeRecord {
+        serial: 0,
+        kind: Kind::Directory,
+        size: 0,
+        created_ns: 0,
+        modified_ns: 0,
+        content: Content::Empty,
+    }];
+    let table = fs_snapshot::encode_inode_table(&profile, records.into_iter(), &mut sink)
+        .expect("encode table");
+    let root_oid = fs_snapshot::encode_root(
+        &profile,
+        &RootValue {
+            scope_id: [8u8; 32],
+            inode_table: table,
+        },
+        &mut sink,
+    )
+    .expect("encode root");
+
+    let reader = SnapshotReader::open(&store, root_oid, profile).expect("open");
+    let dir = reader.inode(0).expect("read").expect("present");
+    assert_eq!(
+        reader.read_dir(&dir, None, 10).expect("list"),
+        Vec::new(),
+        "an empty directory has no entries"
+    );
+    assert_eq!(
+        reader.lookup(&dir, b"anything").expect("lookup"),
+        None,
+        "looking into an empty directory finds nothing"
+    );
+}
+
+/// A file with no extents reads as no extents — zero-length and all-zero files are
+/// legal `Empty` content.
+#[test]
+fn an_empty_file_reports_no_extents() {
+    let root = TempRoot::new("empty-file");
+    let store = store_at(&root);
+    let profile = Profile::V1;
+    let mut sink = StoreSink { store: &store };
+
+    let records = vec![InodeRecord {
+        serial: 0,
+        kind: Kind::File,
+        size: 0,
+        created_ns: 0,
+        modified_ns: 0,
+        content: Content::Empty,
+    }];
+    let table = fs_snapshot::encode_inode_table(&profile, records.into_iter(), &mut sink)
+        .expect("encode table");
+    let root_oid = fs_snapshot::encode_root(
+        &profile,
+        &RootValue {
+            scope_id: [9u8; 32],
+            inode_table: table,
+        },
+        &mut sink,
+    )
+    .expect("encode root");
+
+    let reader = SnapshotReader::open(&store, root_oid, profile).expect("open");
+    let file = reader.inode(0).expect("read").expect("present");
+    assert!(
+        reader
+            .extents_in_range(&file, 0, 4096)
+            .expect("query")
+            .is_empty(),
+        "a file with Empty content has no extents to read"
+    );
+}

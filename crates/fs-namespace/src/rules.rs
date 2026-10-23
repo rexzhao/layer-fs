@@ -317,7 +317,7 @@ impl<S: TreeStore> Rules<S> {
 /// # Errors
 ///
 /// `NotFound`, `NotADirectory`, and `InvalidPath`.
-pub(crate) fn resolve_in(tree: &impl crate::TreeRead, path: &Path) -> NamespaceResult<FileId> {
+pub fn resolve_in(tree: &impl crate::TreeRead, path: &Path) -> NamespaceResult<FileId> {
     let mut current = FileId::ROOT;
     for component in path.segments() {
         let Some(view) = tree.inode(current)? else {
@@ -345,10 +345,7 @@ pub(crate) fn resolve_in(tree: &impl crate::TreeRead, path: &Path) -> NamespaceR
 /// # Errors
 ///
 /// As [`resolve_in`], plus `IsRoot` when `path` is `/`.
-pub(crate) fn resolve_parent_in(
-    tree: &impl crate::TreeRead,
-    path: &Path,
-) -> NamespaceResult<FileId> {
+pub fn resolve_parent_in(tree: &impl crate::TreeRead, path: &Path) -> NamespaceResult<FileId> {
     if path.is_root() {
         return Err(NamespaceError::IsRoot);
     }

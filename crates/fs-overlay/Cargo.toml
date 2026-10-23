@@ -1,0 +1,14 @@
+[package]
+name = "fs-overlay"
+description = "Per-workspace overlay backend: an overlay file composed over a snapshot base (ADR-006)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cas-core.workspace = true
+cas-store.workspace = true
+fs-namespace.workspace = true
+fs-snapshot.workspace = true
+rusqlite.workspace = true

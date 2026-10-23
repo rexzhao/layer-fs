@@ -133,6 +133,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-overlay"
+version = "0.1.0"
+dependencies = [
+ "cas-core",
+ "cas-store",
+ "fs-namespace",
+ "fs-snapshot",
+ "rusqlite",
+]
+
+[[package]]
 name = "fs-snapshot"
 version = "0.1.0"
 dependencies = [

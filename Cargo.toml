@@ -5,6 +5,7 @@ members = [
     "crates/cas-store",
     "crates/fs-namespace",
     "crates/fs-snapshot",
+    "crates/fs-overlay",
     "crates/fs-api",
     "crates/fs-cli",
 ]
@@ -20,6 +21,7 @@ cas-core = { path = "crates/cas-core" }
 cas-store = { path = "crates/cas-store" }
 fs-namespace = { path = "crates/fs-namespace" }
 fs-snapshot = { path = "crates/fs-snapshot" }
+fs-overlay = { path = "crates/fs-overlay" }
 fs-api = { path = "crates/fs-api" }
 blake3 = "1.8.7"
 # Bundled SQLite: one version everywhere, no system-library dependency.

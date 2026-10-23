@@ -170,8 +170,13 @@ impl<'a> SnapshotReader<'a> {
     ///
     /// Decode failures, or a store failure.
     pub fn lookup(&self, dir: &InodeRecord, name: &[u8]) -> SnapshotResult<Option<u64>> {
-        let Content::Dir(root) = dir.content else {
-            return Err(malformed("lookup needs an inode whose content is Dir"));
+        let root = match dir.content {
+            Content::Dir(root) => root,
+            // An empty directory is a legal inode (`Directory + Empty`, ADR-005 §3.2 —
+            // "不为空目录生成空页"), so looking into one finds nothing rather than being a
+            // malformed value. Only a non-directory content here is a real error.
+            Content::Empty if dir.kind == Kind::Directory => return Ok(None),
+            _ => return Err(malformed("lookup needs an inode whose content is Dir")),
         };
         let mut pointer = root;
         loop {
@@ -267,8 +272,12 @@ impl<'a> SnapshotReader<'a> {
         after: Option<&[u8]>,
         limit: usize,
     ) -> SnapshotResult<Vec<DirEntry>> {
-        let Content::Dir(root) = dir.content else {
-            return Err(malformed("read_dir needs an inode whose content is Dir"));
+        let root = match dir.content {
+            Content::Dir(root) => root,
+            // An empty directory has no page tree at all (ADR-005 §3.2), so it lists
+            // nothing — not an error.
+            Content::Empty if dir.kind == Kind::Directory => return Ok(Vec::new()),
+            _ => return Err(malformed("read_dir needs an inode whose content is Dir")),
         };
         let mut out = Vec::new();
         self.collect_dir(root, after, limit, &mut out)?;
@@ -343,8 +352,12 @@ impl<'a> SnapshotReader<'a> {
         from: u64,
         to: u64,
     ) -> SnapshotResult<Vec<Extent>> {
-        let Content::Extents(root) = file.content else {
-            return Err(malformed("extents_in_range needs Extents content"));
+        let root = match file.content {
+            Content::Extents(root) => root,
+            // `Empty` covers both a zero-length file and a file whose blocks are all
+            // zero (ADR-005 §3.2); either way no extent covers any range.
+            Content::Empty if file.kind == Kind::File => return Ok(Vec::new()),
+            _ => return Err(malformed("extents_in_range needs Extents content")),
         };
         let mut out = Vec::new();
         self.collect_extents(root, from, to, &mut out)?;
