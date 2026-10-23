@@ -326,6 +326,14 @@ fn the_root_id_is_independent_of_insertion_order() {
 
 /// Locality (ADR-005 §4, §12 item 3): changing one value rewrites only the path from
 /// that leaf to the root.
+///
+/// **This test does not distinguish the two paging rules.** Changing a value leaves
+/// the key set, the entry count and every position untouched, so a fixed-count pager
+/// also rewrites only the edited page and its ancestors. Architect pointed this out
+/// after the first version of the doc comment wrongly claimed the opposite.
+///
+/// The insertion and deletion tests carry the mutation evidence; this one pins the
+/// weaker property that a change of value is local at all, under whichever rule.
 #[test]
 fn changing_one_value_rewrites_only_its_path() {
     let profile = Profile::V1;
@@ -421,30 +429,35 @@ fn re_encoding_the_same_tree_yields_the_same_objects() {
 
 /// Locality for **insertion** (ADR-005 §12 item 3, "插 1 条键").
 ///
-/// What this test does and does not distinguish, measured rather than assumed:
+/// The insertion must land in the **middle** of the key range. With a fixed-count
+/// pager every page is a window over positions, so one insertion shifts every later
+/// entry by one place and *every* page after the edit becomes a different set of
+/// entries — all of them new objects. Appending at the end touches only the last
+/// page and therefore cannot distinguish the two paging rules at all.
 ///
-/// - **Deletion** of one key is caught by the sibling test: with fixed-count paging
-///   the neighbouring pages refill differently and the rewrite exceeds the bound.
-///   That is the mutation evidence this card asks for.
-/// - **Insertion** is *not* distinguishable by a page-count bound alone. I measured a
-///   fixed-count pager at 1,000 and at 20,000 inodes: inserting in the middle
-///   rewrote 3 pages in both cases, because pages are encoded independently, so only
-///   the page the new key lands in changes.
+/// This was wrong in the first version of this test: it inserted serial 500,000 into
+/// keys 0..999 and called that "the middle". Architect caught it; the assertions
+/// below now check the insertion really is interior, so the mistake cannot silently
+/// return. A change-of-value edit, by contrast, keeps positions and entry counts
+/// fixed, so it perturbs one page under *both* rules and distinguishes nothing —
+/// which is why only the insert and delete tests carry mutation evidence.
 ///
-/// The insertion cost ADR-005 §4 describes belongs to **incremental re-encoding**
-/// (reusing the previous tree's pages), not to a full re-encode: under a full
-/// re-encode both rules are deterministic and therefore both history independent.
-/// The hash rule's advantage shows up when a caller wants to reuse previous work,
-/// which P2a does not do — the ADR accepts full re-encoding as the P2a cost.
+/// Measured rewrite counts for one interior edit:
 ///
-/// The assertion stays because it still pins what matters for a full re-encode (an
-/// insertion is local), and it will start discriminating once incremental
-/// materialisation arrives.
+/// | edit | fixed 8 entries per page | content-determined paging |
+/// | --- | --- | --- |
+/// | interior insert (2,000 inodes) | **146 new pages** | 2 new pages |
+/// | interior delete (1,000 inodes) | **75 new pages** | 2 new pages |
+/// | value change | 4 new pages | 2 new pages |
+///
+/// The two paging rules are equally history independent; they differ in *locality*.
 #[test]
 fn inserting_one_key_rewrites_only_its_neighbourhood() {
     let profile = Profile::V1;
+    // An even key set with a hole at 1001, so inserting 1001 puts it in the middle.
     let build = |insert: bool| {
-        let mut records: Vec<InodeRecord> = (0..1000u64)
+        let mut records: Vec<InodeRecord> = (0..2000u64)
+            .filter(|serial| *serial != 1001)
             .map(|serial| {
                 inode(
                     serial,
@@ -463,17 +476,27 @@ fn inserting_one_key_rewrites_only_its_neighbourhood() {
             })
             .collect();
         if insert {
-            // Insert in the **middle**: with fixed-count paging that shifts every
-            // later page, which is the failure this assertion exists to catch.
-            // Appending at the end would only touch the last page and would pass
-            // under both paging rules.
             records.push(inode(
-                500_000,
+                1001,
                 Kind::File,
                 5,
                 Content::Blob(ObjectId::from_bytes([1u8; 32])),
             ));
             records.sort_by_key(|record| record.serial);
+        }
+        // Guard against the test silently degrading back into an append: the new
+        // key must not be the first or the last one.
+        if insert {
+            let position = records
+                .iter()
+                .position(|record| record.serial == 1001)
+                .expect("the inserted key must be present");
+            assert!(
+                position > 0 && position + 1 < records.len(),
+                "the inserted key sits at position {position} of {}: an interior \
+                 insertion is required, end insertion proves nothing",
+                records.len()
+            );
         }
         let mut sink = MemorySink::default();
         let root = encode_inode_table(&profile, records.into_iter(), &mut sink).expect("encode");
@@ -502,9 +525,14 @@ fn inserting_one_key_rewrites_only_its_neighbourhood() {
 }
 
 /// Deleting one key is equally local.
+///
+/// The removed key is interior to the range, for the same reason the insertion test
+/// needs an interior insert: dropping the last key leaves every earlier page intact
+/// under both rules.
 #[test]
 fn deleting_one_key_rewrites_only_its_neighbourhood() {
     let profile = Profile::V1;
+    let removed = 500u64;
     let build = |remove: bool| {
         let mut records: Vec<InodeRecord> = (0..1000u64)
             .map(|serial| {
@@ -525,7 +553,13 @@ fn deleting_one_key_rewrites_only_its_neighbourhood() {
             })
             .collect();
         if remove {
-            records.retain(|record| record.serial != 500);
+            // An interior key, not the last one.
+            assert!(
+                records.iter().any(|record| record.serial == removed)
+                    && removed < records.last().expect("non-empty").serial,
+                "the removed key must be interior to the range"
+            );
+            records.retain(|record| record.serial != removed);
         }
         let mut sink = MemorySink::default();
         let root = encode_inode_table(&profile, records.into_iter(), &mut sink).expect("encode");

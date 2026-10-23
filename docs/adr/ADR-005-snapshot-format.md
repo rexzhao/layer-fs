@@ -1,6 +1,6 @@
 # ADR-005：快照格式——不可变文件系统对象图
 
-- 状态：**接受（Accepted）**——architect 初稿，P2a-1 由 worker 实现并补全测试名配对表（§13），manager 批准于 2026-10-23
+- 状态：**接受（Accepted）**——architect 初稿；P2a-1 由 worker 实现并补全测试名配对表（§13），review 通过即批准
 - 日期：2026-10-23
 - 起草：architect（P2a 架构设计，mailbox 线程 `manager/3yinqic7xe`）；实现与定稿：worker（P2a-1）
 - 依据：spec §2 P2.7/P2.8、§3 逻辑数据模型、§4；Root 审查 `docs/research/2026-10-22-root-model-review.md` Q2 三条 P2 约束；ADR-001 §4.2（role 5–8 预留）/§4.3（16 MiB 上限）/§5.3（D9）；ADR-003 §4.3（serial 永不复用）、§5.1（名字 = 原始字节、≤255 B）
@@ -272,8 +272,8 @@ S7 的完整表述，`verify --deep <root>` 从根遍历逐条检查：
 | --- | --- | --- | --- |
 | 1 | 四种树编码 → 解码往返 | `a_snapshot_round_trips_every_inode_field`、`directory_lookup_and_listing_agree`、`extents_in_range_returns_the_overlapping_runs`、`the_root_value_is_exactly_105_bytes` | 通过 |
 | 2 | 历史无关 | `the_root_id_is_independent_of_insertion_order`（200 次不同插入序列，根 id 全同） | 通过 |
-| 3a | 局部性：改 1 条值 | `changing_one_value_rewrites_only_its_path` | 通过 |
-| 3b | 局部性：插/删 1 条键 | `inserting_one_key_rewrites_only_its_neighbourhood`、`deleting_one_key_rewrites_only_its_neighbourhood` | 通过（见 §13.3 的实测说明） |
+| 3a | 局部性：改 1 条值 | `changing_one_value_rewrites_only_its_path` | 通过（不区分两种切页规则，见 §13.3.3） |
+| 3b | 局部性：插/删 1 条键 | `inserting_one_key_rewrites_only_its_neighbourhood`、`deleting_one_key_rewrites_only_its_neighbourhood` | 通过；变异证据见 §13.3 |
 | 4 | 解码拒绝逐类 | `a_root_of_the_wrong_role_is_refused`（错 role）、`a_wrong_format_byte_is_refused`（错 fmt）、`a_truncated_root_is_malformed`（截断）、`trailing_bytes_in_a_root_are_malformed`（尾随）、`unsorted_names_are_refused_rather_than_silently_sorted`（乱序）、`overlapping_extents_are_refused`（重叠）、`a_zero_length_extent_is_refused`（零长）、`an_illegal_kind_content_pair_is_refused`（非法 kind/content）、`no_page_exceeds_the_profile_limit`（超页长） | 通过 |
 | 5 | profile 不符 | `an_unknown_profile_is_refused` | 通过 |
 | 6 | 输入未排序 → `Unsorted` | `unsorted_names_are_refused_rather_than_silently_sorted`、`overlapping_extents_are_refused` | 通过 |
@@ -301,28 +301,60 @@ S7 的完整表述，`verify --deep <root>` 从根遍历逐条检查：
    （否则会先按长度排序，违反 §3.3 的"逐字节比较"）。实现已分离 `key`（排序/哈希）与
    `page_key`（写入）。
 
-### 13.3 局部性的实测结论（重要，修正草案的一个说法）
+### 13.3 局部性：测试 bug 的更正与改正后的变异证据
 
-草案 §4 的反例说明写"按固定条目数切页。插入一条会让其后所有页错位，全量物化 = 全量重写"。
-**这句在全量重编码下不成立**，实测数据：
+**本节曾写过一个错误结论，现予撤回。** 过程如下，保留原样以免后来者重复错误。
 
-| 规模 | 固定 8 条/页，中间插入 | 内容分页，中间插入 |
+#### 13.3.1 曾经的错误结论（已撤回）
+
+初版 §13.3 声称"草案 §4 的反例说明（固定条目数切页会导致全量重写）在全量重编码下不成立"，
+依据是实测"1 000 / 20 000 inode 中间插入，固定 8 条/页只新增 3 页"。
+
+**这个结论建立在有 bug 的测试上。** architect 指出：
+`inserting_one_key_rewrites_only_its_neighbourhood` 的既有键是 serial 0..999，
+而新插入的是 **serial 500 000**——排序后位于末尾，**不是中间**。注释写"Insert in the middle"，
+代码做的是追加。追加只影响最后一页，当然只有 3 页变化。
+
+这是"注释描述意图、代码执行另一件事"的典型错误，而且我自己写过两次同类缺陷（T2 期一次）。
+教训：**断言的注释必须由断言本身来守卫**——现在两个测试都在内部检查键确实是内部插入/删除。
+
+同时 architect 指出第二处：`changing_one_value_rewrites_only_its_path` 的注释声称固定条数
+在此失败，也不对——改值不改变位置与条目数，两种规则都只影响所在页。该注释已改为明确说明
+**此测试区分不了两种规则**。
+
+#### 13.3.2 改正后的实测
+
+修正测试（键 0..1999 去掉 1001，再插回 1001；删除测试移除内部的 500），并把切页在**叶与分支
+两层**都改为固定 8 条，实测新增页数：
+
+| 编辑 | 固定 8 条/页 | 内容决定分页 |
 | --- | --- | --- |
-| 1 000 inode | 新增 3 页 | 新增 ≤ 3 页 |
-| 20 000 inode | 新增 3 页 | 新增 ≤ 3 页 |
+| 内部插入（2 000 inode） | **146 页** | 2 页 |
+| 内部删除（1 000 inode） | **75 页** | 2 页 |
+| 改一个值 | 4 页 | 2 页 |
 
-原因是页独立编码：插入只改变它落入的那一页，其后各页内容不变、共享同一 oid。**两种规则的
-全量重编码都是确定性的、都历史无关。**
+architect 的推理得到实测确认：固定条数下页边界由位置决定，内部插入使其后每个条目位置 +1，
+每页成员都换了一条，oid 全不同。**草案 §4 的反例说明是正确的**，我不该质疑它。
 
-草案的说法对的是**增量物化**（复用旧树页）：固定计数下插入会移动后续所有页的边界，导致无法复用；
-内容分页则能复用。P2a 采用全量重编码（§2 决策与 owner"初版全量物化"），所以这个优势目前不体现。
+#### 13.3.3 变异证据（改正后）
 
-**结论**：选定内容分页仍然正确——它使将来的增量物化成为可能，且不增加成本——但**"固定计数会
-导致全量重写"这句话应理解为"会导致无法增量复用"**。已按实测修正表述。
+把叶层与分支层的切页同时改为固定 8 条：
 
-变异证据：把切页改为固定 8 条后，`deleting_one_key_rewrites_only_its_neighbourhood` **失败**；
-`inserting_*` 与 `changing_one_value_*` 在两种规则下都通过（原因如上）。这是本卡能提供的
-诚实证据范围，不夸大。
+- `inserting_one_key_rewrites_only_its_neighbourhood` **失败**
+- `deleting_one_key_rewrites_only_its_neighbourhood` **失败**
+- `changing_one_value_rewrites_only_its_path` **通过**（符合预期：它不区分两种规则）
+- 其余 13 个测试通过（历史无关性测试在两种规则下都成立——两种规则都是确定性的）
+
+这组结果与 architect 的独立推理一致，构成本卡的 §12 第 3 条证据。
+
+#### 13.3.4 两种规则的真实关系
+
+- **历史无关性**：两种规则都成立。切页规则只管确定性，不管边界怎么定——只要规则不依赖输入
+  顺序与旧树，同一集合就产出同一棵树。§12 第 2 条的证据在两种规则下都通过。
+- **局部性**：内容分页胜出。内部插入/删除只扰动静止 1–2 个叶及其祖先路径（实测 2 页）；
+  固定条数改写了编辑点之后的绝大部分页（实测 146 / 75 页）。
+
+因此选定内容分页的理由是**局部性**，与"是否历史无关"无关。§4 原文无须修改。
 
 ### 13.4 推迟项
 
