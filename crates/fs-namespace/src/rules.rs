@@ -368,6 +368,21 @@ pub fn resolve_parent_in(tree: &impl crate::TreeRead, path: &Path) -> NamespaceR
         };
         current = next;
     }
+    // The loop validates the kind of each directory *before* descending, so the last name it
+    // resolved was never checked. Without this, `rename("/file", "/file/child")` handed back
+    // the file as the destination's parent: the move unbound the source and then bound its
+    // name into a parent that cannot hold children, so the entry vanished from the tree
+    // entirely. Found by the reference-model sequence (ADR-006 §18-1).
+    let Some(view) = tree.inode(current)? else {
+        return Err(NamespaceError::NotFound {
+            path: path.display(),
+        });
+    };
+    if view.kind != Kind::Directory {
+        return Err(NamespaceError::NotADirectory {
+            path: path.display(),
+        });
+    }
     Ok(current)
 }
 
