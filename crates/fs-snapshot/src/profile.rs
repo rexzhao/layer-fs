@@ -63,10 +63,38 @@ pub struct Profile {
     pub max_object_value: u64,
     /// Largest legal name length.
     pub name_max: usize,
+    /// How a file's bytes are cut into objects (ADR-007 §3).
+    pub chunker: Chunker,
+}
+
+/// How a file's content is cut into objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chunker {
+    /// One object per fixed `block_bytes` block (ADR-005 §3.2).
+    FixedBlocks,
+    /// Content-defined chunks whose boundaries follow the bytes (ADR-007 §3.1).
+    FastCdc(crate::cdc::CdcParams),
+}
+
+impl Chunker {
+    /// The role a file-content object carries (ADR-007 §3.3).
+    #[must_use]
+    pub const fn content_role(self) -> cas_core::Role {
+        match self {
+            // v1 wrote content as `Bytes`; v2 writes every content object as `Chunk`, so a
+            // single-chunk file and a chunk inside a large one are the same object.
+            Chunker::FixedBlocks => cas_core::Role::Bytes,
+            Chunker::FastCdc(_) => cas_core::Role::Chunk,
+        }
+    }
 }
 
 impl Profile {
     /// The P2a profile, exactly as ADR-005 §5 writes it.
+    ///
+    /// Still readable, never written: ADR-007 §3.5 makes v2 the write profile, and a v2
+    /// build refuses a v1 root (§7). Keeping the constant is what lets the refusal be a
+    /// *decision* — "this is the older format" — rather than an opaque parse failure.
     pub const V1: Profile = Profile {
         fmt: 1,
         mask_bits: 6,
@@ -76,24 +104,67 @@ impl Profile {
         max_extent_len: 65_536,
         max_object_value: 16_777_216,
         name_max: 255,
+        chunker: Chunker::FixedBlocks,
     };
+
+    /// The P2b profile (ADR-007 §3.5): content-defined chunking replaces fixed blocks.
+    pub const V2: Profile = Profile {
+        fmt: 1,
+        mask_bits: 6,
+        min_entries: 4,
+        max_page_bytes: 16_384,
+        // `block_bytes` is gone from the description; the field keeps the largest legal
+        // extent length, which is what the decoder checks (ADR-007 §3.2).
+        block_bytes: 32_768,
+        max_extent_len: 32_768,
+        max_object_value: 16_777_216,
+        name_max: 255,
+        chunker: Chunker::FastCdc(crate::cdc::CdcParams::V2),
+    };
+
+    /// The profile this build writes.
+    pub const CURRENT: Profile = Profile::V2;
+
+    /// Whether this profile is the one this build writes.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        *self == Profile::CURRENT
+    }
 
     /// The canonical description string. Any character change is a new profile.
     #[must_use]
     pub fn description(&self) -> String {
-        format!(
-            "wcas/snapshot/v1;fmt={};mask_bits={};min_entries={};max_page_bytes={};\
-             block_bytes={};max_extent_len={};max_object_value={};\
-             name_max={};hash=blake3;domains=inode,dir,extent",
-            self.fmt,
-            self.mask_bits,
-            self.min_entries,
-            self.max_page_bytes,
-            self.block_bytes,
-            self.max_extent_len,
-            self.max_object_value,
-            self.name_max
-        )
+        match self.chunker {
+            Chunker::FixedBlocks => format!(
+                "wcas/snapshot/v1;fmt={};mask_bits={};min_entries={};max_page_bytes={};\
+                 block_bytes={};max_extent_len={};max_object_value={};\
+                 name_max={};hash=blake3;domains=inode,dir,extent",
+                self.fmt,
+                self.mask_bits,
+                self.min_entries,
+                self.max_page_bytes,
+                self.block_bytes,
+                self.max_extent_len,
+                self.max_object_value,
+                self.name_max
+            ),
+            Chunker::FastCdc(params) => format!(
+                "wcas/snapshot/v2;fmt={};mask_bits={};min_entries={};max_page_bytes={};\
+                 cdc=fastcdc-nc{};cdc_min={};cdc_avg={};cdc_max={};gear=blake3:wcas/gear/v1;\
+                 content_role=chunk;max_object_value={};name_max={};hash=blake3;\
+                 domains=inode,dir,extent",
+                self.fmt,
+                self.mask_bits,
+                self.min_entries,
+                self.max_page_bytes,
+                params.normalisation,
+                params.min,
+                params.avg,
+                params.max,
+                self.max_object_value,
+                self.name_max
+            ),
+        }
     }
 
     /// `profile_id = BLAKE3("wcas/snapshot-profile/v1\0" || description)`.

@@ -78,11 +78,17 @@ pub struct InodeRecord {
 }
 
 impl InodeRecord {
-    /// Checks the kind/content combination table of ADR-005 §3.2.
+    /// Checks the kind/content combination table (ADR-005 §3.2 for v1, ADR-007 §3.2 for v2).
     ///
     /// Returns the reason the combination is illegal, or `None` when it is legal.
+    ///
+    /// The two profiles differ in exactly one place: v2 decides a file's shape by the number
+    /// of **chunks** its content has, not by comparing its size against a fixed block size.
+    /// A 100-byte file and a 7 KiB file are both one chunk, so both are `Blob`; a file of
+    /// many chunks is `Extents` regardless of how small those chunks are.
     #[must_use]
-    pub fn illegal_reason(&self, block_bytes: u64) -> Option<&'static str> {
+    pub fn illegal_reason(&self, profile: &crate::Profile) -> Option<&'static str> {
+        let chunked = matches!(profile.chunker, crate::Chunker::FastCdc(_));
         match (self.kind, self.content) {
             (Kind::Directory, Content::Empty) | (Kind::Directory, Content::Dir(_)) => {
                 if self.size == 0 {
@@ -94,25 +100,42 @@ impl InodeRecord {
             (Kind::Directory, _) => Some("a directory's content must be Empty or Dir"),
             (Kind::File, Content::Dir(_)) => Some("a file's content may not be Dir"),
             (Kind::File, Content::Empty) => {
-                // Empty is only canonical when the content is all zero: size 0, or a
-                // size whose blocks are all zero (ADR-005 §3.2 normalisation).
-                if self.size == 0 || self.size >= block_bytes {
+                // Empty is canonical when there is no content to store: size 0, or a file
+                // whose every chunk is zero (ADR-007 §3.2, last row).
+                if self.size == 0 {
+                    None
+                } else if chunked {
+                    // Above a chunk, "all chunks zero" is legal; below it a non-zero file
+                    // must be a Blob. The decoder cannot know which from the record alone,
+                    // so it accepts Empty for any size and `verify --deep` catches a lie.
+                    None
+                } else if self.size >= profile.block_bytes {
                     None
                 } else {
                     Some("a file smaller than one block must be a Blob")
                 }
             }
             (Kind::File, Content::Blob(_)) => {
-                if self.size > 0 && self.size < block_bytes {
-                    None
-                } else if self.size == 0 {
+                if self.size == 0 {
                     Some("a zero-length file must be Empty")
+                } else if chunked {
+                    // One chunk, so a Blob is legal at any size a chunk may have.
+                    None
+                } else if self.size < profile.block_bytes {
+                    None
                 } else {
                     Some("a file at or above one block must be Extents or Empty")
                 }
             }
             (Kind::File, Content::Extents(_)) => {
-                if self.size >= block_bytes {
+                if chunked {
+                    // Two or more chunks: the size may be anything above zero.
+                    if self.size == 0 {
+                        Some("a zero-length file must be Empty")
+                    } else {
+                        None
+                    }
+                } else if self.size >= profile.block_bytes {
                     None
                 } else {
                     Some("a file smaller than one block must be a Blob")

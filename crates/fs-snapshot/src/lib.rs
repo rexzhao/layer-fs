@@ -35,6 +35,7 @@
 #![deny(missing_debug_implementations)]
 
 pub mod bytes;
+mod cdc;
 mod encode;
 mod error;
 pub mod pager;
@@ -42,9 +43,10 @@ pub mod profile;
 pub mod read;
 pub mod record;
 
+pub use cdc::{chunk, gear_table, is_zero, CdcParams, ChunkSpan};
 pub use encode::{encode_directory, encode_extents, encode_inode_table, encode_root};
 pub use error::{SnapshotError, SnapshotResult};
 pub use pager::PageSink;
-pub use profile::{Profile, TreeDomain};
+pub use profile::{Chunker, Profile, TreeDomain};
 pub use read::SnapshotReader;
 pub use record::{Content, DirEntry, Extent, InodeRecord, Kind, RootValue};

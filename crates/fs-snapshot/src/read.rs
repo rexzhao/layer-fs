@@ -21,10 +21,39 @@ pub struct SnapshotReader<'a> {
 }
 
 impl<'a> SnapshotReader<'a> {
-    /// Opens a snapshot by its root object id.
+    /// Opens a snapshot by its root object id, accepting either known profile.
     ///
-    /// Checks the role, the value format and the profile id before anything else, so
-    /// a root from another format is refused rather than misread.
+    /// A root records its profile id, so the reader does not have to be told which format
+    /// to expect: v1 roots open as v1 and v2 roots as v2. Anything else is
+    /// [`SnapshotError::UnsupportedProfile`], which is the "v1 root refused by a v2 build"
+    /// behaviour ADR-007 §7 asks for — at the level where the choice can still be described.
+    ///
+    /// # Errors
+    ///
+    /// `WrongRole`, `UnsupportedFormat`, `UnsupportedProfile`, `Malformed`, or a store
+    /// failure.
+    pub fn open_any(store: &'a Store, root: ObjectId) -> SnapshotResult<Self> {
+        let value = fetch(store, root, Role::FilesystemRoot, "filesystem root")?;
+        let mut probe = Reader::new(&value);
+        probe.format(Profile::V1.fmt)?;
+        // Layout (ADR-005 §3.1): fmt (1 byte, consumed by `format`), profile id (32),
+        // scope (32), root_serial (8), inode table (32). The profile id is the first 32
+        // bytes after the format byte.
+        let recorded = probe.take(32)?;
+        let profile = [Profile::CURRENT, Profile::V1]
+            .into_iter()
+            .find(|candidate| candidate.id() == recorded)
+            .ok_or_else(|| SnapshotError::UnsupportedProfile {
+                found: hex(recorded),
+            })?;
+        Self::open(store, root, profile)
+    }
+
+    /// Opens a snapshot under a *specific* profile, refusing a root that does not match.
+    ///
+    /// Use this when the caller already knows the format (a workspace publishing under
+    /// [`Profile::CURRENT`]); use [`SnapshotReader::open_any`] when reading history whose
+    /// profile is whatever it was written under.
     ///
     /// # Errors
     ///
@@ -518,7 +547,7 @@ fn decode_inode(reader: &mut Reader<'_>, profile: Profile) -> SnapshotResult<Ino
         modified_ns,
         content,
     };
-    if let Some(reason) = record.illegal_reason(profile.block_bytes) {
+    if let Some(reason) = record.illegal_reason(&profile) {
         return Err(malformed(format!("inode {serial}: {reason}")));
     }
     Ok(record)

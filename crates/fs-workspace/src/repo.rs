@@ -743,7 +743,7 @@ impl Repo {
 
     /// The root directory of an empty tree, encoded and published.
     fn empty_root(&self, scope: [u8; 32]) -> WorkspaceResult<ObjectId> {
-        let profile = Profile::V1;
+        let profile = Profile::CURRENT;
         let store = self
             .store
             .lock()
@@ -776,7 +776,7 @@ impl Repo {
     /// The serial scope a published tree was allocated in.
     fn root_scope(&self, root: ObjectId) -> WorkspaceResult<[u8; 32]> {
         let store = Store::open(&self.store_dir, OpenMode::ReadOnly)?;
-        Ok(SnapshotReader::open(&store, root, Profile::V1)?.scope_id())
+        Ok(SnapshotReader::open(&store, root, Profile::CURRENT)?.scope_id())
     }
 
     /// Opens (or creates) one workspace's overlay file.
@@ -793,7 +793,7 @@ impl Repo {
             store,
             &fs_overlay::OverlayOptions {
                 base_root,
-                profile: Profile::V1,
+                profile: Profile::CURRENT,
                 scope_id: scope,
                 serial_first: segment.first,
                 serial_end: segment.end,

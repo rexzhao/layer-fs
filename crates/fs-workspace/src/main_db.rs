@@ -124,7 +124,7 @@ impl MainDb {
         for (key, value) in [
             ("schema_version", schema::SCHEMA_VERSION.to_string()),
             ("ddl", schema::ddl_text()),
-            ("snapshot_profile", hex(&fs_snapshot::Profile::V1.id())),
+            ("snapshot_profile", hex(&fs_snapshot::Profile::CURRENT.id())),
             ("overlay_page_bytes", schema::OVERLAY_PAGE_BYTES.to_string()),
             (
                 "main_busy_timeout_ms",
@@ -172,7 +172,7 @@ fn validate(connection: &Connection) -> WorkspaceResult<u64> {
         });
     }
     let profile = policy(connection, "snapshot_profile")?;
-    let expected = hex(&fs_snapshot::Profile::V1.id());
+    let expected = hex(&fs_snapshot::Profile::CURRENT.id());
     if profile != expected {
         return Err(WorkspaceError::SchemaMismatch {
             expected: format!("snapshot_profile {expected}"),

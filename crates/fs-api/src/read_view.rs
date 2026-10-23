@@ -35,11 +35,11 @@ impl ReadView {
     ///
     /// Store failures, or [`ApiError::Snapshot`] when the root is not a snapshot.
     pub(crate) fn open(store_dir: &Path, root: ObjectId) -> ApiResult<Self> {
-        let profile = Profile::V1;
+        let profile = Profile::CURRENT;
         let store = Store::open(store_dir, OpenMode::ReadOnly)?;
         // Fail here rather than on the first read: a root that is not a snapshot should be
         // reported by `read_view`, not by whatever calls it next.
-        SnapshotReader::open(&store, root, profile)?;
+        SnapshotReader::open_any(&store, root)?;
         Ok(Self {
             store,
             root,

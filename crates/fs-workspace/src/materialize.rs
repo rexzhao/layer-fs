@@ -241,6 +241,19 @@ fn encode_dir(sink: &mut StoreSink<'_>, node: &Node, profile: Profile) -> Worksp
     )
 }
 
+/// Encodes one file's content in the profile's canonical shape (ADR-007 §3.2).
+///
+/// The rule is stated once, as a table:
+///
+/// | condition | the only legal shape |
+/// | --- | --- |
+/// | `size == 0` | `Empty` |
+/// | the chunker yields one chunk, not all zero | `Blob` (that chunk's oid) |
+/// | two or more chunks, some non-zero | `Extents`, all-zero chunks omitted |
+/// | every chunk zero | `Empty` |
+///
+/// A short file therefore has one chunk and becomes a `Blob`: the shape ADR-005 §3.2 gave a
+/// file below a block, now decided by the chunker rather than by a fixed size.
 fn encode_file(
     sink: &mut StoreSink<'_>,
     node: &Node,
@@ -251,35 +264,32 @@ fn encode_file(
     if size == 0 {
         return Ok(Content::Empty);
     }
-    let block = profile.block_bytes;
-    if size < block {
-        // ADR-005 §3.2: a file below one block is a Blob **even when every byte is zero**.
-        // Empty means "no content", which is reserved for size 0 here and for the
-        // all-zero-block case above `block`. Encoding a zero-filled 64-byte file as Empty
-        // makes the snapshot invalid, and the decoder says so.
-        let index = usize::try_from(size).unwrap_or(usize::MAX);
-        let bytes = read_block(&node.path, 0, index)?;
-        let object = publish(sink, |sink| sink.put(Role::Bytes, &bytes))?;
+    let chunked = chunk_file(node, profile, read_block)?;
+    let role = profile.chunker.content_role();
+
+    if chunked.len() == 1 {
+        let only = &chunked[0];
+        if only.bytes.iter().all(|byte| *byte == 0) {
+            return Ok(Content::Empty);
+        }
+        let object = publish(sink, |sink| sink.put(role, &only.bytes))?;
         return Ok(Content::Blob(object));
     }
+
     let mut extents = Vec::new();
-    let mut start = 0u64;
-    while start < size {
-        let end = (start + block).min(size);
-        let count = usize::try_from(end - start).unwrap_or(usize::MAX);
-        let bytes = read_block(&node.path, start, count)?;
-        // All-zero blocks are omitted: "wrote zeros" and "did not write" must produce the
-        // same tree, or history independence fails (ADR-005 §3.4).
-        if bytes.iter().any(|byte| *byte != 0) {
-            let object = publish(sink, |sink| sink.put(Role::Bytes, &bytes))?;
-            extents.push(Extent {
-                logical_start: start,
-                length: end - start,
-                object,
-                source_offset: 0,
-            });
+    for chunk in &chunked {
+        // All-zero chunks are omitted, leaving a gap the reader fills with zeros: "wrote
+        // zeros" and "did not write" must produce the same tree (ADR-005 §3.4).
+        if chunk.bytes.iter().all(|byte| *byte == 0) {
+            continue;
         }
-        start = end;
+        let object = publish(sink, |sink| sink.put(role, &chunk.bytes))?;
+        extents.push(Extent {
+            logical_start: chunk.offset,
+            length: u64::try_from(chunk.bytes.len()).unwrap_or(0),
+            object,
+            source_offset: 0,
+        });
     }
     if extents.is_empty() {
         return Ok(Content::Empty);
@@ -292,6 +302,53 @@ fn encode_file(
             None => Content::Empty,
         },
     )
+}
+
+/// One chunk of a file, materialised.
+struct Chunked {
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
+/// Reads a file and cuts it the way the profile's chunker defines.
+fn chunk_file(
+    node: &Node,
+    profile: Profile,
+    read_block: &impl Fn(&Path, u64, usize) -> WorkspaceResult<Vec<u8>>,
+) -> WorkspaceResult<Vec<Chunked>> {
+    let size = usize::try_from(node.size).unwrap_or(usize::MAX);
+    // The whole file is read once: CDC boundaries are a function of every byte, so a
+    // boundary cannot be decided without the bytes that follow it. Bounding this is the
+    // incremental materialiser's job (ADR-007 §5), not the chunker's.
+    let bytes = read_block(&node.path, 0, size)?;
+    let bytes = if bytes.len() > size {
+        bytes[..size].to_vec()
+    } else {
+        bytes
+    };
+    let spans = match profile.chunker {
+        fs_snapshot::Chunker::FastCdc(params) => fs_snapshot::chunk(&bytes, &params),
+        fs_snapshot::Chunker::FixedBlocks => {
+            // The v1 shape, kept so a v1 fixture still round-trips in the tests.
+            let block = usize::try_from(profile.block_bytes)
+                .unwrap_or(usize::MAX)
+                .max(1);
+            (0..bytes.len())
+                .step_by(block)
+                .map(|offset| fs_snapshot::ChunkSpan {
+                    offset,
+                    length: block.min(bytes.len() - offset),
+                })
+                .collect()
+        }
+    };
+    Ok(spans
+        .into_iter()
+        .map(|span| Chunked {
+            offset: u64::try_from(span.offset).unwrap_or(0),
+            bytes: bytes[span.offset..span.offset + span.length].to_vec(),
+        })
+        .collect())
 }
 
 fn children_of(view: &impl TreeRead, dir: FileId) -> WorkspaceResult<Vec<(Vec<u8>, FileId)>> {

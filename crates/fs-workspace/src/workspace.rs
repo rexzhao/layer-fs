@@ -74,7 +74,7 @@ impl Workspace {
             overlay,
             repo,
             store: std::sync::Mutex::new(store),
-            profile: Profile::V1,
+            profile: Profile::CURRENT,
         })
     }
 

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use cas_store::{OpenMode, Store};
 use fs_namespace::{Path as FsPath, Rules};
-use fs_snapshot::{Profile, SnapshotReader};
+use fs_snapshot::SnapshotReader;
 use fs_workspace::{Repo, Workspace};
 
 const CHILD_ENV: &str = "WCAS_WORKSPACE_CRASH_CHILD";
@@ -179,8 +179,7 @@ fn recovered(dir: &Path) -> (Arc<Repo>, Workspace) {
 /// objects existed before the row that names them (I5).
 fn assert_tree_holds_payload(dir: &Path, root: &str) {
     let store = Store::open(dir, OpenMode::ReadOnly).expect("store");
-    let reader =
-        SnapshotReader::open(&store, root.parse().expect("root id"), Profile::V1).expect("reader");
+    let reader = SnapshotReader::open_any(&store, root.parse().expect("root id")).expect("reader");
     let root_inode = reader.inode(0).expect("root inode").expect("present");
     let serial = reader
         .lookup(&root_inode, b"f")

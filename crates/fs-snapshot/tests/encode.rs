@@ -233,6 +233,9 @@ fn the_root_value_is_exactly_105_bytes() {
 
 #[test]
 fn an_illegal_kind_content_pair_is_refused() {
+    // These two rules are v1-only: under v2 a file's shape follows its chunk count, so a
+    // small file may be a Blob and a large one may be too. The v1 profile is still readable,
+    // so its normalisation rules must still hold whenever it is the profile in use.
     let profile = Profile::V1;
     // A file smaller than one block must be a Blob.
     let mut sink = MemorySink::default();
@@ -580,5 +583,52 @@ fn deleting_one_key_rewrites_only_its_neighbourhood() {
         new_pages <= depth + 2,
         "deleting one key rewrote {new_pages} pages; the locality bound is {}",
         depth + 2
+    );
+}
+
+/// Under **v2** the shapes follow the chunk count (ADR-007 §3.2), not the size.
+///
+/// The v1 rules above stay in force for v1 roots; this is what replaces them for the profile
+/// this build writes: a one-chunk file is a Blob at any size, and a many-chunk file is
+/// Extents at any size. The one absolute rule is that a zero-length file is `Empty`.
+#[test]
+fn the_current_profile_accepts_chunk_shaped_files() {
+    let profile = fs_snapshot::Profile::CURRENT;
+
+    // A small file as a Blob: legal under v2 (illegal under v1).
+    let mut sink = MemorySink::default();
+    let records = with_root(vec![inode(
+        1,
+        Kind::File,
+        10,
+        Content::Blob(ObjectId::from_bytes([1u8; 32])),
+    )]);
+    encode_inode_table(&profile, records.into_iter(), &mut sink)
+        .expect("a one-chunk file is a Blob at any size");
+
+    // A large file as Extents: legal under v2.
+    let mut sink = MemorySink::default();
+    let records = with_root(vec![inode(
+        1,
+        Kind::File,
+        500_000,
+        Content::Extents(ObjectId::from_bytes([2u8; 32])),
+    )]);
+    encode_inode_table(&profile, records.into_iter(), &mut sink)
+        .expect("a many-chunk file is Extents");
+
+    // A zero-length Blob stays illegal: Empty is the only canonical zero-length shape.
+    let mut sink = MemorySink::default();
+    let records = with_root(vec![inode(
+        1,
+        Kind::File,
+        0,
+        Content::Blob(ObjectId::from_bytes([3u8; 32])),
+    )]);
+    let error = encode_inode_table(&profile, records.into_iter(), &mut sink)
+        .expect_err("a zero-length file must be Empty");
+    assert!(
+        matches!(error, fs_snapshot::SnapshotError::Malformed { .. }),
+        "{error}"
     );
 }

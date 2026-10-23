@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 
 use cas_store::{OpenMode as StoreMode, Store};
-use fs_snapshot::{Content, Profile, SnapshotReader};
+use fs_snapshot::{Content, SnapshotReader};
 
 use crate::error::{ApiError, ApiResult};
 use crate::repo::Repo;
@@ -70,7 +70,7 @@ impl Repo {
         let mut inodes_checked = 0u64;
         for root in self.inner.roots()? {
             roots_checked += 1;
-            match SnapshotReader::open(&store, root, Profile::V1) {
+            match SnapshotReader::open_any(&store, root) {
                 Ok(reader) => {
                     if deep {
                         walk(&store, &reader, &mut dangling, &mut inodes_checked)?;

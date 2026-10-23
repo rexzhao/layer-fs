@@ -93,7 +93,7 @@ pub fn encode_inode_table(
 ) -> SnapshotResult<ObjectId> {
     let mut collected = Vec::new();
     for record in records.by_ref() {
-        if let Some(reason) = record.illegal_reason(profile.block_bytes) {
+        if let Some(reason) = record.illegal_reason(profile) {
             return Err(malformed(format!("inode {}: {reason}", record.serial)));
         }
         let mut key = Writer::new();

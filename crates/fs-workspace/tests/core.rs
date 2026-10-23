@@ -286,12 +286,10 @@ fn a_committed_tree_is_readable_after_the_workspace_is_gone() {
         .expect("info")
         .root;
     let store = Store::open(repo.store_dir(), OpenMode::ReadOnly).expect("store");
-    let reader = fs_snapshot::SnapshotReader::open(
-        &store,
-        root.parse().expect("root id"),
-        fs_snapshot::Profile::V1,
-    )
-    .expect("reader");
+    // `open_any` reads the profile the root records, which is how a v2 build still opens a
+    // tree it published under the current profile.
+    let reader = fs_snapshot::SnapshotReader::open_any(&store, root.parse().expect("root id"))
+        .expect("reader");
     let root_inode = reader.inode(0).expect("root inode").expect("present");
     let serial = reader
         .lookup(&root_inode, b"kept")
