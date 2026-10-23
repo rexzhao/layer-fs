@@ -3,6 +3,7 @@
 - 状态：已派发（2026-10-23，manager）
 - 分支：`p2a/switch`，基于 main = `fca1d3b`
 - 前置：P2a-1~6 + KI-7 已合入；worker 已 compact
+- **P2a-7 分两步：7a 新 API 门面（与旧 Fs 并存），7b 切换 + 删除 + CLI**（2026-10-23，manager 裁决）
 
 ## 先读
 

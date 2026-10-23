@@ -19,7 +19,15 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! # Storage layout
+//! # Two surfaces, for one release
+//!
+//! [`Fs`] is the direct-write surface P1 shipped; [`Repo`], [`Workspace`] and [`ReadView`]
+//! are the workspace-and-history surface ADR-006 §13 defines. They coexist while P2a-7
+//! moves the callers across: the second one edits through an overlay, publishes commits
+//! and reads history from a snapshot root with no table involved, while the first writes
+//! namespace rows directly. Both are tested. P2a-7b deletes `Fs`, the table backend and
+//! this section.
+//!//! # Storage layout
 //!
 //! A file under [`BLOCK_BYTES`] is one object; a larger file is a run of
 //! fixed-size blocks recorded as extent rows. A range read fetches only the
@@ -37,15 +45,23 @@
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 
+mod api_error;
 mod error;
 mod file_system;
+mod read_view;
+mod repo;
 mod stats;
 mod verify;
+mod workspace;
 
+pub use api_error::{ApiError, ApiResult};
 pub use error::{FsError, FsResult};
 pub use file_system::{Fs, BLOCK_BYTES};
+pub use read_view::ReadView;
+pub use repo::{CommitInfo, Repo, WorkspaceStatus};
 pub use stats::{ReadStats, Stats};
 pub use verify::{DanglingReference, Inconsistency, VerifyReport};
+pub use workspace::Workspace;
 
 // Re-exported so entry points (the CLI) can name the open mode without taking a
 // dependency on `cas-store`, which is an implementation detail of this layer

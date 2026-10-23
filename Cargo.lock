@@ -112,6 +112,9 @@ dependencies = [
  "cas-core",
  "cas-store",
  "fs-namespace",
+ "fs-overlay",
+ "fs-snapshot",
+ "fs-workspace",
  "rusqlite",
 ]
 
