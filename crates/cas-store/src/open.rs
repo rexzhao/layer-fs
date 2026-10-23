@@ -166,6 +166,11 @@ fn clear_temporaries(layout: &Layout) -> StoreResult<usize> {
         };
         match result {
             Ok(()) => removed += 1,
+            // Reachable only under concurrency: another process may remove the
+            // same staging file between the directory read and this call, or hold
+            // it briefly on Windows. Not covered by a single-process test; the
+            // multi-process crash suite exercises the path. Exempted from coverage
+            // in docs/reports/p1-baseline.md §9.
             Err(error)
                 if matches!(
                     error.kind(),

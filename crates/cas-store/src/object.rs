@@ -120,6 +120,9 @@ pub(crate) fn put_observed(
             // winner's rename). Either way the bytes at the target are
             // necessarily identical, because the identity covers them. Verify
             // that, and report a genuine mismatch as corruption.
+            //
+            // Reachable only under concurrency; exempted from coverage in
+            // docs/reports/p1-baseline.md §9.
             Err(StoreError::Io(error))
                 if matches!(
                     error.kind(),

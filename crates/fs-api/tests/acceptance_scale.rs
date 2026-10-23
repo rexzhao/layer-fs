@@ -60,7 +60,14 @@ fn s2_files() -> usize {
 /// rule this comes from.
 fn s2_create_budget_secs(files: usize) -> u64 {
     // 6ms per file: 3.9ms measured at P50 plus headroom for the ~5x spread observed
-    // on the reference disk.
+    // on the reference disk, so 100k gets a 600s budget.
+    //
+    // **This assertion can fail on a loaded disk even when nothing regressed.**
+    // Observed full runs of the 100k case spread over 546-682s, which is only
+    // 8-13% inside the budget. If it fails, first check whether the machine was
+    // busy (another build, an indexer, a copy) and re-run before treating it as a
+    // regression -- the spread belongs to the disk, not to the code
+    // (`docs/reports/p1-baseline.md` section 2.2).
     (files as u64 * 6 / 1000).max(60)
 }
 

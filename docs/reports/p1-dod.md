@@ -15,7 +15,7 @@
 | # | 要求 | 判定 | 证据 |
 | --- | --- | --- | --- |
 | D1 | 不需要安装文件系统驱动 | ✅ | P1 是库 + CLI，无 WinFsp、无内核组件；`crates/` 下只有 `cas-core`/`cas-store`/`fs-namespace`/`fs-api`/`fs-cli`（P3 才引入 `fs-winfsp`） |
-| D2 | SDK 可用 | ✅ | `fs-api` 的 `Fs`：15 个公共方法，`cargo doc -p fs-api` 无警告 |
+| D2 | SDK 可用 | ✅ | `fs-api` 的 `Fs`：**18 个公共方法**（`open`/`create`/`read_at`/`write_at`/`truncate`/`flush`/`stat`/`read_dir`/`mkdir`/`remove`/`rename`/`verify`/`stats`/`read_stats`/`file_id`/`head_root`/`root_record`/`root_records`），`cargo doc -p fs-api` 无警告 |
 | D3 | CLI 可用 | ✅ | `fs-cli` 10 条命令；`crates/fs-cli/tests/cli.rs` 17 个集成测试 |
 | D4 | 持久管理 | ✅ | 重启一致性：`s2_many_small_files_survive_a_restart`；对象持久化：`cas-store/tests/crash.rs` 11 个崩溃测试（含真实进程终止） |
 | D5 | 真实大小的虚拟文件树 | ✅ | 1 GiB 单文件（S3）；100,000 文件（S2，`WCAS_ACCEPT_FILES=100000`） |
@@ -40,7 +40,7 @@
 | --- | --- | --- |
 | `CasStore` | `Store::open/put/get/exists/verify/object_count/identify/opened/layout/is_read_only/metadata_path` | 36 + 11 |
 | `Namespace` | `open/head_root/root_record/root_records/root_count/mkdir/rmdir/rename/unlink/stat/read_dir/create_file/content_state/replace_content/replace_extents/referenced_objects` | 29 + 41 |
-| `Fs` | `open/create/read_at/write_at/truncate/flush/stat/read_dir/mkdir/remove/rename/verify/stats/read_stats/file_id` | 语义 16 + 大文件 7 + 形状 6 + 洞 6 + 验收 4 + 覆盖补 10 |
+| `Fs` | 18 个公共方法（含 T5 新增的 `head_root`/`root_record`/`root_records`） | 语义 16 + 大文件 7 + 形状 6 + 洞 6 + 验收 4 + 覆盖补 10 |
 | `fs-cli` | `init/put/get/ls/stat/mkdir/rm/mv/verify/stats` | 17 |
 
 CLI 与 SDK **同核**：CLI 的每条命令都经 `Fs`，不含业务逻辑（`crates/fs-cli/src/main.rs` 只有参数解析与输出）。
