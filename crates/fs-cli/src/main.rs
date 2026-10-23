@@ -7,8 +7,7 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use cas_store::OpenMode;
-use fs_api::{Fs, FsError};
+use fs_api::{Fs, FsError, OpenMode};
 
 const USAGE: &str = "\
 fs-cli --store <dir> [--namespace <name>] <command> [args]

@@ -12,7 +12,3 @@ path = "src/main.rs"
 
 [dependencies]
 fs-api.workspace = true
-cas-store.workspace = true
-
-[dev-dependencies]
-fs-api.workspace = true

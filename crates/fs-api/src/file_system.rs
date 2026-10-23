@@ -103,8 +103,11 @@ impl Fs {
                 let value = Object::decode(&bytes)?.value().to_vec();
                 let available = value.len().saturating_sub(span.start);
                 let copied = available.min(want);
+                // The reported length is `want`; every byte of it must be written
+                // by this call, including any the object does not cover.
+                out[..want].fill(0);
                 out[..copied].copy_from_slice(&value[span.start..span.start + copied]);
-                Ok(copied)
+                Ok(want)
             }
             None => {
                 // Only the extents the range overlaps are read from the table.
@@ -480,16 +483,18 @@ impl Fs {
     /// Only the extents that intersect `span` are fetched, which is what bounds
     /// the amplification: a 4 KiB read touches at most two 64 KiB blocks.
     ///
-    /// Gaps between extents are **allocated zeros**, not absent bytes: the
-    /// caller's `out` already starts zeroed and the file's `size` says the range
-    /// exists, so the whole span counts as read. Returning only the filled count
-    /// would turn a hole into a short read.
+    /// Gaps between extents are **allocated zeros**, not absent bytes. The zero
+    /// fill is written here rather than assumed of the caller: `read_at` is a
+    /// public entry point, and a caller's buffer may hold anything. Relying on a
+    /// zeroed buffer would return stale memory as file content (T4-QA-1).
     fn read_extents(
         &self,
         extents: &[Extent],
         span: std::ops::Range<usize>,
         out: &mut [u8],
     ) -> FsResult<usize> {
+        let len = span.end - span.start;
+        out[..len].fill(0);
         let mut cursor = span.start;
         for extent in extents {
             let extent_start = extent.logical_start as usize;
@@ -523,7 +528,7 @@ impl Fs {
                 .copy_from_slice(&value[source..source + count]);
             cursor = to;
         }
-        Ok(span.end - span.start)
+        Ok(len)
     }
 
     /// Directory listing (delegates to the namespace layer).

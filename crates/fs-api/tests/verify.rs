@@ -135,7 +135,7 @@ fn extents_are_verified_too() {
     assert!(report.is_clean());
     assert_eq!(report.references, 3, "three distinct blocks, three objects");
 
-    let mut probe = vec![0u8; block];
+    let mut probe = vec![0xAAu8; block];
     fs.read_at("/big", 0, &mut probe).expect("read");
     assert!(probe.iter().all(|byte| *byte == 1));
 

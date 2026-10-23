@@ -46,3 +46,9 @@ pub use error::{FsError, FsResult};
 pub use file_system::{Fs, BLOCK_BYTES};
 pub use stats::{ReadStats, Stats};
 pub use verify::{DanglingReference, VerifyReport};
+
+// Re-exported so entry points (the CLI) can name the open mode without taking a
+// dependency on `cas-store`, which is an implementation detail of this layer
+// (`docs/architecture.md` §1: entry points depend on the API, not on what it is
+// built from).
+pub use cas_store::OpenMode;

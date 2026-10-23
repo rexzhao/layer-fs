@@ -115,7 +115,7 @@ fn a_whole_block_read_touches_one_block() {
     fs.write_at("/big", 0, &bytes).expect("write");
 
     let before = fs.read_stats().object_gets;
-    let mut buffer = vec![0u8; BLOCK_BYTES as usize];
+    let mut buffer = vec![0xAAu8; BLOCK_BYTES as usize];
     let read = fs.read_at("/big", BLOCK_BYTES, &mut buffer).expect("read");
     let fetches = fs.read_stats().object_gets - before;
 
@@ -156,7 +156,7 @@ fn a_large_file_round_trips_in_full() {
     fs.create("/big").expect("create");
     fs.write_at("/big", 0, &bytes).expect("write");
 
-    let mut buffer = vec![0u8; bytes.len()];
+    let mut buffer = vec![0xAAu8; bytes.len()];
     assert_eq!(
         fs.read_at("/big", 0, &mut buffer).expect("read"),
         bytes.len()

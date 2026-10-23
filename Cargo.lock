@@ -118,7 +118,6 @@ dependencies = [
 name = "fs-cli"
 version = "0.1.0"
 dependencies = [
- "cas-store",
  "fs-api",
 ]
 

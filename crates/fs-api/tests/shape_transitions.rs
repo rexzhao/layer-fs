@@ -54,9 +54,14 @@ fn pattern(length: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
+/// Reads the whole file into a **poisoned** buffer.
+///
+/// The buffer is deliberately not zeroed: a read must write every byte it
+/// reports, so starting from 0xAA catches a read that leaves stale memory in
+/// place (T4-QA-1). A zeroed buffer here would hide exactly that defect.
 fn read_all(fs: &Fs, path: &str) -> Vec<u8> {
     let size = fs.stat(path).expect("stat").size as usize;
-    let mut buffer = vec![0u8; size];
+    let mut buffer = vec![0xAAu8; size];
     let read = fs.read_at(path, 0, &mut buffer).expect("read");
     buffer.truncate(read);
     buffer

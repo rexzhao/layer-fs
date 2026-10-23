@@ -101,6 +101,20 @@ one command (`rm`) covers both cases the CLI needs. The namespace layer still ke
 - 返回**实际读到的字节数**（短读允许），`offset >= size` 时返回 `0`。
 - 不跨越已写结尾返回填充字节：文件大小 `size` 是硬边界，读 `size` 之后不返回零。
 - `out` 大于剩余长度时只填剩余部分，返回值告诉调用方实际长度。
+- **返回值覆盖的每一个字节都由本次调用写入。** 洞区间（extent 之间的空隙）是**已分配的零**，
+  由 `read_at` 自己写入，**不依赖调用方缓冲区初值**。返回值之外的部分不得触碰。
+
+> **T4-QA-1（必修缺陷，QA 抓到）**：初版 `read_extents` 只写 extent 覆盖的字节，注释却
+> 声称"caller's `out` already starts zeroed"——这是一个**从未对公开 API 调用方声明的内部
+> 前提**。所有在树调用方（测试夹具的 `read_all`、CLI 的 `get`）恰好都用零缓冲，**夹具与生产
+> 调用方共享同一个未声明前提，把缺陷整体掩盖**。QA 用预填 `0xAA` 的缓冲读出洞区间仍是
+> `0xAA`，即陈旧内存被当作文件内容返回。
+>
+> 修复：零填充落在 `read_extents` 内部（`out[..len].fill(0)`），语义由返回值承载。blob 分支
+> 同样改为按 `want` 返回并先把 `out[..want]` 清零。
+>
+> 这与 F-T4-1 同族但更隐蔽：那次是**状态转移**漏测，这次是**前提泄漏**——测试与实现共享了
+> 一个没人写下来的假设。
 
 ### 4.2 `write_at(path, offset, bytes) -> usize`
 
@@ -305,13 +319,33 @@ impl Fs { pub fn read_stats(&self) -> ReadStats; }
 | 边界与去重 | `a_file_at_the_block_boundary_round_trips`、`identical_blocks_share_one_object` |
 | **形态转换（blob ↔ extent）** | `extending_a_blob_file_across_the_boundary_keeps_the_prefix`、`a_blob_extended_by_one_byte_across_the_boundary_keeps_every_byte`、`truncating_a_blob_file_upwards_keeps_the_prefix`、`shrinking_an_extent_file_back_to_a_blob_keeps_the_prefix`、`blob_extent_blob_round_trip_keeps_every_edit`、`crossing_the_boundary_with_a_gap_zero_fills_and_keeps_the_prefix` |
 | 闭包校验（坏引用检出） | `a_dangling_reference_is_reported`、`extents_are_verified_too`、`identical_contents_are_counted_once` |
+| **洞区间与毒化缓冲**（T4-QA-1） | `a_multi_block_hole_reads_as_zeros_not_stale_buffer`、`a_read_inside_a_hole_reports_the_full_length_and_zeroes_it`、`reusing_a_buffer_does_not_leak_between_reads`、`bytes_past_eof_are_not_reported_and_not_claimed`、`a_request_longer_than_the_file_reports_only_the_file_part`、`an_empty_request_writes_nothing` |
 | schema 治理（v1 拒绝、policy 键、DDL） | `a_version_1_store_is_refused`、`a_removed_policy_key_reports_the_qualified_key_name`、`every_recorded_ddl_table_exists` |
 | CLI 全命令 | `tests/cli.rs`（16 个） |
 | 1 GiB 确认 | `a_gi_b_file_answers_a_random_read_from_one_block`（`#[ignore]`，T5 跑） |
 
 具体测试名在提交说明中与每条声明配对列出。
 
-## 13. 下一步
+## 13. 收尾对照清单（每张卡提交前必做）
+
+T3 起引入，T4 两轮 review 各补一条。**三条都是"枚举"而非"抽查"**——它们的共同点是：
+漏掉的东西不会自己冒出来，只能靠系统地列全才发现。
+
+| # | 条目 | 来源 | 为什么抽查不够 |
+| --- | --- | --- | --- |
+| 1 | **枚举所有违反形式** | T3（名称→位置→目录三次漏检） | 只测想到的违规类型，就会漏掉同一规则的其他违规形式 |
+| 2 | **枚举所有状态转移** | T4 F-T4-1（blob↔extent 转换丢数据） | 状态各自正确不代表转移正确；我按"实现了哪些功能"而非"状态之间怎么转移"枚举 |
+| 3 | **读路径测试的输出缓冲区默认毒化** | T4-QA-1（洞读返回陈旧内存） | 测试夹具与生产调用方共享未声明前提时，缺陷被整体掩盖；毒化让任何"没写满"立刻暴露 |
+
+第 3 条的实践含义：任何接收调用方缓冲区的 API，测试**不得**用零初始化缓冲区。用 `0xAA`
+等哨兵填充，并断言"返回值覆盖的每个字节都被写过"。T4 的 `tests/holes.rs` 与
+`tests/shape_transitions.rs::read_all` 已按此执行。
+
+> 注意哨兵**不能**用"缓冲区中是否仍含该字节"来判定——文件内容可以合法包含任意字节值
+> （本卡实测中 `0xAA` 就是合法的文件数据，曾导致一次误报）。判定的正确方式是：哨兵填充 +
+> 与已知正确内容逐字节比对。
+
+## 14. 下一步
 
 - **T5**：规模与性能，复用 `read_stats`；用真实 1 GiB 复测块路径。
 - **P2**：CDC、delta、快照（纯对象图，零表依赖）、GC；Branch CAS 令牌 = 快照根。

@@ -304,3 +304,33 @@ fn the_binary_reports_its_own_errors_with_a_nonzero_exit() {
     assert!(text.contains("/nope"), "{text}");
     let _ = Path::new("");
 }
+
+/// T4-QA-1: a file with a hole must round-trip through the CLI with zeros, and
+/// the hole must come from the file, not from a pre-zeroed buffer.
+#[test]
+fn a_file_with_a_hole_round_trips_as_zeros() {
+    let sandbox = Sandbox::new("hole");
+    sandbox.ok(&["init"]);
+
+    // Build the file through the library so the hole is real.
+    let store = sandbox.store();
+    let fs = fs_api::Fs::open(&store, "default", fs_api::OpenMode::ReadWrite).expect("open");
+    let block = fs_api::BLOCK_BYTES;
+    fs.create("/holed").expect("create");
+    fs.write_at("/holed", 0, b"head").expect("write head");
+    fs.write_at("/holed", block * 2, b"tail")
+        .expect("write tail");
+    drop(fs);
+
+    let destination = sandbox.root.join("out.bin");
+    sandbox.ok(&["get", "/holed", destination.to_str().expect("utf8")]);
+    let bytes = std::fs::read(&destination).expect("read back");
+
+    assert_eq!(bytes.len() as u64, block * 2 + 4);
+    assert_eq!(&bytes[..4], b"head");
+    assert_eq!(&bytes[block as usize * 2..], b"tail");
+    assert!(
+        bytes[4..block as usize * 2].iter().all(|byte| *byte == 0),
+        "the hole must be zeros in the output file"
+    );
+}

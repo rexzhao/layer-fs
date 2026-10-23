@@ -221,7 +221,7 @@ fn a_file_at_the_block_boundary_round_trips() {
     fs.write_at("/f", 0, &bytes).expect("write");
     assert_eq!(fs.stat("/f").expect("stat").size, BLOCK_BYTES);
 
-    let mut buffer = vec![0u8; bytes.len()];
+    let mut buffer = vec![0xAAu8; bytes.len()];
     assert_eq!(fs.read_at("/f", 0, &mut buffer).expect("read"), bytes.len());
     assert_eq!(buffer, bytes);
 }
