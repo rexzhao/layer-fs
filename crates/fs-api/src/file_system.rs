@@ -167,37 +167,63 @@ impl Fs {
         let last = (end - 1) / BLOCK_BYTES;
         let touch_from = first * BLOCK_BYTES;
         let touch_to = ((last + 1) * BLOCK_BYTES).min(new_size);
-        let existing_rows = self
+        // Only the rows this write can reach are fetched, so a one-block write
+        // stays O(1) rows regardless of file size.
+        let mut existing_rows = self
             .namespace
             .extents_in_range(&path, touch_from, touch_to)?;
+        // Shape change: a blob has no extent rows, so its bytes live only in
+        // `content_root`. Turn it into one row covering [0, size) before the
+        // block work, otherwise the bytes are dropped when the transaction
+        // clears `content_root` (F-T4-1). A blob is always under one block, so
+        // this stays bounded.
+        if let Some(root) = content_root {
+            if size > 0 && !existing_rows.iter().any(|row| row.logical_start < size) {
+                existing_rows.insert(
+                    0,
+                    Extent {
+                        logical_start: 0,
+                        length: size,
+                        object_id: root,
+                        source_offset: 0,
+                    },
+                );
+            }
+        }
 
+        // Rebuild every extent row that overlaps the written range: the old rows
+        // are sliced around the blocks being replaced, so an untouched prefix
+        // (whether it came from a blob or from earlier blocks) survives.
         let mut replaced = Vec::new();
         for index in first..=last {
             let block_start = index * BLOCK_BYTES;
             let block_len = BLOCK_BYTES.min(new_size - block_start) as usize;
-            let existing = existing_rows
-                .iter()
-                .find(|extent| extent.logical_start == block_start);
-            let mut block = match existing {
-                Some(extent) => self.read_block(size, extent, block_start, block_len)?,
-                None => vec![0u8; block_len],
-            };
+            let mut block = vec![0u8; block_len];
+            // A block that was inside an existing extent starts from those bytes.
+            let cover = existing_rows.iter().find(|extent| {
+                extent.logical_start < block_start + block_len as u64
+                    && block_start < extent.logical_start + extent.length
+            });
+            if let Some(cover) = cover {
+                block = self.read_block(size, cover, block_start, block_len)?;
+            }
+            let untouched = block.clone();
             let from = (offset as usize).max(block_start as usize);
             let to = ((end as usize).min(block_start as usize + block_len)).max(from);
             block[from - block_start as usize..to - block_start as usize]
                 .copy_from_slice(&bytes[from - offset as usize..to - offset as usize]);
 
-            // An unchanged block keeps its object, so rewriting identical bytes
-            // publishes nothing new.
-            let object_id = match existing {
-                Some(extent)
-                    if extent.length == block_len as u64
-                        && extent.source_offset == 0
-                        && self.block_matches(extent, &block)? =>
-                {
-                    extent.object_id
-                }
-                _ => self.store.put(Role::Bytes, &block)?.oid,
+            // A block whose bytes did not change keeps its existing object, so
+            // rewriting identical bytes publishes nothing new.
+            let reusable = cover.filter(|extent| {
+                extent.logical_start == block_start
+                    && extent.length == block_len as u64
+                    && extent.source_offset == 0
+                    && untouched == block
+            });
+            let object_id = match reusable {
+                Some(extent) => extent.object_id,
+                None => self.store.put(Role::Bytes, &block)?.oid,
             };
             replaced.push(Extent {
                 logical_start: block_start,
@@ -207,10 +233,29 @@ impl Fs {
             });
         }
 
+        // Rows that end at or before the rewritten range are carried over as they
+        // are. That is what preserves an untouched prefix — including a blob's
+        // single row — across the shape change (F-T4-1). A row that *straddles*
+        // `touch_from` is clipped to the part before it, so the rewritten blocks
+        // take over from there without losing the bytes in front.
+        for extent in &existing_rows {
+            let extent_end = extent.logical_start + extent.length;
+            if extent_end <= touch_from {
+                replaced.push(extent.clone());
+            } else if extent.logical_start < touch_from {
+                replaced.push(Extent {
+                    logical_start: extent.logical_start,
+                    length: touch_from - extent.logical_start,
+                    object_id: extent.object_id,
+                    source_offset: extent.source_offset,
+                });
+            }
+        }
+
         replaced.sort_by_key(|extent| extent.logical_start);
-        // Only the rewritten blocks are written back; every other extent row is
-        // left in place, so a one-block write touches a handful of rows rather
-        // than the whole file's extent list.
+        // Rows from `touch_from` upward are replaced by the rewritten blocks;
+        // rows above `touch_to` are out of the write's reach and stay put, which
+        // keeps a one-block write at O(1) rows.
         self.namespace
             .replace_extents(&path, "write_at", new_size, None, &replaced, None)?;
         Ok(bytes.len())
@@ -250,7 +295,29 @@ impl Fs {
         let boundary = size / BLOCK_BYTES;
         let boundary_start = boundary * BLOCK_BYTES;
         let block_len = (size - boundary_start) as usize;
-        let existing = self.extent_covering(&state, boundary_start);
+        // A blob keeps its bytes in `content_root` with no extent rows, so
+        // growing one past the block size would read zeros and then clear
+        // `content_root` — losing every earlier byte (F-T4-1's sibling). Treat
+        // the blob as one row covering [0, old_size) so the boundary block sees
+        // real bytes.
+        let mut rows = state.extents.clone();
+        if let Some(root) = state.content_root {
+            if state.size > 0 {
+                rows.insert(
+                    0,
+                    Extent {
+                        logical_start: 0,
+                        length: state.size,
+                        object_id: root,
+                        source_offset: 0,
+                    },
+                );
+            }
+        }
+        let existing = rows.iter().find(|extent| {
+            extent.logical_start <= boundary_start
+                && boundary_start < extent.logical_start + extent.length
+        });
         let block = match existing {
             Some(extent) => self.read_block(state.size, extent, boundary_start, block_len)?,
             None => vec![0u8; block_len],
@@ -266,12 +333,29 @@ impl Fs {
             }
             _ => self.store.put(Role::Bytes, &block)?.oid,
         };
-        let replaced = [Extent {
+        // Everything below the boundary block is unchanged, so its rows are
+        // re-inserted as they are (a blob's single row gets clipped to the part
+        // in front of the boundary).
+        let mut replaced = vec![Extent {
             logical_start: boundary_start,
             length: block_len as u64,
             object_id,
             source_offset: 0,
         }];
+        for extent in &rows {
+            let extent_end = extent.logical_start + extent.length;
+            if extent_end <= boundary_start {
+                replaced.push(extent.clone());
+            } else if extent.logical_start < boundary_start {
+                replaced.push(Extent {
+                    logical_start: extent.logical_start,
+                    length: boundary_start - extent.logical_start,
+                    object_id: extent.object_id,
+                    source_offset: extent.source_offset,
+                });
+            }
+        }
+        replaced.sort_by_key(|extent| extent.logical_start);
         self.namespace.replace_extents(
             &path,
             "truncate",
@@ -296,13 +380,6 @@ impl Fs {
         let path = NsPath::parse(path)?;
         self.namespace.content_state(&path)?;
         Ok(())
-    }
-
-    /// The extent row that covers `logical`, if any.
-    fn extent_covering<'a>(&self, state: &'a ContentState, logical: u64) -> Option<&'a Extent> {
-        state.extents.iter().find(|extent| {
-            extent.logical_start <= logical && logical < extent.logical_start + extent.length
-        })
     }
 
     /// Whether an extent's object already holds exactly `block`.
@@ -402,13 +479,17 @@ impl Fs {
     ///
     /// Only the extents that intersect `span` are fetched, which is what bounds
     /// the amplification: a 4 KiB read touches at most two 64 KiB blocks.
+    ///
+    /// Gaps between extents are **allocated zeros**, not absent bytes: the
+    /// caller's `out` already starts zeroed and the file's `size` says the range
+    /// exists, so the whole span counts as read. Returning only the filled count
+    /// would turn a hole into a short read.
     fn read_extents(
         &self,
         extents: &[Extent],
         span: std::ops::Range<usize>,
         out: &mut [u8],
     ) -> FsResult<usize> {
-        let mut filled = 0usize;
         let mut cursor = span.start;
         for extent in extents {
             let extent_start = extent.logical_start as usize;
@@ -440,10 +521,9 @@ impl Fs {
             }
             out[from - span.start..from - span.start + count]
                 .copy_from_slice(&value[source..source + count]);
-            filled += count;
             cursor = to;
         }
-        Ok(filled)
+        Ok(span.end - span.start)
     }
 
     /// Directory listing (delegates to the namespace layer).

@@ -161,11 +161,27 @@ CREATE INDEX file_extent_by_file ON file_extent (namespace, file_id, logical_sta
 块尺寸冻结进 `namespace_policy`（键 `block_bytes`），打开时校验——与 CDC profile 冻结参数
 是同一先例。
 
-### 5.3 大小文件的边界
+### 5.3 大小文件的边界与形态转换
 
 `size` 恰好 64 KiB 时用块路径还是整文件路径 **由 §5.4 的写入过程决定，不由读取猜测**：
 读路径先看 `content_root` 是否为空、再看有没有 extent 行，两者互斥。这避免了"按 size 推断
 编码方式"在 `truncate` 后失配。
+
+**形态转换是独立的一类状态转移，必须显式处理。** 两种形态各自正确不代表转换正确：
+
+| 转换 | 触发 | 处理 |
+| --- | --- | --- |
+| blob → extent | 写入或 `truncate` 使 `size ≥ 64 KiB` | 把 blob 物化为 `logical_start=0` 的一行，再走块逻辑；覆盖范围内被块替代，`touch_from` 之前的字节由该行承载 |
+| extent → blob | 收缩到 `size < 64 KiB` | 读回整文件，写成单个对象，清空 extent 行 |
+
+> **F-T4-1（关键数据丢失，review 实测抓到）**：初版的块路径用 `shape_of` 取到
+> `content_root` 后**从未使用**它——`existing_rows` 只查 `file_extent` 表，而 blob 文件没有
+> extent 行。于是每个受影响的块从全零起步，`replace_extents` 又把 `content_root` 置空，
+> **原有内容静默蒸发**。`truncate` 向上扩展有同族缺陷（边界块从零开始）。
+>
+> 根因是状态机维度的漏测：两种形态各自的路径都测了（§12 的 blob 与 extent 用例），
+> **转换**没测。这与"名字→位置→目录"的空间维度漏测同构。修复补了 6 个转换测试，并把
+> "枚举所有状态转移"加入收尾对照清单。
 
 ### 5.4 写入路径定序（A9，Root 审查 Q3）
 
@@ -272,7 +288,8 @@ impl Fs { pub fn read_stats(&self) -> ReadStats; }
 4. **`flush` no-op** 可能让从 POSIX 语义来的调用方误以为有持久化保证；文档已明示，但这是
    真实的语义陷阱。
 5. **`block_bytes` 冻结但无迁移**：改块尺寸等同于换格式，需要新版本。
-6. **无稀疏表示**：`truncate` 扩大与跨越 EOF 的写都会实写零块，大空洞浪费空间。
+6. **无稀疏表示**：`truncate` 扩大与跨越 EOF 的写都会实写零块，大空洞浪费空间。读路径把
+   extent 之间的空隙视为**已分配的零**并返回完整长度（不是短读），与 `size` 语义一致。
 
 ## 12. 测试清单
 
@@ -286,6 +303,7 @@ impl Fs { pub fn read_stats(&self) -> ReadStats; }
 | 大文件有界 read_at（放大计数） | `large_file_read_is_bounded`、`a_read_straddling_a_boundary_fetches_two_blocks`、`reading_one_byte_from_either_end_fetches_one_block` |
 | 写路径有界（O(1)/块） | `per_block_write_cost_does_not_grow_with_file_size` |
 | 边界与去重 | `a_file_at_the_block_boundary_round_trips`、`identical_blocks_share_one_object` |
+| **形态转换（blob ↔ extent）** | `extending_a_blob_file_across_the_boundary_keeps_the_prefix`、`a_blob_extended_by_one_byte_across_the_boundary_keeps_every_byte`、`truncating_a_blob_file_upwards_keeps_the_prefix`、`shrinking_an_extent_file_back_to_a_blob_keeps_the_prefix`、`blob_extent_blob_round_trip_keeps_every_edit`、`crossing_the_boundary_with_a_gap_zero_fills_and_keeps_the_prefix` |
 | 闭包校验（坏引用检出） | `a_dangling_reference_is_reported`、`extents_are_verified_too`、`identical_contents_are_counted_once` |
 | schema 治理（v1 拒绝、policy 键、DDL） | `a_version_1_store_is_refused`、`a_removed_policy_key_reports_the_qualified_key_name`、`every_recorded_ddl_table_exists` |
 | CLI 全命令 | `tests/cli.rs`（16 个） |
