@@ -51,11 +51,17 @@ pub struct OverlayOptions {
     pub base_root: cas_core::ObjectId,
     /// The snapshot profile the base was written under.
     pub profile: Profile,
+    /// The serial scope this workspace belongs to (ADR-006 §6).
+    ///
+    /// Every workspace in one lineage shares it, so their serials cannot collide. A
+    /// reopened file must be handed the same value it was created with; a mismatch is a
+    /// wiring error, not a recoverable state.
+    pub scope_id: [u8; 32],
     /// The serial range this workspace may allocate from, `[first, end)`.
     ///
-    /// Reserving it is fs-workspace's job (ADR-006 §6, `scope_allocator`); P2a-4 takes
-    /// it as a parameter so the backend can be exercised without the workspace tables,
-    /// and reports exhaustion rather than silently colliding with the base.
+    /// Reserving it is fs-workspace's job (ADR-006 §6, `scope_allocator`). `first` is only
+    /// used when the file is created; `end` is also applied when it extends an existing
+    /// reservation, which is how a long-lived workspace gets more serials.
     pub serial_first: u64,
     /// One past the last serial this workspace may allocate.
     pub serial_end: u64,
@@ -151,13 +157,12 @@ impl OverlayStore {
             for statement in schema::DDL {
                 connection.execute(statement, [])?;
             }
-            let scope = new_scope_id();
             for (key, value) in [
                 ("schema_version", schema::SCHEMA_VERSION.to_string()),
                 ("ddl", ddl_text()),
                 ("workspace_id", String::new()),
                 ("base_root", options.base_root.to_string()),
-                ("scope_id", hex(&scope)),
+                ("scope_id", hex(&options.scope_id)),
                 ("serial_next", options.serial_first.to_string()),
                 ("serial_end", options.serial_end.to_string()),
                 ("pending_root", String::new()),
@@ -169,21 +174,45 @@ impl OverlayStore {
             }
         } else {
             validate(&connection)?;
-            let stored_base: String = meta(&connection, "base_root")?;
-            let stored_profile_matches = stored_base == options.base_root.to_string();
-            if !stored_profile_matches {
+            let stored_scope = meta(&connection, "scope_id")?;
+            if stored_scope != hex(&options.scope_id) {
                 return Err(OverlayError::SchemaMismatch {
-                    expected: format!("base_root {}", options.base_root),
-                    found: stored_base,
+                    expected: format!("scope_id {}", hex(&options.scope_id)),
+                    found: stored_scope,
                 });
             }
+            let stored_base = meta(&connection, "base_root")?;
+            if stored_base != options.base_root.to_string() {
+                // The one recoverable disagreement: the main database has already adopted
+                // this exact root and step 4 has not run yet. `pending_root` is the record
+                // of it (ADR-006 §9.3); anything else is a wiring error.
+                let pending = meta(&connection, "pending_root")?;
+                if pending != options.base_root.to_string() {
+                    return Err(OverlayError::SchemaMismatch {
+                        expected: format!("base_root {}", options.base_root),
+                        found: stored_base,
+                    });
+                }
+            }
+            // A reopening workspace brings a fresh reservation; keep the larger range so
+            // neither an earlier open nor this one loses serials it was given.
+            let stored_end = meta(&connection, "serial_end")?.parse::<u64>().unwrap_or(0);
+            if options.serial_end > stored_end {
+                connection.execute(
+                    "UPDATE ov_meta SET value = ?1 WHERE key = 'serial_end'",
+                    [options.serial_end.to_string()],
+                )?;
+            }
         }
+        // The file is the authority on its own base. fs-workspace's row can be one step
+        // ahead of it during recovery, and `adopt_base` is what closes that gap.
+        let (scope, base) = (
+            meta(&connection, "scope_id")?,
+            meta(&connection, "base_root")?,
+        );
         drop(connection);
-        self.scope_id = {
-            let connection = self.lock();
-            let text = meta(&connection, "scope_id")?;
-            parse_scope(&text)?
-        };
+        self.scope_id = parse_scope(&scope)?;
+        self.base.set_root(parse_base(&base)?);
         Ok(())
     }
 }
@@ -221,7 +250,7 @@ fn validate(connection: &Connection) -> OverlayResult<()> {
     Ok(())
 }
 
-fn meta(connection: &Connection, key: &str) -> OverlayResult<String> {
+pub(crate) fn meta(connection: &Connection, key: &str) -> OverlayResult<String> {
     connection
         .query_row("SELECT value FROM ov_meta WHERE key = ?1", [key], |row| {
             row.get(0)
@@ -239,22 +268,6 @@ fn ddl_text() -> String {
     schema::DDL.join(";\n")
 }
 
-fn new_scope_id() -> [u8; 32] {
-    // A workspace's serials must not collide with any other workspace's, and the base's
-    // serials belong to the scope the snapshot was taken in. A random value is enough
-    // here because P2a-4 does not yet allocate against the shared allocator (P2a-6).
-    let mut bytes = [0u8; 32];
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    let pid = u128::from(std::process::id());
-    let mixed = nanos ^ (pid << 64) ^ (std::process::id() as u128 * 0x9E37_79B9_7F4A_7C15);
-    bytes[..16].copy_from_slice(&mixed.to_le_bytes());
-    bytes[16..].copy_from_slice(&mixed.rotate_left(64).to_le_bytes());
-    bytes
-}
-
 fn hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -262,6 +275,15 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(text, "{byte:02x}");
     }
     text
+}
+
+/// Parses the stored base root.
+fn parse_base(text: &str) -> OverlayResult<cas_core::ObjectId> {
+    text.parse::<cas_core::ObjectId>()
+        .map_err(|error| OverlayError::InvalidRecord {
+            field: "ov_meta.base_root",
+            detail: error.to_string(),
+        })
 }
 
 fn parse_scope(text: &str) -> OverlayResult<[u8; 32]> {

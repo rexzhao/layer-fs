@@ -1,0 +1,259 @@
+//! A workspace handle: identity, the tree it exposes, and the overlay it edits
+//! (ADR-006 §3, §9.3).
+//!
+//! The handle is a **view**, not a copy: it holds one exclusive overlay file and the
+//! snapshot the workspace currently starts from. Everything that makes changes durable —
+//! `flush`, `snapshot`, `commit` — lives here or in [`crate::publish`].
+
+use std::fmt;
+use std::sync::Arc;
+
+use cas_core::ObjectId;
+use cas_store::Store;
+use fs_overlay::OverlayStore;
+use fs_snapshot::Profile;
+
+use crate::error::{WorkspaceError, WorkspaceResult};
+use crate::ids::parse_oid;
+use crate::repo::Repo;
+use crate::tree::WorkspaceStore;
+
+/// One workspace's mutable view of a snapshot.
+pub struct Workspace {
+    pub(crate) name: String,
+    pub(crate) id: String,
+    pub(crate) branch: String,
+    pub(crate) base_commit: String,
+    pub(crate) base_root: ObjectId,
+    pub(crate) overlay: Arc<OverlayStore>,
+    pub(crate) repo: Arc<Repo>,
+    pub(crate) store: std::sync::Mutex<Store>,
+    pub(crate) profile: Profile,
+}
+
+impl fmt::Debug for Workspace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Workspace")
+            .field("name", &self.name)
+            .field("id", &self.id)
+            .field("branch", &self.branch)
+            .field("base_commit", &self.base_commit)
+            .field("base_root", &self.base_root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Workspace {
+    pub(crate) fn open(
+        name: String,
+        id: String,
+        branch: String,
+        base_commit: String,
+        base_root: ObjectId,
+        overlay: Arc<OverlayStore>,
+        repo: Arc<Repo>,
+    ) -> WorkspaceResult<Self> {
+        // A second handle on the store, for publishing objects during materialisation. The
+        // overlay owns its own; keeping them separate is what stops a `put` from happening
+        // while the overlay holds a read scope (TX4).
+        let store = Store::open(repo.store_dir(), cas_store::OpenMode::ReadWrite)?;
+        Ok(Self {
+            name,
+            id,
+            branch,
+            base_commit,
+            base_root,
+            overlay,
+            repo,
+            store: std::sync::Mutex::new(store),
+            profile: Profile::V1,
+        })
+    }
+
+    /// The workspace's name in the main database.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The workspace's directory id, which outlives the name (ADR-006 §4).
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The branch this workspace publishes to.
+    #[must_use]
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// The commit this workspace's changes are based on (ADR-006 §10.3's expectation).
+    #[must_use]
+    pub fn base_commit(&self) -> &str {
+        &self.base_commit
+    }
+
+    /// The snapshot the view is composed over.
+    ///
+    /// Normally `root(base_commit)`; after [`Workspace::restore`] or [`Workspace::snapshot`]
+    /// it can be a different tree without the base commit changing.
+    #[must_use]
+    pub fn base_root(&self) -> ObjectId {
+        self.base_root
+    }
+
+    /// The overlay file's path.
+    #[must_use]
+    pub fn overlay_path(&self) -> &std::path::Path {
+        self.overlay.path()
+    }
+
+    /// A handle that drives `fs_namespace::Rules` against this workspace.
+    #[must_use]
+    pub fn store(&self) -> WorkspaceStore {
+        WorkspaceStore::new(Arc::clone(&self.overlay), Arc::clone(&self.repo))
+    }
+
+    /// The overlay behind this workspace.
+    #[must_use]
+    pub fn overlay(&self) -> &OverlayStore {
+        &self.overlay
+    }
+
+    /// Makes every change so far durable (ADR-006 §8).
+    ///
+    /// # Errors
+    ///
+    /// Overlay failures.
+    pub fn flush(&self) -> WorkspaceResult<()> {
+        Ok(self.overlay.flush()?)
+    }
+
+    /// Whether the workspace has changes the base does not have.
+    ///
+    /// # Errors
+    ///
+    /// Overlay failures.
+    pub fn is_dirty(&self) -> WorkspaceResult<bool> {
+        Ok(self.overlay.is_dirty()?)
+    }
+
+    /// A consistent summary of the workspace's state.
+    ///
+    /// # Errors
+    ///
+    /// Overlay failures.
+    pub fn status(&self) -> WorkspaceResult<WorkspaceStatus> {
+        Ok(WorkspaceStatus {
+            name: self.name.clone(),
+            id: self.id.clone(),
+            branch: self.branch.clone(),
+            base_commit: self.base_commit.clone(),
+            base_root: self.base_root.to_string(),
+            dirty: self.is_dirty()?,
+        })
+    }
+
+    /// Replaces the view's base with `commit`'s tree, leaving `base_commit` alone
+    /// (ADR-006 §10.2).
+    ///
+    /// A later `commit` therefore records "put the content back the way this commit had
+    /// it", which is what makes restore different from `reset`: history grows.
+    ///
+    /// `discard` allows replacing a workspace that still has uncommitted changes.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::WorkspaceDirty`] when the overlay is not empty and `discard` is
+    /// false, [`WorkspaceError::NotFound`] when the commit is unknown.
+    pub fn restore(&mut self, commit: &str, discard: bool) -> WorkspaceResult<()> {
+        let root = self.repo.commit_root(commit)?;
+        if !discard && self.is_dirty()? {
+            return Err(WorkspaceError::WorkspaceDirty);
+        }
+        // The same three-step shape as a publication: record the intent, move the main
+        // database (the publication point), then adopt. A crash at any point leaves the
+        // §9.3 table with an unambiguous answer.
+        self.overlay.set_pending_root(Some(root))?;
+        if let Err(error) = self.repo.set_workspace_base_root(&self.name, root) {
+            let _ = self.overlay.set_pending_root(None);
+            return Err(error);
+        }
+        self.overlay.adopt_base(root)?;
+        self.base_root = root;
+        Ok(())
+    }
+
+    /// Re-points this handle and the main database at `branch` (ADR-006 §10.3, 出路 1).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::BranchMoved`] when the branch's head is not this workspace's base
+    /// commit — rebinding is only allowed onto an unchanged branch, because merging is not
+    /// part of P2.
+    pub fn rebind(&mut self, branch: &str) -> WorkspaceResult<()> {
+        self.repo.workspace_rebind(&self.name, branch)?;
+        self.branch = branch.to_owned();
+        Ok(())
+    }
+
+    /// Closes the handle.
+    ///
+    /// The overlay file stays; the workspace can be opened again. If an [`WorkspaceStore`]
+    /// clone is still alive the SQLite connection stays open until that is dropped too.
+    ///
+    /// # Errors
+    ///
+    /// Never in this build; the signature leaves room for a final checkpoint.
+    pub fn close(self) -> WorkspaceResult<()> {
+        Ok(())
+    }
+
+    /// The commit id a publication must have as its parent.
+    pub(crate) fn parent_commit(&self) -> ObjectId {
+        parse_oid(&self.base_commit).expect("the stored base commit is a commit id")
+    }
+
+    /// Records the outcome of a publication in the main database and the handle.
+    pub(crate) fn adopt(&mut self, root: ObjectId, commit: Option<String>) -> WorkspaceResult<()> {
+        self.overlay.adopt_base(root)?;
+        self.base_root = root;
+        if let Some(commit) = commit {
+            self.base_commit = commit;
+        }
+        Ok(())
+    }
+}
+
+/// What `status` reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceStatus {
+    /// The workspace's name.
+    pub name: String,
+    /// Its directory id.
+    pub id: String,
+    /// The branch it publishes to.
+    pub branch: String,
+    /// The commit its changes are based on.
+    pub base_commit: String,
+    /// The snapshot its view is composed over.
+    pub base_root: String,
+    /// Whether it has changes the base does not have.
+    pub dirty: bool,
+}
+
+/// One row of `workspace list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSummary {
+    /// The workspace's name.
+    pub name: String,
+    /// Its directory id.
+    pub id: String,
+    /// The branch it publishes to.
+    pub branch: String,
+    /// The commit its changes are based on.
+    pub base_commit: String,
+    /// `creating` or `ready`.
+    pub state: String,
+}

@@ -21,7 +21,7 @@ use crate::error::OverlayResult;
 #[derive(Debug)]
 pub(crate) struct BaseLayer {
     store: Mutex<Store>,
-    root: ObjectId,
+    root: Mutex<ObjectId>,
     profile: Profile,
 }
 
@@ -29,19 +29,35 @@ impl BaseLayer {
     pub(crate) fn new(store: Store, root: ObjectId, profile: Profile) -> Self {
         Self {
             store: Mutex::new(store),
-            root,
+            root: Mutex::new(root),
             profile,
         }
     }
 
     pub(crate) fn root(&self) -> ObjectId {
-        self.root
+        *self
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Moves the base to a new snapshot (ADR-006 §9.1 step 4).
+    ///
+    /// Only `OverlayStore::adopt_base` calls this, and only after the overlay rows that
+    /// referred to the old base are gone — otherwise a read could see one workspace's
+    /// entries applied to a different snapshot.
+    pub(crate) fn set_root(&self, root: ObjectId) {
+        *self
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = root;
     }
 
     /// The base inode for `serial`, if the base has one.
     pub(crate) fn inode(&self, serial: u64) -> OverlayResult<Option<InodeRecord>> {
+        let root = self.root();
         let store = self.lock();
-        let reader = SnapshotReader::open(&store, self.root, self.profile)?;
+        let reader = SnapshotReader::open(&store, root, self.profile)?;
         Ok(reader.inode(serial)?)
     }
 
@@ -55,8 +71,9 @@ impl BaseLayer {
 
     /// Looks a name up in a base directory.
     pub(crate) fn lookup(&self, dir: &InodeRecord, name: &[u8]) -> OverlayResult<Option<u64>> {
+        let root = self.root();
         let store = self.lock();
-        let reader = SnapshotReader::open(&store, self.root, self.profile)?;
+        let reader = SnapshotReader::open(&store, root, self.profile)?;
         Ok(reader.lookup(dir, name)?)
     }
 
@@ -67,8 +84,9 @@ impl BaseLayer {
         after: Option<&[u8]>,
         limit: usize,
     ) -> OverlayResult<Vec<(Vec<u8>, u64)>> {
+        let root = self.root();
         let store = self.lock();
-        let reader = SnapshotReader::open(&store, self.root, self.profile)?;
+        let reader = SnapshotReader::open(&store, root, self.profile)?;
         let entries = reader.read_dir(dir, after, limit)?;
         Ok(entries
             .into_iter()
@@ -115,8 +133,9 @@ impl BaseLayer {
                 Ok(out)
             }
             fs_snapshot::Content::Extents(_) => {
+                let root = self.root();
                 let store = self.lock();
-                let reader = SnapshotReader::open(&store, self.root, self.profile)?;
+                let reader = SnapshotReader::open(&store, root, self.profile)?;
                 let extents = reader.extents_in_range(file, offset, offset + want as u64)?;
                 for extent in extents {
                     let extent_start = extent.logical_start;

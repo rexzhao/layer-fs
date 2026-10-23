@@ -103,6 +103,7 @@ fn open_overlay(dir: &Path, base_root: ObjectId) -> OverlayStore {
         &OverlayOptions {
             base_root,
             profile: Profile::V1,
+            scope_id: [1u8; 32],
             serial_first: 1,
             serial_end: 1 << 20,
         },

@@ -106,6 +106,7 @@ impl Fixture {
             &OverlayOptions {
                 base_root,
                 profile: Profile::V1,
+                scope_id: [1u8; 32],
                 serial_first: 1,
                 serial_end: 1 << 20,
             },
@@ -299,6 +300,54 @@ fn k6_truncate_to_a_page_boundary_creates_no_page() {
     );
 }
 
+/// **K6 regression** — shrinking to a size inside a page keeps that page's surviving bytes.
+///
+/// The page containing the new end starts *before* it, so a truncate that dropped pages
+/// from `new_size / page_bytes` down destroyed data it was supposed to keep: `truncate(5)`
+/// on a ten-byte file left five zero bytes.
+#[test]
+fn k6_truncate_inside_a_page_keeps_the_surviving_bytes() {
+    let fixture = Fixture::new("k6-inside");
+    fixture.store().create_file(&p("/f")).expect("create");
+    fixture
+        .store()
+        .write_at(&p("/f"), 0, b"0123456789")
+        .expect("write");
+    assert_eq!(
+        fixture
+            .store()
+            .read_at(&p("/f"), 0, 10)
+            .expect("read before"),
+        b"0123456789",
+        "the write itself must be readable"
+    );
+    assert_eq!(
+        fixture
+            .store()
+            .content_state(&p("/f"))
+            .expect("state")
+            .pages,
+        1
+    );
+    fixture.store().truncate(&p("/f"), 5).expect("truncate");
+    assert_eq!(
+        fixture
+            .store()
+            .content_state(&p("/f"))
+            .expect("state")
+            .pages,
+        1
+    );
+    assert_eq!(
+        fixture.store().read_at(&p("/f"), 0, 5).expect("read"),
+        b"01234",
+        "the surviving prefix must still be there"
+    );
+    assert_eq!(
+        fixture.store().content_state(&p("/f")).expect("state").size,
+        5
+    );
+}
 // ---------------------------------------------------------------------- K3
 
 /// **K3** — concurrent writes to different pages of one file both survive.
@@ -446,6 +495,7 @@ fn a_base_file_reads_through_the_overlay() {
         &OverlayOptions {
             base_root,
             profile,
+            scope_id: [1u8; 32],
             serial_first: 2,
             serial_end: 1024,
         },
@@ -476,6 +526,7 @@ fn flush_makes_changes_survive_a_reopen() {
     let options = OverlayOptions {
         base_root,
         profile: Profile::V1,
+        scope_id: [1u8; 32],
         serial_first: 1,
         serial_end: 1 << 20,
     };
@@ -551,6 +602,7 @@ fn a_second_handle_is_refused() {
     let options = OverlayOptions {
         base_root,
         profile: Profile::V1,
+        scope_id: [1u8; 32],
         serial_first: 1,
         serial_end: 1024,
     };
@@ -599,6 +651,7 @@ fn ten_workspaces_over_one_base_stay_isolated() {
             &OverlayOptions {
                 base_root,
                 profile: Profile::V1,
+                scope_id: [1u8; 32],
                 serial_first: 1,
                 serial_end: 1 << 20,
             },
@@ -658,6 +711,7 @@ fn ten_workspaces_over_one_base_stay_isolated() {
             &OverlayOptions {
                 base_root,
                 profile: Profile::V1,
+                scope_id: [1u8; 32],
                 serial_first: 1,
                 serial_end: 1 << 20,
             },

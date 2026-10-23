@@ -42,6 +42,7 @@
 mod base;
 mod content;
 mod error;
+mod publish;
 pub mod schema;
 mod store;
 mod store_impl;

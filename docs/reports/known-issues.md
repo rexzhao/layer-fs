@@ -174,3 +174,75 @@ T5 用互异块重测：**192 秒，~5 MiB/s**，相差 6 倍。
 **与 B1-1 的区别**（manager 裁决不修 B1-1）：B1-1 是**丢失写入**（后写覆盖先写的块），
 属语义选择；B1-3 是**数据完整性**（孤儿行被 `verify` 报损坏），表里出现自相矛盾的状态。
 前者可以等 overlay 后端结构性消除，后者会让 `verify` 永远报错，必须修。
+
+---
+
+## KI-6：`truncate` 到非页对齐尺寸会丢掉存活的字节（**P2a-6 已修复**）
+
+**发现于**：P2a-6，写 workspace 的测试辅助函数时（`write` 后 `truncate` 到更短的内容，
+读回全零）。
+
+**复现**：写 10 字节，然后 `truncate` 到 5：
+
+```rust
+overlay.write_at("/f", 0, b"0123456789")?;
+overlay.truncate("/f", 5)?;
+assert_eq!(overlay.read_at("/f", 0, 5)?, b"01234");   // 实际：[0,0,0,0,0]
+```
+
+**成因**：`truncate_impl` 用 `boundary = new_size / PAGE_BYTES` 作为"从此页往后删除"的起点。
+向下取整对**页对齐**尺寸是对的（那一页正好从新结尾开始），对**非对齐**尺寸是错的：承载最后
+存活字节的那页从 `new_size` 之前开始，被一起删掉了。
+
+**影响**：数据丢失，且 `size` 仍是 5，所以读回是静默的零，`verify` 也看不出来。
+
+**为什么 P2a-4 没发现**：当时只有"truncate 到页边界"的 K6 测试（`new_size` 为 4096 的倍数），
+恰好落在向下取整也正确的那一侧。
+
+**修复**：`boundary = new_size.div_ceil(PAGE_BYTES)`（向上取整：只删真正从新结尾**或之后**开始的页）。
+
+**钉住它的测试**：`crates/fs-overlay/tests/contract.rs::k6_truncate_inside_a_page_keeps_the_surviving_bytes`
+（断言截断后 5 字节内容仍在，且页数不变）。
+
+---
+
+## KI-7：ADR-006 §11.1 与 ADR-002 §8 对 cas-store 连接的 `busy_timeout` 直接冲突
+
+**发现于**：P2a-6，写"主库锁被持有 > 5 s"的 Busy 测试时。第一次用 `commit` 触发，得到的是
+`WorkspaceError::Store(StoreError::Busy)` 而不是 `WorkspaceError::Busy`——因为物化阶段先碰到
+cas-store 的连接。
+
+**冲突**：
+
+| 来源 | 要求 |
+| --- | --- |
+| ADR-006 §11.1（F2 修订） | 主库上的**两条**连接（cas-store 一条、fs-workspace 一条）`busy_timeout = 5000` |
+| ADR-002 §8 + `crates/cas-store/tests/crash.rs::a_cross_process_writer_reports_busy_without_retrying` | cas-store 连接 `busy_timeout = 0`，竞争立即暴露 |
+
+**后果**：ADR-006 §11.1 自己列出的验收测试（"两个 workspace 并发 snapshot 各 1000 个文件，
+均成功"）在 cas-store 保持 0 ms 的情况下**不可能通过**——大快照在 `put` 阶段就会随机 Busy。
+
+**为什么 P2a-6 不修**：改 cas-store 的 pragma 会让上面那个已合入的测试失败，属于 ADR 级裁决，
+不是 worker 能单方面决定的。本卡只保证 **fs-workspace 自己的连接**有界等待，并有测试钉住
+（`a_held_main_database_lock_ends_in_a_typed_busy`，走纯主库写路径）。
+
+**建议**：要么 ADR-002 §8 给主库连接开同样的例外（并同步改那个测试的断言），要么 §11.1 的
+并发 snapshot 验收测试改为接受"重试/重排"策略。需要 manager/architect 裁决。
+
+---
+
+## KI-8：物化器未复用 base 的目录树 oid 与 extent（已知未优化）
+
+**现象**：每次 `snapshot` / `commit` 都**全量**遍历并从字节重新编码：未变的目录重新编码
+（结果 oid 相同，靠内容寻址不多写对象），未变的文件块重新读取并重新 `put`
+（`AlreadyPresent`，同样不多写）。正确性不受影响，成本是 `O(可达 inode 数)` 的读 + 编码。
+
+**为什么这样交付**：ADR-006 §9.2 明确把"未变目录复用 base oid / 未变块复用 base extent"
+写成优化；P2a-6 任务卡给了预算条款（"物化器优化可标'已知未优化'，如实报告"）。
+本卡按此标注，不宣称已实现。
+
+**已做的**：内容按 64 KiB 块**逐块**读取（峰值内存一块，不是一个文件）；两趟分离使遍历在
+一个读作用域内完成、内容读取不重入（TX4）。
+
+**去向**：P2a-8 度量（1k/10k/100k 文件、变更 1 文件/1%/100% 的 snapshot 耗时与新增对象数），
+再决定是否需要增量物化。

@@ -260,10 +260,12 @@ pub(crate) fn truncate_impl(
     new_size: u64,
 ) -> OverlayResult<()> {
     let (_old_size, base_limit) = geometry(connection, base, id)?;
-    let boundary = new_size / schema::PAGE_BYTES;
-    // Drop every page that starts at or past the new end. When `new_size` lands exactly
-    // on a boundary the page at `boundary` starts at the end, so it goes too — that is
-    // why no partial page is ever written for an aligned truncate (K6).
+    // Drop every page that *starts* at or past the new end. Rounding up, not down: for a
+    // size that is not a multiple of the page size, the page containing the last surviving
+    // byte starts before the new size and must be kept; only its bytes past the end become
+    // unreadable, through the size check in the read path. Rounding down deleted that page
+    // and with it every byte the file still had.
+    let boundary = new_size.div_ceil(schema::PAGE_BYTES);
     connection.execute(
         "DELETE FROM ov_page WHERE serial = ?1 AND page_index >= ?2",
         (id.serial() as i64, boundary as i64),

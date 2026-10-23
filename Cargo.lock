@@ -153,6 +153,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-workspace"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cas-core",
+ "cas-store",
+ "fs-namespace",
+ "fs-overlay",
+ "fs-snapshot",
+ "rusqlite",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
