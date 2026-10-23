@@ -384,3 +384,206 @@ fn trailing_bytes_in_a_root_are_malformed() {
     let error = expect_error(SnapshotReader::open(&store, oid, profile));
     assert!(matches!(error, SnapshotError::Malformed { .. }), "{error}");
 }
+
+// ============================================================================
+// P2a-1-QA-1 — multi-page directories (regression tests for QA's report)
+//
+// `lookup` used to `fetch(pointer, Role::DirectoryLeaf, …)` before looking at the
+// role, so a branch page was rejected by the fetch and the `DirectoryBranch` match
+// arm was unreachable dead code. Every earlier test used a directory that fit in one
+// page, which is why the whole suite was green.
+//
+// The tests below force a multi-page directory and check both navigation and the
+// reader-side bounds QA asked for.
+// ============================================================================
+
+/// A directory with enough entries to need branch pages, and a lookup for an entry
+/// that can only be found by descending.
+fn build_large_directory(store: &Store, profile: &Profile) -> (ObjectId, Vec<DirEntry>) {
+    let mut sink = StoreSink { store };
+    let entries: Vec<DirEntry> = (0..2_000u64)
+        .map(|index| DirEntry {
+            name: format!("name-{index:06}").into_bytes(),
+            child_serial: index + 1,
+        })
+        .collect();
+    let dir_root = fs_snapshot::encode_directory(profile, entries.iter().cloned(), &mut sink)
+        .expect("encode directory")
+        .expect("non-empty");
+
+    // The root inode points at that directory; children are only referenced by serial,
+    // so the inode table does not need a row per entry for this test.
+    let records = vec![InodeRecord {
+        serial: 0,
+        kind: Kind::Directory,
+        size: 0,
+        created_ns: 0,
+        modified_ns: 0,
+        content: Content::Dir(dir_root),
+    }];
+    let table = fs_snapshot::encode_inode_table(profile, records.into_iter(), &mut sink)
+        .expect("encode table");
+    let root = fs_snapshot::encode_root(
+        profile,
+        &RootValue {
+            scope_id: [3u8; 32],
+            inode_table: table,
+        },
+        &mut sink,
+    )
+    .expect("encode root");
+    (root, entries)
+}
+
+#[test]
+fn lookup_works_in_a_directory_larger_than_one_page() {
+    let root = TempRoot::new("multipage");
+    let store = store_at(&root);
+    let profile = Profile::V1;
+    let (root_oid, entries) = build_large_directory(&store, &profile);
+
+    let reader = SnapshotReader::open(&store, root_oid, profile).expect("open");
+    let dir = reader.inode(0).expect("read").expect("present");
+
+    // First, middle and last: the middle one is only reachable through a branch page.
+    for index in [0usize, 1_500, 1_999] {
+        let expected = index as u64 + 1;
+        let found = reader
+            .lookup(&dir, &entries[index].name)
+            .unwrap_or_else(|error| panic!("lookup of entry {index} failed: {error}"));
+        assert_eq!(
+            found,
+            Some(expected),
+            "entry {index} must resolve through the branch pages"
+        );
+    }
+
+    // A name that is not present still reports absence, not an error.
+    assert_eq!(reader.lookup(&dir, b"name-999999").expect("lookup"), None);
+}
+
+#[test]
+fn read_dir_lists_every_entry_of_a_multi_page_directory() {
+    let root = TempRoot::new("multipage-list");
+    let store = store_at(&root);
+    let profile = Profile::V1;
+    let (root_oid, entries) = build_large_directory(&store, &profile);
+
+    let reader = SnapshotReader::open(&store, root_oid, profile).expect("open");
+    let dir = reader.inode(0).expect("read").expect("present");
+    let listed = reader.read_dir(&dir, None, 10_000).expect("list");
+
+    assert_eq!(listed.len(), entries.len(), "every entry must be listed");
+    // Order is name order, and the walk crosses branch boundaries.
+    for (got, want) in listed.iter().zip(entries.iter()) {
+        assert_eq!(&got.name, &want.name);
+        assert_eq!(got.child_serial, want.child_serial);
+    }
+}
+
+// ------------------------------------------------------- QA's two observations
+
+/// **QA observation ①** — the read path must reject an extent longer than the
+/// profile allows, not only the encoder.
+///
+/// A forged leaf that claims a huge `length` would otherwise be accepted and handed
+/// back to a caller as a real extent.
+#[test]
+fn reading_an_extent_longer_than_the_profile_allows_is_refused() {
+    let root = TempRoot::new("extent-bound");
+    let store = store_at(&root);
+    let profile = Profile::V1;
+    let mut sink = StoreSink { store: &store };
+
+    // Build a leaf by hand: fmt | count=1 | start | length | oid | source_offset,
+    // with a length beyond `max_extent_len`.
+    let mut value = Vec::new();
+    value.push(profile.fmt);
+    value.extend_from_slice(&1u32.to_be_bytes());
+    value.extend_from_slice(&0u64.to_be_bytes()); // logical_start
+    value.extend_from_slice(&(profile.max_extent_len + 1).to_be_bytes()); // length
+    value.extend_from_slice(ObjectId::from_bytes([1u8; 32]).as_bytes());
+    value.extend_from_slice(&0u64.to_be_bytes()); // source_offset
+    let leaf = sink.put(Role::ExtentLeaf, &value).expect("put leaf");
+
+    let records = vec![InodeRecord {
+        serial: 0,
+        kind: Kind::File,
+        size: profile.block_bytes * 2,
+        created_ns: 0,
+        modified_ns: 0,
+        content: Content::Extents(leaf),
+    }];
+    let table = fs_snapshot::encode_inode_table(&profile, records.into_iter(), &mut sink)
+        .expect("encode table");
+    let root_oid = fs_snapshot::encode_root(
+        &profile,
+        &RootValue {
+            scope_id: [4u8; 32],
+            inode_table: table,
+        },
+        &mut sink,
+    )
+    .expect("encode root");
+
+    let reader = SnapshotReader::open(&store, root_oid, profile).expect("open");
+    let file = reader.inode(0).expect("read").expect("present");
+    let error = reader
+        .extents_in_range(&file, 0, 1)
+        .expect_err("an over-long extent must be refused on the read path");
+    assert!(matches!(error, SnapshotError::Malformed { .. }), "{error}");
+}
+
+/// **QA observation ②** — a page larger than the profile allows must be refused when
+/// read, because the byte limit is part of the format, not only of the encoder.
+#[test]
+fn reading_an_oversized_page_is_refused() {
+    let root = TempRoot::new("page-bound");
+    let store = store_at(&root);
+    let profile = Profile::V1;
+    let mut sink = StoreSink { store: &store };
+
+    // A directory leaf that declares more entries than the page limit allows.
+    let entry_bytes = 1 + 4 + 8; // name length + short name + serial
+    let count = (profile.max_page_bytes / entry_bytes + 1) as u32;
+    let mut value = Vec::new();
+    value.push(profile.fmt);
+    value.extend_from_slice(&count.to_be_bytes());
+    for _ in 0..count {
+        value.push(4);
+        value.extend_from_slice(b"aaaa");
+        value.extend_from_slice(&1u64.to_be_bytes());
+    }
+    assert!(
+        value.len() > profile.max_page_bytes,
+        "the forged page must exceed the limit"
+    );
+    let dir_root = sink.put(Role::DirectoryLeaf, &value).expect("put leaf");
+
+    let records = vec![InodeRecord {
+        serial: 0,
+        kind: Kind::Directory,
+        size: 0,
+        created_ns: 0,
+        modified_ns: 0,
+        content: Content::Dir(dir_root),
+    }];
+    let table = fs_snapshot::encode_inode_table(&profile, records.into_iter(), &mut sink)
+        .expect("encode table");
+    let root_oid = fs_snapshot::encode_root(
+        &profile,
+        &RootValue {
+            scope_id: [5u8; 32],
+            inode_table: table,
+        },
+        &mut sink,
+    )
+    .expect("encode root");
+
+    let reader = SnapshotReader::open(&store, root_oid, profile).expect("open");
+    let dir = reader.inode(0).expect("read").expect("present");
+    let error = reader
+        .read_dir(&dir, None, 10)
+        .expect_err("an oversized page must be refused when read");
+    assert!(matches!(error, SnapshotError::Malformed { .. }), "{error}");
+}
