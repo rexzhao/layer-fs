@@ -109,8 +109,8 @@ impl Namespace {
     ///
     /// # Errors
     ///
-    /// See [`NamespaceDb`]; also [`NamespaceError::NamespaceNotFound`] when opening
-    /// an existing database without a matching namespace.
+    /// See [`crate::NamespaceDb`]; also [`crate::NamespaceError::NamespaceNotFound`]
+    /// when opening an existing database without a matching namespace.
     pub fn open(store: &Store, name: &str, mode: cas_store::OpenMode) -> NamespaceResult<Self> {
         Ok(Self {
             rules: crate::rules::Rules::new(crate::sql_tree::SqlTree::open(store, name, mode)?),
