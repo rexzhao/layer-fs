@@ -64,6 +64,9 @@ impl Fs {
     pub fn stats(&self) -> FsResult<Stats>;
     pub fn read_stats(&self) -> ReadStats;              // §6, the amplification counter
     pub fn file_id(&self, path: &str) -> FsResult<FileId>;  // identity, for callers that need it
+    pub fn head_root(&self) -> Option<u64>;                 // current publication serial
+    pub fn root_record(&self, root_id: u64) -> Option<RootRecord>;
+    pub fn root_records(&self) -> FsResult<Vec<RootRecord>>; // the whole chain, for S4
 }
 ```
 
@@ -363,6 +366,7 @@ T3 起引入，T4 两轮 review 各补一条。**三条都是"枚举"而非"抽�
 | 2 | **枚举所有状态转移** | T4 F-T4-1（blob↔extent 转换丢数据） | 状态各自正确不代表转移正确；我按"实现了哪些功能"而非"状态之间怎么转移"枚举 |
 | 3 | **读路径测试的输出缓冲区默认毒化** | T4-QA-1（洞读返回陈旧内存） | 测试夹具与生产调用方共享未声明前提时，缺陷被整体掩盖；毒化让任何"没写满"立刻暴露 |
 | 4 | **每个性能数字旁注明它的载荷特征** | T5 KI-3（1 GiB 数字被当成写吞吐） | 同内容块会被去重成 1 个对象；不注明载荷特征，一个测量结果的标签就会在传递中失义，而数字本身看起来依然精确 |
+| 5 | **文档中每个关于代码现状的数字或清单，收尾时用脚本重新生成或核对** | T5 审查（覆盖率列标签对调、方法数陈旧） | "写的时候正确、改的时候没回头"是文档漂移的固定形态；靠人眼回读抓不住，靠脚本比对能抓住 |
 
 第 3 条的实践含义：任何接收调用方缓冲区的 API，测试**不得**用零初始化缓冲区。用 `0xAA`
 等哨兵填充，并断言"返回值覆盖的每个字节都被写过"。T4 的 `tests/holes.rs` 与
@@ -372,8 +376,22 @@ T3 起引入，T4 两轮 review 各补一条。**三条都是"枚举"而非"抽�
 > （本卡实测中 `0xAA` 就是合法的文件数据，曾导致一次误报）。判定的正确方式是：哨兵填充 +
 > 与已知正确内容逐字节比对。
 
+第 5 条的实践含义：文档里凡是**可以机械得出**的东西，就不该手写。具体到执行：
+
+| 文档内容 | 生成/核对方式 |
+| --- | --- |
+| 覆盖率数字 | 直接从 `cargo llvm-cov` 的输出版本化（`docs/reports/raw/`），报告正文的表从该文件生成，不手抄 |
+| 公共 API 清单与方法数 | `grep '^    pub fn ' crates/fs-api/src/file_system.rs` 与文档清单比对 |
+| DDL 与表结构 | ADR-003 §4 的 SQL 块与 `schema.rs` 的 `DDL` 常量逐语句比对（T4 已用脚本演练过一次，抓到 `file_extent` 缺失） |
+| 测试名 | 提交说明中的测试名清单与实际 `cargo test -- --list` 输出比对 |
+
+手写这些数字的代价不是"可能写错"，而是**写错后没人会再核对**——因为读者假设它是抄来的。
+T5 的两处错误（覆盖率列标签对调、`Fs` 方法数 15 vs 18）都属此类，都是 QA 手工核对才抓到的；
+若表格由脚本生成，两处都不会发生。
+
 ## 14. 下一步
 
-- **T5**：规模与性能，复用 `read_stats`；用真实 1 GiB 复测块路径。
+- **T5 已完成**：验收矩阵六项、性能基线（`docs/reports/p1-baseline.md`）、覆盖率基线、
+  DoD 对照（`docs/reports/p1-dod.md`）。P1 达成。
 - **P2**：CDC、delta、快照（纯对象图，零表依赖）、GC；Branch CAS 令牌 = 快照根。
 - **P3**：句柄层（§3.2 的四条问题清单）、WinFsp 映射。

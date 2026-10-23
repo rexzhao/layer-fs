@@ -512,7 +512,7 @@ COMMIT
 | 类型冲突 | T1–T6 | `mkdir_*`、`unlink_*`、`rmdir_*` |
 | rename 组合 | R1–R12 | `rename_*` 系列 |
 | 大小写 | C1–C3 | `case_sensitive_names_coexist`、`rename_case_only_change_is_a_real_rename` |
-| root 与事务 | X1–X4 | `failed_operation_leaves_previous_state` |
+| root 与事务 | X1–X4 | `failure_before_the_mutation_leaves_everything_unchanged`、`failure_after_the_mutation_rolls_the_rows_back`、`failure_rolls_back_every_mutating_operation`、`failed_operation_leaves_published_roots_intact`、`root_record_of_an_unknown_serial_is_absent`、`namespaces_keep_separate_root_chains`（逐条映射见 §12.2） |
 | 并发 | 线程级不同路径、同路径；跨进程至少一例 | `concurrent_*` |
 
 ### 12.1 T5 / QA 的 root 验收钩子（D+ 专有）

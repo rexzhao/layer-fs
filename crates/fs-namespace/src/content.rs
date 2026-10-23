@@ -61,7 +61,12 @@ impl Namespace {
         self.with_write_tx(|_tx| {
             let id = self.next_serial()?;
             let now = now_ns();
-            self.insert_entry(parent, name, FileId::from_serial(id))?;
+            // The existence check above runs before the write lock is taken, so a
+            // concurrent creator can slip in between. The primary key is the real
+            // arbiter; translate its complaint into the documented outcome instead
+            // of leaking a raw constraint error (QA round: S5 concurrency).
+            self.insert_entry(parent, name, FileId::from_serial(id))
+                .map_err(|error| crate::operations::already_exists_if_constraint(error, path))?;
             self.conn().execute(
                 "INSERT INTO file
                  (namespace, file_id, kind, size, content_root, created_ns, modified_ns)

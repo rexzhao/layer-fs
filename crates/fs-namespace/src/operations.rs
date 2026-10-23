@@ -30,7 +30,11 @@ impl Namespace {
         let id = self.with_write_tx(|_tx| {
             let id = self.next_serial()?;
             let now = now_ns();
-            self.insert_entry(parent, name, FileId::from_serial(id))?;
+            // Same race as `create_file`: the pre-check runs outside the write
+            // lock, so a concurrent mkdir can win. The primary key decides, and a
+            // constraint violation means the name is taken.
+            self.insert_entry(parent, name, FileId::from_serial(id))
+                .map_err(|error| already_exists_if_constraint(error, path))?;
             self.conn().execute(
                 "INSERT INTO file (namespace, file_id, kind, size, content_root, created_ns, modified_ns)
                  VALUES (?1, ?2, ?3, 0, NULL, ?4, ?4)",
@@ -362,5 +366,25 @@ impl Namespace {
             }
             current = parent;
         }
+    }
+}
+
+/// Turns a primary-key violation into `AlreadyExists`.
+///
+/// The existence pre-checks in `mkdir` and `create_file` run before the write lock,
+/// so two concurrent creators can both pass them. The table's primary key is the
+/// real arbiter; without this translation the loser surfaces a raw SQLite
+/// constraint message instead of the documented `AlreadyExists` (S5 concurrency).
+pub(crate) fn already_exists_if_constraint(error: NamespaceError, path: &Path) -> NamespaceError {
+    match error {
+        NamespaceError::Store(cas_store::StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            inner,
+            _,
+        ))) if inner.code == rusqlite::ErrorCode::ConstraintViolation => {
+            NamespaceError::AlreadyExists {
+                path: path.display(),
+            }
+        }
+        other => other,
     }
 }
