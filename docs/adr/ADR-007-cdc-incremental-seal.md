@@ -1,7 +1,7 @@
 # ADR-007：内容定义分块、增量物化与 Seal
 
-- 状态：**草案（Proposed）**——architect 起草，P2b-1/P2b-3/P2b-4/P2b-5 的设计输入；标 **[待 G#]** 的条目等
-  owner 对 P2b 分叉的答复（mailbox `manager/oe5sdob823` §8）
+- 状态：**草案（Proposed），分叉已决**——architect 起草，P2b-0/P2b-1/P2b-3/P2b-4/P2b-5 的设计输入；
+  worker 落地核对后转 Accepted。分叉 G1/G5/G6/G7 的 owner 结论见 §2.1
 - 日期：2026-10-23
 - 起草：architect
 - 依据：spec §2 P2.5（Seal）、P2.6（CDC）、P2.7（Extent/Chunk 复用）、§5.1–5.5、§6 P2 第 2/3/6 条；
@@ -26,16 +26,28 @@ P2a 交付了正确但昂贵的发布路径（p2a-baseline §4）：
 
 | # | 决策 |
 | --- | --- |
-| C1 | 文件内容用 **FastCDC（归一化分块，GEAR）** 切分，min 8 / avg 16 / max 32 KiB **[待 G6]**；参数与 gear 表冻结进 **snapshot profile v2** |
+| C1 | 文件内容用 **FastCDC（归一化分块，GEAR）** 切分，min 8 / avg 16 / max 32 KiB **[G6 已定]**；参数与 gear 表冻结进 **snapshot profile v2** |
 | C2 | 规范形态：对整个逻辑字节流（空洞按零）做 CDC；1 个非零 chunk → Blob；多个 → Extents（全零 chunk 不写）；空或全零 → Empty |
 | C3 | 文件内容对象统一用 **role 2（Chunk）**；Blob 是"一个 chunk"的退化情形 |
-| C4 | extent 树格式不变（ADR-005 S10）：`length` 可变、`source_offset` 恒为 0；**不做 chunk 切片复用** **[待 G5]** |
+| C4 | extent 树格式不变（ADR-005 S10）：`length` 可变、`source_offset` 恒为 0；**不做 chunk 切片复用** **[G5 已定]** |
 | C5 | 一个**增量分页器**同时服务目录树、inode 表、extent 树与文件内容的局部重切：从变更点前最近的真实切点重切，直到新旧切点重合 |
 | C6 | **正确性判据**：任意 base 与变更集，增量结果的根 id ≡ 全量编码的根 id。全量物化器保留为测试 oracle（`test-support` feature），生产只有增量一条路径 |
 | C7 | 增量物化的变更集 = overlay 的 `ov_inode` / `ov_entry` 行；依赖不变量"live 行 ⇔ 从根可达"，V4 在 debug/测试/`verify --deep` 中校验 |
 | C8 | **Seal = 单文件提前物化**：同一编码器产出该文件的规范 Content，overlay 中以 `sealed_content` 替代该文件的全部页；版本号防竞争，冲突即放弃 |
-| C9 | Seal 有字节预算与取消令牌；触发：API / CLI 显式，进程内后台线程默认关闭 **[待 G7]** |
-| C10 | profile v1 的根一律拒绝（`UnsupportedProfile`），不迁移 **[待 G6]** |
+| C9 | Seal 有字节预算与取消令牌；触发：API / CLI 显式，进程内后台线程默认关闭 **[G7 已定]** |
+| C10 | profile v1 的根一律拒绝（`UnsupportedProfile`），不迁移 **[G6 已定]** |
+
+### 2.1 owner 决策记录
+
+以下分叉均由 **owner 于 2026-10-23 通过 qclaw@2qcuc12p 确认**按 architect 建议执行（经 manager 转达，
+mailbox `manager/c7yba9ud6s`、`manager/taek3xts1d`）：
+
+| 分叉 | 结论 | 落在本 ADR |
+| --- | --- | --- |
+| G1 Seal 纳入 P2b | 纳入（spec P2.5 必须项；§6 P2 第 3/6 条依赖） | C8/C9、§6 |
+| G5 chunk 切片复用 | **不做**；与 spec P2.7 字面"旧 Chunk 和 Chunk 切片复用"的偏差如实记录：旧 chunk 复用做（§4.3），切片不做（会破坏规范形态与历史无关性），"避免小编辑全文件读写"由 CDC 重同步满足 | C4、§3.4 |
+| G6 CDC 参数与 profile | FastCDC 8/16/32 KiB；profile v2；v1 根拒绝、不迁移 | C1、C10、§3.5、§7 |
+| G7 Seal 触发 | API / CLI 显式；进程内后台 sealer 默认关闭、可开启 | C9、§6.4 |
 
 ## 3. CDC（C1–C4）
 
@@ -224,7 +236,7 @@ O(变更数 × 树深) 的页读写 + 脏区间附近的 chunk I/O。KI-8 的"�
 - 预算：单次运行处理的字节上限（默认 256 MiB）、文件数上限；取消令牌在每个文件之间、每批 PageSink 之间检查；
 - `seal_idle` 默认 5 s；均写入 `workspace_policy`，打开时读回校验；
 - 触发：`Workspace::seal(budget, cancel)`、CLI `workspace seal <w>`；进程内后台 sealer 线程（周期 + idle
-  检测）**默认关闭**，SDK 长驻进程与 P3 挂载可开启 **[待 G7]**；
+  检测）**默认关闭**，SDK 长驻进程与 P3 挂载可开启 **[G7 已定]**；
 - 指标（spec §5.6 的 seal queue）：`status()` 报告"待封存文件数 / 字节数"。
 
 ### 6.5 物理去重（spec §6 P2 第 6 条）
@@ -236,7 +248,7 @@ O(变更数 × 树深) 的页读写 + 脏区间附近的 chunk I/O。KI-8 的"�
 
 | 对象 | 变化 | 处理 |
 | --- | --- | --- |
-| snapshot profile | v1 → v2 | v1 根 `UnsupportedProfile`，不迁移 **[待 G6]** |
+| snapshot profile | v1 → v2 | v1 根 `UnsupportedProfile`，不迁移 **[G6 已定]** |
 | overlay schema | 1 → 2（Seal 列） | 旧 overlay 拒绝；要求先 snapshot/discard（ADR-006 §14 先例） |
 | workspace_policy | 新键 `seal_idle_ms`、`seal_budget_bytes` | 读回校验 |
 
@@ -255,7 +267,26 @@ O(变更数 × 树深) 的页读写 + 脏区间附近的 chunk I/O。KI-8 的"�
 | 后台 sealer 默认开启 | P3 视挂载需求再议 |
 | Seal 的跨 workspace 协调（避免重复编码同一内容） | 不做；内容寻址保证结果去重，代价是重复 CPU |
 
-## 10. 测试清单
+## 10. 参考模型随机序列（P2b-0，ADR-006 §18-1 的落地合约）
+
+本 ADR 的 C6 判据、Seal 的"视图不变"、ADR-008 GC 的"根不变"都以它为底座，所以合约写在这里
+（architect 裁决，`manager/8dk7j722ea`；worker 准备稿的三个倾向中，前两个采纳，第三个按 M4 修正）。
+
+| # | 合约 |
+| --- | --- |
+| M1 | **模型独立实现**：数据结构朴素（`BTreeMap<路径, Dir \| File(Vec<u8>)>`），不模拟 serial / overlay / whiteout；规则依据 ADR-003 §3 与 ADR-004 §4 的**文档**实现，不参照 `rules.rs` |
+| M2 | **错误类别也比对**：模型给出期望类别（NotFound / AlreadyExists / NotADirectory / IsADirectory / DirectoryNotEmpty / IntoOwnSubtree / IsRoot / InvalidPath），实现返回的类别必须一致 |
+| M3 | **每步全树比对**：全部路径的 stat（kind、size；不比时间戳）、全部目录的有序 read_dir、全部文件的完整字节。单步比对超过约 5 ms 时才允许改为"本步触及路径 + 每 50 步与每个 flush/snapshot/崩溃点全比对"；不抽样 |
+| M4 | **崩溃按 W4 断言**：模型保存最后一次 flush 时的状态 S_f 及其后每步状态 S_f+1..S_n；崩溃重开后实现的全树状态必须**等于某个 S_k（k ≥ f）**，模型回退到 S_k 继续；一个序列可多次崩溃。**不得**断言"等于 S_f"——正确实现在进程崩溃时通常保留 flush 之后已提交的操作 |
+| M5 | **覆盖统计**：全部种子中 k > f 的情形必须出现过 |
+| M6 | **崩溃的造法**：进程内 drop 句柄（不 flush）只得到 k = n，保留为快速回归；真实前缀行为用子进程在随机步数经 crash-point 或 kill 退出、父进程重开核对。掉电不可测，照抄 ADR-006 §8 的声明 |
+| M7 | **历史比对**：每次 snapshot/commit 记录模型树副本；之后任意时刻 `--at` 读该提交，逐字节等于副本 |
+| M8 | **随卡扩展**：P2b-4 每次 snapshot 断言 `incremental == oracle`；P2b-5 插入 seal 并断言视图不变；P2b-6 插入 gc（关闭 → GC → 重开）并断言视图与全部历史不变 |
+| M9 | **可复现**：失败时打印种子与步号，`WCAS_SEED=<n>` 单独重放 |
+
+模型与实现不一致时，先按文档判定谁错；文档未写清的，提交 architect 裁决，不让模型迁就实现。
+
+## 11. 测试清单
 
 1. CDC 测试向量（§3.1）；重同步：1 MiB 随机数据中间改 1/16/4096 字节，变化的 chunk 数 ≤ 3；
 2. 规范形态四种情形各一例；解码拒绝：Blob 超长、extent `source_offset ≠ 0`、`length > MAX`；

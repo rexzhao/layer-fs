@@ -1,7 +1,7 @@
 # ADR-008：Pack 存储、批量发布与离线 GC
 
-- 状态：**草案（Proposed）**——architect 起草，P2b-2/P2b-6 的设计输入；标 **[待 G#]** 的条目等 owner 答复
-  （mailbox `manager/oe5sdob823` §8）
+- 状态：**草案（Proposed），分叉已决**——architect 起草，P2b-2/P2b-6 的设计输入；worker 落地核对后转
+  Accepted。分叉 G2/G3/G4 的 owner 结论见 §2.1
 - 日期：2026-10-23
 - 起草：architect
 - 依据：spec §2 P2.11、§4（Seal/GC 顺序、故障注入点）、§5.4；ADR-002（Store 布局、发布顺序、恢复）；
@@ -16,7 +16,7 @@
 
 - 每个对象一个文件，每次 put 一次文件 fsync + 一次目录 fsync + 一次索引事务：首次 snapshot 1 000 个
   小文件 8–9 s（p2a-baseline §4.1）。ADR-006 §12 的"批量索引"只能去掉索引事务，**去不掉每对象的文件
-  fsync**——F7 的"先批量、实测、不达标上 pack"已被 P2a 数据回答 **[待 G4]**；
+  fsync**——F7 的"先批量、实测、不达标上 pack"已被 P2a 数据回答 **[G4 已定]**；
 - CDC（ADR-007）使对象平均 16 KiB，对象数比 64 KiB 固定块多约 4 倍，每对象一个文件更不可行；
 - P2 必须有"不回收被 Root、活跃 Workspace 或未完成事务引用的数据"的最小正确 GC（spec P2.11）。
 
@@ -26,13 +26,29 @@
 | --- | --- |
 | P1 | 新对象一律写入**不可变 pack 文件**；一批（一次物化 / 一次 Seal 运行）→ 一个或少数几个 pack |
 | P2 | 发布顺序：去重 → 写 tmp pack → fsync → rename → fsync 目录 → **一个短 `BEGIN IMMEDIATE` 事务**写入这一批索引行（fsync 全在事务外，KI-7） |
-| P3 | cas-store schema v3：`object_location` 增加 `kind`/`pack_id`/`offset`；loose 对象读路径保留，写路径只写 pack；v2 Store 拒绝 **[待 G4]** |
+| P3 | cas-store schema v3：`object_location` 增加 `kind`/`pack_id`/`offset`；loose 对象读路径保留，写路径只写 pack；v2 Store 拒绝 **[G4 已定]** |
 | P4 | 无索引行引用的 pack 文件 = 崩溃残留：普通打开只读不删（ADR-002 §7.1 精神），GC 时删除 |
-| P5 | GC **离线**：独占打开主库与全部 overlay；有任何使用者即拒绝 **[待 G3]** |
+| P5 | GC **离线**：独占打开主库与全部 overlay；有任何使用者即拒绝 **[G3 已定]** |
 | P6 | 根集合 = 提交（各 branch head 的祖先 ∪ `branch_log` 出现过的提交的祖先）∪ `snapshot` 表 ∪ 每个 workspace 的 `base_root`、root(`base_commit`)、overlay `pending_root`、全部 `sealed_content` |
-| P7 | 保留策略：P2b **不做过期**；新增 `snapshot drop`；删除 branch 保留其 `branch_log` **[待 G2]** |
+| P7 | 保留策略：P2b **不做过期**；新增 `snapshot drop`；删除 branch 保留其 `branch_log` **[G2 已定]** |
 | P8 | mark 用临时 SQLite 文件存标记集（不全量驻留内存，spec §5.4）；sweep：loose 直接删，pack 存活率低于阈值则**拷贝式重打包** |
 | P9 | 每一步：新数据先落盘 → 索引原子切换 → 旧数据删除；任意点崩溃只留多余文件，绝无悬空引用 |
+
+### 2.1 owner 决策记录
+
+以下分叉均由 **owner 于 2026-10-23 通过 qclaw@2qcuc12p 确认**按 architect 建议执行（经 manager 转达，
+mailbox `manager/c7yba9ud6s`、`manager/taek3xts1d`）：
+
+| 分叉 | 结论 | 落在本 ADR |
+| --- | --- | --- |
+| G2 GC 保留策略 | 不做历史过期；只回收孤儿、被 drop 的 snapshot、被 discard 的 workspace 的封存内容；`branch_log` 永久保留 | P7、§6.2 |
+| G3 GC 方式 | 离线：独占打开，有使用者即拒绝 | P5、§6.1 |
+| G4 pack 与 schema | pack 直接上；cas-store schema v3，v2 Store 拒绝、不迁移（存储格式变更已批准） | P1–P3、§3–§5 |
+
+**与 ADR-006 F7 的衔接**（owner 指出，按 manager 与 architect 的判断处理）：F7 定的是"先做批量发布、实测、
+不达标再上 pack"。P2a 实测（首次 snapshot 约 8 ms/对象，瓶颈是每对象一次文件 fsync）已经回答了"是否
+达标"，所以 F7 的"批量发布"阶段**提前收口**：不再单独实现 ADR-006 §12 的"对象文件逐个 durable + 索引
+分块提交"，直接以本 ADR §5 的 pack 批量发布取代。ADR-006 §12 标注"已由 ADR-008 §5 取代"。
 
 ## 3. Pack 格式
 
@@ -66,7 +82,7 @@ CREATE TABLE pack (
 ) STRICT;
 ```
 
-`store_policy.schema_version = 3`；v2 Store → `UnsupportedSchemaVersion`，不迁移（P2a 零部署）**[待 G4]**。
+`store_policy.schema_version = 3`；v2 Store → `UnsupportedSchemaVersion`，不迁移（P2a 零部署）**[G4 已定]**。
 
 ## 5. 批量发布（取代 ADR-006 §12）
 
@@ -119,7 +135,7 @@ batch.commit()?;                             // 下面的 1–4
 
 `Repo::roots()`（P2a-6）只覆盖前四行的一部分；P2b-6 扩展为上表，并由 `verify --deep` 共用。
 
-**保留策略（P7）[待 G2]**：P2b 不做过期。因此 P2b 的 GC 实际回收：
+**保留策略（P7）[G2 已定]**：P2b 不做过期。因此 P2b 的 GC 实际回收：
 
 - 孤儿对象：失败或未完成的发布、`NothingToCommit` 的物化产物、Seal 竞争放弃的 chunk、被 discard 的
   workspace 的封存 chunk、`BranchMoved` 后的物化产物；
@@ -180,7 +196,7 @@ GcReport { roots, marked_objects, freed_objects, freed_bytes, packs_repacked, pa
 | 项 | 去向 |
 | --- | --- |
 | 在线 GC（epoch / 写屏障） | P3 之后 |
-| 历史过期（reflog/snapshot 保留期） | owner 定策略后 **[待 G2]** |
+| 历史过期（reflog/snapshot 保留期） | owner 定策略后 **[G2 已定]** |
 | pack 压缩、delta | 非 P2 |
 | loose → pack 的批量迁移 | 不需要（v2 Store 拒绝；v3 新对象全部进 pack） |
 
