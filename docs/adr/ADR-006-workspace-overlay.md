@@ -429,6 +429,10 @@ spec P2.9 要求的 revert 与 reset 区别：revert **生成**逆向提交（�
 
 ## 12. 批量发布（ADR-002 §5 修订）**[F7 已确认]**
 
+> **已由 ADR-008 §5 取代（2026-10-23）**：P2a 实测回答了 F7 的"批量是否达标"（每对象一次文件 fsync
+> 是瓶颈），本节的"对象文件逐个 durable + 索引分块提交"不再实现，直接改为 pack 批量发布。
+> 衔接说明见 ADR-008 §2.1。下文保留为历史记录。
+
 ```rust
 let mut batch = store.batch();             // PageSink 的实现之一
 let oid = batch.put(role, value)?;         // tmp → fsync → rename；不写索引
