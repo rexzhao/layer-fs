@@ -79,6 +79,9 @@ impl<'a> SnapshotReader<'a> {
             let page = fetch(self.store, pointer, Role::InodeTable, "inode table")?;
             let mut reader = Reader::new(&page);
             reader.format(self.profile.fmt)?;
+            // The fourth and last caller: `lookup`, `read_dir` and `extents_in_range`
+            // already bound the page, and this one was missed (P2a-1-QA-2).
+            check_page_size(&page, &self.profile)?;
             let node = reader.u8()?;
             match node {
                 0 => return self.find_inode_in_leaf(&mut reader, serial),
@@ -172,12 +175,16 @@ impl<'a> SnapshotReader<'a> {
         };
         let mut pointer = root;
         loop {
-            let page = fetch(self.store, pointer, Role::DirectoryLeaf, "directory")?;
+            // Resolve the role **before** fetching. A directory page is a leaf or a
+            // branch and the two carry different roles, so a `fetch` pinned to
+            // `DirectoryLeaf` rejects every branch page and leaves the branch arm
+            // below unreachable (P2a-1-QA-1). `read_dir` and `extents_in_range`
+            // already worked this way; this one did not.
+            let role = role_of(self.store, pointer)?;
+            let page = fetch(self.store, pointer, role, "directory")?;
             let mut reader = Reader::new(&page);
             reader.format(self.profile.fmt)?;
-            // A directory leaf has no node byte; a branch is a different role, so the
-            // role itself tells them apart (ADR-005 §3.3).
-            let role = role_of(self.store, pointer)?;
+            check_page_size(&page, &self.profile)?;
             match role {
                 Role::DirectoryLeaf => {
                     let count = reader.u32()?;
@@ -279,6 +286,7 @@ impl<'a> SnapshotReader<'a> {
         let value = fetch(self.store, page, role, "directory")?;
         let mut reader = Reader::new(&value);
         reader.format(self.profile.fmt)?;
+        check_page_size(&value, &self.profile)?;
         match role {
             Role::DirectoryLeaf => {
                 let count = reader.u32()?;
@@ -354,6 +362,7 @@ impl<'a> SnapshotReader<'a> {
         let value = fetch(self.store, page, role, "extent tree")?;
         let mut reader = Reader::new(&value);
         reader.format(self.profile.fmt)?;
+        check_page_size(&value, &self.profile)?;
         match role {
             Role::ExtentLeaf => {
                 let count = reader.u32()?;
@@ -363,6 +372,15 @@ impl<'a> SnapshotReader<'a> {
                     let length = reader.u64()?;
                     if length == 0 {
                         return Err(malformed("an extent may not have zero length"));
+                    }
+                    // Syntax-level bounds, checked without reading the object pointed
+                    // at, so a forged leaf is refused here rather than handed to a
+                    // caller as a real extent (P2a-1-QA-1 ①).
+                    if length > self.profile.max_extent_len {
+                        return Err(malformed(format!(
+                            "extent length {length} exceeds the profile limit {}",
+                            self.profile.max_extent_len
+                        )));
                     }
                     if let Some(previous_end) = previous_end {
                         if start < previous_end {
@@ -376,6 +394,16 @@ impl<'a> SnapshotReader<'a> {
                     previous_end = Some(start + length);
                     let object = reader.oid()?;
                     let source_offset = reader.u64()?;
+                    // The companion of the length bound above: a run may not read past
+                    // the largest legal object value. Checked against the syntax only,
+                    // without fetching the object (ADR-005 §3.4).
+                    if source_offset.saturating_add(length) > self.profile.max_object_value {
+                        return Err(malformed(format!(
+                            "extent at {start} reads {} bytes past the object value limit {}",
+                            source_offset.saturating_add(length),
+                            self.profile.max_object_value
+                        )));
+                    }
                     if start < to && start + length > from {
                         out.push(Extent {
                             logical_start: start,
@@ -472,6 +500,22 @@ fn decode_inode(reader: &mut Reader<'_>, profile: Profile) -> SnapshotResult<Ino
         return Err(malformed(format!("inode {serial}: {reason}")));
     }
     Ok(record)
+}
+
+/// Rejects a page whose encoded bytes exceed the profile's limit (P2a-1-QA-1 ②).
+///
+/// The encoder enforces this bound, but a reader must not trust its input: a forged
+/// page claiming more entries than the format allows is a malformed value, and
+/// accepting it would let one object dictate unbounded work.
+fn check_page_size(page: &[u8], profile: &Profile) -> SnapshotResult<()> {
+    if page.len() > profile.max_page_bytes {
+        return Err(malformed(format!(
+            "page is {} bytes, over the profile limit of {}",
+            page.len(),
+            profile.max_page_bytes
+        )));
+    }
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {
