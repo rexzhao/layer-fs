@@ -74,13 +74,22 @@ fn fixture(label: &str) -> (TempRoot, Fs) {
     (root, fs)
 }
 
-/// **K3** — concurrent writes to different blocks of one file must both survive.
+/// **K3** — concurrent writes to disjoint blocks of one file must both survive.
 ///
-/// This is the contract the overlay backend has to meet. On the table backend it
-/// fails (B1-1); see the module docs. Kept `#[ignore]`d so its known failure does
-/// not hide a genuine regression elsewhere.
+/// Under linearizable semantics this assertion is exactly right, not too strong:
+/// the overlay runs each operation as one complete transaction under a handle mutex
+/// held until commit (ADR-006 §2.5, §7.4 inference 2), so two writes to disjoint
+/// ranges have only two possible serial orders — write-low-then-high and
+/// write-high-then-low — and **both orders produce the same final bytes**, because
+/// neither range overlaps the other. Asserting "both survive" therefore does not
+/// pick an order; it states the one result every serial order agrees on.
+///
+/// On the table backend this fails: it is the B1-1 reproduction (the size and extent
+/// layout are read outside the committing transaction). `#[ignore]`d so that known
+/// failure does not hide a real regression, and so the overlay backend can be held
+/// to it.
 #[test]
-#[ignore = "fails on the table backend by design (B1-1); the overlay backend must pass it"]
+#[ignore = "fails on the table backend by design (this is B1-1); the overlay backend must pass it"]
 fn k3_concurrent_writes_to_different_blocks_keep_both() {
     let (root, _fs) = fixture("k3-blocks");
     let rounds = 40;
@@ -271,4 +280,244 @@ fn k4_cross_renames_never_form_a_cycle() {
     }
 
     assert_eq!(violations, 0, "K4: {violations}/40 rounds formed a cycle");
+}
+// ============================================================================
+// K3a–K3d — the four inferences from ADR-006 §7.4 (architect, 7a6cf49).
+//
+// Every assertion has the same shape:
+//
+//     result ∈ { outcome of serial order A, outcome of serial order B }
+//
+// Under linearizable semantics a concurrent pair must settle on exactly one of the
+// two orders, so a result matching neither is a violation. This form is deliberately
+// weaker than "matches order A" — it does not demand a particular interleaving, only
+// that one of them happened.
+//
+// All four are `#[ignore]`d: the table backend is not linearizable for concurrent
+// writes to one file (B1-1), and these are the overlay backend's admission gates.
+// ============================================================================
+
+use std::sync::Mutex;
+
+/// **K3a** — concurrent writes to *overlapping* ranges settle on one serial order,
+/// and the overlap is never byte-interleaved.
+#[test]
+#[ignore = "table backend is not linearizable here (B1-1); the overlay backend must pass it"]
+fn k3a_overlapping_concurrent_writes_match_one_serial_order() {
+    let (root, _fs) = fixture("k3a");
+    let mut violations = 0;
+
+    for round in 0..40 {
+        let path = format!("/o{round}");
+        {
+            let fs = Fs::open(root.path(), "default", OpenMode::Create).expect("open");
+            fs.create(&path).expect("create");
+            fs.write_at(&path, 0, &[0u8; 64]).expect("seed");
+        }
+
+        // Two writes whose ranges overlap on bytes 20..44.
+        let first_offset = 10u64;
+        let first_bytes = vec![1u8; 34]; // 10..44
+        let second_offset = 20u64;
+        let second_bytes = vec![2u8; 34]; // 20..54
+        std::thread::scope(|scope| {
+            for (offset, bytes) in [
+                (first_offset, first_bytes.clone()),
+                (second_offset, second_bytes.clone()),
+            ] {
+                let root = root.path().to_path_buf();
+                let path = path.clone();
+                scope.spawn(move || {
+                    let fs = Fs::open(&root, "default", OpenMode::ReadWrite).expect("open");
+                    let _ = fs.write_at(&path, offset, &bytes);
+                });
+            }
+        });
+
+        // The two serial orders, computed rather than assumed.
+        let mut a_then_b = vec![0u8; 64];
+        a_then_b[10..44].copy_from_slice(&first_bytes);
+        a_then_b[20..54].copy_from_slice(&second_bytes);
+        let mut b_then_a = vec![0u8; 64];
+        b_then_a[20..54].copy_from_slice(&second_bytes);
+        b_then_a[10..44].copy_from_slice(&first_bytes);
+
+        let fs = Fs::open(root.path(), "default", OpenMode::ReadWrite).expect("open");
+        let mut got = vec![0xAAu8; 64];
+        let read = fs.read_at(&path, 0, &mut got).expect("read");
+        got.truncate(read);
+
+        if got != a_then_b && got != b_then_a {
+            violations += 1;
+        }
+    }
+
+    assert_eq!(
+        violations, 0,
+        "K3a: {violations}/40 rounds produced bytes matching neither serial order \
+         (byte-level interleaving is not allowed)"
+    );
+}
+
+/// **K3b** — `write_at` and `truncate` racing settle on one of the two orders.
+#[test]
+#[ignore = "table backend is not linearizable here (B1-1); the overlay backend must pass it"]
+fn k3b_write_and_truncate_match_one_serial_order() {
+    let (root, _fs) = fixture("k3b");
+    let seed: usize = 1024;
+    let mut violations = 0;
+
+    for round in 0..40 {
+        let path = format!("/t{round}");
+        {
+            let fs = Fs::open(root.path(), "default", OpenMode::Create).expect("open");
+            fs.create(&path).expect("create");
+            fs.write_at(&path, 0, &vec![7u8; seed]).expect("seed");
+        }
+
+        std::thread::scope(|scope| {
+            for action in 0..2 {
+                let root = root.path().to_path_buf();
+                let path = path.clone();
+                scope.spawn(move || {
+                    let fs = Fs::open(&root, "default", OpenMode::ReadWrite).expect("open");
+                    if action == 0 {
+                        let _ = fs.write_at(&path, 100, &[9u8; 50]);
+                    } else {
+                        let _ = fs.truncate(&path, 10);
+                    }
+                });
+            }
+        });
+
+        // Order A: write 100..150, then truncate to 10 -> ten 7s.
+        let order_a = vec![7u8; 10];
+        // Order B: truncate to 10, then write 100..150 -> ten 7s, zeros, fifty 9s.
+        let mut order_b = vec![7u8; 150];
+        for byte in order_b.iter_mut().take(150).skip(10) {
+            *byte = 0;
+        }
+        order_b[100..150].copy_from_slice(&[9u8; 50]);
+
+        let fs = Fs::open(root.path(), "default", OpenMode::ReadWrite).expect("open");
+        let size = fs.stat(&path).expect("stat").size as usize;
+        let mut got = vec![0xAAu8; size];
+        let read = fs.read_at(&path, 0, &mut got).expect("read");
+        got.truncate(read);
+
+        if got != order_a && got != order_b {
+            violations += 1;
+        }
+    }
+
+    assert_eq!(
+        violations, 0,
+        "K3b: {violations}/40 rounds produced bytes matching neither serial order"
+    );
+}
+
+/// **K3c** — `write_at` racing `unlink` settles on one order, and when the unlink
+/// wins the write fails and leaves nothing behind (K1).
+#[test]
+#[ignore = "table backend is not linearizable here (B1-1); the overlay backend must pass it"]
+fn k3c_write_and_unlink_match_one_serial_order() {
+    let (root, _fs) = fixture("k3c");
+    let mut violations = 0;
+
+    for round in 0..40 {
+        let path = format!("/u{round}");
+        {
+            let fs = Fs::open(root.path(), "default", OpenMode::Create).expect("open");
+            fs.create(&path).expect("create");
+            fs.write_at(&path, 0, &vec![1u8; BLOCK_BYTES as usize])
+                .expect("seed");
+        }
+
+        let wrote = Mutex::new(false);
+        std::thread::scope(|scope| {
+            for action in 0..2 {
+                let root = root.path().to_path_buf();
+                let path = path.clone();
+                let wrote = &wrote;
+                scope.spawn(move || {
+                    let fs = Fs::open(&root, "default", OpenMode::ReadWrite).expect("open");
+                    if action == 0 {
+                        let _ = fs.remove(&path);
+                    } else if fs
+                        .write_at(&path, 0, &vec![2u8; BLOCK_BYTES as usize])
+                        .is_ok()
+                    {
+                        *wrote.lock().expect("lock") = true;
+                    }
+                });
+            }
+        });
+
+        let fs = Fs::open(root.path(), "default", OpenMode::ReadWrite).expect("open");
+        // Under either order the namespace must stay consistent (K1).
+        if !fs.verify().expect("verify").is_clean() {
+            violations += 1;
+        }
+        // Order A (write then unlink): gone. Order B (unlink then write): gone, the
+        // write failed. Neither order may leave a file that the writer did not write.
+        let exists = fs.stat(&path).is_ok();
+        let did_write = *wrote.lock().expect("lock");
+        if exists && !did_write {
+            violations += 1;
+        }
+        let _ = fs.remove(&path);
+    }
+
+    assert_eq!(
+        violations, 0,
+        "K3c: {violations}/40 rounds left an outcome that matches neither serial order"
+    );
+}
+
+/// **K3d** — two cross-directory renames racing: at most one commits (K4).
+#[test]
+#[ignore = "table backend is not linearizable here (B1-1); the overlay backend must pass it"]
+fn k3d_cross_renames_admit_at_most_one_winner() {
+    let (root, _fs) = fixture("k3d");
+    let mut violations = 0;
+
+    for round in 0..40 {
+        let base = format!("/r{round}");
+        {
+            let fs = Fs::open(root.path(), "default", OpenMode::Create).expect("open");
+            fs.mkdir(&base).expect("mkdir base");
+            fs.mkdir(&format!("{base}/x")).expect("mkdir x");
+            fs.mkdir(&format!("{base}/y")).expect("mkdir y");
+            fs.mkdir(&format!("{base}/x/deep")).expect("mkdir deep");
+        }
+
+        let successes = Mutex::new(0usize);
+        std::thread::scope(|scope| {
+            for (from, to) in [
+                (format!("{base}/x"), format!("{base}/y/x")),
+                (format!("{base}/y"), format!("{base}/x/y")),
+            ] {
+                let root = root.path().to_path_buf();
+                let successes = &successes;
+                scope.spawn(move || {
+                    let fs = Fs::open(&root, "default", OpenMode::ReadWrite).expect("open");
+                    if fs.rename(&from, &to).is_ok() {
+                        *successes.lock().expect("lock") += 1;
+                    }
+                });
+            }
+        });
+
+        // Both succeeding would mean each moved into the other's tree: a cycle.
+        let both = *successes.lock().expect("lock") > 1;
+        let fs = Fs::open(root.path(), "default", OpenMode::ReadWrite).expect("open");
+        if both || !fs.verify().expect("verify").is_clean() {
+            violations += 1;
+        }
+    }
+
+    assert_eq!(
+        violations, 0,
+        "K3d: {violations}/40 rounds let both cross-renames commit"
+    );
 }

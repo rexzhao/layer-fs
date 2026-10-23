@@ -289,3 +289,73 @@ fn k3_a_rejected_operation_changes_nothing() {
     );
     assert!(fs.verify().expect("verify").is_clean());
 }
+
+// --------------------------------------------------------------------- K1/K2 补强
+
+/// **K1** — `rmdir` must remove the directory's inode, not just its name.
+///
+/// Architect reported the cascade gap in `unlink` and `rename` R3; `rmdir` has the
+/// same shape and was found while enumerating every removal path for this contract.
+/// An empty directory still owns a `file` row.
+#[test]
+fn k1_rmdir_removes_the_directory_inode() {
+    let (_root, fs) = fixture("k1-rmdir");
+    fs.mkdir("/d").expect("mkdir");
+    fs.mkdir("/d/empty").expect("mkdir inner");
+
+    fs.remove("/d/empty").expect("rmdir inner");
+    fs.remove("/d").expect("rmdir");
+
+    let report = fs.verify().expect("verify");
+    assert!(
+        report.is_clean(),
+        "K1: rmdir must leave no unreachable inode: {:?}",
+        report.inconsistencies
+    );
+    assert!(fs.stat("/d").is_err());
+}
+
+/// **K2** — replacing an empty directory with `rename` must remove the replaced
+/// directory's inode as well as its name.
+///
+/// This is the R7 branch: architect's report covered R3 (file over file) but R7 has
+/// the same "replace the destination, drop its inode" obligation.
+#[test]
+fn k2_rename_over_an_empty_directory_removes_the_replaced_inode() {
+    let (_root, fs) = fixture("k2-r7");
+    fs.mkdir("/src").expect("mkdir src");
+    fs.mkdir("/dst").expect("mkdir dst");
+
+    fs.rename("/src", "/dst").expect("rename over");
+
+    let report = fs.verify().expect("verify");
+    assert!(
+        report.is_clean(),
+        "K2/R7: the replaced directory must leave no unreachable inode: {:?}",
+        report.inconsistencies
+    );
+    assert!(fs.stat("/dst").is_ok());
+    assert!(fs.stat("/src").is_err());
+}
+
+/// **K1** across repeated create/remove cycles: no residue accumulates.
+///
+/// A leak that only appears after several rounds would be invisible to a
+/// create-once-remove-once test.
+#[test]
+fn k1_repeated_create_and_remove_cycles_leave_no_residue() {
+    let (_root, fs) = fixture("k1-cycles");
+    for round in 0..10 {
+        let path = format!("/cycle{round}");
+        fs.create(&path).expect("create");
+        fs.write_at(&path, 0, &blocky(round as u8)).expect("write");
+        fs.remove(&path).expect("remove");
+
+        let report = fs.verify().expect("verify");
+        assert!(
+            report.is_clean(),
+            "K1: round {round} left residue: {:?}",
+            report.inconsistencies
+        );
+    }
+}
