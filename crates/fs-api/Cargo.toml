@@ -15,5 +15,5 @@ fs-overlay.workspace = true
 fs-workspace.workspace = true
 
 [dev-dependencies]
-# Tests tamper with the namespace tables directly to reach corruption guards.
+# `verify`'s legacy-store test forges a P1 metadata database directly.
 rusqlite.workspace = true

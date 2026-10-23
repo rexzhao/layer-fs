@@ -140,8 +140,14 @@ impl Workspace {
 
     /// Step 3 for a snapshot: record the root as a GC root and move the view's base.
     fn record_snapshot(&self, root: cas_core::ObjectId) -> WorkspaceResult<()> {
-        let connection = self.repo.db().lock();
-        let transaction = connection.unchecked_transaction()?;
+        let mut connection = self.repo.db().lock();
+        // BEGIN IMMEDIATE, not a deferred transaction that reads first and writes second:
+        // under WAL a deferred transaction upgrades its read snapshot to a write lock, and
+        // SQLite answers a contested upgrade with SQLITE_BUSY_SNAPSHOT **without running the
+        // busy handler** — so the 5 s wait would never be used. ADR-006 §9.1 asks for
+        // BEGIN IMMEDIATE precisely because the head is read before it is written.
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO snapshot (root_oid, workspace, created_ns) VALUES (?1, ?2, ?3)",
             (root.to_string(), &self.name, now_ns()),
@@ -165,8 +171,14 @@ impl Workspace {
         let parent = self.parent_commit();
         let id = commit_id(root, Some(parent), created, message);
         let expected = self.base_commit.clone();
-        let connection = self.repo.db().lock();
-        let transaction = connection.unchecked_transaction()?;
+        let mut connection = self.repo.db().lock();
+        // BEGIN IMMEDIATE, not a deferred transaction that reads first and writes second:
+        // under WAL a deferred transaction upgrades its read snapshot to a write lock, and
+        // SQLite answers a contested upgrade with SQLITE_BUSY_SNAPSHOT **without running the
+        // busy handler** — so the 5 s wait would never be used. ADR-006 §9.1 asks for
+        // BEGIN IMMEDIATE precisely because the head is read before it is written.
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let head: String = transaction
             .query_row(
                 "SELECT head_commit FROM branch WHERE name = ?1",

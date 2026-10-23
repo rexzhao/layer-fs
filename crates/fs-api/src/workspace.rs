@@ -78,7 +78,7 @@ impl Workspace {
     ///
     /// [`ApiError::Namespace`] for an existing name or a missing parent.
     pub fn create(&self, path: &str) -> ApiResult<()> {
-        Ok(self.inner.overlay().create_file(&parse(path)?)?)
+        Ok(self.inner.create_file(path)?)
     }
 
     /// Removes a file or an **empty** directory.
@@ -128,15 +128,14 @@ impl Workspace {
     ///
     /// [`ApiError::Namespace`] when the path is missing or is a directory.
     pub fn read_at(&self, path: &str, offset: u64, out: &mut [u8]) -> ApiResult<usize> {
-        let path = parse(path)?;
-        let size = self.inner.overlay().content_state(&path)?.size;
+        let size = self.inner.content_size(path)?;
         if out.is_empty() || offset >= size {
             return Ok(0);
         }
         let want = usize::try_from(size - offset)
             .unwrap_or(usize::MAX)
             .min(out.len());
-        let bytes = self.inner.overlay().read_at(&path, offset, want)?;
+        let bytes = self.inner.read_at(path, offset, want)?;
         out[..bytes.len()].copy_from_slice(&bytes);
         Ok(bytes.len())
     }
@@ -149,9 +148,7 @@ impl Workspace {
     ///
     /// [`ApiError::Namespace`] when the path is missing or is a directory.
     pub fn write_at(&self, path: &str, offset: u64, bytes: &[u8]) -> ApiResult<usize> {
-        self.inner
-            .overlay()
-            .write_at(&parse(path)?, offset, bytes)?;
+        self.inner.write_at(path, offset, bytes)?;
         Ok(bytes.len())
     }
 
@@ -161,7 +158,7 @@ impl Workspace {
     ///
     /// [`ApiError::Namespace`] when the path is missing or is a directory.
     pub fn truncate(&self, path: &str, size: u64) -> ApiResult<()> {
-        Ok(self.inner.overlay().truncate(&parse(path)?, size)?)
+        Ok(self.inner.truncate(path, size)?)
     }
 
     /// Makes every change so far durable (ADR-006 §8).
@@ -208,6 +205,19 @@ impl Workspace {
     /// `discard` is false.
     pub fn restore(&mut self, commit: &str, discard: bool) -> ApiResult<()> {
         Ok(self.inner.restore(commit, discard)?)
+    }
+
+    /// Re-points this workspace at `branch` (ADR-006 §10.3, 出路 1).
+    ///
+    /// Only allowed when that branch's head is already this workspace's base commit;
+    /// anything else would be a merge, and P2 has no merge.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Workspace`] with `BranchMoved` when the target branch has moved on, or
+    /// `NotFound`.
+    pub fn rebind(&mut self, branch: &str) -> ApiResult<()> {
+        Ok(self.inner.rebind(branch)?)
     }
 
     /// Closes the handle; the workspace and its work stay on disk.

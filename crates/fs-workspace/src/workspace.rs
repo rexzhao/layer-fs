@@ -129,6 +129,64 @@ impl Workspace {
         &self.overlay
     }
 
+    /// Creates an empty regular file, reserving serials first if the workspace is low.
+    ///
+    /// The overlay's own content API cannot reserve: the allocator lives in the main
+    /// database, and the overlay's transaction must not be open across another database's
+    /// lock. So every content operation goes through this crate's handle, which buys the
+    /// serials — otherwise a workspace with more than one segment's worth of new files
+    /// would run dry (`ov_meta.serial_next` exhausted).
+    ///
+    /// # Errors
+    ///
+    /// Namespace rules or allocator failures.
+    pub fn create_file(&self, path: &str) -> WorkspaceResult<()> {
+        self.reserve_for_growth()?;
+        Ok(self.overlay.create_file(&parse_path(path)?)?)
+    }
+
+    /// Writes `bytes` at `offset`, extending the file when the write runs past its end.
+    ///
+    /// # Errors
+    ///
+    /// Namespace rules or allocator failures.
+    pub fn write_at(&self, path: &str, offset: u64, bytes: &[u8]) -> WorkspaceResult<()> {
+        Ok(self.overlay.write_at(&parse_path(path)?, offset, bytes)?)
+    }
+
+    /// Sets a file's size.
+    ///
+    /// # Errors
+    ///
+    /// Namespace rules or allocator failures.
+    pub fn truncate(&self, path: &str, size: u64) -> WorkspaceResult<()> {
+        Ok(self.overlay.truncate(&parse_path(path)?, size)?)
+    }
+
+    /// Reads `[offset, offset + len)` of a file.
+    ///
+    /// # Errors
+    ///
+    /// Namespace rules.
+    pub fn read_at(&self, path: &str, offset: u64, len: usize) -> WorkspaceResult<Vec<u8>> {
+        Ok(self.overlay.read_at(&parse_path(path)?, offset, len)?)
+    }
+
+    /// A file's logical size.
+    ///
+    /// # Errors
+    ///
+    /// Namespace rules.
+    pub fn content_size(&self, path: &str) -> WorkspaceResult<u64> {
+        Ok(self.overlay.content_state(&parse_path(path)?)?.size)
+    }
+
+    /// The tree backend's serial top-up, so a caller that drives the overlay directly can
+    /// keep the same guarantee.
+    fn reserve_for_growth(&self) -> WorkspaceResult<()> {
+        self.store().top_up()
+    }
+
     /// Makes every change so far durable (ADR-006 §8).
     ///
     /// # Errors
@@ -232,6 +290,12 @@ impl Workspace {
         }
         Ok(())
     }
+}
+
+fn parse_path(text: &str) -> WorkspaceResult<fs_namespace::Path> {
+    fs_namespace::Path::parse(text).map_err(|error| {
+        WorkspaceError::Namespace(fs_namespace::NamespaceError::InvalidPath(error))
+    })
 }
 
 /// What `status` reports.

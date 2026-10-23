@@ -719,3 +719,86 @@ fn two_workspaces_publish_a_thousand_files_concurrently() {
         "a concurrent publication must not be starved, took {worst:?}"
     );
 }
+
+/// **§6 / regression** — a workspace may create more files than one serial segment holds.
+///
+/// The overlay's own content API cannot reserve serials (the allocator is in the main
+/// database), so a workspace that bypassed `Workspace::create_file` used to run dry after
+/// 1024 new files with `ov_meta.serial_next: reserved range is exhausted`. Found by the
+/// P2a-8 flush benchmark at N=10 000.
+#[test]
+fn a_workspace_can_create_more_files_than_one_serial_segment() {
+    let (_root, repo) = repository("serial-growth");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
+    // Two and a half segments: past the first reservation, and past one top-up.
+    let count = 2500;
+    for index in 0..count {
+        let path = format!("/f{index:05}");
+        workspace.create_file(&path).expect("create file");
+        workspace.write_at(&path, 0, b"x").expect("write");
+    }
+    // The top-up happened: the scope's next serial moved past the first segment.
+    let scope = repo.branches().expect("branches")[0].scope_id.clone();
+    let connection = rusqlite::Connection::open(repo.metadata_path()).expect("connection");
+    let next: i64 = connection
+        .query_row(
+            "SELECT next_serial FROM scope_allocator WHERE scope_id = ?1",
+            [&scope],
+            |row| row.get(0),
+        )
+        .expect("next_serial");
+    assert!(
+        next > 1 + i64::try_from(fs_workspace::SERIAL_SEGMENT).expect("fits"),
+        "more than one segment must have been reserved, next = {next}"
+    );
+    // And the files are all there.
+    assert_eq!(names(&workspace, "/").len(), count);
+}
+/// **§9.1 / regression** — the publication transaction is `BEGIN IMMEDIATE`.
+///
+/// A deferred transaction reads `branch.head_commit` and then writes. Under WAL, a
+/// contested *upgrade* of a read snapshot answers `SQLITE_BUSY_SNAPSHOT` **without running
+/// the busy handler**, so the 5 s bounded wait would never be used: with ten workspaces
+/// publishing at once, two failed after ~200 ms instead of waiting. Found by acceptance
+/// row A1.
+///
+/// This test does not need ten threads: it holds the write lane from another connection
+/// and asserts the publication *waits* (rather than failing immediately), which is only
+/// true if the transaction asks for the write lock up front.
+#[test]
+fn a_publication_waits_for_the_write_lane_before_reading_the_head() {
+    let (_root, repo) = repository("immediate");
+    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    put_file(&workspace, "/f", b"x");
+
+    let blocker = rusqlite::Connection::open(repo.metadata_path()).expect("second connection");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("take the write lane");
+
+    // Release the blocker after 300 ms, so a correct publication waits and then succeeds;
+    // a deferred one would fail almost immediately with SQLITE_BUSY_SNAPSHOT.
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = blocker.execute_batch("ROLLBACK");
+        blocker
+    });
+
+    let started = Instant::now();
+    let outcome = workspace.commit("waited", false);
+    let waited = started.elapsed();
+    drop(release.join().expect("release thread"));
+
+    assert!(
+        outcome.is_ok(),
+        "the publication must wait for the lane and then succeed, got {outcome:?}"
+    );
+    assert!(
+        waited >= Duration::from_millis(250),
+        "it must actually have waited, measured {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(5),
+        "and it must not have waited out the timeout, measured {waited:?}"
+    );
+}

@@ -253,11 +253,12 @@ fn encode_file(
     }
     let block = profile.block_bytes;
     if size < block {
+        // ADR-005 §3.2: a file below one block is a Blob **even when every byte is zero**.
+        // Empty means "no content", which is reserved for size 0 here and for the
+        // all-zero-block case above `block`. Encoding a zero-filled 64-byte file as Empty
+        // makes the snapshot invalid, and the decoder says so.
         let index = usize::try_from(size).unwrap_or(usize::MAX);
         let bytes = read_block(&node.path, 0, index)?;
-        if bytes.iter().all(|byte| *byte == 0) {
-            return Ok(Content::Empty);
-        }
         let object = publish(sink, |sink| sink.put(Role::Bytes, &bytes))?;
         return Ok(Content::Blob(object));
     }

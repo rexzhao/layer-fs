@@ -220,7 +220,14 @@ impl<'a> SnapshotReader<'a> {
                     if height == 0 {
                         return Err(malformed("a directory branch height must be at least 1"));
                     }
-                    pointer = self.descend_name_branch(&mut reader, name)?;
+                    // A name that sorts before the branch's first key simply is not in
+                    // this directory — the leaf arm already answers `Ok(None)` for that
+                    // case, and a lookup of a missing name must not depend on which level
+                    // of the tree happened to be reached.
+                    match self.descend_name_branch(&mut reader, name)? {
+                        Some(child) => pointer = child,
+                        None => return Ok(None),
+                    }
                 }
                 other => {
                     return Err(SnapshotError::WrongRole {
@@ -232,11 +239,13 @@ impl<'a> SnapshotReader<'a> {
         }
     }
 
+    /// The child page that would hold `name`, or `None` when `name` sorts before every
+    /// entry of this branch.
     fn descend_name_branch(
         &self,
         reader: &mut Reader<'_>,
         name: &[u8],
-    ) -> SnapshotResult<ObjectId> {
+    ) -> SnapshotResult<Option<ObjectId>> {
         let count = reader.u32()?;
         if count == 0 {
             return Err(malformed("a directory branch may not be empty"));
@@ -258,7 +267,7 @@ impl<'a> SnapshotReader<'a> {
             }
         }
         reader.finish()?;
-        chosen.ok_or_else(|| malformed("name precedes the first key of every branch entry"))
+        Ok(chosen)
     }
 
     /// Lists a directory's entries in order, starting after `after`.

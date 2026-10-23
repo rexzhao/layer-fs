@@ -43,7 +43,7 @@ impl WorkspaceStore {
     /// more when it runs low. That has to happen *before* the write transaction opens:
     /// the reservation is a main-database transaction, and the overlay's transaction must
     /// not be open across another database's lock.
-    fn top_up(&self) -> WorkspaceResult<()> {
+    pub fn top_up(&self) -> WorkspaceResult<()> {
         let (next, end) = self.overlay.serial_range()?;
         if end.saturating_sub(next) >= SERIAL_LOW_WATER {
             return Ok(());
