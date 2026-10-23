@@ -1,9 +1,10 @@
 //! The reference model's supporting machinery: the model itself, the random driver, and the
-//! full-tree comparison (ADR-006 §18-1).
+//! full-tree comparison (ADR-006 §18-1, ADR-007 §10).
 //!
-//! Split out of `reference_model.rs` so the test file reads as "what is checked" and this
-//! file reads as "how".
+//! Split out of the test files so they read as "what is checked" and this file reads as
+//! "how". Each phase uses a different part of it, so the whole module allows dead code.
 
+#![allow(dead_code)]
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -515,6 +516,29 @@ pub fn assert_tree_matches(
             }
         }
     }
+    // The other direction: nothing may exist that the model does not know. Without this a
+    // removal that silently did nothing would pass every check above, because the model no
+    // longer holds the path being compared.
+    let mut pending = vec!["/".to_owned()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = workspace.read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let child = if dir == "/" {
+                format!("/{}", entry.name)
+            } else {
+                format!("{dir}/{}", entry.name)
+            };
+            assert!(
+                reference.get(&child).is_some(),
+                "{context}: the workspace holds {child:?}, which the model does not have"
+            );
+            if entry.kind == Kind::Directory {
+                pending.push(child);
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ fixture
@@ -560,5 +584,188 @@ impl Fixture {
         let root = TempRoot::new(seed);
         let repo = Repo::create(root.path.join("store")).expect("create repository");
         Self { repo, _root: root }
+    }
+}
+
+// ------------------------------------------------------------------ states and history
+
+/// A frozen copy of the reference tree, for the prefix assertions (M4) and the history
+/// comparisons (M7).
+///
+/// Equality is on every path, every kind and every byte — the same granularity M3 asks the
+/// per-step comparison for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frozen {
+    nodes: BTreeMap<String, Node>,
+}
+
+impl Reference {
+    /// A frozen copy of the current tree.
+    #[must_use]
+    pub fn freeze(&self) -> Frozen {
+        Frozen {
+            nodes: self.nodes.clone(),
+        }
+    }
+}
+
+impl Frozen {
+    /// Whether the workspace's whole tree equals this frozen state (M3 granularity).
+    #[must_use]
+    pub fn matches(&self, workspace: &Workspace) -> bool {
+        let reference = Reference {
+            nodes: self.nodes.clone(),
+        };
+        for path in reference.paths() {
+            let expected = reference.get(&path).expect("a path that exists");
+            let Ok(stat) = workspace.stat(&path) else {
+                return false;
+            };
+            match expected {
+                Node::Dir => {
+                    if stat.kind != Kind::Directory {
+                        return false;
+                    }
+                    let mut actual: Vec<String> = match workspace.read_dir(&path) {
+                        Ok(entries) => entries.into_iter().map(|entry| entry.name).collect(),
+                        Err(_) => return false,
+                    };
+                    actual.sort();
+                    let expected_names: Vec<String> = reference.children(&path).collect();
+                    if actual != expected_names {
+                        return false;
+                    }
+                }
+                Node::File(bytes) => {
+                    if stat.kind != Kind::File
+                        || stat.size != u64::try_from(bytes.len()).unwrap_or(0)
+                    {
+                        return false;
+                    }
+                    let mut buffer = vec![0u8; bytes.len()];
+                    let Ok(read) = workspace.read_at(&path, 0, &mut buffer) else {
+                        return false;
+                    };
+                    buffer.truncate(read);
+                    if &buffer != bytes {
+                        return false;
+                    }
+                }
+            }
+        }
+        // Nothing else may exist either: a path the model does not know is a divergence.
+        let known: std::collections::BTreeSet<&String> = self.nodes.keys().collect();
+        known.len() == count_paths(workspace)
+    }
+
+    /// A one-line description, for the mismatch message.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!("{} paths", self.nodes.len())
+    }
+}
+
+/// Counts the paths the workspace currently exposes, by walking from the root.
+fn count_paths(workspace: &Workspace) -> usize {
+    let mut total = 0;
+    let mut pending = vec!["/".to_owned()];
+    while let Some(dir) = pending.pop() {
+        total += 1;
+        let Ok(entries) = workspace.read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let child = if dir == "/" {
+                format!("/{}", entry.name)
+            } else {
+                format!("{dir}/{}", entry.name)
+            };
+            if entry.kind == Kind::Directory {
+                pending.push(child);
+            } else {
+                total += 1;
+            }
+        }
+    }
+    total
+}
+
+/// The state history the crash assertions need (M4): `S_f` and every state after it.
+#[derive(Debug, Default)]
+pub struct History {
+    /// The step number of the last flush; `0` before any flush.
+    pub last_flush: usize,
+    /// States from `last_flush` onwards, in step order.
+    states: Vec<(usize, Frozen)>,
+}
+
+impl History {
+    /// Records the state after `step`.
+    ///
+    /// Before the first flush the history is irrelevant ("nothing is promised"), so states
+    /// are only kept from the most recent flush onwards: that keeps the vector bounded no
+    /// matter how long the sequence runs.
+    pub fn record(&mut self, step: usize, reference: &Reference) {
+        self.states.push((step, reference.freeze()));
+        // Keep the states after the last flush plus one before it (the flush point itself).
+        if let Some(position) = self
+            .states
+            .iter()
+            .rposition(|(at, _)| *at <= self.last_flush)
+        {
+            if position > 0 {
+                self.states.drain(0..position);
+            }
+        }
+    }
+
+    /// Marks `step` as a flush point (W3/W4: everything up to here is durable).
+    pub fn flushed(&mut self, step: usize) {
+        self.last_flush = step;
+    }
+
+    /// The first state the recovered workspace matches, if any (M4: `k ≥ f`).
+    ///
+    /// Returns `None` when the recovered tree matches no recorded prefix — which is the
+    /// failure the contract is about.
+    #[must_use]
+    pub fn matching(&self, workspace: &Workspace) -> Option<usize> {
+        self.states
+            .iter()
+            .find(|(step, frozen)| *step >= self.last_flush && frozen.matches(workspace))
+            .map(|(step, _)| *step)
+    }
+
+    /// Truncates the history to `step`, so the model can be rewound to the recovered state.
+    pub fn rewind(&mut self, step: usize) {
+        self.states.retain(|(at, _)| *at <= step);
+    }
+
+    /// Every recorded step number, for diagnostics.
+    #[must_use]
+    pub fn steps(&self) -> Vec<usize> {
+        self.states.iter().map(|(step, _)| *step).collect()
+    }
+}
+
+impl Frozen {
+    /// The state as a reference tree, so the caller can keep using the model after a
+    /// snapshot or a commit.
+    #[must_use]
+    pub fn to_reference(&self) -> Reference {
+        Reference {
+            nodes: self.nodes.clone(),
+        }
+    }
+}
+
+impl History {
+    /// The state recorded at `step`, if it is still in the history.
+    #[must_use]
+    pub fn state_at(&self, step: usize) -> Option<Reference> {
+        self.states
+            .iter()
+            .find(|(at, _)| *at == step)
+            .map(|(_, frozen)| frozen.to_reference())
     }
 }

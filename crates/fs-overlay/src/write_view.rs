@@ -148,10 +148,23 @@ pub(crate) fn unbind_impl(
         // Already a whiteout: nothing is visible, nothing to do.
         Some(None) => Ok(()),
         Some(Some(_)) => {
-            connection.execute(
-                "DELETE FROM ov_entry WHERE parent = ?1 AND name = ?2",
-                (parent.serial() as i64, name),
-            )?;
+            // Whether deleting the row is enough depends on the *base*: if the base still
+            // binds this name, deleting the overlay row would reveal the base binding again
+            // and the entry would reappear. That is exactly what happened when a name from
+            // the base was removed, re-created and removed again — the re-creation reused
+            // the same `ov_entry` row, so the second removal must turn it back into a
+            // whiteout rather than drop it.
+            if base_binds(base, parent, name)? {
+                connection.execute(
+                    "UPDATE ov_entry SET child = NULL WHERE parent = ?1 AND name = ?2",
+                    (parent.serial() as i64, name),
+                )?;
+            } else {
+                connection.execute(
+                    "DELETE FROM ov_entry WHERE parent = ?1 AND name = ?2",
+                    (parent.serial() as i64, name),
+                )?;
+            }
             bump_entries(connection, parent, -1)?;
             Ok(())
         }
