@@ -240,7 +240,7 @@ impl<S: TreeStore> Rules<S> {
     ///
     /// # Errors
     ///
-    /// As [`Namespace::resolve`], and `IsRoot` when `path` is `/`.
+    /// As [`Rules::resolve`], and `IsRoot` when `path` is `/`.
     pub fn resolve_parent(&self, path: &Path) -> NamespaceResult<(FileId, String)> {
         if path.is_root() {
             return Err(NamespaceError::IsRoot);
