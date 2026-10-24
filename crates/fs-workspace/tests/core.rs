@@ -483,7 +483,19 @@ fn a_held_main_database_lock_ends_in_a_typed_busy() {
 
     match outcome {
         Err(WorkspaceError::Busy { waited_ms }) => {
-            assert_eq!(waited_ms, fs_workspace::MAIN_BUSY_TIMEOUT_MS);
+            // `waited_ms` is a **measurement**, not the policy constant: the old code filled it
+            // with `MAIN_BUSY_TIMEOUT_MS`, so a failure after 5 ms claimed a 5000 ms wait. The
+            // reported value must match the wall clock the driver measured, and the policy is
+            // only what the wait is *configured* to.
+            let measured = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+            assert!(
+                waited_ms.abs_diff(measured) <= 100,
+                "reported wait {waited_ms} ms must be the measured {measured} ms"
+            );
+            assert!(
+                waited_ms >= fs_workspace::MAIN_BUSY_TIMEOUT_MS,
+                "the wait is configured to be at least {waited_ms} ms"
+            );
         }
         other => panic!("expected a typed Busy, got {other:?}"),
     }
@@ -635,7 +647,19 @@ fn a_blocked_cas_index_also_waits_boundedly() {
 
     match outcome {
         Err(WorkspaceError::Busy { waited_ms }) => {
-            assert_eq!(waited_ms, fs_workspace::MAIN_BUSY_TIMEOUT_MS);
+            // `waited_ms` is a **measurement**, not the policy constant: the old code filled it
+            // with `MAIN_BUSY_TIMEOUT_MS`, so a failure after 5 ms claimed a 5000 ms wait. The
+            // reported value must match the wall clock the driver measured, and the policy is
+            // only what the wait is *configured* to.
+            let measured = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+            assert!(
+                waited_ms.abs_diff(measured) <= 100,
+                "reported wait {waited_ms} ms must be the measured {measured} ms"
+            );
+            assert!(
+                waited_ms >= fs_workspace::MAIN_BUSY_TIMEOUT_MS,
+                "the wait is configured to be at least {waited_ms} ms"
+            );
         }
         other => panic!("expected a typed Busy from the CAS connection, got {other:?}"),
     }
