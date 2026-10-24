@@ -38,6 +38,7 @@
 
 mod busy;
 mod error;
+pub mod gc;
 mod ids;
 mod main_db;
 mod materialize;
