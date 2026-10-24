@@ -122,6 +122,54 @@ impl Repo {
         Ok(repo)
     }
 
+    /// Opens the repository **exclusively**, for offline maintenance (ADR-008 §6.1).
+    ///
+    /// Takes a write lock on the main database and on every workspace overlay, with no busy wait:
+    /// a maintenance run must either have the whole store or change nothing. "Change nothing" is
+    /// not a promise made by discipline here — nothing is written before every lock is held, so a
+    /// refusal leaves the files byte-identical (the test compares a fingerprint taken outside the
+    /// process).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::StoreInUse`] when another process holds the store or one of its overlays.
+    pub fn open_exclusive(store_dir: impl AsRef<Path>) -> WorkspaceResult<MaintenanceRepo> {
+        let store_dir = store_dir.as_ref().to_path_buf();
+        let repo = Self::open(&store_dir, false)?;
+        let mut held: Vec<rusqlite::Connection> = Vec::new();
+
+        // The main database first: taking it through the repository's own connection means no
+        // second opener fights the first one for a lock it already holds.
+        {
+            let connection = repo.db.lock();
+            connection
+                .pragma_update(None, "busy_timeout", 0)
+                .and_then(|()| connection.pragma_update(None, "locking_mode", "EXCLUSIVE"))
+                .and_then(|()| connection.execute_batch("BEGIN IMMEDIATE"))
+                .map_err(|error| WorkspaceError::StoreInUse {
+                    what: format!("the main database ({error})"),
+                })?;
+        }
+
+        // Every overlay, because an active workspace's pending root is only visible inside it.
+        let workspaces = store_dir.join("workspaces");
+        if let Ok(entries) = std::fs::read_dir(&workspaces) {
+            for entry in entries.flatten() {
+                let overlay = entry.path().join("overlay.sqlite");
+                if !overlay.is_file() {
+                    continue;
+                }
+                let label = format!(
+                    "the overlay of workspace {}",
+                    entry.file_name().to_string_lossy()
+                );
+                held.push(take_exclusive(&overlay, &label)?);
+            }
+        }
+
+        Ok(MaintenanceRepo { repo, _held: held })
+    }
+
     /// Where this repository lives.
     #[must_use]
     pub fn store_dir(&self) -> &Path {
@@ -973,4 +1021,45 @@ fn commit_row(connection: &Connection, id: &str) -> WorkspaceResult<CommitInfo> 
         .ok_or_else(|| WorkspaceError::NotFound {
             what: format!("commit {id}"),
         })
+}
+
+/// Opens `path` and takes its write lock immediately, without waiting.
+///
+/// `locking_mode = EXCLUSIVE` keeps the lock for the life of the connection, so a maintenance run
+/// holds the store until it finishes; `busy_timeout = 0` means a competing user is reported now
+/// rather than after a wait whose outcome would be the same (ADR-008 §6.1).
+fn take_exclusive(path: &Path, what: &str) -> WorkspaceResult<rusqlite::Connection> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|error| WorkspaceError::StoreInUse {
+                what: format!("{what} ({error})"),
+            })?;
+    connection
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .and_then(|()| connection.pragma_update(None, "busy_timeout", 0))
+        .and_then(|()| connection.execute_batch("BEGIN IMMEDIATE"))
+        .map_err(|error| WorkspaceError::StoreInUse {
+            what: format!("{what} ({error})"),
+        })?;
+    Ok(connection)
+}
+
+/// A repository opened for offline maintenance (ADR-008 §6.1).
+///
+/// Holding it keeps every lock; dropping it releases them. The type exists so that "am I allowed
+/// to collect garbage" is answered by the type system rather than by a boolean someone must
+/// remember to check.
+#[derive(Debug)]
+pub struct MaintenanceRepo {
+    repo: Repo,
+    /// The connections whose write locks *are* the exclusivity: dropped last.
+    _held: Vec<rusqlite::Connection>,
+}
+
+impl MaintenanceRepo {
+    /// The repository, for the maintenance operations.
+    #[must_use]
+    pub fn repo(&self) -> &Repo {
+        &self.repo
+    }
 }

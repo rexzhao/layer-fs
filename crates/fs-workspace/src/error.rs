@@ -19,6 +19,15 @@ pub enum WorkspaceError {
     },
     /// `commit` was called when the workspace's view already equals the base.
     NothingToCommit,
+    /// The store is in use by another process (offline maintenance only).
+    ///
+    /// ADR-008 §6.1: GC takes the whole store exclusively. "In use" is reported, never waited out
+    /// and never partially applied — a maintenance run that half-started would be worse than one
+    /// that refused.
+    StoreInUse {
+        /// What could not be taken exclusively.
+        what: String,
+    },
     /// A name was already taken.
     AlreadyExists {
         /// The name.
@@ -88,6 +97,9 @@ impl fmt::Display for WorkspaceError {
             WorkspaceError::Busy { waited_ms } => {
                 write!(f, "the main database stayed locked for {waited_ms} ms")
             }
+            WorkspaceError::StoreInUse { what } => {
+                write!(f, "the store is in use: {what} is held by another process")
+            }
             WorkspaceError::Inconsistent { detail } => write!(f, "inconsistent state: {detail}"),
             WorkspaceError::SchemaMismatch { expected, found } => {
                 write!(
@@ -125,7 +137,8 @@ impl std::error::Error for WorkspaceError {
             | WorkspaceError::Busy { .. }
             | WorkspaceError::Inconsistent { .. }
             | WorkspaceError::SchemaMismatch { .. }
-            | WorkspaceError::NotInitialised => None,
+            | WorkspaceError::NotInitialised
+            | WorkspaceError::StoreInUse { .. } => None,
         }
     }
 }
@@ -211,7 +224,12 @@ mod tests {
                 None,
             ),
             (
-                WorkspaceError::Busy { waited_ms: 5000 },
+                WorkspaceError::StoreInUse { what: "overlay".into() },
+                "the store is in use: overlay is held by another process",
+                None,
+            ),
+            (
+            WorkspaceError::Busy { waited_ms: 5000 },
                 "the main database stayed locked for 5000 ms",
                 None,
             ),
