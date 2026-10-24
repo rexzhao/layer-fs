@@ -284,7 +284,7 @@ architect 裁决方案 (c)——**参数化，不改默认**：
 由 `materialize::publish` 还原成 `WorkspaceError`（因此上面那条 cas-store Busy 测试才能断言类型）。
 ---
 
-## KI-9：`truncate` 缩容后再扩展会**复活**已丢弃的字节（**R3-1，修复中**）
+## KI-9：`truncate` 缩容后再扩展会**复活**已丢弃的字节（**R3-1，已修复 07a4bb1**）
 
 **发现于**：P2b-0 之后，QA 覆盖率第 3 轮（2026-10-24）的参考模型长 soak：
 `cargo test --release -p fs-api --test reference_model -- --ignored`，
@@ -342,3 +342,21 @@ workspace.truncate("/f", 181)?;               // 扩展：按 POSIX/ADR-006 §7.
 | 缩容 → `snapshot`/`commit` → 再扩 | 绿（被物化掩蔽） | 仅作覆盖用例，**不得**用作撤销实验判据 |
 
 参考模型 soak 是端到端兑底（`seed=1000 step=357`，干净树必红；修后 10×1000 汇总全绿）。
+
+**修复与验收（QA 终态 PASS，`07a4bb1`）**：清零实现（`live_end = min(old,new)`、删 `⌈live_end/page⌉`
+起的页、跨界页自 `live_end % page` 起原地清零，页恒为 `PAGE_BYTES`），A/B 六判据成立（crate 层 3 + API 层 3），
+4 例覆盖用例显式标注（对齐缩容 / `truncate(0)` / `commit` 掩蔽 / `snapshot` 掩蔽）。QA 用 10 个自写形状独立
+交叉验证：7 例红→绿、3 例绿→绿，与本节分类一致。
+
+**归类更正（同一轮的重要发现）**：soak 改为"跑完全部种子再汇总"后，干净树上 **10/10 种子全部失败**
+（`1000 step=357`、`1001 step=195`、`1002 step=357`、`1004 step=201 write_at`、`1006 step=436`、`1008 step=90` …），
+不是"只有 seed 1000"。此前"仅 seed=1000 失败"是 panic 即停造成的假象——**首次失败即停的测试会低估缺陷面**，
+这也是把汇总模式纳入验收的原因。
+
+**遗留观察项（非阻塞，未在本卡修）**：
+
+- **N1**：`content_state().pages` 只能钉"页数"，钉不住"页不短"（短页也是 1 行）。"本实现不产生短页"目前是
+  构造性事实而非测试钉住；建议在 `fs-overlay/src/content.rs` 模块内单测直接断言缩容后 `data.len() == PAGE_BYTES`。
+- **N2**：soak 汇总的 `summarise` 截断 240 字符，长 `write_at` 信息行会截掉字节段（step/路径/尺寸保留）。
+- **N3**：`k6_aligned_shrink_then_growth_...` 的注释把"扩展不重建页"（由 `pages` 钉）与"读路径为零"（由读断言钉）
+  写在一句里，建议分开。
