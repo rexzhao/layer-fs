@@ -199,3 +199,65 @@ fn a_committed_workspace_contributes_no_pending_root() {
         .iter()
         .any(|entry| entry.kind == RootKind::Commit));
 }
+
+// ------------------------------------------------- two enumerations, deliberately different
+
+/// `Repo::roots()` (what `verify` reads) **never touches an overlay**: it is a UNION of three
+/// main-database columns, so it answers in microseconds even while a workspace holds its overlay.
+///
+/// Pinned because the asymmetry is easy to forget: the bare list is *not* the GC root set, and using
+/// it for GC would silently protect nothing from a pending publication.
+#[test]
+fn the_bare_root_list_works_while_a_workspace_is_open_and_omits_overlay_roots() {
+    let root = TempRoot::new("bare");
+    let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
+    repo.init().expect("init");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
+    put_file(&workspace, "/f", b"uncommitted bytes");
+
+    let bare = repo.roots().expect("the bare list must not touch overlays");
+    assert!(!bare.is_empty(), "the commit and base roots are there");
+    let labelled = RepoRoots { repo: &repo }.roots();
+    assert!(
+        labelled.is_err(),
+        "the labelled enumeration needs the overlay, which this workspace is holding; got {:?}",
+        labelled.map(|set| set.entries().len())
+    );
+
+    drop(workspace);
+    let after = RepoRoots { repo: &repo }
+        .roots()
+        .expect("roots after the workspace closes");
+    assert!(
+        after.entries().len() > bare.len(),
+        "the labelled enumeration carries one row per fact ({} bare vs {} labelled)",
+        bare.len(),
+        after.entries().len()
+    );
+}
+
+/// The failure while a workspace is open must be **loud**: a silently omitted overlay root is a
+/// subtree the sweep would delete. This is the property, not the error class.
+#[test]
+fn a_live_overlay_is_never_silently_omitted() {
+    let root = TempRoot::new("loud");
+    let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
+    repo.init().expect("init");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
+    put_file(&workspace, "/f", b"uncommitted bytes");
+
+    let result = RepoRoots { repo: &repo }.roots();
+    match result {
+        Err(error) => assert!(
+            matches!(error, fs_workspace::WorkspaceError::Busy { .. }),
+            "expected Busy (the everyday path's vocabulary), got {error:?}"
+        ),
+        Ok(set) => {
+            panic!(
+            "a live overlay was enumerated anyway; if this is now supported, prove the read is \
+             still consistent: {:?}",
+            set.entries().iter().map(|e| e.label.clone()).collect::<Vec<_>>()
+        )
+        }
+    }
+}
