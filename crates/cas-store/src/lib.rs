@@ -39,6 +39,7 @@
 mod batch;
 mod durability;
 mod error;
+pub mod index;
 mod layout;
 mod object;
 mod objects_scan;

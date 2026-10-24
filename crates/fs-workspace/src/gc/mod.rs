@@ -12,9 +12,11 @@
 pub mod criteria;
 pub mod mark;
 pub mod roots;
+pub mod sweep;
 
 pub use mark::{mark_roots, Marker};
 pub use roots::{MaintenanceRoots, RepoRoots, RootKind, RootRef, RootRow, RootSet, RootSource};
+pub use sweep::{plan, PackDecision, SweepPlan};
 
 use std::collections::BTreeMap;
 use std::time::Duration;
