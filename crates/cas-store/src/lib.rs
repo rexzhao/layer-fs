@@ -65,6 +65,19 @@ pub struct PinForTest {
     _pin: durability::Pin,
 }
 
+/// Validates a store's schema over a caller-owned connection (offline maintenance, ADR-008 §6.1).
+///
+/// The maintenance open owns **one** connection for the whole store, so it cannot go through
+/// [`Store::open`] (which opens its own). This runs the same read-only checks the normal path runs,
+/// inside the caller's exclusive lock.
+///
+/// # Errors
+///
+/// [`StoreError::UnsupportedSchemaVersion`] / [`StoreError::SchemaMismatch`] as usual.
+pub fn validate_schema_over(connection: &rusqlite::Connection) -> StoreResult<()> {
+    schema::validate(connection)
+}
+
 #[cfg(feature = "crash-points")]
 pub mod testing;
 

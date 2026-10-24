@@ -82,7 +82,7 @@ fn a_refused_exclusive_open_leaves_every_byte_alone() {
     let held = std::sync::Arc::new(Repo::open(&dir, false).expect("open"));
     let before = fingerprint(&dir);
 
-    match Repo::open_exclusive(&dir) {
+    match fs_workspace::MaintenanceRepo::open(&dir) {
         Err(fs_workspace::WorkspaceError::StoreInUse { what }) => {
             assert!(
                 what.contains("main database") || what.contains("overlay"),
@@ -102,7 +102,6 @@ fn a_refused_exclusive_open_leaves_every_byte_alone() {
 }
 
 #[test]
-#[ignore = "blocked: `locking_mode=EXCLUSIVE` on the main connection returns `database is locked`             because the same Repo holds a second connection to store.sqlite (cas-store's). Needs a             decision on which connection owns the lock — see the ④ report."]
 fn an_unused_store_can_be_taken_exclusively() {
     let root = TempRoot::new("taken");
     let dir = root.store();
@@ -110,11 +109,16 @@ fn an_unused_store_can_be_taken_exclusively() {
     repo.init().expect("init");
     drop(repo);
 
-    let maintenance = Repo::open_exclusive(&dir).expect("exclusive open");
-    assert_eq!(
-        maintenance.repo().branch_head("main").expect("head").len(),
-        64
-    );
+    let maintenance = fs_workspace::MaintenanceRepo::open(&dir).expect("exclusive open");
+    let head: String = maintenance
+        .connection()
+        .query_row(
+            "SELECT head_commit FROM branch WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("head");
+    assert_eq!(head.len(), 64);
     drop(maintenance);
 
     // Released: an ordinary open works again.
