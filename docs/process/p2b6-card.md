@@ -179,18 +179,42 @@ distinct_oids(visited) == distinct_oids(roots)
 - **G1c「dry-run 无副作用」**：`gc --dry-run` 之后，除**标记库**外 store 内每个文件的哈希不变。它同时验证两件事：
   dry-run 真的只读；标记库位置正确（若写进 `packs/` 或 `tmp/`，哈希就会变）。
 
-## 11. 接口新增（mark 依赖，manager 批准 + architect 复核中）
+## 11. 接口新增（mark 依赖，architect 裁决：`references` 而非 visitor）
 
-`fs-snapshot` 公开 visitor 式遍历（**不在 GC 里复制格式知识**，与 KI-10 同类风险）：
+**不采用 visitor 的 `for_each_object`**，理由（architect）：visitor 由库控制下降，调用方无法说"这个 oid 已标记，别再往下走"——
+若库不内部去重，共享子树被反复展开，直接违反 §6.3；若库内部去重，则"去重"被搬进 fs-snapshot，而 GC 的 mark 集才是
+G2/G3 的判据本身。另外 visitor 的回调不能返回错误，而 GC 每访问一个对象要写标记库、失败必须中止；遍历递归在库内还会吃栈。
+
+采用：
 
 ```rust
-/// Visits every object reachable from `root`, in no particular order.
-/// Visitor-based on purpose: a `Vec<ObjectId>` return would make the caller hold the whole closure
-/// in memory (ADR-008 §5.4). The same object may be visited more than once through a shared
-/// subtree — deduplication is the **caller's** job (GC inserts into a `BTreeSet`).
-pub fn for_each_object(root: ObjectId, visit: impl FnMut(ObjectId, Role)) -> SnapshotResult<()>
+impl SnapshotReader<'_> {
+    /// The objects the value `oid` **directly** references (not `oid` itself):
+    /// filesystem root → inode table page; inode table page → child table pages and each
+    /// inode's content root; directory page → child pages; extent node → child nodes/chunks;
+    /// Empty/Blob → nothing. Pure read: same `oid` always yields the same list.
+    ///
+    /// **Only object ids**: a child's exact `Role` lives in the child's own envelope, so
+    /// returning it here would make the caller read every child twice for nothing.
+    pub fn references(&self, oid: ObjectId) -> SnapshotResult<Vec<ObjectId>>;
+}
 ```
 
-约束：① 只访问不返回；② 不暴露 pager 内部（`Entry`/`Shape`/`build_tree` 仍 `pub(crate)`）；③ 允许重复访问并写进文档，
-**去重留在 GC**（"去重后访问了几个"是 G2/G3 的判据本身）；④ 单测须证明**共享子树节点被访问多次**（否则 G3 的 per-kind
-断言会失真）；⑤ 纯新增，不改既有 API 语义。
+- **去重与展开策略留在 GC**：从每个根入队 → 弹出 oid → 已标记则不展开（§6.3 的字面算法）→ 否则写标记集并把 `references`
+  的子节点入队。"共享子树只走一次"是 **mark 的性质，不是遍历器的性质**；
+- 内存：每次只持有一个对象的直接引用（页扇出有界），全量集合在临时 SQLite（§5.4）；
+- 错误：每个对象一次 `Result`，GC 天然可中止；损坏对象**报错**而不是静默跳过；
+- 约束：不暴露页级结构（`Entry`/`Shape`/`build_tree` 仍 `pub(crate)`）；纯新增；测试要求：重复调用结果一致（纯读）、
+  `Empty`/`Blob`/叶目录页返回空、损坏/未知 role 报错而不是跳过。
+
+**ADR 记录**（待直提）：ADR-008 §6.3 末尾 + ADR-005 读取接口半句（"读取器暴露引用边，不暴露页级结构"）。
+
+## 12. 追加验收：解码失败不得被当成"没有子节点"（QA，数据丢失路径）
+
+> `references` 遇到任何读取/解码失败**必须返回错误**，GC **必须中止**（不是跳过子树）；`MissingPack`/`CorruptPack` 走 2d 的
+> typed 错误；报告体现"因存储损坏而中止"，**不得删任何对象**。
+
+即：**一次读取失败不能变成一次静默删除**——若把损坏节点当叶子，其子对象全部变"不可达"而被回收，而且之后 `verify`
+仍然干净（垃圾没了，看起来更健康）。
+
+K8 拆两例：**K8a** 发布前缺失（`pack` 行在、文件缺）；**K8b** 遍历中途缺失（"把损坏当叶子"的活体检测）。
