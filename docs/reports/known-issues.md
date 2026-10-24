@@ -282,3 +282,43 @@ architect 裁决方案 (c)——**参数化，不改默认**：
 **顺带修正的一处**：物化器的 `PageSink` 实现原先把 `StoreError` 压成
 `SnapshotError::Malformed { detail }`，这会把 `Busy` 的类型信息抹掉。改为把 store 失败暂存于 sink、
 由 `materialize::publish` 还原成 `WorkspaceError`（因此上面那条 cas-store Busy 测试才能断言类型）。
+---
+
+## KI-9：`truncate` 缩容后再扩展会**复活**已丢弃的字节（**R3-1，修复中**）
+
+**发现于**：P2b-0 之后，QA 覆盖率第 3 轮（2026-10-24）的参考模型长 soak：
+`cargo test --release -p fs-api --test reference_model -- --ignored`，
+`seed=1000 step=357 op=truncate /n2 → 181`。常规 40×200 序列全过，10×1000 才撞到这个形状。
+
+**复现（最小）**：
+
+```rust
+workspace.write_at("/f", 0, &[0xEE; 200])?;   // 或 0xE9，任意非零填充
+workspace.truncate("/f", 66)?;
+workspace.truncate("/f", 181)?;               // 扩展：按 POSIX/ADR-006 §7.3 应为零
+// 实际：[66, 181) 仍是 0xEE；应为 0
+```
+
+**成因**：`truncate_impl` 只 `DELETE FROM ov_page WHERE page_index >= boundary`
+（`boundary = new_size.div_ceil(PAGE_BYTES)`），**跨界页保留、尾部没有清零**；`base_limit` 的下调
+只掩蔽 base 字节，掩不住 overlay 页里的旧字节。缩容后 size 检查让它们不可读，但**下一次扩展**又把
+它们放了出来。
+
+**影响**：比"字节失配"更重——**被截掉的数据会复活**（信息泄露/语义错误），且 `verify` 看不出来。
+
+**方向记录（重要，防后续误判）**：QA 第 3 轮报告曾写"模型期望 `0xE9`、产品全零"（产品读少了），
+**方向写反了，已作废**（原邮件保留不删）。实测是产品**读多**：`first_differing_index=104`，
+`product[104..112]=[233…]`、`model[104..112]=[0…]`，两侧 size 均 181。归档一律按"复活"记。
+
+**与既有条目的关系**：KI-1（精确块边界多发零长度对象）与 KI-6（非页对齐缩容丢存活字节）是同一族
+（`truncate_impl` 的边界页处理），但本条既不是"多发对象"也不是"丢存活字节"，**不要**并进那两条。
+
+**修复方向**：删除越界页之后，若 `new_size % PAGE_BYTES != 0` 且边界页存在且长于该余数，把该页 blob
+截短后写回（页因此**允许短于 `PAGE_BYTES`**，读路径已按 `data.len()` 容错）；`new_size == 0` 只删页，
+不走边界页裁剪。不变式："**任何存储页在文件 EOF 之后不得持有非零字节**"。
+
+**为什么既有回归没抓到**：`fs-overlay/tests/contract.rs` 的 K6 只覆盖"截到页边界"与"非对齐截断保留
+存活字节"，**没有"缩容后再扩展 / 再写越 EOF"的组合**；参考模型的常规序列没撞上，长 soak 撞上了。
+
+**钉住它的测试（修复时需补）**：crate 层至少四例（缩后扩、缩后 `write_at` 越 EOF、缩到 0 再扩、
+缩容 → `snapshot`/`commit` → 再扩展读取），加参考模型 soak 全种子汇总。
