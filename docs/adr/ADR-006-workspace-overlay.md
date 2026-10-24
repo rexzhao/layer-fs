@@ -235,9 +235,11 @@ pub trait TreeStore {
 - **write_at**：对触及的每个页：页不存在时**拷入**该页的当前视图字节（至多首尾两页需要读 base，
   有界）→ 覆盖写入范围 → 存页；更新 `size = max(size, end)`、`modified_ns`。base 来源的 inode 首次
   修改时插入 `ov_inode(origin=0, base_limit=原 size)`；
-- **truncate(new)**：删除 `page_index ≥ ⌈new/page⌉` 的页、把边界页的尾部截掉；
-  `base_limit = min(base_limit, new)`；`size = new`。之后再扩展读到的都是零（被截掉的 base 字节因
-  `base_limit` 不再可见）——P1 的 KI-1 类边界问题在此结构中不存在，由 K6 钉住；
+- **truncate(new)**：令 `live_end = min(size, new)`；删除 `page_index ≥ ⌈live_end/page⌉` 的页，并把
+  跨界页自 `live_end` 起的部分**清零**（页保持满长，§5.3 的短页仅为容错）；`base_limit = min(base_limit, new)`；
+  `size = new`。**不变式（缩容与扩展共用）**：任何存储页在文件 EOF 之后不得持有非零字节——因此缩容后
+  再扩展读到的都是零（被截掉的 base 字节另由 `base_limit` 不再可见）；P1 的 KI-1 类边界问题在此结构中
+  不存在，由 K6 与 KI-9 回归钉住；
 - **unlink / rename 覆盖（K1/K2）**：名字：若 base 父目录确实绑定该名字 → 写 whiteout，否则删
   `ov_entry` 行。inode：base 来源 → `live=0` 墓碑 + 删其全部页；新建 → 删 `ov_inode` 行 + 页；
 - **rename**：源名字按上一条处理（不动 inode），目标名字 bind 到同一 serial。目录改名只写两条名字行，
