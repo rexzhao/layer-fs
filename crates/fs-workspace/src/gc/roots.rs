@@ -202,6 +202,35 @@ pub struct RepoRoots<'a> {
     pub repo: &'a crate::repo::Repo,
 }
 
+/// The maintenance-mode root source: same rows, read through the connections maintenance already
+/// holds (P2b-6 section 19).
+///
+/// Exists as a separate type rather than a flag on [`RepoRoots`] because the two differ in what they
+/// are allowed to do: [`RepoRoots`] may open its own read-only overlay connections, this one must
+/// not — during a sweep those files are locked exclusively, and a second connection is exactly the
+/// mistake the ruling names.
+#[derive(Debug)]
+pub struct MaintenanceRoots<'a> {
+    /// The handle whose connections are used.
+    pub maintenance: &'a crate::repo::MaintenanceRepo,
+}
+
+impl RootSource for MaintenanceRoots<'_> {
+    fn roots(&self) -> WorkspaceResult<RootSet> {
+        let overlays = crate::repo::Overlays::Held(self.maintenance.overlay_connections());
+        let rows = crate::repo::root_rows_from(
+            self.maintenance.connection(),
+            self.maintenance.store_dir(),
+            overlays,
+        )?;
+        let entries: Vec<RootRef> = rows
+            .into_iter()
+            .map(|row| RootRef::new(row.kind, row.root, row.label))
+            .collect();
+        RootSet::try_from_entries(entries)
+    }
+}
+
 impl RootSource for RepoRoots<'_> {
     /// Enumerates the main-database sources of ADR-008 §6.2, **each row as its own label**.
     ///

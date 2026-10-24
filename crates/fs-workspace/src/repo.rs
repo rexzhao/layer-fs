@@ -715,110 +715,144 @@ impl Repo {
     /// SQLite failures, or a stored value that is not an object id.
     pub(crate) fn root_rows(&self) -> WorkspaceResult<Vec<crate::gc::roots::RootRow>> {
         let connection = self.db.lock();
-        let mut rows = Vec::new();
-        {
-            let mut statement = connection.prepare("SELECT commit_id, root_oid FROM \"commit\"")?;
-            for row in statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })? {
-                let (id, root) = row?;
-                rows.push(crate::gc::roots::RootRow {
-                    kind: crate::gc::roots::RootKind::Commit,
-                    root: parse_oid(&root)?,
-                    label: format!("commit:{id}"),
-                });
-            }
+        root_rows_from(&connection, &self.store_dir, Overlays::Open)
+    }
+}
+
+/// Every root row, read through a **caller-owned** connection (ADR-008 section 6.2, P2b-6 section
+/// 19).
+///
+/// Split out of [`Repo::root_rows`] so maintenance can use it: maintenance owns the store's single
+/// connection and every overlay's, and must not open a second connection to an exclusively-locked
+/// file. The caller therefore decides where the overlay connections come from ([`Overlays`]).
+///
+/// # Errors
+///
+/// SQLite failures, or a stored value that is not an object id.
+pub(crate) fn root_rows_from(
+    connection: &rusqlite::Connection,
+    store_dir: &Path,
+    overlays: Overlays<'_>,
+) -> WorkspaceResult<Vec<crate::gc::roots::RootRow>> {
+    let mut rows = Vec::new();
+    {
+        let mut statement = connection.prepare("SELECT commit_id, root_oid FROM \"commit\"")?;
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (id, root) = row?;
+            rows.push(crate::gc::roots::RootRow {
+                kind: crate::gc::roots::RootKind::Commit,
+                root: parse_oid(&root)?,
+                label: format!("commit:{id}"),
+            });
         }
-        {
-            let mut statement = connection.prepare("SELECT DISTINCT root_oid FROM snapshot")?;
+    }
+    {
+        let mut statement = connection.prepare("SELECT DISTINCT root_oid FROM snapshot")?;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            let root = row?;
+            rows.push(crate::gc::roots::RootRow {
+                kind: crate::gc::roots::RootKind::Snapshot,
+                root: parse_oid(&root)?,
+                label: format!("snapshot:{root}"),
+            });
+        }
+    }
+    {
+        let mut statement = connection.prepare("SELECT name, base_root FROM workspace")?;
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (name, root) = row?;
+            rows.push(crate::gc::roots::RootRow {
+                kind: crate::gc::roots::RootKind::WorkspaceBase,
+                root: parse_oid(&root)?,
+                label: format!("workspace:{name}"),
+            });
+        }
+    }
+    // Overlay sources (ADR-008 §6.2): each workspace's `ov_meta.pending_root`, and every
+    // sealed content reference. Both live in the workspace's own SQLite file, so they are read
+    // from a second connection per workspace — offline GC holds those files exclusively, which
+    // is why this is safe here and nowhere else.
+    // Read the names through the connection we already hold: `workspace_names()` locks the
+    // same mutex, and `std::sync::Mutex` is not reentrant — calling it here deadlocks.
+    let names: Vec<String> = {
+        let mut statement = connection.prepare("SELECT id FROM workspace")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for name in names {
+        let held = overlays.held_for(&name);
+        let overlay = store_dir
+            .join("workspaces")
+            .join(&name)
+            .join("overlay.sqlite");
+        if held.is_none() && !overlay.is_file() {
+            continue;
+        }
+        // Maintenance hands its own connection over: a second connection to an exclusively
+        // locked overlay is refused, and reading a `pending_root` from a stale snapshot is how a
+        // live root gets missed (P2b-6 section 19).
+        let opened;
+        let connection: &rusqlite::Connection = match held {
+            Some(connection) => connection,
+            None => {
+                opened = rusqlite::Connection::open_with_flags(
+                    &overlay,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                &opened
+            }
+        };
+        let pending: Option<String> = connection
+            .query_row(
+                "SELECT value FROM ov_meta WHERE key = 'pending_root'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // An **empty** `pending_root` is the normal state of a clean workspace (publish clears
+        // it), so it is "no pending root", not a malformed id. Parsing it would make every
+        // committed workspace unreadable to the collector — found by a mark test that committed
+        // before enumerating, which the earlier fixtures never did.
+        if let Some(root) = pending.filter(|root| !root.is_empty()) {
+            rows.push(crate::gc::roots::RootRow {
+                kind: crate::gc::roots::RootKind::OverlayPending,
+                root: parse_oid(&root)?,
+                label: format!("overlay-pending:{name}"),
+            });
+        }
+        // `sealed_content` does not exist until Seal lands; the query is skipped rather than
+        // guessed at, and the tripwire (T1) is what makes that a checked statement.
+        let has_sealed: Option<String> = connection
+            .query_row(
+                "SELECT name FROM pragma_table_info('ov_inode') WHERE name = 'sealed_content'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if has_sealed.is_some() {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT sealed_content FROM ov_inode
+                     WHERE sealed_content IS NOT NULL AND sealed_content <> ''",
+            )?;
             for row in statement.query_map([], |row| row.get::<_, String>(0))? {
                 let root = row?;
                 rows.push(crate::gc::roots::RootRow {
-                    kind: crate::gc::roots::RootKind::Snapshot,
+                    kind: crate::gc::roots::RootKind::SealedContent,
                     root: parse_oid(&root)?,
-                    label: format!("snapshot:{root}"),
+                    label: format!("sealed:{name}:{root}"),
                 });
             }
         }
-        {
-            let mut statement = connection.prepare("SELECT name, base_root FROM workspace")?;
-            for row in statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })? {
-                let (name, root) = row?;
-                rows.push(crate::gc::roots::RootRow {
-                    kind: crate::gc::roots::RootKind::WorkspaceBase,
-                    root: parse_oid(&root)?,
-                    label: format!("workspace:{name}"),
-                });
-            }
-        }
-        // Overlay sources (ADR-008 §6.2): each workspace's `ov_meta.pending_root`, and every
-        // sealed content reference. Both live in the workspace's own SQLite file, so they are read
-        // from a second connection per workspace — offline GC holds those files exclusively, which
-        // is why this is safe here and nowhere else.
-        // Read the names through the connection we already hold: `workspace_names()` locks the
-        // same mutex, and `std::sync::Mutex` is not reentrant — calling it here deadlocks.
-        let names: Vec<String> = {
-            let mut statement = connection.prepare("SELECT id FROM workspace")?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        for name in names {
-            let overlay = self.workspace_dir(&name).join("overlay.sqlite");
-            if !overlay.is_file() {
-                continue;
-            }
-            let connection = rusqlite::Connection::open_with_flags(
-                &overlay,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )?;
-            let pending: Option<String> = connection
-                .query_row(
-                    "SELECT value FROM ov_meta WHERE key = 'pending_root'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            // An **empty** `pending_root` is the normal state of a clean workspace (publish clears
-            // it), so it is "no pending root", not a malformed id. Parsing it would make every
-            // committed workspace unreadable to the collector — found by a mark test that committed
-            // before enumerating, which the earlier fixtures never did.
-            if let Some(root) = pending.filter(|root| !root.is_empty()) {
-                rows.push(crate::gc::roots::RootRow {
-                    kind: crate::gc::roots::RootKind::OverlayPending,
-                    root: parse_oid(&root)?,
-                    label: format!("overlay-pending:{name}"),
-                });
-            }
-            // `sealed_content` does not exist until Seal lands; the query is skipped rather than
-            // guessed at, and the tripwire (T1) is what makes that a checked statement.
-            let has_sealed: Option<String> = connection
-                .query_row(
-                    "SELECT name FROM pragma_table_info('ov_inode') WHERE name = 'sealed_content'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if has_sealed.is_some() {
-                let mut statement = connection.prepare(
-                    "SELECT DISTINCT sealed_content FROM ov_inode
-                     WHERE sealed_content IS NOT NULL AND sealed_content <> ''",
-                )?;
-                for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-                    let root = row?;
-                    rows.push(crate::gc::roots::RootRow {
-                        kind: crate::gc::roots::RootKind::SealedContent,
-                        root: parse_oid(&root)?,
-                        label: format!("sealed:{name}:{root}"),
-                    });
-                }
-            }
-        }
-        Ok(rows)
     }
+    Ok(rows)
+}
 
-    /// The root a commit publishes.
+impl Repo {
+    /// The root a commit publishes..
     pub(crate) fn commit_root(&self, id: &str) -> WorkspaceResult<ObjectId> {
         let connection = self.db.lock();
         let root: Option<String> = connection
@@ -1000,8 +1034,9 @@ pub struct MaintenanceRepo {
     store_dir: PathBuf,
     /// The one connection to `store.sqlite`; holding it holds the store.
     connection: rusqlite::Connection,
-    /// One connection per overlay, held for the same reason.
-    overlays: Vec<rusqlite::Connection>,
+    /// One connection per overlay, held for the same reason. The workspace name travels with it:
+    /// the root reader labels the rows it reads, and a bare connection cannot say whose it is.
+    overlays: Vec<(String, rusqlite::Connection)>,
 }
 
 impl MaintenanceRepo {
@@ -1013,6 +1048,13 @@ impl MaintenanceRepo {
     pub fn open(store_dir: impl AsRef<Path>) -> WorkspaceResult<Self> {
         let store_dir = store_dir.as_ref().to_path_buf();
         let connection = open_exclusively(&store_dir.join("store.sqlite"), "the main database")?;
+        // The store's own schema check, inside the lock: it cannot move while we hold it, and it is
+        // read-only, so nothing is written before the check passes.
+        cas_store::validate_schema_over(&connection).map_err(|error| {
+            WorkspaceError::StoreInUse {
+                what: format!("the main database schema ({error})"),
+            }
+        })?;
 
         // Schema checks happen **inside** the lock, so what is validated cannot move underneath.
         cas_store::validate_schema_over(&connection).map_err(|error| {
@@ -1028,11 +1070,31 @@ impl MaintenanceRepo {
                 if !overlay.is_file() {
                     continue;
                 }
-                let what = format!(
-                    "the overlay of workspace {}",
-                    entry.file_name().to_string_lossy()
-                );
-                overlays.push(open_exclusively(&overlay, &what)?);
+                let name = entry.file_name().to_string_lossy().to_string();
+                let what = format!("the overlay of workspace {name}");
+                let connection = open_exclusively(&overlay, &what)?;
+                // An overlay is fs-overlay's file: its version lives in `ov_meta`, not in SQLite's
+                // `user_version`, so cas-store's check would refuse every overlay (found by the first
+                // test that opened one through maintenance).
+                let recorded: Option<String> = connection
+                    .query_row(
+                        "SELECT value FROM ov_meta WHERE key = 'schema_version'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| WorkspaceError::StoreInUse {
+                        what: format!("{what} schema ({error})"),
+                    })?;
+                if recorded.as_deref() != Some(&fs_overlay::schema::SCHEMA_VERSION.to_string()) {
+                    return Err(WorkspaceError::StoreInUse {
+                        what: format!(
+                            "{what} schema (found {recorded:?}, this build writes {})",
+                            fs_overlay::schema::SCHEMA_VERSION
+                        ),
+                    });
+                }
+                overlays.push((name, connection));
             }
         }
         Ok(Self {
@@ -1059,6 +1121,36 @@ impl MaintenanceRepo {
     pub fn overlays_held(&self) -> usize {
         self.overlays.len()
     }
+
+    /// The overlay connections this handle owns, for the root reader (P2b-6 section 19).
+    pub(crate) fn overlay_connections(&self) -> &[(String, rusqlite::Connection)] {
+        &self.overlays
+    }
+}
+
+/// Where the root reader gets its overlay connections from (P2b-6 section 19).
+///
+/// The everyday path opens a short-lived read-only connection per overlay. Maintenance cannot: it
+/// already holds every overlay **exclusively** (ADR-008 section 6.1), and SQLite refuses a second
+/// connection to an exclusively-locked file. Whoever holds the lock is who reads.
+pub(crate) enum Overlays<'a> {
+    /// Open a read-only connection per overlay (the everyday path).
+    Open,
+    /// Use the connections the caller already holds, keyed by workspace name (maintenance).
+    Held(&'a [(String, rusqlite::Connection)]),
+}
+
+impl Overlays<'_> {
+    /// The connection for `name`, when the caller is holding them.
+    fn held_for(&self, name: &str) -> Option<&rusqlite::Connection> {
+        match self {
+            Self::Open => None,
+            Self::Held(held) => held
+                .iter()
+                .find(|(held_name, _)| held_name == name)
+                .map(|(_, connection)| connection),
+        }
+    }
 }
 
 /// Opens `path` in maintenance mode and takes its write lock immediately, without waiting.
@@ -1083,11 +1175,6 @@ fn open_exclusively(path: &Path, what: &str) -> WorkspaceResult<rusqlite::Connec
         .map_err(|error| WorkspaceError::StoreInUse {
             what: format!("{what} (another writer holds it: {error})"),
         })?;
-    // Schema validation now: the state cannot move while the write lock is held, and it is still
-    // read-only, so nothing is written before the checks pass.
-    cas_store::validate_schema_over(&connection).map_err(|error| WorkspaceError::StoreInUse {
-        what: format!("{what} schema ({error})"),
-    })?;
     connection.execute_batch("COMMIT").map_err(refuse)?;
     // Connection-level pragmas after the transaction; WAL is not settable inside one, and a v3
     // store already is WAL, so this is a no-op in practice.
