@@ -126,27 +126,33 @@ pub fn open_for_child(root: &std::path::Path) -> StoreResult<Store> {
     }
 }
 
-/// Bytes this process has read out of pack files, for the "a single-object read reads one
-/// frame" assertion (ADR-008 §3, acceptance 2.2).
-///
-/// Instrumentation only: it is compiled behind the same feature as the crash points, so a
-/// production build neither pays for it nor can depend on it.
-static PACK_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+// Bytes this thread has read out of pack files, for the "a single-object read reads one
+// frame" assertion (ADR-008 §3, acceptance 2.2).
+//
+// Instrumentation only: compiled behind the same feature as the crash points, so a production
+// build neither pays for it nor can depend on it.
+//
+// Per-thread, not per-process: libtest runs a binary's tests in parallel, and a process-wide
+// counter would let a neighbouring test's reads land inside this test's measurement. The claim
+// being asserted ("this read touched one frame") is about the calling thread's read anyway.
+thread_local! {
+    static PACK_READ_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Records one frame read of `bytes` bytes.
 pub(crate) fn note_pack_read(bytes: u64) {
-    PACK_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    PACK_READ_BYTES.with(|cell| cell.set(cell.get() + bytes));
 }
 
-/// How many pack bytes this process has read since the last [`reset_pack_read_bytes`].
+/// How many pack bytes this **thread** has read since the last [`reset_pack_read_bytes`].
 #[must_use]
 pub fn pack_read_bytes() -> u64 {
-    PACK_READ_BYTES.load(Ordering::Relaxed)
+    PACK_READ_BYTES.with(std::cell::Cell::get)
 }
 
-/// Resets the pack-read counter.
+/// Resets this thread's pack-read counter.
 pub fn reset_pack_read_bytes() {
-    PACK_READ_BYTES.store(0, Ordering::Relaxed);
+    PACK_READ_BYTES.with(|cell| cell.set(0));
 }
 
 /// A guard that keeps instrumentation-reading tests from observing each other.
