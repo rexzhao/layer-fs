@@ -236,7 +236,7 @@ pub trait TreeStore {
   有界）→ 覆盖写入范围 → 存页；更新 `size = max(size, end)`、`modified_ns`。base 来源的 inode 首次
   修改时插入 `ov_inode(origin=0, base_limit=原 size)`；
 - **truncate(new)**：令 `live_end = min(size, new)`；删除 `page_index ≥ ⌈live_end/page⌉` 的页，并把
-  跨界页自 `live_end` 起的部分**清零**（页保持满长，§5.3 的短页仅为容错）；`base_limit = min(base_limit, new)`；
+  跨界页**若存在**，则自 `live_end` 起的部分**清零**（纯 base 文件无跨界页，不必造一个；页保持满长，§5.3 的短页仅为容错）；`base_limit = min(base_limit, new)`；
   `size = new`。**不变式（缩容与扩展共用）**：任何存储页在文件 EOF 之后不得持有非零字节——因此缩容后
   再扩展读到的都是零（被截掉的 base 字节另由 `base_limit` 不再可见）；P1 的 KI-1 类边界问题在此结构中
   不存在，由 K6 与 KI-9 回归钉住；
