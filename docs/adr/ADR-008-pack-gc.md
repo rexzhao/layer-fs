@@ -119,6 +119,10 @@ batch.commit()?;                             // 下面的 1–4
 | 2 后 3 前 | packs/ 下无索引的 pack | 无 | 普通打开只读不删；GC 删除 |
 | 3 后 | 完整 | 全部可见 | — |
 
+> **步骤 1 的 `tmp` 文件可能被并发 opener 的恢复清扫删除**（ADR-002 §7.0 的单向容忍）：此时整个 pack 以
+> **新临时名从零重新 staging**，不发布任何部分内容；重试有界（20×2 ms，仅 `NotFound`/`PermissionDenied`），
+> 耗尽后向上报原始错误。P2b-6 起 `tmp/` 回收由离线 GC 独占负责，常规 `open` 不再清扫。
+
 ## 6. GC
 
 ### 6.1 离线（P5）
@@ -153,7 +157,8 @@ batch.commit()?;                             // 下面的 1–4
 
 ```text
 mark：
-  建临时库 gc-<id>.sqlite（marked(oid PRIMARY KEY)）
+  建临时库 gc-<id>.sqlite（marked(oid PRIMARY KEY)）——**放在 store 根目录下的独立名字，不得放进 `tmp/`**：
+  常规 `open` 的恢复清扫（ADR-002 §7.0）可能并发删掉它；GC 结束自行删除。
   从每个根出发，经 fs-snapshot 读取器遍历：root → inode 表页 → 目录树页 → extent 树页 → chunk
   已标记的对象不再展开（共享子树只走一次）
 sweep：
