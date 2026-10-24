@@ -382,3 +382,45 @@ workspace.truncate("/f", 181)?;               // 扩展：按 POSIX/ADR-006 §7.
 
 **钉住它的测试**：上述并发用例（要求 `verify` 干净）；以及 `verify` 对"人为制造空洞"的 pack 仍判 ok、
 对"重叠/越界/零长行"判错。
+
+---
+
+## KI-11：并发发布下 `verify` 可观察到"`pack` 行存在、文件缺失"（**未定性，P2b-2 收口为已知不变量缺口**）
+
+**发现于**：P2b-2 的并发发布验收（`fs-workspace/tests/pack_concurrency.rs`，两条用例），QA 独立复现。
+
+**现象**：两个 workspace 并发发布后，由**新开的** `Store` 做 `verify`，得到
+
+```
+VerificationReport { checked: 9, packs_checked: 3,
+  failures: [4 个 oid → "store i/o error: The system cannot find the file specified (os error 2)"],
+  pack_failures: [1 个 pack_id → 同上], bad_names: [] }
+```
+
+即 `pack` 行与 `object_location` 行都在，该 pack 文件 ENOENT；每次恰好缺一个 pack（`packs_checked: 3 / checked: 9`
+恒定）。
+
+**复现率**：worker 3–4/12；QA 1/140（`%TEMP%` 40 轮命中 1 次；另两组 0 次——因此**不能**据此断言"Defender 扫 TEMP"）。
+
+**已排除（决定性）**
+
+1. **环境/文件系统**：4 线程 × 500 轮 × 6 = 12 000 次 `write → fsync → rename → stat`，missing 0。只排除了通用 syscall
+   模式，**不能**排除"定向删除"（扫描器对特定目录/策略）。
+2. **跨用例 static 串扰**：`--test-threads=1` 连跑 12 次仍 4 红。
+3. **写路径未落地**：`record_pack` **提交前**断言 `packs/<id>.pack` 存在且大小匹配，从未触发——提交那一刻文件在、
+   大小正确。
+
+**因此范围缩到"提交之后文件不再可见"**：删除类（外部删除 / 目录级清理 / delete-on-close）或命名空间可见性，
+未定性。QA 的现场打印形似 Windows **delete-pending**（另两个 pack 的 `metadata()` 仍返回正确大小，而
+`read_dir(packs/)` 枚举为空）；但她的枚举用了 `.flatten()`，在 Windows 并发枚举下会静默丢弃 entry error，
+所以"目录为空"**不能**当铁证。
+
+**对不变式的威胁（为什么必须给它建卡）**：`pack` 行 ⇒ 文件存在，是 P2b-6 的 GC（删无行文件、重打包）与
+`verify` 的前提。带着未定性的缺口做 GC 等于在流沙上盖楼。**欠账 → P2b-2c（优先于 P2b-6）**。
+
+**已做的处置**：两条并发用例标 `#[ignore]`（理由写明"索引可指向缺失 pack"），`staging-audit` 诊断 feature
+（默认关；含 verify 侧 ENOENT 重试 + 完整路径 + 逐条 entry error、rename 后 evidence 硬链接、`pack_id` 实样）。
+
+**已知非缺陷但需记**：`Repo::open(create=false)` 会打开**两次** `Store`（先 probe `busy_timeout`，再正式开），
+每次 `open` 都执行 `clear_temporaries()`——一次 commit 期间可能有 4 次 `tmp/` 清扫插进来，这解释了并发下
+staging 重试为何频繁（与 ADR-002 §7.0 一致）。

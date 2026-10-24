@@ -1,14 +1,9 @@
 # ADR-008：Pack 存储、批量发布与离线 GC
 
-- 状态：**草案（Proposed），分叉已决**——architect 起草，P2b-2/P2b-6 的设计输入；worker 落地核对后转
-  Accepted。分叉 G2/G3/G4 的 owner 结论见 §2.1
-- 日期：2026-10-23
-- 起草：architect
-- 依据：spec §2 P2.11、§4（Seal/GC 顺序、故障注入点）、§5.4；ADR-002（Store 布局、发布顺序、恢复）；
-  ADR-006 §12（批量发布草案）、§15（GC 根集合）、F7；KI-7 处置（fsync 在索引事务之外）；
-  p2a-baseline §4.1（首次 snapshot 约 8 ms/对象）
-- 修订：**修订** ADR-002 §3（布局）、§4（schema v3）、§5（发布顺序）、§7（恢复）；**取代** ADR-006 §12
-  （批量发布改为 pack 批量）；兑现 ADR-006 §15
+- 状态：**Accepted（2026-10-24）**。设计定稿；P2b-2 落地核对完成、QA 独立复验 PASS；实现见 main `6b5f404`。
+  §6–§8（GC、`verify --deep`、推迟项）的实现由 P2b-6 核对，**不在本次 Accept 的证据范围内**。
+  分叉 G2–G4 的 owner 结论见 §2.1；落地差异与遗留（非阻塞）见
+  `docs/reports/p2b2-adr008-conformance.md` 与 KI-11。
 
 ---
 
