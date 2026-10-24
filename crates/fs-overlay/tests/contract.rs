@@ -348,6 +348,80 @@ fn k6_truncate_inside_a_page_keeps_the_surviving_bytes() {
         5
     );
 }
+
+/// **K6 regression** — a truncate that cuts mid-page must also cut that page's tail.
+///
+/// The page straddling the new end is kept (above), but its bytes past the new size stayed
+/// in the row: the next extension made them readable again — truncate handing back bytes it
+/// had already cut, the mirror of KI-1. §7.3 asks for the boundary page's tail to be trimmed,
+/// and that is what makes "之后再扩展读到的都是零" true rather than merely "unreadable".
+#[test]
+fn k6_shrinking_then_growing_inside_a_page_reads_zeros() {
+    let fixture = Fixture::new("k6-tail");
+    fixture.store().create_file(&p("/f")).expect("create");
+    fixture
+        .store()
+        .write_at(&p("/f"), 0, b"0123456789")
+        .expect("write");
+    fixture.store().truncate(&p("/f"), 5).expect("shrink");
+    fixture.store().truncate(&p("/f"), 8).expect("grow");
+
+    assert_eq!(
+        fixture.store().read_at(&p("/f"), 0, 8).expect("read"),
+        b"01234\0\0\0",
+        "the extension must read zeros, not the cut bytes \"567\""
+    );
+    assert_eq!(
+        fixture.store().content_state(&p("/f")).expect("state").size,
+        8
+    );
+}
+
+/// **K6 regression, across pages** — the same defect on a page boundary.
+///
+/// The shrink lands inside page 1, so page 1 is the straddling page: it survives whole and
+/// its tail is where the cut bytes came back. Pages 2 and up are dropped, so they can only
+/// reappear as zeros. Both halves are checked, because the fix uses one rule for both.
+#[test]
+fn k6_shrinking_across_pages_then_growing_reads_zeros() {
+    let fixture = Fixture::new("k6-pages");
+    let page = fs_overlay::schema::PAGE_BYTES;
+    fixture.store().create_file(&p("/f")).expect("create");
+    fixture
+        .store()
+        .write_at(&p("/f"), 0, &vec![0xEE; (page * 2 + 100) as usize])
+        .expect("write");
+
+    fixture
+        .store()
+        .truncate(&p("/f"), page + 10)
+        .expect("shrink");
+    fixture.store().truncate(&p("/f"), page * 3).expect("grow");
+
+    let read = fixture
+        .store()
+        .read_at(&p("/f"), 0, (page * 3) as usize)
+        .expect("read");
+    assert_eq!(
+        &read[..(page + 10) as usize],
+        vec![0xEE; (page + 10) as usize]
+    );
+    assert_eq!(
+        &read[(page + 10) as usize..],
+        &vec![0u8; (page * 2 - 10) as usize][..],
+        "page 1's tail and the dropped pages must read as zeros after the extension"
+    );
+    assert_eq!(
+        fixture
+            .store()
+            .content_state(&p("/f"))
+            .expect("state")
+            .pages,
+        2,
+        "pages 0 and 1 exist (page 1 zeroed in place); page 2 is implicit zeros, and no page \
+         is ever short"
+    );
+}
 // ---------------------------------------------------------------------- K3
 
 /// **K3** — concurrent writes to different pages of one file both survive.
@@ -725,4 +799,33 @@ fn ten_workspaces_over_one_base_stay_isolated() {
         reopened.backend().read_at(&p("/w0/f"), 0, 9).expect("read"),
         b"payload-0"
     );
+}
+
+/// **K6 regression, shrink then write past EOF** — the other way the cut bytes come back.
+///
+/// `write_at` materialises the page it touches from the page's current bytes, so if the
+/// straddling page still held the cut tail, an out-of-range write would copy it back into the
+/// row. KI-9 lists this shape as A/B effective; it fails on the unfixed tree for that reason.
+#[test]
+fn k6_writing_past_eof_after_a_shrink_keeps_the_cut_region_zeroed() {
+    let fixture = Fixture::new("k6-write-after-shrink");
+    fixture.store().create_file(&p("/f")).expect("create");
+    fixture
+        .store()
+        .write_at(&p("/f"), 0, &[0xEE; 200])
+        .expect("write");
+    fixture.store().truncate(&p("/f"), 66).expect("shrink");
+    fixture
+        .store()
+        .write_at(&p("/f"), 190, &[0x11; 4])
+        .expect("write past EOF");
+
+    let read = fixture.store().read_at(&p("/f"), 0, 194).expect("read");
+    assert_eq!(&read[..66], &[0xEE; 66][..], "the surviving prefix");
+    assert_eq!(
+        &read[66..190],
+        &[0u8; 124][..],
+        "the write must not carry the cut bytes back into the page"
+    );
+    assert_eq!(&read[190..], &[0x11; 4][..], "the write itself");
 }

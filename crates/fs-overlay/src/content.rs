@@ -6,10 +6,15 @@
 //!
 //! Two properties come straight out of that shape:
 //!
-//! - **truncate cannot leave a boundary artefact.** Lowering `base_limit` makes the cut
-//!   bytes unreadable in one column update; there is no "rewrite the partial block"
+//! - **truncate cannot lose a byte to a boundary artefact.** Lowering `base_limit` makes the
+//!   cut bytes unreadable in one column update; there is no "rewrite the partial block"
 //!   step, which is what P1's KI-1 had to fix. `truncate` to a page boundary therefore
 //!   creates nothing (K6).
+//! - **truncate cannot give a byte back either** (R3-1/KI-9). The boundary page is kept, so
+//!   its tail is zeroed in place: *no stored page holds a non-zero byte at or past EOF*, and
+//!   a later extension therefore reads zeros. Reads are bounded by `size`, but "unreadable"
+//!   is not enough — the bytes must be **gone**, or the next extension resurrects them.
+//!   Pages stay exactly `PAGE_BYTES` long; this tree never produces a short page.
 //! - **a write touches only its own pages.** Every other page keeps whatever it had —
 //!   its overlay row, or its base bytes.
 //!
@@ -259,17 +264,45 @@ pub(crate) fn truncate_impl(
     id: FileId,
     new_size: u64,
 ) -> OverlayResult<()> {
-    let (_old_size, base_limit) = geometry(connection, base, id)?;
-    // Drop every page that *starts* at or past the new end. Rounding up, not down: for a
-    // size that is not a multiple of the page size, the page containing the last surviving
-    // byte starts before the new size and must be kept; only its bytes past the end become
-    // unreadable, through the size check in the read path. Rounding down deleted that page
-    // and with it every byte the file still had.
-    let boundary = new_size.div_ceil(schema::PAGE_BYTES);
+    let (old_size, base_limit) = geometry(connection, base, id)?;
+    // Both directions of `truncate` have to end with one invariant — it *is* the whole rule:
+    //
+    // > **No stored page holds a non-zero byte at or past the file's EOF.**
+    //
+    // Shrinking needs it so that a later extension reads zeros instead of the bytes it cut;
+    // growing needs it because it has just exposed a range that must read as zeros. The two
+    // directions share the single `live_end` below, and the read path relies on it: a page
+    // that exists is returned as-is (a missing tail reads as zeros), so "the read path stops
+    // at `size`" would only hide cut bytes, not remove them.
+    //
+    // Zeroing rather than truncating the page blob is this implementation's choice (ADR-006
+    // §7.3, KI-9): pages stay exactly `PAGE_BYTES` long, so no short page ever exists and no
+    // later stage needs short-page tolerance.
+    //
+    // The live bytes are below `live_end`, so every page that *starts* at or past it is
+    // droppable. Rounding up, not down: for a size that is not a multiple of the page size,
+    // the page containing the last surviving byte starts before it and must be kept. Rounding
+    // down deleted that page and with it every byte the file still had (KI-6).
+    let live_end = old_size.min(new_size);
+    let boundary = live_end.div_ceil(schema::PAGE_BYTES);
     connection.execute(
         "DELETE FROM ov_page WHERE serial = ?1 AND page_index >= ?2",
         (id.serial() as i64, boundary as i64),
     )?;
+    // The one page that straddles `live_end` cannot be dropped — it still carries live
+    // bytes — so its tail is zeroed in place (ADR-006 §7.3: 把边界页的尾部截掉). Skipping
+    // this was R3-1's defect: write 0xE9 over [104, 159), truncate to 66, extend to 181, and
+    // the cut bytes came back (reference model, seed=1000 step=357).
+    let straddling = live_end / schema::PAGE_BYTES;
+    let keep_bytes = (live_end % schema::PAGE_BYTES) as usize;
+    if keep_bytes != 0 {
+        if let Some(mut data) = page_bytes(connection, id.serial(), straddling)? {
+            if data.len() > keep_bytes {
+                data[keep_bytes..].fill(0);
+                store_page(connection, id.serial(), straddling, &data)?;
+            }
+        }
+    }
     // Base bytes above the new size stop being visible by lowering `base_limit`; no
     // copy, no rewrite, and it cannot be raised again by a later extension.
     let new_limit = base_limit.min(new_size);
