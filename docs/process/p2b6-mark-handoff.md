@@ -17,6 +17,9 @@
   `InodeRecord { serial, kind, size, created_ns, modified_ns, content }`；
 - `Content::{Empty, Blob(oid), Extents(oid), Dir(oid)}` —— **引用只在这里**；目录项只带 child serial（不产生新 oid）。
 
+> **注意（architect 提醒）**：`references` 枚举的是**对象 id**，不是 inode serial。目录页里存的是 serial；`serial → content root`
+> 这条边出现在 **inode 表页那一层**。不要把"目录页引用了 serial"当成"引用了对象"。
+
 ## 3. 必须遵守的读取纪律
 
 所有页读取都经过 `fetch(store, oid, Role, ..)` + `Reader::new` + `profile.fmt` + `check_page_size`；这三步是 ADR-005 的

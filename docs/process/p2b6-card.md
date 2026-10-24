@@ -200,6 +200,11 @@ impl SnapshotReader<'_> {
 }
 ```
 
+- **role 明确不带**（architect 终裁）：他逐条排查过"必须知道 role"的场景——GC mark 只看"是否已标记"；`verify --deep` 要的是
+  父侧**期望** role（实际 role 在子对象信封里，`get` 时自然解码）；统计可由 `get`/`inode` 派生；pack 统计与 role 无关。
+  唯一"免费"的 role 是被展开对象自己的，对调用方无用。
+- **`references` 枚举的是对象 id，不是 inode serial**：目录页里存的是 **serial**，不是对象 oid；`serial → content root` 这条边
+  出现在 **inode 表页那一层**。文档必须写清，否则很容易把"目录页引用了 serial"误当成"引用了对象"。
 - **去重与展开策略留在 GC**：从每个根入队 → 弹出 oid → 已标记则不展开（§6.3 的字面算法）→ 否则写标记集并把 `references`
   的子节点入队。"共享子树只走一次"是 **mark 的性质，不是遍历器的性质**；
 - 内存：每次只持有一个对象的直接引用（页扇出有界），全量集合在临时 SQLite（§5.4）；
