@@ -75,9 +75,14 @@ impl MainDb {
 
     /// Takes the connection lock.
     pub(crate) fn lock(&self) -> MutexGuard<'_, Connection> {
-        self.connection
+        let guard = self
+            .connection
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Every main-database operation starts its own wait clock here, so a `Busy` reports
+        // the time this operation actually spent, not the configured timeout.
+        crate::busy::start();
+        guard
     }
 
     /// One policy value.

@@ -108,14 +108,21 @@ pub struct SerialSegment {
 /// Reserves the next `count` serials of a scope.
 ///
 /// A short main-database transaction, which is exactly the contention §11.1's bounded
-/// wait exists for.
+/// wait exists for — hence **`BEGIN IMMEDIATE`**: this reads the allocator row and then writes
+/// it, and under WAL a deferred transaction that upgrades a read lock to a write lock fails
+/// immediately with `SQLITE_BUSY` (SQLite's deadlock avoidance), without consulting the busy
+/// timeout. That made two workspaces opening at the same time report `Busy` after ~5 ms while
+/// claiming a 5000 ms wait.
 ///
 /// # Errors
 ///
 /// [`WorkspaceError::NotFound`] when the scope is unknown.
 pub fn reserve_serials(db: &MainDb, scope_id: &str, count: u64) -> WorkspaceResult<SerialSegment> {
     let connection = db.lock();
-    let transaction = connection.unchecked_transaction()?;
+    let transaction = rusqlite::Transaction::new_unchecked(
+        &connection,
+        rusqlite::TransactionBehavior::Immediate,
+    )?;
     let next: Option<i64> = transaction
         .query_row(
             "SELECT next_serial FROM scope_allocator WHERE scope_id = ?1",

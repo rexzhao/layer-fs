@@ -26,9 +26,16 @@ impl TempRoot {
     fn new(label: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // The clock is part of the name, not just the pid: a later run of this binary can
+        // reuse the pid, and reusing an earlier run's leftover store would make the test
+        // depend on history instead of on this run.
         let path = std::env::temp_dir().join(format!(
-            "fs-workspace-pack-concurrency-{label}-{}-{sequence}",
-            std::process::id()
+            "fs-workspace-pack-concurrency-{label}-{}-{}-{sequence}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
         ));
         std::fs::create_dir_all(&path).expect("temp root");
         Self { path }
@@ -163,5 +170,63 @@ fn two_workspaces_publishing_the_same_page_leave_one_row_and_a_clean_store() {
                 }
             }
         }
+    }
+}
+
+/// Concurrent **opens** must succeed inside the bounded wait (ADR-006 §11.1).
+///
+/// This is the regression for the `ids.rs` defect: reserving serials read the allocator row
+/// and then wrote it inside a `DEFERRED` transaction, so two workspaces opening at the same
+/// time upgraded a read lock to a write lock and got an immediate `SQLITE_BUSY` — after ~5 ms,
+/// while the error claimed a 5000 ms wait. With `BEGIN IMMEDIATE` the busy timeout applies,
+/// and the publish that follows is still correct.
+#[test]
+fn concurrent_opens_wait_then_publish_correctly() {
+    for round in 0..10 {
+        let root = TempRoot::new(&format!("open-{round}"));
+        let dir = root.store();
+        prepare(&dir);
+
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = ["w1", "w2"]
+                .into_iter()
+                .map(|name| {
+                    let dir = dir.clone();
+                    scope.spawn(move || {
+                        let repo = Arc::new(Repo::open(&dir, false).expect("open"));
+                        // The two opens overlap here: each reserves a serial segment.
+                        match repo.workspace_open(name) {
+                            Ok(mut workspace) => workspace.commit("published", false).map(Some),
+                            Err(error) => Err(error),
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("thread"))
+                .collect()
+        });
+
+        let mut commits = 0;
+        for outcome in outcomes {
+            match outcome {
+                Ok(Some(_)) => commits += 1,
+                Ok(None) => {}
+                Err(WorkspaceError::Busy { waited_ms }) => panic!(
+                    "round {round}: a concurrent open must wait, not fail                      (reported wait {waited_ms} ms)"
+                ),
+                Err(WorkspaceError::BranchMoved { .. }) => {}
+                Err(other) => panic!("round {round}: unexpected failure: {other:?}"),
+            }
+        }
+        assert!(commits >= 1, "round {round}: at least one publish lands");
+
+        let store = Store::open(&dir, OpenMode::ReadOnly).expect("store");
+        let report = store.verify().expect("verify");
+        assert!(
+            report.is_clean(),
+            "round {round}: the store stays clean: {report:?}"
+        );
     }
 }

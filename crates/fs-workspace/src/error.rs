@@ -2,8 +2,6 @@
 
 use std::fmt;
 
-use crate::schema::MAIN_BUSY_TIMEOUT_MS;
-
 /// Why a workspace operation failed.
 #[derive(Debug)]
 pub enum WorkspaceError {
@@ -132,7 +130,8 @@ impl From<rusqlite::Error> for WorkspaceError {
                 rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
             ) {
                 return WorkspaceError::Busy {
-                    waited_ms: MAIN_BUSY_TIMEOUT_MS,
+                    // Measured, not the policy constant: see `busy`.
+                    waited_ms: crate::busy::waited_ms(),
                 };
             }
         }
@@ -165,7 +164,7 @@ impl From<cas_store::StoreError> for WorkspaceError {
         // must not leak which of the two connections happened to be blocked.
         match error {
             cas_store::StoreError::Busy => WorkspaceError::Busy {
-                waited_ms: MAIN_BUSY_TIMEOUT_MS,
+                waited_ms: crate::busy::waited_ms(),
             },
             other => WorkspaceError::Store(other),
         }
