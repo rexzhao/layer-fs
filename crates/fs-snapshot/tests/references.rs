@@ -92,9 +92,25 @@ fn fixture(store: &Store, profile: &Profile) -> Expected {
     let extent_leaf_a = encode_extents(profile, std::iter::once(shared_extent()), &mut sink)
         .expect("encode extents")
         .expect("non-empty");
-    let extent_leaf_b = encode_extents(profile, std::iter::once(shared_extent()), &mut sink)
-        .expect("encode extents")
-        .expect("non-empty");
+    // Deliberately a *different* leaf over the **same** chunk: two extents, both reading the one
+    // chunk object. Encoding a second identical leaf would collapse into one object id (content
+    // addressing) and the shared-parent case would quietly become a shared-self case.
+    let extent_leaf_b = encode_extents(
+        profile,
+        vec![
+            shared_extent(),
+            Extent {
+                logical_start: profile.block_bytes,
+                length: profile.block_bytes,
+                object: chunk,
+                source_offset: 0,
+            },
+        ]
+        .into_iter(),
+        &mut sink,
+    )
+    .expect("encode extents")
+    .expect("non-empty");
 
     let dir_leaf = encode_directory(
         profile,
@@ -353,4 +369,65 @@ fn a_damaged_object_is_an_error_not_an_empty_leaf() {
         matches!(error, SnapshotError::Malformed { .. }),
         "expected a typed Malformed, got {error:?}"
     );
+}
+
+// ------------------------------------------------------------------- counts reconcile
+
+/// Y22 in miniature: hand-computed edge counts, then a test-side walk that must land on exactly the
+/// planted objects.
+///
+/// Two independent numbers are compared here and neither is derived from the reader: the fan-out of
+/// each domain (1 / 4 / 0 / 1 / 1 / 0 / 0) and the total number of planted objects (7). A `references`
+/// that missed an edge would fail the per-domain count; one that invented an edge would fail the
+/// visited set; one that returned everything everywhere would fail both.
+#[test]
+fn reference_counts_reconcile_with_a_hand_counted_fixture() {
+    let root = TempRoot::new("counts");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+    let reader = SnapshotReader::open(&store, expected.root, profile).expect("open reader");
+
+    let fan_out = [
+        ("root", expected.root, 1usize),
+        ("inode table", expected.table, 4),
+        ("directory leaf", expected.dir_leaf, 0),
+        ("blob", expected.blob, 0),
+        ("chunk", expected.chunk, 0),
+        ("extent leaf a", expected.extent_leaf_a, 1),
+        // Two extent entries, one distinct child: this row also pins the within-page collapse.
+        ("extent leaf b", expected.extent_leaf_b, 1),
+    ];
+    let mut edges = 0;
+    for (label, oid, want) in fan_out {
+        let got = reader.references(oid).expect("refs").len();
+        assert_eq!(got, want, "{label} fan-out");
+        edges += got;
+    }
+    assert_eq!(edges, 7, "total edges over the fixture");
+
+    // A test-side breadth-first walk: the same shape the GC's mark will have, written here so the
+    // count is checked against a second implementation rather than against itself.
+    let mut visited = std::collections::BTreeSet::new();
+    let mut queue = vec![expected.root];
+    while let Some(oid) = queue.pop() {
+        if !visited.insert(oid) {
+            continue;
+        }
+        queue.extend(reader.references(oid).expect("refs"));
+    }
+    assert_eq!(
+        visited,
+        set(vec![
+            expected.root,
+            expected.table,
+            expected.dir_leaf,
+            expected.blob,
+            expected.chunk,
+            expected.extent_leaf_a,
+            expected.extent_leaf_b,
+        ]),
+        "the walk must reach exactly the planted objects"
+    );
+    assert_eq!(visited.len(), 7, "hand-counted object total");
 }

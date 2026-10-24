@@ -223,10 +223,24 @@ impl<'a> SnapshotReader<'a> {
     /// "no children" and "children unknown" lead to opposite actions - one deletes a subtree, the
     /// other must abort (P2b-6 section 12).
     pub fn references(&self, oid: ObjectId) -> SnapshotResult<Vec<ObjectId>> {
-        let role = role_of(self.store, oid)?;
+        // One read per object, not two. `role_of` would fetch the object and this would then fetch
+        // it again to decode the page, doubling the I/O of the whole mark phase on a large store.
+        // Role and value come from the same decoded envelope; the role is deliberately not returned
+        // (ADR-008 6.3) precisely because the caller never needs it back.
+        let bytes = self.store.get(oid)?;
+        let object = Object::decode(&bytes)?;
+        self.references_of(object.role(), object.value())
+    }
+
+    /// The reference list for one already-decoded value.
+    ///
+    /// Split out so [`SnapshotReader::references`] decodes each object exactly once: the arms below
+    /// need only the bytes and the role, never the store.
+    fn references_of(&self, role: Role, value: &[u8]) -> SnapshotResult<Vec<ObjectId>> {
         match role {
             Role::FilesystemRoot => {
-                let value = fetch(self.store, oid, Role::FilesystemRoot, "filesystem root")?;
+                let value = value.to_vec();
+                debug_assert_eq!(role, Role::FilesystemRoot, "filesystem root");
                 let mut reader = Reader::new(&value);
                 reader.format(self.profile.fmt)?;
                 let _profile = reader.take(32)?;
@@ -237,7 +251,8 @@ impl<'a> SnapshotReader<'a> {
                 Ok(vec![inode_table])
             }
             Role::InodeTable => {
-                let value = fetch(self.store, oid, Role::InodeTable, "inode table")?;
+                let value = value.to_vec();
+                debug_assert_eq!(role, Role::InodeTable, "inode table");
                 let mut reader = Reader::new(&value);
                 reader.format(self.profile.fmt)?;
                 check_page_size(&value, &self.profile)?;
@@ -283,7 +298,8 @@ impl<'a> SnapshotReader<'a> {
             Role::DirectoryLeaf => {
                 // Decoded so a damaged leaf still fails loudly, but it yields no object
                 // references: entries hold serials.
-                let value = fetch(self.store, oid, Role::DirectoryLeaf, "directory leaf")?;
+                let value = value.to_vec();
+                debug_assert_eq!(role, Role::DirectoryLeaf, "directory leaf");
                 let mut reader = Reader::new(&value);
                 reader.format(self.profile.fmt)?;
                 check_page_size(&value, &self.profile)?;
@@ -296,7 +312,8 @@ impl<'a> SnapshotReader<'a> {
                 Ok(Vec::new())
             }
             Role::DirectoryBranch => {
-                let value = fetch(self.store, oid, Role::DirectoryBranch, "directory branch")?;
+                let value = value.to_vec();
+                debug_assert_eq!(role, Role::DirectoryBranch, "directory branch");
                 let mut reader = Reader::new(&value);
                 reader.format(self.profile.fmt)?;
                 check_page_size(&value, &self.profile)?;
@@ -318,7 +335,8 @@ impl<'a> SnapshotReader<'a> {
                 Ok(without_duplicates(out))
             }
             Role::ExtentLeaf => {
-                let value = fetch(self.store, oid, Role::ExtentLeaf, "extent leaf")?;
+                let value = value.to_vec();
+                debug_assert_eq!(role, Role::ExtentLeaf, "extent leaf");
                 let mut reader = Reader::new(&value);
                 reader.format(self.profile.fmt)?;
                 check_page_size(&value, &self.profile)?;
@@ -334,7 +352,8 @@ impl<'a> SnapshotReader<'a> {
                 Ok(without_duplicates(out))
             }
             Role::ExtentBranch => {
-                let value = fetch(self.store, oid, Role::ExtentBranch, "extent branch")?;
+                let value = value.to_vec();
+                debug_assert_eq!(role, Role::ExtentBranch, "extent branch");
                 let mut reader = Reader::new(&value);
                 reader.format(self.profile.fmt)?;
                 check_page_size(&value, &self.profile)?;
