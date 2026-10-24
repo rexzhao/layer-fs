@@ -15,6 +15,30 @@
 //! materialiser).
 //! The rules here only ever change *name bindings* and *inode existence*.
 //!
+//! # Why this file reports 0% line coverage
+//!
+//! `llvm-cov` shows **0% for this file because there is nothing in it to execute**: it holds
+//! trait declarations and doc comments, and a signature has no body to instrument. That is
+//! "nothing to instrument", not "nothing is tested" — the assertions live where the bodies are.
+//!
+//! | Implementer | Where | Driving tests |
+//! | --- | --- | --- |
+//! | `OverlayStore` (`TreeStore`) | `fs-overlay/src/store_impl.rs` | `fs-overlay/tests/contract.rs` (K1–K6, `Rules::new(overlay)` paths), `fs-overlay/tests/crash.rs` |
+//! | `OverlayRead` (`TreeRead`) | `fs-overlay/src/view.rs` | `fs-overlay/tests/contract.rs` 的读断言（`stat` / `read_dir` / 白化） |
+//! | `OverlayWrite` (`TreeRead` + `TreeWrite`) | `fs-overlay/src/write_view.rs` | `fs-overlay/tests/contract.rs` 每次 `Rules::*` 写操作；`fs-api/tests/workspace_api.rs` 端到端 |
+//! | `WorkspaceStore` (`TreeStore`) | `fs-workspace/src/tree.rs` | `fs-workspace/tests/core.rs`（生命周期/状态机）、`fs-workspace/tests/crash.rs`（四个注入点） |
+//! | `SnapshotTree` (`TreeRead`) | `fs-api/src/read_view.rs` | `fs-api/tests/workspace_api.rs`（commit → `read_view`）、`fs-api/tests/verify.rs` |
+//!
+//! Keeping this table true is a grep, not a memory test:
+//!
+//! ```text
+//! grep -rn "impl TreeRead for\|impl TreeWrite for\|impl TreeStore for" crates/
+//! ```
+//!
+//! Every line that command prints must have a row above, and every row must name a test file
+//! that exists and exercises it. A new implementer with no row is the failure mode this table
+//! exists to catch (`docs/reports/` 的覆盖率轮次里出现过一次"0% 被当成未测试"）。
+//!
 //! # Atomicity
 //!
 //! Atomicity is part of this contract, not an implementation detail of one backend.
