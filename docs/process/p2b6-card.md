@@ -353,3 +353,20 @@ gc_exclusive --list = 2   (其中 1 条当时 ignore；④ 完成后已摘)
 
 **fixture 前置条件必须断言（本轮第二例"看似测 X 实则测 Y"）**：内容寻址下"同字节 = 同 oid"，因此凡"构造两个对象
 来测共享"的地方，必须 `assert_ne!` 两个 oid；凡"我造了两个 X"（两个叶、两个 pack、两个 workspace）都应断言身份不同。
+
+## 19. 裁决：维护模式下 overlay 根的读取（manager，2026-10-24）
+
+**背景**：`root_rows` 为取 `ov_meta.pending_root` / `ov_inode.sealed_content`，自己再开一条只读连接连每个
+`overlay.sqlite`。但按 §6.1 裁决 (c)，维护模式已用 `MaintenanceRepo` 的连接把每个 overlay **独占**锁住 → 第二条连接读不到
+（实测 `Busy`；独占下同类失败）。**生产路径上 ⑤ 一开工就会在"读 overlay 根"这一步失败**，而这是 §6.2 的根来源之一。
+
+**裁决：走 (1) 维护路径自己枚举 overlay 根**（"谁的锁谁读"）。
+
+- `root_rows` 增加一个**连接提供者**参数：维护模式传 `MaintenanceRepo` 已持有的 overlay 连接；日常路径仍按原样开只读连接；
+- 不得改变日常路径的语义与错误类别（日常仍是 `Busy`，维护仍是 `StoreInUse`/`WorkspaceInUse`）；
+- 这条与 (c) 的原则一致：**维护模式的一条连接服务一个库**，不在锁外另开连接；
+- 否决 (2)"先读 overlay 根再取独占锁"：窗口期内 overlay 可能被改，读到过期 `pending_root` 会**漏标 → 删数据**。
+
+**顺带修的真实缺陷**（同一次提交）：`root_rows` 把 `ov_meta.pending_root` 的**空串**当对象 id 解析 → 任何**已提交**的
+workspace 都让根枚举失败（`Inconsistent: object id ""`）。空串是"没有 pending root"的正常状态（publish 会清空），
+必须显式过滤；`sealed_content` 同理。
