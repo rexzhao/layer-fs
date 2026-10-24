@@ -183,10 +183,12 @@ batch.commit()?;                             // 下面的 1–4
 | 主库 `workspace` | `base_root`、root(`base_commit`) |
 | 每个 overlay | `ov_meta.pending_root`（非空时）、`ov_inode.sealed_content` 引用的对象（Blob 的 chunk，或 Extents 树根） |
 
-`Repo::roots()`（P2a-6）只覆盖前四行的一部分；P2b-6 扩展为上表，并由 `verify --deep` 共用。
+**GC 的根集合**由 `RootSource`/`RootRows` 带标签枚举，覆盖上表全部来源（含 overlay 的 `pending_root`、`sealed_content`）；**`verify --deep` 仍以 `Repo::roots()` 为输入，只覆盖主库可达根**（`commit` / `snapshot` / `workspace.base_root`）——它不打开任何 `overlay.sqlite`，因此**不静默宣称**覆盖 overlay 未提交根。overlay 根的存活由 GC 的 K5c 用例单独覆盖。
 
 `pending_root` 为空/缺失是**正常状态**（没有未完成的发布），根枚举按"无引用"处理；不得把空串解析成对象 id，也不得把它
 当损坏。**合法的"没有"不是错误**——与 K8/KI-10 同一条原则。
+
+**显式未完成项（2026-10-24）**：`sealed_content`（Seal 落地后新增）**当前不存在**。P2b-6 的根枚举已为它预留 `RootKind`，并以 tripwire（T1/T2 + kind tripwire）保证「Seal 合入时若未在根分类表里出现，测试必须红」。因此在 Seal 合入前，本 ADR 的根集合**不含**封存内容；Seal 合入的那张卡必须同卡更新根枚举与金丝雀，并把这一项从「未完成」移除。
 
 **保留策略（P7）[G2 已定]**：P2b 不做过期。因此 P2b 的 GC 实际回收：
 
@@ -227,7 +229,7 @@ sweep：
 | 重打包：切换后、删旧 pack 前 | 旧 pack 文件无 pack 行 | 下次 GC 的 c) 删除 |
 | c) 中 | 部分孤儿已删 | 下次 GC 继续 |
 
-每个注入点之后：重开（非独占）→ `verify --deep`（全部根）干净 → 全部根可读、逐字节等于 GC 前。
+每个注入点之后：重开（非独占）→ `verify --deep`（**全部主库根**）干净 → 全部主库根可读、逐字节等于 GC 前；overlay 未提交根另由 K5c 用例覆盖（见 §6.2 的说明）。
 
 ### 6.5 CLI 与 API
 
