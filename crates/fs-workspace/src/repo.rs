@@ -1064,19 +1064,32 @@ fn open_exclusively(path: &Path, what: &str) -> WorkspaceResult<rusqlite::Connec
     let connection =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(refuse)?;
-    // The ADR's order: no waiting, then the locking mode, then the connection profile.
+    // ADR's order, and the order matters twice over: `busy_timeout = 0` before anything else so a
+    // competing writer fails immediately; `locking_mode = EXCLUSIVE` **before** the lock, because
+    // the mode changes when the next lock is taken; `journal_mode` **after** the lock, because it
+    // cannot be set inside a transaction and setting it first would write the file before we know
+    // we are alone.
     connection
         .pragma_update(None, "busy_timeout", 0)
         .and_then(|()| connection.pragma_update(None, "locking_mode", "EXCLUSIVE"))
-        .and_then(|()| connection.pragma_update(None, "journal_mode", "WAL"))
-        .and_then(|()| connection.pragma_update(None, "synchronous", "FULL"))
-        .and_then(|()| connection.pragma_update(None, "foreign_keys", "ON"))
         .map_err(refuse)?;
-    // Take the write lock now: after the commit the exclusive *file* lock is what keeps others out.
     connection
-        .execute_batch("BEGIN IMMEDIATE; COMMIT")
+        .execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| WorkspaceError::StoreInUse {
             what: format!("{what} (another writer holds it: {error})"),
         })?;
+    // Schema validation now: the state cannot move while the write lock is held, and it is still
+    // read-only, so nothing is written before the checks pass.
+    cas_store::validate_schema_over(&connection).map_err(|error| WorkspaceError::StoreInUse {
+        what: format!("{what} schema ({error})"),
+    })?;
+    connection.execute_batch("COMMIT").map_err(refuse)?;
+    // Connection-level pragmas after the transaction; WAL is not settable inside one, and a v3
+    // store already is WAL, so this is a no-op in practice.
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .and_then(|()| connection.pragma_update(None, "synchronous", "FULL"))
+        .and_then(|()| connection.pragma_update(None, "foreign_keys", "ON"))
+        .map_err(refuse)?;
     Ok(connection)
 }

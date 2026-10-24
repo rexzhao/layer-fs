@@ -56,7 +56,11 @@ fn fingerprint(root: &Path) -> Vec<(String, u64)> {
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                out.push((relative, meta.len()));
+                // `-shm` is shared memory between connections: no durable content, and any
+                // opener may create or drop it. ADR-008 §6.1 fixes this comparison accordingly.
+                if !relative.ends_with("-shm") {
+                    out.push((relative, meta.len()));
+                }
             }
         }
     }
