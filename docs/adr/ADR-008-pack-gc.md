@@ -143,10 +143,15 @@ batch.commit()?;                             // 下面的 1–4
 
 - 打开方式（**维护模式单连接集**，2026-10-24 裁决）：维护模式用**一条连接**同时承担 cas-store 的 store 元数据与
   fs-workspace 的主库表；日常 `Repo` 的双连接**完全不动**（`architecture.md` §4 的"同库双连接"裁决只对日常路径生效，
-  维护模式是唯一例外）。顺序固定为：打开连接（`busy_timeout=0`）→ `locking_mode=EXCLUSIVE`（只设标志，不写文件）→
-  `journal_mode`/`synchronous`/`foreign_keys`（v3 本就是 WAL，通常 no-op）→ `schema::validate`（只读）→
-  `BEGIN IMMEDIATE` 取写锁（`Busy` → `StoreInUse`，立即失败不等待）→ `COMMIT`（EXCLUSIVE 文件锁不释放）→ GC。
-  **先锁后校验**：校验所需的读取在锁内进行，看到的是稳定状态；`validate` 仍先于任何数据写入。随后**逐个独占打开**
+  维护模式是唯一例外）。顺序固定为：打开连接（`busy_timeout=0`）→ `PRAGMA locking_mode=EXCLUSIVE`（只设标志，不写文件）→
+  `BEGIN IMMEDIATE` 取写锁（`Busy` → `StoreInUse`，立即失败不等待）→ `schema::validate`（只读；此时数据库状态已稳定，
+  仍先于任何**数据**写入）→ `COMMIT`（结束写事务；EXCLUSIVE 模式下列锁不释放）→ 连接级 pragma
+  （`synchronous`/`foreign_keys`；`journal_mode=WAL` **不能在事务内设置**，v3 库本就为 WAL 通常 no-op，确需设置时放在
+  `COMMIT` 之后，锁仍持有）→ GC。**先锁后校验**：校验所需的读取在锁内进行，看到的是稳定状态。
+
+  拒绝路径的度量：`{ (相对路径, 长度) }` 排序比较，**排除 `-shm`**（连接间共享内存、无持久内容，任何 opener 的只读
+  校验都会创建它）；`-wal` 保留（可能含已提交页）。采样时要求持有者**静默**（持有事务且不提交、不 checkpoint）。
+  版本拒绝另用 `store.sqlite` + `-wal` 的字节哈希，不套目录指纹。随后**逐个独占打开**
   `workspaces/*/overlay.sqlite`，失败 → `WorkspaceInUse`，不做任何修改；
 - **"有任何使用者即拒绝"的精确化**：GC 在取锁时拒绝任何**活跃写入者**与任何**已打开的 overlay**；已经打开但空闲的
   主库连接不会被"提前拒绝"，其**下一次访问**会得到 typed `StoreError::Busy` / `WorkspaceError::Busy`，在 GC 期间
