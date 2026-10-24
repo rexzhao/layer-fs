@@ -269,44 +269,11 @@ fn record_pack(
     #[cfg(feature = "sync-probe")]
     crate::probe::run_injection();
 
-    // Diagnostic (feature `staging-audit`, default off): the file must exist before any index
-    // row names it. If this fires, the write path broke the "pack row == pack file" invariant.
+    // Diagnostic checkpoints (`staging-audit`, default off): one immediately after `BEGIN`, so
+    // the window is at most one system call wide (rename → sync_dir → BEGIN → INSERT).
     #[cfg(feature = "staging-audit")]
     {
-        let path = _layout.pack_path(pack_id);
-        let meta = std::fs::metadata(&path).unwrap_or_else(|error| {
-            let evidence = _layout.packs().join(format!("{pack_id}.pack.evidence"));
-            let mut listing = String::new();
-            match std::fs::read_dir(_layout.packs()) {
-                Ok(entries) => {
-                    for entry in entries {
-                        match entry {
-                            Ok(entry) => listing.push_str(&format!(
-                                "{:?}(len={:?}) ",
-                                entry.file_name(),
-                                entry.metadata().map(|meta| meta.len())
-                            )),
-                            Err(entry_error) => {
-                                listing.push_str(&format!("ENTRY-ERROR({entry_error}) "))
-                            }
-                        }
-                    }
-                }
-                Err(dir_error) => listing.push_str(&format!("READDIR-ERROR({dir_error})")),
-            }
-            panic!(
-                "staging-audit: {pack_id} missing before commit: {error}; path={}; root={:?};                  evidence_exists={}; entries=[{listing}]",
-                path.display(),
-                _layout.root().canonicalize(),
-                evidence.exists()
-            )
-        });
-        assert_eq!(
-            meta.len(),
-            bytes,
-            "staging-audit: {pack_id} is {} bytes, expected {bytes}",
-            meta.len()
-        );
+        pack::audit("after-begin", _layout, pack_id, bytes);
     }
     write_rows(&transaction, pack_id, frames, bytes)?;
     transaction.commit()?;

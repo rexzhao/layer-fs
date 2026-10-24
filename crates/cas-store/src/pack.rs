@@ -22,6 +22,51 @@ use crate::durability::{rename_replace, sync_directory, sync_file};
 use crate::error::{CorruptCause, StoreError, StoreResult};
 use crate::layout::{temporary_name, Layout};
 
+/// Diagnostic checkpoint (`staging-audit`): the pack must be on disk at `stage`, with `bytes`.
+///
+/// Prints the concrete `tmp/` and `packs/` paths (so a layout mistake cannot hide behind "the
+/// code clearly only deletes tmp/"), the entry listing with each entry's own error, and the
+/// evidence link's state.
+#[cfg(feature = "staging-audit")]
+pub(crate) fn audit(stage: &str, layout: &Layout, pack_id: &str, bytes: u64) {
+    let path = layout.pack_path(pack_id);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        let evidence = layout.packs().join(format!("{pack_id}.pack.evidence"));
+        let mut listing = String::new();
+        match std::fs::read_dir(layout.packs()) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => listing.push_str(&format!(
+                            "{:?}(len={:?}) ",
+                            entry.file_name(),
+                            entry.metadata().map(|meta| meta.len())
+                        )),
+                        Err(entry_error) => {
+                            listing.push_str(&format!("ENTRY-ERROR({entry_error}) "))
+                        }
+                    }
+                }
+            }
+            Err(dir_error) => listing.push_str(&format!("READDIR-ERROR({dir_error})")),
+        }
+        panic!(
+            "staging-audit[{stage}]: {pack_id} missing; path={}; packs={}; tmp={}; root={:?};              evidence_exists={}; entries=[{listing}]",
+            path.display(),
+            layout.packs().display(),
+            layout.temporaries().display(),
+            layout.root().canonicalize(),
+            evidence.exists(),
+        );
+    };
+    assert_eq!(
+        meta.len(),
+        bytes,
+        "staging-audit[{stage}]: {pack_id} is {} bytes, expected {bytes}",
+        meta.len()
+    );
+}
+
 /// The tail's magic, so a truncated or foreign file is never mistaken for a pack.
 pub(crate) const TAIL_MAGIC: [u8; 4] = *b"WPK1";
 
@@ -187,6 +232,12 @@ pub(crate) fn write(
     }
     #[cfg(feature = "staging-audit")]
     {
+        audit(
+            "after-rename-pre-evidence",
+            layout,
+            pack_id,
+            bytes.len() as u64,
+        );
         // Evidence link: if the file later "disappears", this tells us whether the *name* was
         // removed (link survives) or the whole directory entry went with it.
         let evidence = layout.packs().join(format!("{pack_id}.pack.evidence"));
@@ -196,8 +247,12 @@ pub(crate) fn write(
         }
     }
     observer.step(PackStep::Renamed);
+    #[cfg(feature = "staging-audit")]
+    audit("after-rename", layout, pack_id, bytes.len() as u64);
     sync_directory(&layout.packs())?;
     observer.step(PackStep::DirectorySynced);
+    #[cfg(feature = "staging-audit")]
+    audit("after-sync-dir", layout, pack_id, bytes.len() as u64);
     Ok(())
 }
 
