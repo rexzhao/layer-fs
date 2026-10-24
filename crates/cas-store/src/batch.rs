@@ -242,32 +242,30 @@ fn record_pack(
     bytes: u64,
     observer: &mut dyn PackObserver,
 ) -> StoreResult<()> {
-    // `BEGIN IMMEDIATE`, spelled out rather than left to a `Transaction` default: ADR-008 §5
-    // step 3 names the behaviour, and the difference is real if anything inside the
-    // transaction ever reads before it writes — a deferred transaction would take a read
-    // snapshot first and then fail with `BUSY_SNAPSHOT` instead of the typed `Busy` this crate
-    // promises (ADR-006 §11.1).
-    database.connection.execute_batch("BEGIN IMMEDIATE")?;
+    // `BEGIN IMMEDIATE`, explicit rather than a `Transaction` default: ADR-008 §5 step 3 names
+    // the behaviour, and the difference is real if anything inside the transaction ever reads
+    // before it writes — a deferred transaction would take a read snapshot first and then fail
+    // with `BUSY_SNAPSHOT` instead of the typed `Busy` this crate promises (ADR-006 §11.1).
+    //
+    // `new_unchecked` keeps that behaviour *and* the rollback guarantee: the value is created
+    // with `DropBehavior::Rollback`, so an early return, a failed `COMMIT`, or a panic in the
+    // probe leaves no open transaction behind — a connection stuck inside one would turn the
+    // next `BEGIN IMMEDIATE` into "cannot start a transaction within a transaction", or worse,
+    // quietly enrol later writes in it.
+    let transaction = rusqlite::Transaction::new_unchecked(
+        &database.connection,
+        rusqlite::TransactionBehavior::Immediate,
+    )?;
     #[cfg(feature = "sync-probe")]
     {
         crate::probe::note_transaction_begin();
         crate::probe::run_injection();
     }
 
-    let written = write_rows(database, pack_id, frames, bytes);
-    match written {
-        Ok(()) => {
-            database.connection.execute_batch("COMMIT")?;
-            #[cfg(feature = "sync-probe")]
-            crate::probe::note_transaction_end();
-        }
-        Err(error) => {
-            // Leave the connection out of a transaction: a later operation would otherwise
-            // run inside this one and its failure mode would be unrecognisable.
-            let _ = database.connection.execute_batch("ROLLBACK");
-            return Err(error);
-        }
-    }
+    write_rows(&transaction, pack_id, frames, bytes)?;
+    transaction.commit()?;
+    #[cfg(feature = "sync-probe")]
+    crate::probe::note_transaction_end();
 
     observer.step(pack::PackStep::Committed);
     Ok(())
@@ -278,7 +276,7 @@ fn record_pack(
 /// Separated from [`record_pack`] so the `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` handling reads
 /// as one thing and the statements as another.
 fn write_rows(
-    database: &Database,
+    connection: &rusqlite::Connection,
     pack_id: &str,
     frames: &[PackedFrame],
     bytes: u64,
@@ -287,7 +285,7 @@ fn write_rows(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos() as i64)
         .unwrap_or(0);
-    database.connection.execute(
+    connection.execute(
         "INSERT OR IGNORE INTO pack (pack_id, bytes, objects, created_ns) VALUES (?1, ?2, ?3, ?4)",
         (
             pack_id,
@@ -296,7 +294,7 @@ fn write_rows(
             created,
         ),
     )?;
-    let mut statement = database.connection.prepare(
+    let mut statement = connection.prepare(
         "INSERT OR IGNORE INTO object_location
          (oid, role, length, kind, location, offset) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
