@@ -10,8 +10,10 @@
 //! database — a collector with two views of "what is live" cannot be tested for G2.
 
 pub mod criteria;
+pub mod mark;
 pub mod roots;
 
+pub use mark::{mark_roots, Marker};
 pub use roots::{RepoRoots, RootKind, RootRef, RootRow, RootSet, RootSource};
 
 use std::collections::BTreeMap;

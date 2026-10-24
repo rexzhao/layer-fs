@@ -780,7 +780,11 @@ impl Repo {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if let Some(root) = pending {
+            // An **empty** `pending_root` is the normal state of a clean workspace (publish clears
+            // it), so it is "no pending root", not a malformed id. Parsing it would make every
+            // committed workspace unreadable to the collector — found by a mark test that committed
+            // before enumerating, which the earlier fixtures never did.
+            if let Some(root) = pending.filter(|root| !root.is_empty()) {
                 rows.push(crate::gc::roots::RootRow {
                     kind: crate::gc::roots::RootKind::OverlayPending,
                     root: parse_oid(&root)?,
@@ -798,7 +802,8 @@ impl Repo {
                 .optional()?;
             if has_sealed.is_some() {
                 let mut statement = connection.prepare(
-                    "SELECT DISTINCT sealed_content FROM ov_inode WHERE sealed_content IS NOT NULL",
+                    "SELECT DISTINCT sealed_content FROM ov_inode
+                     WHERE sealed_content IS NOT NULL AND sealed_content <> ''",
                 )?;
                 for row in statement.query_map([], |row| row.get::<_, String>(0))? {
                     let root = row?;
