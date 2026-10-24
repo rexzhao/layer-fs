@@ -232,7 +232,7 @@ fn pack_max_bytes_splits_the_batch_where_the_arithmetic_says() {
         // The limit bounds the frames, not the file: every pack's body is at most `limit`.
         for (_, bytes, _) in &rows {
             assert!(
-                (*bytes as u64) <= limit + TAIL_BYTES as u64,
+                *bytes <= limit + TAIL_BYTES as u64,
                 "pack of {bytes} bytes exceeds {limit} + 48"
             );
         }
@@ -272,4 +272,139 @@ fn a_repeated_object_is_written_once_and_a_second_batch_is_a_no_op() {
     );
     assert_eq!(pack_rows(&root.store()).len(), 1);
     assert_eq!(store.object_count().expect("count"), 1);
+}
+
+// ----------------------------------------------------------------- KI-10: verify's shape rules
+//
+// `verify` must accept exactly what ADR-008 §5/§7 allow — dead frames and therefore holes —
+// and reject only genuine damage. Asserting that here is what keeps a future tightening of the
+// checker from turning healthy stores into "corrupt" reports (KI-10).
+
+/// `(oid, length, offset)` for one pack, in offset order.
+fn rows_of(store: &Path, pack_id: &str) -> Vec<(String, i64, i64)> {
+    let connection = rusqlite::Connection::open(store.join("store.sqlite")).expect("db");
+    let mut statement = connection
+        .prepare(
+            "SELECT oid, length, offset FROM object_location
+             WHERE kind = 1 AND location = ?1 ORDER BY offset",
+        )
+        .expect("prepare");
+    statement
+        .query_map([pack_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect")
+}
+
+fn update_row(store: &Path, oid: &str, offset: i64, length: i64) {
+    let connection = rusqlite::Connection::open(store.join("store.sqlite")).expect("db");
+    connection
+        .execute(
+            "UPDATE object_location SET offset = ?2, length = ?3 WHERE oid = ?1",
+            (oid, offset, length),
+        )
+        .expect("update row");
+}
+
+/// The pack with one 2-frame body, plus the ids of its two objects.
+fn two_frame_pack(label: &str) -> (TempRoot, Store, String, Vec<(String, i64, i64)>) {
+    let root = TempRoot::new(label);
+    let store = Store::open(root.store(), OpenMode::Create).expect("open");
+    let mut batch = store.batch();
+    batch.put(Role::Bytes, &payload(1, 1000)).expect("put");
+    batch.put(Role::Bytes, &payload(2, 1000)).expect("put");
+    batch.commit().expect("commit");
+    let pack_id = pack_rows(&root.store())[0].0.clone();
+    let rows = rows_of(&root.store(), &pack_id);
+    assert_eq!(rows.len(), 2);
+    (root, store, pack_id, rows)
+}
+
+#[test]
+fn verify_accepts_a_hole_left_by_a_dead_frame() {
+    let (root, store, pack_id, rows) = two_frame_pack("hole");
+    // Drop the second row: this is exactly what `INSERT OR IGNORE` leaves behind when another
+    // workspace published that object first — a dead frame, hence a hole the index does not
+    // cover. ADR-008 §5 says it is legal; GC's repack is what reclaims it.
+    let connection = rusqlite::Connection::open(root.store().join("store.sqlite")).expect("db");
+    connection
+        .execute("DELETE FROM object_location WHERE oid = ?1", (&rows[1].0,))
+        .expect("drop the losing row");
+    let report = store.verify().expect("verify");
+    assert!(
+        report.is_clean(),
+        "a hole is legal (KI-10), got {report:?} for pack {pack_id}"
+    );
+    assert_eq!(report.checked, 1, "one row survived");
+}
+
+#[test]
+fn verify_rejects_overlapping_rows() {
+    let (root, store, _pack_id, rows) = two_frame_pack("overlap");
+    update_row(&root.store(), &rows[1].0, 500, 100);
+    let report = store.verify().expect("verify");
+    assert!(!report.is_clean());
+    assert_eq!(report.pack_failures.len(), 1);
+    assert!(
+        report.pack_failures[0].reason.contains("inside the frame"),
+        "{}",
+        report.pack_failures[0].reason
+    );
+}
+
+#[test]
+fn verify_rejects_a_row_that_runs_past_the_frames() {
+    let (root, store, _pack_id, rows) = two_frame_pack("past");
+    let frames_len = 2 * 1014i64;
+    update_row(&root.store(), &rows[1].0, frames_len - 10, 100);
+    let report = store.verify().expect("verify");
+    assert!(!report.is_clean());
+    assert!(
+        report.pack_failures[0].reason.contains("past the pack's"),
+        "{}",
+        report.pack_failures[0].reason
+    );
+}
+
+#[test]
+fn verify_rejects_a_zero_length_row() {
+    let (root, store, _pack_id, rows) = two_frame_pack("zero");
+    update_row(&root.store(), &rows[1].0, rows[1].2, 0);
+    let report = store.verify().expect("verify");
+    assert!(!report.is_clean());
+    assert!(
+        report.pack_failures[0].reason.contains("non-positive"),
+        "{}",
+        report.pack_failures[0].reason
+    );
+}
+
+#[test]
+fn verify_uses_the_tail_count_as_a_necessary_condition() {
+    // The tail's `count` records physical frames, so it may exceed the row count (dead
+    // frames) but never fall below it. The tail's BLAKE3 covers the frames only, so the count
+    // can be edited without invalidating the checksum — which makes this a cheap, honest test.
+    let (root, store, pack_id, _rows) = two_frame_pack("count");
+
+    let path = root.store().join("packs").join(format!("{pack_id}.pack"));
+    let mut bytes = std::fs::read(&path).expect("read");
+    let count_at = bytes.len() - TAIL_BYTES + 4;
+    bytes[count_at..count_at + 4].copy_from_slice(&3u32.to_le_bytes());
+    std::fs::write(&path, &bytes).expect("widen count");
+    assert!(
+        store.verify().expect("verify").is_clean(),
+        "more physical frames than rows is legal (dead frames)"
+    );
+
+    bytes[count_at..count_at + 4].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(&path, &bytes).expect("shrink count");
+    let report = store.verify().expect("verify");
+    assert!(!report.is_clean());
+    assert!(
+        report.pack_failures[0]
+            .reason
+            .contains("tail declares 1 frames, the index has 2 rows"),
+        "{}",
+        report.pack_failures[0].reason
+    );
 }

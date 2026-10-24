@@ -276,6 +276,20 @@ fn verify_pack(database: &Database, layout: &Layout, pack_id: &str) -> StoreResu
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
+    // The tail counts *physical* frames, so it may exceed the rows (dead frames from a
+    // concurrent publisher), but never fall below them: that would mean the index names a
+    // frame the body does not have.
+    if (tail.count as usize) < rows.len() {
+        return Err(StoreError::CorruptPack {
+            pack_id: pack_id.to_owned(),
+            cause: CorruptCause::PackTail(format!(
+                "tail declares {} frames, the index has {} rows",
+                tail.count,
+                rows.len()
+            )),
+        });
+    }
+
     let mut previous_end = 0i64;
     for (oid, length, offset) in rows {
         if offset < 0 || length <= 0 {

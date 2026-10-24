@@ -143,6 +143,14 @@ fn violations(events: &[Event]) -> Vec<String> {
     let mut block: Vec<&Event> = Vec::new();
     for (index, event) in events.iter().enumerate() {
         if event.is_begin() {
+            // ADR-008 §5 step 3 is `BEGIN IMMEDIATE`: a `DEFERRED` transaction would take a
+            // read snapshot first and could later fail with `BUSY_SNAPSHOT` instead of `Busy`.
+            if !event.is_begin_immediate() {
+                found.push(format!(
+                    "V8: transaction at {index} is not BEGIN IMMEDIATE: {:?}",
+                    event.sql()
+                ));
+            }
             if in_transaction {
                 found.push(format!("V3: transaction at {index} began inside another"));
             }

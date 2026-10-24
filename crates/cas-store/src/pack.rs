@@ -223,6 +223,10 @@ pub(crate) fn read_frame(
 }
 
 /// What checking one pack found.
+///
+/// `count` is the tail's own record of how many frames the body holds. It is used as a
+/// **necessary** condition only: concurrent publishers leave dead frames behind (ADR-008 §5),
+/// so the physical frame count may exceed the index's row count, but it can never be smaller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PackTail {
     /// Frames the tail claims.

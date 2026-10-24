@@ -66,6 +66,18 @@ impl Event {
         })
     }
 
+    /// Whether this is specifically `BEGIN IMMEDIATE` (ADR-008 §5 step 3).
+    ///
+    /// Checked separately because "some BEGIN happened" would let a `DEFERRED` regression pass
+    /// silently until something reads before writing inside the transaction.
+    #[must_use]
+    pub fn is_begin_immediate(&self) -> bool {
+        self.sql().is_some_and(|sql| {
+            let sql = sql.trim().to_ascii_uppercase();
+            sql.starts_with("BEGIN") && sql.contains("IMMEDIATE")
+        })
+    }
+
     /// Whether this reads as the end of a transaction.
     #[must_use]
     pub fn is_commit(&self) -> bool {

@@ -242,17 +242,52 @@ fn record_pack(
     bytes: u64,
     observer: &mut dyn PackObserver,
 ) -> StoreResult<()> {
-    let transaction = database.connection.unchecked_transaction()?;
+    // `BEGIN IMMEDIATE`, spelled out rather than left to a `Transaction` default: ADR-008 §5
+    // step 3 names the behaviour, and the difference is real if anything inside the
+    // transaction ever reads before it writes — a deferred transaction would take a read
+    // snapshot first and then fail with `BUSY_SNAPSHOT` instead of the typed `Busy` this crate
+    // promises (ADR-006 §11.1).
+    database.connection.execute_batch("BEGIN IMMEDIATE")?;
     #[cfg(feature = "sync-probe")]
     {
         crate::probe::note_transaction_begin();
         crate::probe::run_injection();
     }
+
+    let written = write_rows(database, pack_id, frames, bytes);
+    match written {
+        Ok(()) => {
+            database.connection.execute_batch("COMMIT")?;
+            #[cfg(feature = "sync-probe")]
+            crate::probe::note_transaction_end();
+        }
+        Err(error) => {
+            // Leave the connection out of a transaction: a later operation would otherwise
+            // run inside this one and its failure mode would be unrecognisable.
+            let _ = database.connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+
+    observer.step(pack::PackStep::Committed);
+    Ok(())
+}
+
+/// The transaction body: one `pack` row and one `object_location` row per frame.
+///
+/// Separated from [`record_pack`] so the `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` handling reads
+/// as one thing and the statements as another.
+fn write_rows(
+    database: &Database,
+    pack_id: &str,
+    frames: &[PackedFrame],
+    bytes: u64,
+) -> StoreResult<()> {
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos() as i64)
         .unwrap_or(0);
-    transaction.execute(
+    database.connection.execute(
         "INSERT OR IGNORE INTO pack (pack_id, bytes, objects, created_ns) VALUES (?1, ?2, ?3, ?4)",
         (
             pack_id,
@@ -261,25 +296,20 @@ fn record_pack(
             created,
         ),
     )?;
-    {
-        let mut statement = transaction.prepare(
-            "INSERT OR IGNORE INTO object_location
-             (oid, role, length, kind, location, offset) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
-        for frame in frames {
-            statement.execute((
-                frame.oid.to_string(),
-                frame.role.tag(),
-                frame.frame.len() as i64,
-                schema::KIND_PACK,
-                pack_id,
-                i64::try_from(frame.offset).unwrap_or(i64::MAX),
-            ))?;
-        }
+    let mut statement = database.connection.prepare(
+        "INSERT OR IGNORE INTO object_location
+         (oid, role, length, kind, location, offset) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for frame in frames {
+        statement.execute((
+            frame.oid.to_string(),
+            frame.role.tag(),
+            frame.frame.len() as i64,
+            schema::KIND_PACK,
+            pack_id,
+            i64::try_from(frame.offset).unwrap_or(i64::MAX),
+        ))?;
     }
-    transaction.commit()?;
-    #[cfg(feature = "sync-probe")]
-    crate::probe::note_transaction_end();
-    observer.step(pack::PackStep::Committed);
+    drop(statement);
     Ok(())
 }
