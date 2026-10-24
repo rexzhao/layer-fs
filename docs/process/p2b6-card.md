@@ -138,3 +138,16 @@ distinct_oids(visited) == distinct_oids(roots)
 - **T3 值域启发**：T1 判为 `RootSource` 的列抽样至多 N 行，断言值可解析为 ObjectId（64 hex）。
 - T1 必须覆盖 **overlay**（`ov_meta.pending_root`、Seal 落地后的 `ov_inode.sealed_content`）。`sealed_content` 目前
   不存在——**卡里写死**：Seal 合入时若 T1 未分类，tripwire 必须红（这是分两次做的护栏）。
+
+## 8. 追加条款 C（QA：反例的期望值必须独立构造）
+
+1. **测试自己持有 ground truth**：`R_true` 由测试用**自己的知识**构造（"本轮我创建了 3 个 branch + 2 个 snapshot，
+   所以 `R_true` 是这 5 个"），**不得**从实现的根枚举/`GcReport` 里取。否则注入后 `R_true` 跟着缩小，反例 C 永远绿
+   （"用被测物证明被测物"，与 P2b-2b 的 `contains` 同源）。
+2. **注入只发生在来源/查询层**：让 GC 只看到 `R_injected ⊂ R_true`，断言 `F ⊇ R_true` 失败。
+3. **阳性对照固定三步模板**：
+   1. 不注入跑一次 → 全绿；
+   2. 注入跑一次 → **只有指定判据红**（其它仍绿，防"一注入全红"的假精度）；
+   3. **关闭注入再跑** → 回到全绿（证明注入面真被消费、无残留）。
+   第 3 步专抓"标志没被消费 / 跨用例泄漏"——本项目已踩过两次同类（`SWEEP_ONCE` 全局、`pack_read_bytes` 进程级）。
+4. **`visit_sink` 的测试实现自带 `BTreeSet<(kind, oid)>`**：接口保持流式，由测试决定是否落内存。
