@@ -38,6 +38,14 @@ impl TempRoot {
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(&path).expect("temp root");
+        assert!(
+            std::fs::read_dir(&path)
+                .expect("temp root")
+                .next()
+                .is_none(),
+            "temp root {} is not empty: the name collided with an earlier run",
+            path.display()
+        );
         Self { path }
     }
 

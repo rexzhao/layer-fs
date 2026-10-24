@@ -149,6 +149,18 @@ pub fn reset_pack_read_bytes() {
     PACK_READ_BYTES.store(0, Ordering::Relaxed);
 }
 
+/// A guard that keeps instrumentation-reading tests from observing each other.
+///
+/// The counters here are process-global and libtest runs a binary's tests in parallel, so
+/// "reset → read → assert" must be exclusive. Holding this for the whole sequence is what makes
+/// the number mean something; putting it in the crate (not in one test file) means a new test
+/// cannot forget it.
+pub fn serialised() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// How many staging attempts had to be retried because a concurrent opener swept `tmp/`.
 static STAGING_RETRIES: AtomicU64 = AtomicU64::new(0);
 

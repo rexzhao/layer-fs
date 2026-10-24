@@ -14,6 +14,9 @@ crash-points = []
 # rusqlite's `trace` so transaction boundaries come from SQLite, not from our own markers.
 # Off by default; a consumer never gets it.
 sync-probe = ["rusqlite/trace"]
+# Transaction timings only: no `trace`, so the measurement is not polluted by a per-statement
+# callback inside the very window it measures (ADR-008 §5 acceptance D).
+lock-probe = []
 
 [dependencies]
 blake3.workspace = true
@@ -22,10 +25,23 @@ rusqlite.workspace = true
 
 [dev-dependencies]
 # Self-reference so `cargo test -p cas-store` compiles the crash-point module.
-cas-store = { path = ".", features = ["crash-points", "sync-probe"] }
+# Only the crash points: the probe features are opt-in per run so that the lock-hold
+# measurement is not polluted by `rusqlite/trace` (see `[[test]]` below).
+cas-store = { path = ".", features = ["crash-points"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
+
+# The probe tests need their feature explicitly: `sync-probe` turns on `rusqlite/trace`, whose
+# per-statement callback would inflate the very transaction it measures, so `lock-probe` is a
+# separate run rather than a default.
+[[test]]
+name = "sync_probe"
+required-features = ["sync-probe"]
+
+[[test]]
+name = "lock_hold"
+required-features = ["lock-probe"]

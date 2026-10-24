@@ -15,7 +15,9 @@
 //! 2. **one pack costs one file sync, one directory sync and one short transaction**, so the
 //!    write lock's duration does not grow with the number of objects.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+#[cfg(feature = "sync-probe")]
+use std::sync::OnceLock;
 
 /// One observable event, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,12 +90,27 @@ impl Event {
     }
 }
 
+/// A guard that keeps probe-reading tests from observing each other.
+///
+/// The log and the timings are process-global, so a test that resets them and then reads them
+/// must not run beside another one doing the same: libtest runs a binary's tests in parallel.
+/// Holding this guard for the whole reset → act → read sequence is what makes the observation
+/// atomic, and putting it here (rather than in one test file) means a new test cannot forget.
+#[cfg(any(feature = "sync-probe", feature = "lock-probe"))]
+pub fn serialised() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(feature = "sync-probe")]
 fn log() -> &'static Mutex<Vec<Event>> {
     static LOG: OnceLock<Mutex<Vec<Event>>> = OnceLock::new();
     LOG.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Starts a staging attempt and records its number (1-based, process-wide).
+#[cfg(feature = "sync-probe")]
 pub(crate) fn begin_attempt() {
     static ATTEMPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let number = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -101,6 +118,7 @@ pub(crate) fn begin_attempt() {
 }
 
 /// Appends one event. Called from the production functions; does nothing else.
+#[cfg(feature = "sync-probe")]
 pub(crate) fn record(event: Event) {
     if let Ok(mut log) = log().lock() {
         log.push(event);
@@ -108,6 +126,7 @@ pub(crate) fn record(event: Event) {
 }
 
 /// Empties the log, so a test observes only its own batch.
+#[cfg(feature = "sync-probe")]
 pub fn reset() {
     if let Ok(mut log) = log().lock() {
         log.clear();
@@ -116,13 +135,16 @@ pub fn reset() {
 
 /// Everything recorded since the last [`reset`].
 #[must_use]
+#[cfg(feature = "sync-probe")]
 pub fn events() -> Vec<Event> {
     log().lock().map(|log| log.clone()).unwrap_or_default()
 }
 
 /// Whether the next transaction should contain an extra `sync_file` (the positive control).
+#[cfg(feature = "sync-probe")]
 static INJECT_SYNC: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
 
+#[cfg(feature = "sync-probe")]
 fn injection() -> &'static Mutex<Option<std::path::PathBuf>> {
     INJECT_SYNC.get_or_init(|| Mutex::new(None))
 }
@@ -133,6 +155,7 @@ fn injection() -> &'static Mutex<Option<std::path::PathBuf>> {
 /// Without this, "no sync appears inside a transaction" could simply mean the probe is not
 /// wired up. With it, the same checker that passes for a real batch must fail, which is what
 /// makes the negative result meaningful.
+#[cfg(feature = "sync-probe")]
 pub fn inject_sync_inside_next_transaction(scratch: impl Into<std::path::PathBuf>) {
     if let Ok(mut slot) = injection().lock() {
         *slot = Some(scratch.into());
@@ -186,6 +209,7 @@ pub fn reset_timings() {
 }
 
 /// Called by the write path right after `BEGIN`; performs the injection when armed.
+#[cfg(feature = "sync-probe")]
 pub(crate) fn run_injection() {
     let armed = injection()
         .lock()

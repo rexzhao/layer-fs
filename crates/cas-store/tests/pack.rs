@@ -130,6 +130,9 @@ fn a_batch_lands_in_one_pack_and_each_object_reads_back_byte_for_byte() {
 
 #[test]
 fn reading_one_object_reads_exactly_one_frame() {
+    // The read-byte counter is process-global, so this observation must not race another test
+    // that also reads packs (libtest runs tests in parallel).
+    let _guard = cas_store::testing::serialised();
     let root = TempRoot::new("one-frame");
     let store = Store::open(root.store(), OpenMode::Create).expect("open");
 

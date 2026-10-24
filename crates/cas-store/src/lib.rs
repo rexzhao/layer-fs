@@ -56,7 +56,7 @@ pub mod testing;
 /// The publication probe used by the ADR-008 §5 acceptance tests.
 ///
 /// Compiled only with the `sync-probe` feature.
-#[cfg(feature = "sync-probe")]
+#[cfg(any(feature = "sync-probe", feature = "lock-probe"))]
 pub mod probe;
 
 pub use batch::{Batch, BatchReport, PutOutcome};

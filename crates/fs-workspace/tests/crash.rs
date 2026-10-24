@@ -40,10 +40,24 @@ impl TempRoot {
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
             .join(format!(
-                "fs-workspace-crash-{label}-{}-{sequence}",
-                std::process::id()
+                // Clock + counter + pid: a later run can reuse the pid, and reusing an
+                // earlier run's leftover store would make the test depend on history.
+                "fs-workspace-crash-{label}-{}-{}-{sequence}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or(0)
             ));
         std::fs::create_dir_all(&path).expect("temp root");
+        assert!(
+            std::fs::read_dir(&path)
+                .expect("temp root")
+                .next()
+                .is_none(),
+            "temp root {} is not empty: the name collided with an earlier run",
+            path.display()
+        );
         Self { path }
     }
 

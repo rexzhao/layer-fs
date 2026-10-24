@@ -256,15 +256,14 @@ fn record_pack(
         &database.connection,
         rusqlite::TransactionBehavior::Immediate,
     )?;
+    #[cfg(any(feature = "sync-probe", feature = "lock-probe"))]
+    crate::probe::note_transaction_begin();
     #[cfg(feature = "sync-probe")]
-    {
-        crate::probe::note_transaction_begin();
-        crate::probe::run_injection();
-    }
+    crate::probe::run_injection();
 
     write_rows(&transaction, pack_id, frames, bytes)?;
     transaction.commit()?;
-    #[cfg(feature = "sync-probe")]
+    #[cfg(any(feature = "sync-probe", feature = "lock-probe"))]
     crate::probe::note_transaction_end();
 
     observer.step(pack::PackStep::Committed);
