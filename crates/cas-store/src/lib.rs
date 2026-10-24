@@ -53,6 +53,12 @@ mod schema;
 #[cfg(feature = "crash-points")]
 pub mod testing;
 
+/// The publication probe used by the ADR-008 §5 acceptance tests.
+///
+/// Compiled only with the `sync-probe` feature.
+#[cfg(feature = "sync-probe")]
+pub mod probe;
+
 pub use batch::{Batch, BatchReport, PutOutcome};
 pub use object::{PackVerificationFailure, VerificationFailure, VerificationReport};
 pub use pack::{NoPackObservation, PackObserver, PackStep};

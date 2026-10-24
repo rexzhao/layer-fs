@@ -33,6 +33,8 @@ use std::path::{Path, PathBuf};
 
 /// Makes a file's contents durable.
 pub(crate) fn sync_file(file: &File) -> io::Result<()> {
+    #[cfg(feature = "sync-probe")]
+    crate::probe::record(crate::probe::Event::SyncFile);
     file.sync_all()
 }
 
@@ -41,6 +43,8 @@ pub(crate) fn sync_file(file: &File) -> io::Result<()> {
 /// Both paths must be on the same filesystem; a cross-device rename fails with
 /// an error rather than being emulated by copy-and-delete (ADR-002 §3).
 pub(crate) fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(feature = "sync-probe")]
+    crate::probe::record(crate::probe::Event::Rename);
     std::fs::rename(from, to)
 }
 
@@ -50,6 +54,8 @@ pub(crate) fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
 /// that platform has no contract to fail against; a genuine open failure is
 /// still reported so a missing directory is not silently ignored.
 pub(crate) fn sync_directory(directory: &Path) -> io::Result<()> {
+    #[cfg(feature = "sync-probe")]
+    crate::probe::record(crate::probe::Event::SyncDir);
     platform::sync_directory(directory)
 }
 

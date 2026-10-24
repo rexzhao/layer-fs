@@ -243,6 +243,11 @@ fn record_pack(
     observer: &mut dyn PackObserver,
 ) -> StoreResult<()> {
     let transaction = database.connection.unchecked_transaction()?;
+    #[cfg(feature = "sync-probe")]
+    {
+        crate::probe::note_transaction_begin();
+        crate::probe::run_injection();
+    }
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos() as i64)
@@ -273,6 +278,8 @@ fn record_pack(
         }
     }
     transaction.commit()?;
+    #[cfg(feature = "sync-probe")]
+    crate::probe::note_transaction_end();
     observer.step(pack::PackStep::Committed);
     Ok(())
 }

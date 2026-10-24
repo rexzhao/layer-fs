@@ -10,6 +10,10 @@ license.workspace = true
 # Compiles the crash-point helpers used by this crate's own tests. Off by
 # default: a consumer of `cas-store` never gets the abort hooks (ADR-002 §13.1).
 crash-points = []
+# The publication probe (ADR-008 §5 acceptance): records what a batch did on disk and opens
+# rusqlite's `trace` so transaction boundaries come from SQLite, not from our own markers.
+# Off by default; a consumer never gets it.
+sync-probe = ["rusqlite/trace"]
 
 [dependencies]
 blake3.workspace = true
@@ -18,7 +22,7 @@ rusqlite.workspace = true
 
 [dev-dependencies]
 # Self-reference so `cargo test -p cas-store` compiles the crash-point module.
-cas-store = { path = ".", features = ["crash-points"] }
+cas-store = { path = ".", features = ["crash-points", "sync-probe"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

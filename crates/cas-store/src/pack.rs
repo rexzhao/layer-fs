@@ -132,6 +132,8 @@ pub(crate) fn write(
                 let mut file = File::create(&staged)?;
                 file.write_all(bytes)?;
                 observer.step(PackStep::Staged);
+                #[cfg(feature = "sync-probe")]
+                crate::probe::record(crate::probe::Event::PackWrite);
                 sync_file(&file)?;
                 observer.step(PackStep::StagedSynced);
             }

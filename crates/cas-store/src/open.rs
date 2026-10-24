@@ -118,7 +118,7 @@ pub(crate) fn open(
     if already_present {
         schema::validate(&connection)?;
     }
-    configure(&connection, options)?;
+    configure(&mut connection, options)?;
 
     if !already_present {
         if !mode.may_write() {
@@ -155,7 +155,7 @@ pub(crate) fn open(
 /// `synchronous=FULL` is chosen deliberately: ADR-002 §9 requires a committed
 /// index change to be durable, which is what makes "index commit == publish"
 /// meaningful across a process crash.
-fn configure(connection: &Connection, options: StoreOptions) -> StoreResult<()> {
+fn configure(connection: &mut Connection, options: StoreOptions) -> StoreResult<()> {
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     // Zero by default: ADR-002 §8. A caller that shares the store between writers passes
@@ -163,8 +163,27 @@ fn configure(connection: &Connection, options: StoreOptions) -> StoreResult<()> 
     // this crate replaying an operation.
     let wait_ms = i64::try_from(options.busy_timeout.as_millis()).unwrap_or(i64::MAX);
     connection.pragma_update(None, "busy_timeout", wait_ms)?;
+    // With the probe on, SQLite reports every statement it runs — including the `BEGIN
+    // IMMEDIATE`/`COMMIT` of the index transaction. That is the independent witness the
+    // "fsync outside the transaction" criterion needs; the probe's own markers cannot be
+    // used for it.
+    // `trace_v2` takes a plain `fn`, so the sink must be a free function rather than a
+    // closure: it records into the probe's global log, which needs no captured state.
+    #[cfg(feature = "sync-probe")]
+    connection.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(record_statement),
+    );
     connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
+}
+
+/// The probe's statement sink: SQLite hands us the SQL text of each statement it runs.
+#[cfg(feature = "sync-probe")]
+fn record_statement(event: rusqlite::trace::TraceEvent<'_>) {
+    if let rusqlite::trace::TraceEvent::Stmt(statement, _) = event {
+        crate::probe::record(crate::probe::Event::Sql(statement.sql().into_owned()));
+    }
 }
 
 /// Removes every file left in `tmp/` by a crash.
