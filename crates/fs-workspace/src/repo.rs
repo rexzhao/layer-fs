@@ -753,6 +753,63 @@ impl Repo {
                 });
             }
         }
+        // Overlay sources (ADR-008 §6.2): each workspace's `ov_meta.pending_root`, and every
+        // sealed content reference. Both live in the workspace's own SQLite file, so they are read
+        // from a second connection per workspace — offline GC holds those files exclusively, which
+        // is why this is safe here and nowhere else.
+        // Read the names through the connection we already hold: `workspace_names()` locks the
+        // same mutex, and `std::sync::Mutex` is not reentrant — calling it here deadlocks.
+        let names: Vec<String> = {
+            let mut statement = connection.prepare("SELECT id FROM workspace")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for name in names {
+            let overlay = self.workspace_dir(&name).join("overlay.sqlite");
+            if !overlay.is_file() {
+                continue;
+            }
+            let connection = rusqlite::Connection::open_with_flags(
+                &overlay,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let pending: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM ov_meta WHERE key = 'pending_root'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(root) = pending {
+                rows.push(crate::gc::roots::RootRow {
+                    kind: crate::gc::roots::RootKind::OverlayPending,
+                    root: parse_oid(&root)?,
+                    label: format!("overlay-pending:{name}"),
+                });
+            }
+            // `sealed_content` does not exist until Seal lands; the query is skipped rather than
+            // guessed at, and the tripwire (T1) is what makes that a checked statement.
+            let has_sealed: Option<String> = connection
+                .query_row(
+                    "SELECT name FROM pragma_table_info('ov_inode') WHERE name = 'sealed_content'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if has_sealed.is_some() {
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT sealed_content FROM ov_inode WHERE sealed_content IS NOT NULL",
+                )?;
+                for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                    let root = row?;
+                    rows.push(crate::gc::roots::RootRow {
+                        kind: crate::gc::roots::RootKind::SealedContent,
+                        root: parse_oid(&root)?,
+                        label: format!("sealed:{name}:{root}"),
+                    });
+                }
+            }
+        }
         Ok(rows)
     }
 

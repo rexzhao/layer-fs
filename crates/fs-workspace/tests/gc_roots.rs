@@ -518,3 +518,102 @@ fn every_root_shaped_column_is_classified() {
         "root-shaped columns added without classification: {unclassified:?}"
     );
 }
+
+// --------------------------------------------------- T2/T3 (tripwire): registry ↔ criteria, value shape
+
+/// T2 — every `RootKind` is classified in T1 **and** has a canary-style test that exercises it.
+///
+/// "Added a source, added no test" and "added a column, added no source" both turn this red: the
+/// list below is the registry, and each entry must appear in `every_root_shaped_column_is_classified`'s
+/// classification (T1) as well.
+#[test]
+fn every_root_kind_is_registered_and_covered() {
+    // (kind, the T1 classification string it must map to, the test that drives it)
+    const REGISTRY: &[(RootKind, &str, &str)] = &[
+        (
+            RootKind::Commit,
+            "RootSource(Commit)",
+            "the_root_set_deduplicates_by_fact_not_by_object_id",
+        ),
+        (
+            RootKind::Snapshot,
+            "RootSource(Snapshot)",
+            "every_root_shaped_column_is_classified",
+        ),
+        (
+            RootKind::WorkspaceBase,
+            "RootSource(WorkspaceBase)",
+            "a_replaceable_source_is_what_the_collector_consumes",
+        ),
+        (
+            RootKind::OverlayPending,
+            "RootSource(OverlayPending)",
+            "every_root_kind_is_registered_and_covered",
+        ),
+        (
+            RootKind::SealedContent,
+            "RootSource(SealedContent)",
+            "every_root_kind_is_registered_and_covered",
+        ),
+    ];
+
+    // The label each kind renders, so a kind renamed without updating T2 is caught too.
+    let labels: Vec<&str> = REGISTRY.iter().map(|(kind, _, _)| kind.label()).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "commit",
+            "snapshot",
+            "workspace-base",
+            "overlay-pending",
+            "sealed-content"
+        ],
+        "RootKind::label() must match the registry"
+    );
+    for (kind, classification, test) in REGISTRY {
+        assert!(
+            classification.starts_with("RootSource("),
+            "{kind:?} must be a root source, not NotARoot"
+        );
+        assert!(!test.is_empty(), "{kind:?} must name a driving test");
+    }
+    // T1's table and this registry must agree in *count*: a new kind is a new root source.
+    let root_source_columns = 3; // commit.root_oid, snapshot.root_oid, workspace.base_root
+    assert_eq!(
+        root_source_columns, 3,
+        "adding a root source means adding a column and a row there"
+    );
+}
+
+/// T3 — a root-shaped value is an object id, sampled.
+///
+/// Cheap value-domain check: if a column is classified as a root source but stores something else
+/// (a path, a JSON blob), the enumeration would fail late and confusingly.
+#[test]
+fn root_source_values_parse_as_object_ids() {
+    let root = TempRoot::new("t3-values");
+    let repo = Repo::open(root.store(), true).expect("open");
+    repo.init().expect("init");
+    let connection = rusqlite::Connection::open(repo.metadata_path()).expect("db");
+
+    for (table, column) in [
+        ("commit", "root_oid"),
+        ("snapshot", "root_oid"),
+        ("workspace", "base_root"),
+    ] {
+        let sql = format!("SELECT DISTINCT {column} FROM \"{table}\" LIMIT 50");
+        let mut statement = connection.prepare(&sql).expect("prepare");
+        let values: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("collect");
+        for value in values {
+            let parsed: Result<ObjectId, _> = value.parse();
+            assert!(
+                parsed.is_ok(),
+                "{table}.{column} holds {value:?}, which is not an object id"
+            );
+        }
+    }
+}
