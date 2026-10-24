@@ -325,3 +325,31 @@ gc_exclusive --list = 2   (其中 1 条当时 ignore；④ 完成后已摘)
 
 **转交注意**：`b73f413` 已与 main 分叉，`git diff origin/main..b73f413 -- docs/` 会显示 **`p2b6-mark-handoff.md` 被删**，
 也就是说**从 `b73f413` 直接开工的人本地没有这份交接材料**。恢复工作第一件事必须是 `git fetch && git rebase origin/main`。
+
+## 18. 给 ⑤（mark/sweep）的施工要点（manager；因邮件通道不稳，要点以此为准）
+
+**开工前先读本节 + §11/§12/§13/§15/§16。**
+
+1. **mark**
+   - 从 `RootSet::by_root()` 入队 → 弹出 oid → **已标记则不展开**（§6.3 的字面算法）→ 否则写标记集 + 把
+     `references(oid)` 的子节点入队；
+   - **根先入标记集再展开**（§13.1；否则空根 / `Empty` 根时 G3 假绿）；
+   - 标记集落**临时 SQLite**，放 store 根下、**不放 `tmp/`**（§6.3、§13）；
+   - `skip_root` 在**进入 traversal 之前**生效（反例 F）；
+   - `reachable_count` 是**去重后**的数；`GcReport` 逐 ID 给 `freed`（§15/§16）。
+2. **sweep 之前不得有任何写操作**：mark 遇任何读取/解码失败必须 typed 中止（`MissingPack`/`Corrupt*`），
+   **零删除、零行改写**（§13.2；半修状态比不跑 GC 更糟）。
+3. **sweep**
+   - 按**可达性**判断，不按"被引用计数"、不按根分组（K5b 打的就是这条）；
+   - `pack` 行在、文件缺 → **报 `MissingPack` 并让 gc 失败（dry-run 告警）**，**绝不删索引行**（K8a/K8b）；
+   - 重打包顺序：tmp → fsync → rename → fsync 目录 → 一个事务切换索引 → 删旧 pack；存活率 0 → 删行删文件；
+     `< gc_repack_threshold` → 拷贝式重打包；否则保留；
+   - `packs/` 无行文件 → 删；`tmp/` 全删；标记库删除。
+4. **计数语义**（§15）：`freed_objects` 不含重打包；`freed_bytes` 拆 `freed_object_bytes` /
+   `reclaimed_dead_bytes`；G5 **不得**用字节判非真空；`packs_deleted + packs_repacked <= packs_before`。
+5. **测试**：K1–K10 + K5b/K5c、反例 C/D/E/F/G（三步阳性对照）、Y1–Y22（§16）、崩溃五点 + 到达点号（I6）、
+   dry-run 除标记库外哈希不变（G1c）。
+6. **计数回报**：固定给 `HEAD / origin/main / --list 原文 / feature 配置 / 判定`；新增测试数必须可解释到具体测试。
+
+**fixture 前置条件必须断言（本轮第二例"看似测 X 实则测 Y"）**：内容寻址下"同字节 = 同 oid"，因此凡"构造两个对象
+来测共享"的地方，必须 `assert_ne!` 两个 oid；凡"我造了两个 X"（两个叶、两个 pack、两个 workspace）都应断言身份不同。
