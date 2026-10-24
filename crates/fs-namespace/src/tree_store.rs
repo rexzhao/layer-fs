@@ -27,7 +27,7 @@
 //! | `OverlayRead` (`TreeRead`) | `fs-overlay/src/view.rs` | `fs-overlay/tests/contract.rs` 的读断言（`stat` / `read_dir` / 白化） |
 //! | `OverlayWrite` (`TreeRead` + `TreeWrite`) | `fs-overlay/src/write_view.rs` | `fs-overlay/tests/contract.rs` 每次 `Rules::*` 写操作；`fs-api/tests/workspace_api.rs` 端到端 |
 //! | `WorkspaceStore` (`TreeStore`) | `fs-workspace/src/tree.rs` | `fs-workspace/tests/core.rs`（生命周期/状态机）、`fs-workspace/tests/crash.rs`（四个注入点） |
-//! | `SnapshotTree` (`TreeRead`) | `fs-api/src/read_view.rs` | `fs-api/tests/workspace_api.rs`（commit → `read_view`）、`fs-api/tests/verify.rs` |
+//! | `SnapshotTree` (`TreeRead`) | `fs-api/src/read_view.rs` | `fs-api/tests/workspace_api.rs`（5 处 `repo.read_view`）、`fs-api/tests/acceptance.rs`（3 处）、`fs-api/tests/reference_transitions.rs`（每次 commit 后回读） |
 //!
 //! Keeping this table true is a grep, not a memory test:
 //!
