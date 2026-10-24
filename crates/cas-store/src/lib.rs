@@ -68,6 +68,12 @@ pub struct PinForTest {
 #[cfg(feature = "crash-points")]
 pub mod testing;
 
+/// Arms a one-shot pin failure for the next publication (`staging-audit` builds only).
+#[cfg(all(feature = "staging-audit", feature = "crash-points"))]
+pub fn fail_next_pin() {
+    testing::fail_next_pin();
+}
+
 /// The publication probe used by the ADR-008 §5 acceptance tests.
 ///
 /// Compiled only with the `sync-probe` feature.

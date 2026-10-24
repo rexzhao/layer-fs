@@ -208,3 +208,31 @@ pub(crate) fn run_staging_sweep(temporaries: &std::path::Path) {
         }
     }
 }
+
+/// Arms a one-shot pin failure for the next publication (`staging-audit` builds only).
+///
+/// It exists so the failure path ADR-008 §5.2 describes — the pack is gone between its rename
+/// and the pin — can be driven deterministically, without pretending the *cause* is an `Io`
+/// error: the publication must fail as `MissingPack` and commit nothing.
+// Thread-scoped, so arming it in one test cannot make a *parallel* test's publication fail:
+// the hook has to be deterministic for the caller that armed it and invisible to everyone else.
+#[cfg(feature = "staging-audit")]
+thread_local! {
+    static FAIL_NEXT_PIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms a one-shot pin failure for the **calling thread's** next publication.
+#[cfg(feature = "staging-audit")]
+pub fn fail_next_pin() {
+    FAIL_NEXT_PIN.with(|flag| flag.set(true));
+}
+
+/// Takes (and clears) the armed flag.
+#[cfg(feature = "staging-audit")]
+pub(crate) fn take_fail_next_pin() -> bool {
+    FAIL_NEXT_PIN.with(std::cell::Cell::get).then(|| {
+        FAIL_NEXT_PIN.with(|flag| flag.set(false));
+        true
+    }) == Some(true)
+        || { false }
+}

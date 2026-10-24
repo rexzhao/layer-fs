@@ -539,3 +539,50 @@ fn a_pinned_pack_cannot_be_deleted_but_can_be_read() {
     drop(pin);
     std::fs::remove_file(&path).expect("after the pin is dropped the file can be deleted");
 }
+
+/// ADR-008 §5.2: if the pack is gone between its rename and the pin, the publication fails as
+/// `MissingPack` and commits **nothing** — the file is left as an unreferenced pack for GC.
+///
+/// Driven by `fail_next_pin()` (staging-audit only), which is the deterministic form of "the
+/// external deleter won the race". The important half is the second: no index row may exist,
+/// because a row pointing at a pack that is not there is exactly the damage P2b-2d names.
+#[cfg(feature = "staging-audit")]
+#[test]
+fn a_failed_pin_fails_the_publication_and_commits_no_rows() {
+    let root = TempRoot::new("pin-fail");
+    let store = Store::open(root.store(), OpenMode::Create).expect("open");
+
+    cas_store::fail_next_pin();
+    let mut batch = store.batch();
+    let value = payload(11, 200);
+    batch.put(Role::Bytes, &value).expect("put");
+    match batch.commit() {
+        Err(cas_store::StoreError::MissingPack { pack_id }) => assert!(!pack_id.is_empty()),
+        other => panic!("a lost pack must surface as MissingPack, got {other:?}"),
+    }
+
+    assert_eq!(
+        store.object_count().expect("count"),
+        0,
+        "nothing was committed"
+    );
+    assert_eq!(pack_rows(&root.store()).len(), 0, "no pack row either");
+    // The bytes are on disk but nameless: an orphan, which is GC's business (ADR-008 §5.1).
+    let packs = root.store().join("packs");
+    let present = std::fs::read_dir(&packs)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".pack"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        present, 1,
+        "the renamed file stays behind as an unreferenced pack"
+    );
+    assert!(
+        store.verify().expect("verify").is_clean(),
+        "an unreferenced pack is not a failure — it is not published"
+    );
+}

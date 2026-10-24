@@ -263,20 +263,29 @@ pub(crate) fn write(
     observer.step(PackStep::Renamed);
     #[cfg(feature = "staging-audit")]
     audit("after-rename", layout, pack_id, bytes.len() as u64);
+    // ADR-008 §5.2: the pin is taken **after the rename and before the directory fsync**, so the
+    // name is already in `packs/` (a pin on a name that does not exist would be meaningless) and
+    // the denials cover the whole window in which the file exists but no row names it.
+    #[cfg(feature = "staging-audit")]
+    if crate::testing::take_fail_next_pin() {
+        return Err(StoreError::MissingPack {
+            pack_id: pack_id.to_owned(),
+        });
+    }
+    let pin =
+        crate::durability::Pin::hold(&layout.pack_path(pack_id)).map_err(|error| {
+            match error.kind() {
+                std::io::ErrorKind::NotFound => StoreError::MissingPack {
+                    pack_id: pack_id.to_owned(),
+                },
+                _ => StoreError::Io(error),
+            }
+        })?;
     sync_directory(&layout.packs())?;
     observer.step(PackStep::DirectorySynced);
     #[cfg(feature = "staging-audit")]
     audit("after-sync-dir", layout, pack_id, bytes.len() as u64);
-    // ADR-008 §5.2: deny deletion from here until the index row exists. A failure to hold the
-    // handle means the file is already gone, which is exactly `MissingPack`; nothing has been
-    // committed at this point, so the batch can be abandoned cleanly (no retry: a visibility
-    // re-check would not close the window, and retrying would turn data loss into latency).
-    crate::durability::Pin::hold(&layout.pack_path(pack_id)).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => StoreError::MissingPack {
-            pack_id: pack_id.to_owned(),
-        },
-        _ => StoreError::Io(error),
-    })
+    Ok(pin)
 }
 
 /// Reads exactly one frame at `(offset, length)`.
@@ -291,53 +300,7 @@ pub(crate) fn read_frame(
     length: u64,
 ) -> StoreResult<Vec<u8>> {
     let path = layout.pack_path(pack_id);
-    #[cfg(not(feature = "staging-audit"))]
     let mut file = open_pack(&path, pack_id)?;
-    #[cfg(feature = "staging-audit")]
-    let mut file = match File::open(&path) {
-        Ok(file) => file,
-        Err(error) => {
-            // One short retry, then the full picture: the exact path, every directory entry
-            // with *its own* error (Windows can fail a per-entry read while the directory is
-            // being modified — `.flatten()` would silently hide that), and the canonical root.
-            let mut line = format!(
-                "staging-audit: pack frame read failed for {pack_id}: {error}; path={}; root={:?}",
-                path.display(),
-                layout.root().canonicalize()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            match File::open(&path) {
-                Ok(file) => {
-                    eprintln!("{line}; RETRY SUCCEEDED (visibility delay)");
-                    file
-                }
-                Err(second) => {
-                    line.push_str(&format!("; retry failed: {second}; entries="));
-                    match std::fs::read_dir(layout.packs()) {
-                        Ok(entries) => {
-                            let mut listed = Vec::new();
-                            for entry in entries {
-                                match entry {
-                                    Ok(entry) => listed.push(format!(
-                                        "{:?}(len={:?})",
-                                        entry.file_name(),
-                                        entry.metadata().map(|meta| meta.len())
-                                    )),
-                                    Err(entry_error) => {
-                                        listed.push(format!("ENTRY-ERROR({entry_error})"))
-                                    }
-                                }
-                            }
-                            line.push_str(&format!("{listed:?}"));
-                        }
-                        Err(dir_error) => line.push_str(&format!("READDIR-ERROR({dir_error})")),
-                    }
-                    panic!("{line}");
-                }
-            }
-        }
-    };
-
     let mut bytes = vec![0u8; usize::try_from(length).unwrap_or(0)];
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(&mut bytes)
