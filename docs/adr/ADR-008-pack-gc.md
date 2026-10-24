@@ -82,7 +82,14 @@ CREATE TABLE pack (
 ) STRICT;
 ```
 
-`store_policy.schema_version = 3`；v2 Store → `UnsupportedSchemaVersion`，不迁移（P2a 零部署）**[G4 已定]**。
+`store_policy.schema_version = 3`；**任何 ≠ 3 的 Store → `UnsupportedSchemaVersion`**，不迁移（P2a 零部署）**[G4 已定]**。
+
+> **编号澄清（architect 落地核对，2026-10-24）**：P2a 实际现存的是 `SCHEMA_VERSION = 1`（`crates/cas-store/src/schema.rs`，
+> `PRAGMA user_version = 1`），**2 从未发布**；G4 里的"v2 Store 拒绝"应读作"任何非 3 版本拒绝"，
+> 编号仍是 3（owner 已确认）。因此验收夹具必须用**真实的 P2a v1 DDL**（5 列 `object_location`、无
+> `kind/pack_id/offset`），不是把新 DDL 的 `user_version` 改成 2 的合成库——合成 v2 恰好会漏掉真实旧库。
+> 另：`cas-store/src/open.rs` 现在是 `configure()`（含 `journal_mode = WAL`）在 `validate()` **之前**，
+> 所以"被拒时文件不得被改动"需以字节哈希断言验证，红了就把 `validate` 提前或先以只读连接读版本。
 
 ## 5. 批量发布（取代 ADR-006 §12）
 
