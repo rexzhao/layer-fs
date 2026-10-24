@@ -370,3 +370,13 @@ gc_exclusive --list = 2   (其中 1 条当时 ignore；④ 完成后已摘)
 **顺带修的真实缺陷**（同一次提交）：`root_rows` 把 `ov_meta.pending_root` 的**空串**当对象 id 解析 → 任何**已提交**的
 workspace 都让根枚举失败（`Inconsistent: object id ""`）。空串是"没有 pending root"的正常状态（publish 会清空），
 必须显式过滤；`sealed_content` 同理。
+
+## 20. `verify --deep` 的根来源（worker 实测，manager 采纳）
+
+- `Repo::roots()` 是**主库三列的 UNION**（`commit.root_oid` / `snapshot.root_oid` / `workspace.base_root`），**不打开任何
+  `overlay.sqlite`** → 它**看不见** `pending_root` / `sealed_content`。它是 `verify` 的输入，**不是** GC 的根集合。
+- 因此 **`verify --deep` 若要覆盖 overlay 根，必须用 `RootSource`/`RootRows`，不能用 `Repo::roots()`**；否则 K5c 只覆盖到
+  snapshot 表 + workspace base，`pending_root` 的子树不在检查范围。
+- GC 的带标签枚举（`RepoRoots`）在有活 overlay 时**报 typed `Busy`**（先等满默认 `busy_timeout` ≈5.5 s）。这是**正确**的：
+  **一个被静默丢掉的 overlay 根 = 一棵会被删掉的子树**，宁可整次枚举失败，也不能少一行。
+- 交互式调用嫌等待长属 API 取舍，P2b-6 **不改**（若将来要改，另开卡并保留"不得静默少行"这条）。
