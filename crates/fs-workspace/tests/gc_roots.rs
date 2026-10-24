@@ -135,3 +135,126 @@ fn a_replaceable_source_is_what_the_collector_consumes() {
         "the two sources disagree, which is exactly what an injection needs"
     );
 }
+
+// --------------------------------------------------------------- criteria seam (G1–G5, C/D/E/F/G)
+//
+// The four counter-examples all need to *lie at one seam* and then assert that exactly one
+// criterion goes red. Each test here therefore runs a clean mark and an injected one on the same
+// fixture — the clean run is the positive control QA requires (a red assertion in a seam that
+// never fires proves nothing).
+
+use fs_workspace::gc::criteria;
+
+/// Declares two roots, walks both: the positive control for every injection below.
+fn clean_pair() -> (RootSet, RootSet) {
+    let commit = oid("commit-tree");
+    let snap = oid("snapshot-tree");
+    let declared = RootSet::from_entries(vec![
+        RootRef::new(RootKind::Commit, commit, "commit:c1"),
+        RootRef::new(RootKind::Snapshot, snap, "snapshot:s1"),
+    ]);
+    (declared.clone(), declared)
+}
+
+#[test]
+fn a_clean_mark_passes_g1_g2_g3_and_fails_only_g5_for_lack_of_collection() {
+    let (declared, walked) = clean_pair();
+    let mut report = fs_workspace::gc::GcReport::skeleton(&declared);
+    for entry in walked.entries() {
+        report.record_visit(entry);
+        report.reachable.push(entry.root);
+    }
+    report.reachable_count = report.reachable.len();
+
+    assert!(criteria::g1_no_live_object_freed(&report).is_ok());
+    assert!(criteria::g2_mark_covers_declared(&report).is_ok());
+    assert!(criteria::g3_every_root_visited(&report).is_ok());
+    // G5 is the non-vacuous criterion: nothing was freed, so the run proves nothing yet.
+    assert!(criteria::g5_not_vacuous(&report).is_err());
+}
+
+#[test]
+fn skipping_one_root_is_caught_by_g2_and_g3() {
+    // Counter-example D: the source omits a root, so mark never visits it.
+    let (declared, walked) = clean_pair();
+    let mut report = fs_workspace::gc::GcReport::skeleton(&declared);
+    for entry in &walked.entries()[..1] {
+        report.record_visit(entry);
+    }
+    let (missed, extra) = criteria::g2_mark_covers_declared(&report).expect_err("G2 must go red");
+    assert_eq!(missed, vec!["snapshot:s1".to_owned()]);
+    assert!(extra.is_empty());
+    assert!(
+        criteria::g3_every_root_visited(&report).is_err(),
+        "G3 must go red"
+    );
+}
+
+#[test]
+fn visiting_a_root_without_counting_it_is_caught_by_g3_per_kind() {
+    // Counter-example F: the label is in the visited list but the per-kind counter never moved —
+    // the shape a UNION query invites when the per-kind dispatch forgets a source.
+    let (declared, walked) = clean_pair();
+    let report = fs_workspace::gc::GcReport {
+        roots_declared: declared.entries().iter().map(|e| e.label.clone()).collect(),
+        roots_visited: declared.entries().iter().map(|e| e.label.clone()).collect(),
+        root_oids: declared.ids(),
+        visited_oids: declared.ids(),
+        roots_by_kind: [(RootKind::Snapshot, 1), (RootKind::Commit, 1)].into(),
+        visited_by_kind: [(RootKind::Commit, 1)].into(),
+        ..Default::default()
+    };
+    let error = criteria::g3_every_root_visited(&report).expect_err("G3 must go red");
+    assert!(
+        error.contains("Snapshot"),
+        "the reason names the kind: {error}"
+    );
+    assert!(
+        criteria::g2_mark_covers_declared(&report).is_ok(),
+        "G2 alone cannot see this"
+    );
+    let _ = walked;
+}
+
+#[test]
+fn forcing_a_reachable_object_into_the_free_set_is_caught_by_g1_and_g4() {
+    // Counter-example G: the sweep's seam adds an id that mark reached.
+    let (declared, walked) = clean_pair();
+    let mut report = fs_workspace::gc::GcReport::skeleton(&declared);
+    for entry in walked.entries() {
+        report.record_visit(entry);
+        report.reachable.push(entry.root);
+    }
+    let victim = walked.entries()[0].root;
+    report.freed.push(victim);
+
+    let offending = criteria::g1_no_live_object_freed(&report).expect_err("G1 must go red");
+    assert_eq!(offending, vec![victim]);
+    assert!(
+        criteria::g4_freed_is_unreachable(&report).is_err(),
+        "G4 must go red"
+    );
+    assert!(
+        criteria::g5_not_vacuous(&report).is_ok(),
+        "G5 is satisfied — something was freed"
+    );
+}
+
+#[test]
+fn freeing_only_unreachable_objects_satisfies_all_five() {
+    // Counter-example E's positive side: a genuinely unreachable object is freed, live ones are not.
+    let (declared, walked) = clean_pair();
+    let mut report = fs_workspace::gc::GcReport::skeleton(&declared);
+    for entry in walked.entries() {
+        report.record_visit(entry);
+        report.reachable.push(entry.root);
+    }
+    report.freed.push(oid("garbage"));
+    report.reachable_count = report.reachable.len();
+
+    assert!(criteria::g1_no_live_object_freed(&report).is_ok());
+    assert!(criteria::g2_mark_covers_declared(&report).is_ok());
+    assert!(criteria::g3_every_root_visited(&report).is_ok());
+    assert!(criteria::g4_freed_is_unreachable(&report).is_ok());
+    assert!(criteria::g5_not_vacuous(&report).is_ok());
+}

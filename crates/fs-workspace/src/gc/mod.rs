@@ -9,6 +9,129 @@
 //! themselves on top of it, and each one consumes [`roots::RootSet`] rather than re-querying the
 //! database — a collector with two views of "what is live" cannot be tested for G2.
 
+pub mod criteria;
 pub mod roots;
 
 pub use roots::{RepoRoots, RootKind, RootRef, RootSet, RootSource};
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use cas_core::ObjectId;
+
+use crate::error::WorkspaceResult;
+
+/// The facts one GC run reports (P2b-6 §6).
+///
+/// Everything the criteria need is a **field**, not a log line: G1–G5 are computed from this value
+/// by [`criteria`], so a test can assert exactly one property without re-running the collector.
+#[derive(Debug, Clone, Default)]
+pub struct GcReport {
+    /// The labels of the roots the caller declared (G2's right-hand side).
+    pub roots_declared: Vec<String>,
+    /// The labels `mark` actually visited (G2's left-hand side).
+    pub roots_visited: Vec<String>,
+    /// Distinct root object ids declared.
+    pub root_oids: Vec<ObjectId>,
+    /// Distinct root object ids visited.
+    pub visited_oids: Vec<ObjectId>,
+    /// Every object id the sweep freed, **one entry per id** (G4's intersection, G5's witness).
+    pub freed: Vec<ObjectId>,
+    /// Objects still reachable after the run (G1: none of these may be in `freed`).
+    pub reachable: Vec<ObjectId>,
+    /// How many objects mark reached.
+    pub reachable_count: usize,
+    /// Packs rewritten because their survivor ratio fell below the threshold.
+    pub packs_repacked: usize,
+    /// Packs deleted because nothing in them survived.
+    pub packs_deleted: usize,
+    /// Bytes reclaimed.
+    pub freed_bytes: u64,
+    /// Wall-clock duration of the run.
+    pub duration: Duration,
+    /// Declared roots per source kind (G3's second half).
+    pub roots_by_kind: BTreeMap<RootKind, usize>,
+    /// Visited roots per source kind.
+    pub visited_by_kind: BTreeMap<RootKind, usize>,
+}
+
+impl GcReport {
+    /// Builds a report from the declared root set, before any mark or sweep has run.
+    #[must_use]
+    pub fn skeleton(declared: &RootSet) -> Self {
+        let mut roots_by_kind = BTreeMap::new();
+        for entry in declared.entries() {
+            *roots_by_kind.entry(entry.kind).or_insert(0) += 1;
+        }
+        Self {
+            roots_declared: declared.entries().iter().map(|e| e.label.clone()).collect(),
+            root_oids: declared.ids(),
+            roots_by_kind,
+            ..Self::default()
+        }
+    }
+
+    /// Records one visited root (G2/G3 bookkeeping).
+    pub fn record_visit(&mut self, entry: &RootRef) {
+        self.roots_visited.push(entry.label.clone());
+        if !self.visited_oids.contains(&entry.root) {
+            self.visited_oids.push(entry.root);
+        }
+        *self.visited_by_kind.entry(entry.kind).or_insert(0) += 1;
+    }
+}
+
+/// Callbacks the collector offers so a test can observe a run without a `Vec` of every object
+/// (ADR-008 §5.4: memory must not grow with the store).
+#[derive(Default)]
+pub struct GcHooks<'a> {
+    /// Called once per visited root (streaming; a test collects it into a set).
+    pub on_root_visited: Option<&'a mut dyn FnMut(RootKind, ObjectId)>,
+    /// Under `gc-test-hooks`: ids forced into the free set (injection G).
+    pub extra_free_candidates: Vec<ObjectId>,
+}
+
+impl std::fmt::Debug for GcHooks<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcHooks")
+            .field("extra_free_candidates", &self.extra_free_candidates.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The two inputs of a run: what must be protected, and the source `mark` actually walks.
+///
+/// Kept separate on purpose (P2b-6 §6). A single `gc(roots)` could only produce counter-example C;
+/// splitting "what should be there" from "what mark walks" makes D (a missing root) and F
+/// (registered but skipped) constructible, and G is the hook above.
+#[derive(Debug)]
+pub struct GcInput<'a, S: roots::RootSource> {
+    /// The roots the caller says must be protected.
+    pub declared: &'a RootSet,
+    /// The source whose roots `mark` will actually walk.
+    pub mark_source: S,
+}
+
+impl<S: roots::RootSource> GcInput<'_, S> {
+    /// Runs the mark side: walks every root the source yields and records each visit.
+    ///
+    /// Sweep and repacking land in a later commit; this exists so the criteria seam is real —
+    /// `GcReport::record_visit` is the same call the full collector will make.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the source reported.
+    pub fn mark(&self, hooks: &mut GcHooks<'_>) -> WorkspaceResult<GcReport> {
+        let mut report = GcReport::skeleton(self.declared);
+        let walked = self.mark_source.roots()?;
+        for entry in walked.entries() {
+            report.record_visit(entry);
+            report.reachable.push(entry.root);
+            if let Some(sink) = hooks.on_root_visited.as_mut() {
+                sink(entry.kind, entry.root);
+            }
+        }
+        report.reachable_count = report.reachable.len();
+        Ok(report)
+    }
+}
