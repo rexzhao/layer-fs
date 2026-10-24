@@ -27,6 +27,15 @@ use cas_store::{OpenMode, Store};
 
 const TAIL_BYTES: u64 = 48;
 
+/// The probe's log is process-global, so tests that reset it and then read it must not run
+/// beside each other: libtest runs the tests in a binary in parallel by default. One lock per
+/// test keeps "reset → do the batch → read events" an atomic observation.
+fn serialised() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct TempRoot {
     path: PathBuf,
 }
@@ -216,6 +225,7 @@ fn publish(store: &Store, objects: usize) -> cas_store::BatchReport {
 #[test]
 fn a_pack_costs_one_sync_and_one_short_transaction() {
     for (objects, expected_packs) in [(2usize, 1usize), (3, 2), (5, 3)] {
+        let _guard = serialised();
         let root = TempRoot::new(&format!("counts-{objects}"));
         drop(Store::open(root.store(), OpenMode::Create).expect("open"));
         set_pack_max_bytes(&root.store(), 2400);
@@ -282,6 +292,7 @@ fn a_pack_costs_one_sync_and_one_short_transaction() {
 
 #[test]
 fn a_batch_of_published_objects_writes_nothing() {
+    let _guard = serialised();
     let root = TempRoot::new("already");
     let store = Store::open(root.store(), OpenMode::Create).expect("open");
     let value = vec![7u8; 500];
@@ -306,6 +317,7 @@ fn a_batch_of_published_objects_writes_nothing() {
 #[test]
 fn the_positive_control_is_caught_by_the_same_checker() {
     // Without this, "no sync inside the transaction" could simply mean the probe is dead.
+    let _guard = serialised();
     let root = TempRoot::new("control");
     let store = Store::open(root.store(), OpenMode::Create).expect("open");
     let scratch = root.store().join("scratch.bin");
@@ -333,6 +345,7 @@ fn the_positive_control_is_caught_by_the_same_checker() {
 #[test]
 #[ignore = "timing: run explicitly with --ignored and paste the numbers into the report"]
 fn the_transaction_does_not_grow_with_the_object_count() {
+    let _guard = serialised();
     let root = TempRoot::new("lock-hold");
     let store = Store::open(root.store(), OpenMode::Create).expect("open");
 
