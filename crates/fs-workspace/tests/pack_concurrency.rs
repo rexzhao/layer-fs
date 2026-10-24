@@ -141,6 +141,18 @@ fn prepare(dir: &Path) {
     }
 }
 
+/// Whether a snapshot error is the one KI-11 tolerates: a published pack's file is gone.
+///
+/// Matched structurally, not by rendering the error and searching the text: a string match
+/// would also accept any other error that happens to mention the variant, which is the mistake
+/// this project already made once (KI-11's own lesson).
+fn is_missing_pack(error: &fs_snapshot::SnapshotError) -> bool {
+    matches!(
+        error,
+        fs_snapshot::SnapshotError::Store(StoreError::MissingPack { .. })
+    )
+}
+
 /// The tree of `commit` names `/f` with the shared payload.
 ///
 /// Same tolerance as `verify` (architect's condition 3): a post-publication read may fail only
@@ -149,33 +161,28 @@ fn prepare(dir: &Path) {
 fn assert_root_reads(dir: &Path, commit: &str, round: usize) {
     let store = Store::open(dir, OpenMode::ReadOnly).expect("store");
     let root: ObjectId = commit.parse().expect("root id");
+    // One rule for every read path (architect's condition 3), asserted on the **type**: a
+    // `MissingPack` for a pack that is really absent is KI-11's data loss; anything else fails.
     let reader = match SnapshotReader::open_any(&store, root) {
         Ok(reader) => reader,
         Err(error) => {
-            let message = format!("{error:?}");
             assert!(
-                message.contains("MissingPack"),
-                "round {round}: a post-publication read failed with something other than                  KI-11's data loss: {message}"
-            );
-            assert!(
-                !dir.join("packs").join("missing").exists(),
-                "round {round}: sanity"
+                is_missing_pack(&error),
+                "round {round}: a post-publication read failed with something other than                  KI-11's data loss: {error:?}"
             );
             return;
         }
     };
     let root_inode = reader.inode(0).expect("root inode").expect("present");
     // Descending the tree can hit the same data loss: a page of the directory inode may live in
-    // a pack the deleter removed. Only `MissingPack` is tolerated here (architect's condition 3).
-    let lookup = reader.lookup(&root_inode, b"f");
-    let serial = match lookup {
+    // a pack the deleter removed.
+    let serial = match reader.lookup(&root_inode, b"f") {
         Ok(Some(serial)) => serial,
         Ok(None) => return,
         Err(error) => {
-            let message = format!("{error:?}");
             assert!(
-                message.contains("MissingPack"),
-                "round {round}: a tree walk failed with something other than KI-11's data loss:                  {message}"
+                is_missing_pack(&error),
+                "round {round}: a tree walk failed with something other than KI-11's data loss:                  {error:?}"
             );
             return;
         }
@@ -184,10 +191,9 @@ fn assert_root_reads(dir: &Path, commit: &str, round: usize) {
         Ok(Some(inode)) => inode,
         Ok(None) => return,
         Err(error) => {
-            let message = format!("{error:?}");
             assert!(
-                message.contains("MissingPack"),
-                "round {round}: reading an inode failed with something other than KI-11's data                  loss: {message}"
+                is_missing_pack(&error),
+                "round {round}: reading an inode failed with something other than KI-11's data                  loss: {error:?}"
             );
             return;
         }
