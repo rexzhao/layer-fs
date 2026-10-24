@@ -11,7 +11,7 @@
 use cas_core::{Object, ObjectId, Role};
 use fs_workspace::gc::{RepoRoots, RootKind, RootRef, RootSet, RootSource};
 use fs_workspace::Repo;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 struct TempRoot {
     path: PathBuf,
@@ -431,65 +431,130 @@ fn a_label_naming_two_trees_is_an_error_not_two_facts() {
     );
 }
 
-// ------------------------------------------------------ T1 (tripwire): every root-ish column is classified
+// ---------------------------------------------------------------- tripwire T1–T3 (card §7, QA)
 //
-// A new column that carries a root and is not classified here means the enumeration silently
-// missed a source: the collector would then look correct while protecting nothing. The table below
-// is the classification; the test fails when the schema grows a column nobody classified.
+// One table, three checks. QA's first review found all three weak in the same way: they looked
+// thorough but could not fail for the reason they claimed. So:
+//
+//   T1 enumerates **both** databases (the metadata database *and* every workspace overlay) and
+//      fails on a root-shaped column nobody classified — the overlay half is the point, since
+//      `ov_meta`/`ov_inode` are where a GC root would hide;
+//   T2 derives its two sides from *different* sources (this table vs `RootKind`'s variants) and
+//      compares them; a table that agrees with itself would prove nothing;
+//   T3 checks the value domain of every column classified as a root source, in whichever database
+//      it lives.
+
+/// `(database, table, column) → classification`.
+///
+/// `RootSource(<Kind>)` means "this column holds a root and a `RootKind` covers it"; `NotARoot(..)`
+/// records why it is not one. Adding a root-shaped column without a row here is what T1 catches.
+type Classification = (&'static str, &'static str, &'static str, &'static str);
+
+const CLASSIFIED: &[Classification] = &[
+    ("main", "commit", "root_oid", "RootSource(Commit)"),
+    ("main", "snapshot", "root_oid", "RootSource(Snapshot)"),
+    (
+        "main",
+        "workspace",
+        "base_root",
+        "RootSource(WorkspaceBase)",
+    ),
+    (
+        "main",
+        "workspace",
+        "base_commit",
+        "NotARoot(points at a commit row, whose root_oid is the root)",
+    ),
+    (
+        "main",
+        "branch",
+        "head_commit",
+        "NotARoot(points at a commit row)",
+    ),
+    (
+        "main",
+        "branch_log",
+        "old_commit",
+        "NotARoot(points at a commit row; its root_oid is the root)",
+    ),
+    (
+        "main",
+        "branch_log",
+        "new_commit",
+        "NotARoot(points at a commit row)",
+    ),
+    (
+        "main",
+        "object_location",
+        "oid",
+        "NotARoot(the CAS index's own id — the marked side, not a root)",
+    ),
+    (
+        "main",
+        "pack",
+        "pack_id",
+        "NotARoot(names the container; the objects inside are object_location rows)",
+    ),
+    ("overlay", "ov_meta", "value", "RootSource(OverlayPending)"),
+    (
+        "main",
+        "store_policy",
+        "value",
+        "NotARoot(key/value policy scalars; keys are not trees)",
+    ),
+    (
+        "main",
+        "workspace_policy",
+        "value",
+        "NotARoot(key/value policy scalars; keys are not trees)",
+    ),
+    (
+        "overlay",
+        "ov_inode",
+        "serial",
+        "NotARoot(inode identity inside the overlay, not a tree root)",
+    ),
+];
+
+/// Opens every database a store has: the metadata one plus each workspace overlay.
+fn databases(dir: &Path) -> Vec<(String, rusqlite::Connection)> {
+    let mut found = vec![(
+        "main".to_owned(),
+        rusqlite::Connection::open(dir.join("store.sqlite")).expect("main db"),
+    )];
+    let workspaces = dir.join("workspaces");
+    if let Ok(entries) = std::fs::read_dir(&workspaces) {
+        for entry in entries.flatten() {
+            let overlay = entry.path().join("overlay.sqlite");
+            if overlay.is_file() {
+                found.push((
+                    "overlay".to_owned(),
+                    rusqlite::Connection::open(&overlay).expect("overlay db"),
+                ));
+            }
+        }
+    }
+    found
+}
+
+/// The store the tripwires inspect: a commit **and** an overlay, so both database kinds exist.
+fn fixture(label: &str) -> (TempRoot, PathBuf) {
+    let root = TempRoot::new(label);
+    let dir = root.store();
+    let repo = std::sync::Arc::new(Repo::open(&dir, true).expect("open"));
+    repo.init().expect("init");
+    let mut workspace = repo.workspace_create("w1", "main").expect("workspace");
+    workspace.create_file("/f").expect("create");
+    workspace.write_at("/f", 0, b"tripwire").expect("write");
+    workspace.snapshot().expect("snapshot");
+    workspace.close().expect("close");
+    drop(repo);
+    (root, dir)
+}
 
 #[test]
-fn every_root_shaped_column_is_classified() {
-    // (table, column) → which RootSource covers it, or why it is not a root.
-    // Keep this in sync with `RootKind`; T2 (registry ↔ criterion mapping) builds on it.
-    const CLASSIFIED: &[(&str, &str, &str)] = &[
-        ("commit", "root_oid", "RootSource(Commit)"),
-        ("snapshot", "root_oid", "RootSource(Snapshot)"),
-        ("workspace", "base_root", "RootSource(WorkspaceBase)"),
-        (
-            "workspace",
-            "base_commit",
-            "NotARoot(points at a commit row, whose root_oid is the root)",
-        ),
-        ("branch", "head_commit", "NotARoot(points at a commit row)"),
-        (
-            "branch_log",
-            "old_commit",
-            "NotARoot(points at a commit row; its root_oid is the root)",
-        ),
-        (
-            "branch_log",
-            "new_commit",
-            "NotARoot(points at a commit row)",
-        ),
-        (
-            "object_location",
-            "oid",
-            "NotARoot(the CAS index's own object id — the *marked* side, not a root)",
-        ),
-        (
-            "pack",
-            "pack_id",
-            "NotARoot(pack names the container; the objects inside are rows of object_location)",
-        ),
-    ];
-
-    let root = TempRoot::new("t1-columns");
-    let repo = Repo::open(root.store(), true).expect("open");
-    repo.init().expect("init");
-    let connection = rusqlite::Connection::open(repo.metadata_path()).expect("db");
-
-    let mut statement = connection
-        .prepare(
-            "SELECT m.name, p.name FROM sqlite_master AS m
-             JOIN pragma_table_info(m.name) AS p
-             WHERE m.type = 'table'",
-        )
-        .expect("prepare");
-    let columns: Vec<(String, String)> = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .expect("rows")
-        .collect::<Result<_, _>>()
-        .expect("collect");
+fn t1_every_root_shaped_column_in_every_database_is_classified() {
+    let (_root, dir) = fixture("t1-columns");
 
     let looks_like_a_root = |column: &str| {
         let lower = column.to_ascii_lowercase();
@@ -499,18 +564,34 @@ fn every_root_shaped_column_is_classified() {
             || lower == "oid"
             || lower.ends_with("_oid")
             || lower.contains("content")
+            || lower == "value" // `ov_meta.value` holds the pending root (ADR-008 §6.2)
+            || lower == "pending_root"
     };
 
     let mut unclassified = Vec::new();
-    for (table, column) in &columns {
-        if !looks_like_a_root(column) {
-            continue;
-        }
-        let known = CLASSIFIED
-            .iter()
-            .any(|(known_table, known_column, _)| known_table == table && known_column == column);
-        if !known {
-            unclassified.push(format!("{table}.{column}"));
+    for (database, connection) in databases(&dir) {
+        let mut statement = connection
+            .prepare(
+                "SELECT m.name, p.name FROM sqlite_master AS m
+                 JOIN pragma_table_info(m.name) AS p
+                 WHERE m.type = 'table'",
+            )
+            .expect("prepare");
+        let columns: Vec<(String, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("collect");
+        for (table, column) in columns {
+            if !looks_like_a_root(&column) {
+                continue;
+            }
+            let known = CLASSIFIED.iter().any(|(db, known_table, known_column, _)| {
+                *db == database && *known_table == table && *known_column == column
+            });
+            if !known {
+                unclassified.push(format!("{database}:{table}.{column}"));
+            }
         }
     }
     assert!(
@@ -519,101 +600,93 @@ fn every_root_shaped_column_is_classified() {
     );
 }
 
-// --------------------------------------------------- T2/T3 (tripwire): registry ↔ criteria, value shape
-
-/// T2 — every `RootKind` is classified in T1 **and** has a canary-style test that exercises it.
-///
-/// "Added a source, added no test" and "added a column, added no source" both turn this red: the
-/// list below is the registry, and each entry must appear in `every_root_shaped_column_is_classified`'s
-/// classification (T1) as well.
 #[test]
-fn every_root_kind_is_registered_and_covered() {
-    // (kind, the T1 classification string it must map to, the test that drives it)
-    const REGISTRY: &[(RootKind, &str, &str)] = &[
-        (
-            RootKind::Commit,
-            "RootSource(Commit)",
-            "the_root_set_deduplicates_by_fact_not_by_object_id",
-        ),
-        (
-            RootKind::Snapshot,
-            "RootSource(Snapshot)",
-            "every_root_shaped_column_is_classified",
-        ),
-        (
-            RootKind::WorkspaceBase,
-            "RootSource(WorkspaceBase)",
-            "a_replaceable_source_is_what_the_collector_consumes",
-        ),
-        (
-            RootKind::OverlayPending,
-            "RootSource(OverlayPending)",
-            "every_root_kind_is_registered_and_covered",
-        ),
-        (
-            RootKind::SealedContent,
-            "RootSource(SealedContent)",
-            "every_root_kind_is_registered_and_covered",
-        ),
-    ];
+fn t2_every_classified_root_source_has_a_kind_and_a_kind_has_a_column() {
+    // Two independent sides: the classification table (T1) and the `RootKind` variants (the code).
+    // Comparing them catches "added a source, forgot the kind" and "added a kind, forgot a column".
+    let classified: std::collections::BTreeSet<&str> = CLASSIFIED
+        .iter()
+        .filter_map(|(_, _, _, classification)| {
+            classification
+                .strip_prefix("RootSource(")
+                .map(|rest| rest.trim_end_matches(')').to_owned())
+        })
+        .map(|kind| Box::leak(kind.into_boxed_str()) as &str)
+        .collect();
 
-    // The label each kind renders, so a kind renamed without updating T2 is caught too.
-    let labels: Vec<&str> = REGISTRY.iter().map(|(kind, _, _)| kind.label()).collect();
+    let kinds: std::collections::BTreeSet<&str> = [
+        RootKind::Commit,
+        RootKind::Snapshot,
+        RootKind::WorkspaceBase,
+        RootKind::OverlayPending,
+        RootKind::SealedContent,
+    ]
+    .iter()
+    .map(|kind| match kind {
+        RootKind::Commit => "Commit",
+        RootKind::Snapshot => "Snapshot",
+        RootKind::WorkspaceBase => "WorkspaceBase",
+        RootKind::OverlayPending => "OverlayPending",
+        RootKind::SealedContent => "SealedContent",
+    })
+    .collect();
+
+    let missing: Vec<&&str> = kinds.difference(&classified).collect();
+    // Card §7: `sealed_content` does not exist until Seal lands, and when it does, T1 must classify
+    // it. Until then the only acceptable gap is exactly this one — a new kind without a column has
+    // to be added here deliberately, which is what makes the tripwire live.
     assert_eq!(
-        labels,
-        vec![
-            "commit",
-            "snapshot",
-            "workspace-base",
-            "overlay-pending",
-            "sealed-content"
-        ],
-        "RootKind::label() must match the registry"
+        missing,
+        vec![&"SealedContent"],
+        "a RootKind without a classified column must be the documented pending one"
     );
-    for (kind, classification, test) in REGISTRY {
-        assert!(
-            classification.starts_with("RootSource("),
-            "{kind:?} must be a root source, not NotARoot"
-        );
-        assert!(!test.is_empty(), "{kind:?} must name a driving test");
-    }
-    // T1's table and this registry must agree in *count*: a new kind is a new root source.
-    let root_source_columns = 3; // commit.root_oid, snapshot.root_oid, workspace.base_root
-    assert_eq!(
-        root_source_columns, 3,
-        "adding a root source means adding a column and a row there"
+    let unexpected: Vec<&&str> = classified.difference(&kinds).collect();
+    assert!(
+        unexpected.is_empty(),
+        "T1 classifies roots of kinds RootKind does not know: {unexpected:?}"
     );
 }
 
-/// T3 — a root-shaped value is an object id, sampled.
-///
-/// Cheap value-domain check: if a column is classified as a root source but stores something else
-/// (a path, a JSON blob), the enumeration would fail late and confusingly.
 #[test]
-fn root_source_values_parse_as_object_ids() {
-    let root = TempRoot::new("t3-values");
-    let repo = Repo::open(root.store(), true).expect("open");
-    repo.init().expect("init");
-    let connection = rusqlite::Connection::open(repo.metadata_path()).expect("db");
+fn t3_root_source_values_parse_as_object_ids() {
+    let (_root, dir) = fixture("t3-values");
+    let mut checked = 0usize;
 
-    for (table, column) in [
-        ("commit", "root_oid"),
-        ("snapshot", "root_oid"),
-        ("workspace", "base_root"),
-    ] {
-        let sql = format!("SELECT DISTINCT {column} FROM \"{table}\" LIMIT 50");
-        let mut statement = connection.prepare(&sql).expect("prepare");
+    for (database, table, column, classification) in CLASSIFIED {
+        if !classification.starts_with("RootSource(") {
+            continue;
+        }
+        // `ov_meta` is key/value storage: the root lives under the `pending_root` key.
+        let sql = if *database == "overlay" && *table == "ov_meta" {
+            // Key/value storage: only the `pending_root` row is a root, and a clean workspace has
+            // no such row at all — an empty string here would be a *different* column, not this one.
+            "SELECT value FROM ov_meta WHERE key = 'pending_root' AND value <> '' LIMIT 50"
+                .to_owned()
+        } else {
+            format!("SELECT DISTINCT {column} FROM \"{table}\" LIMIT 50")
+        };
+        let Some((_, connection)) = databases(&dir)
+            .into_iter()
+            .find(|(name, _)| name == database)
+        else {
+            continue;
+        };
+        // A column that does not exist yet (Seal) is T1's business, not a value-domain failure.
+        let Ok(mut statement) = connection.prepare(&sql) else {
+            continue;
+        };
         let values: Vec<String> = statement
             .query_map([], |row| row.get::<_, String>(0))
             .expect("rows")
             .collect::<Result<_, _>>()
             .expect("collect");
         for value in values {
-            let parsed: Result<ObjectId, _> = value.parse();
+            checked += 1;
             assert!(
-                parsed.is_ok(),
-                "{table}.{column} holds {value:?}, which is not an object id"
+                value.parse::<ObjectId>().is_ok(),
+                "{database}:{table}.{column} holds {value:?}, which is not an object id"
             );
         }
     }
+    assert!(checked > 0, "T3 sampled nothing, so it proves nothing");
 }
