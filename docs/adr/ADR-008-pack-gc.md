@@ -162,6 +162,10 @@ batch.commit()?;                             // 下面的 1–4
   `StoreInUse` 表示"现在有维护者在运行，不要重试"；
 - `gc(self)` **消费**维护句柄：返回时连接关闭、锁释放；`Drop` 同样释放。维护句柄不得长命（否则 GC 结束后
   `Repo::open` 仍会被拒）；
+- **同一原则适用于每个数据库**：维护模式对主库与每个 `workspaces/*/overlay.sqlite` 都**只有一条连接**——主库那条、
+  以及它独占打开的那条 overlay 连接。每个库的状态（含 `ov_meta.pending_root`、`ov_inode.sealed_content`）必须经**该库
+  自己的**连接读取，**不得在已持锁的库上另开连接**（"谁的锁，谁读"）：锁外读到的是未受保护的快照，窗口期内 overlay
+  被改会漏掉 pending 引用，从而误删数据。日常 `Repo::open` 不受此约束；
 - 运行期间其他进程的 `Repo::open` 失败（不等待：GC 可能很长，有界等待没有意义）；
 - 理由：在线 GC 的经典竞争——物化中 put 一个"索引里已有"的对象（`AlreadyPresent`，不写），GC 恰好把它
   当垃圾删掉，随后发布的根引用了它 → 悬空。离线排除了一切并发写入者，正确性论证最简单；
@@ -178,6 +182,9 @@ batch.commit()?;                             // 下面的 1–4
 | 每个 overlay | `ov_meta.pending_root`（非空时）、`ov_inode.sealed_content` 引用的对象（Blob 的 chunk，或 Extents 树根） |
 
 `Repo::roots()`（P2a-6）只覆盖前四行的一部分；P2b-6 扩展为上表，并由 `verify --deep` 共用。
+
+`pending_root` 为空/缺失是**正常状态**（没有未完成的发布），根枚举按"无引用"处理；不得把空串解析成对象 id，也不得把它
+当损坏。**合法的"没有"不是错误**——与 K8/KI-10 同一条原则。
 
 **保留策略（P7）[G2 已定]**：P2b 不做过期。因此 P2b 的 GC 实际回收：
 
