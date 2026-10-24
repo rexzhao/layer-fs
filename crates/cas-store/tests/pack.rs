@@ -186,15 +186,20 @@ fn verify_names_a_pack_whose_tail_no_longer_hashes() {
 
 #[test]
 fn pack_max_bytes_splits_the_batch_where_the_arithmetic_says() {
-    // Frames are 1014 bytes (1000 + the 14-byte envelope), so a 2400-byte limit fits two
-    // frames per pack: 2 objects -> 1 pack, 3 -> 2 packs, 5 -> 3 packs.
-    let cases = [(2usize, 1usize), (3, 2), (5, 3)];
-    for (objects, expected_packs) in cases {
+    // Frames are 1014 bytes (1000 + the 14-byte envelope). `pack_max_bytes` bounds the *frame
+    // body*; the 48-byte tail is not counted (ADR-008 §3), so the file may be 48 bytes larger.
+    let cases = [
+        (2usize, 1usize, 2400u64), // 2 028 <= 2 400 -> one pack
+        (2, 1, 2028),              // exactly the limit -> still one pack ("at most")
+        (3, 2, 2400),              // 3 042 > 2 400 -> two packs
+        (5, 3, 2400),              // 5 070 > 2 400 -> three packs
+    ];
+    for (objects, expected_packs, limit) in cases {
         let root = TempRoot::new(&format!("split-{objects}"));
         drop(Store::open(root.store(), OpenMode::Create).expect("open"));
-        set_pack_max_bytes(&root.store(), 2400);
+        set_pack_max_bytes(&root.store(), limit);
         let store = Store::open(root.store(), OpenMode::ReadWrite).expect("reopen");
-        assert_eq!(store.pack_max_bytes(), 2400);
+        assert_eq!(store.pack_max_bytes(), limit);
 
         let payloads: Vec<Vec<u8>> = (0..objects)
             .map(|index| payload(u8::try_from(index).expect("fits"), 1000))
@@ -208,7 +213,7 @@ fn pack_max_bytes_splits_the_batch_where_the_arithmetic_says() {
         let report = batch.commit().expect("commit");
         assert_eq!(
             report.packs, expected_packs,
-            "{objects} objects of 1000 bytes with a 2400-byte limit"
+            "{objects} objects of 1000 bytes with a {limit}-byte limit"
         );
 
         let rows = pack_rows(&root.store());
@@ -222,8 +227,15 @@ fn pack_max_bytes_splits_the_batch_where_the_arithmetic_says() {
         assert_eq!(
             bytes as usize,
             frame_bytes + TAIL_BYTES * expected_packs,
-            "each pack pays its own 48-byte tail"
+            "each pack pays its own 48-byte tail (outside pack_max_bytes)"
         );
+        // The limit bounds the frames, not the file: every pack's body is at most `limit`.
+        for (_, bytes, _) in &rows {
+            assert!(
+                (*bytes as u64) <= limit + TAIL_BYTES as u64,
+                "pack of {bytes} bytes exceeds {limit} + 48"
+            );
+        }
 
         // Splitting must not lose or duplicate an object.
         assert_eq!(store.object_count().expect("count"), objects as u64);
