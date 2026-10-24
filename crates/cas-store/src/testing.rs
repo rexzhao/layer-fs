@@ -1,10 +1,11 @@
 //! Publication with a named crash point, for the crash-injection tests.
 //!
-//! This module contains **no publication sequence of its own**. It calls the
-//! same `object::put_observed` entry point the production `Store::put` calls and
-//! passes an observer that terminates the process when its step arrives, so the
-//! code under test is the code that ships: a change to the staging, rename,
-//! directory-sync or index-commit order is exercised here automatically.
+//! This module contains **no publication sequence of its own**. It drives the
+//! same `Batch::commit_observed` path the production `Store::put` and the
+//! materialiser use, and passes an observer that terminates the process when its
+//! step arrives, so the code under test is the code that ships: a change to the
+//! pack staging, rename, directory-sync or index-commit order is exercised here
+//! automatically (ADR-008 §5.1).
 //!
 //! The only thing this module adds is the observer, and the only thing the
 //! observer does is [`std::process::abort`] — a real process death with no
@@ -16,37 +17,39 @@
 
 use cas_core::Role;
 
-use crate::object::PublishStep;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::pack::PackStep;
 use crate::{OpenMode, Store, StoreResult};
 
 /// The publication steps a crash can be injected at, in order.
 ///
-/// Every variant maps onto one [`PublishStep`], which is the production
-/// sequence; there is no separate list of "test steps" that could drift from it.
+/// Every variant maps onto one [`PackStep`], which is the production sequence;
+/// there is no separate list of "test steps" that could drift from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashPoint {
     /// The staging file has been written but not synced.
     Staged,
     /// The staging file has been synced and is durable.
     StagedSynced,
-    /// The staging file has been renamed into `objects/`; no index row yet.
+    /// The staging file has been renamed into `packs/`; no index row yet.
     Renamed,
     /// The parent directory has been synced; still no index row.
     DirectorySynced,
-    /// The index row has been committed: the object is published.
+    /// The pack's index rows have been committed: its objects are published.
     Committed,
 }
 
 impl CrashPoint {
     /// The production step this point observes.
     #[must_use]
-    pub fn step(self) -> PublishStep {
+    pub fn step(self) -> PackStep {
         match self {
-            CrashPoint::Staged => PublishStep::Staged,
-            CrashPoint::StagedSynced => PublishStep::StagedSynced,
-            CrashPoint::Renamed => PublishStep::Renamed,
-            CrashPoint::DirectorySynced => PublishStep::DirectorySynced,
-            CrashPoint::Committed => PublishStep::Committed,
+            CrashPoint::Staged => PackStep::Staged,
+            CrashPoint::StagedSynced => PackStep::StagedSynced,
+            CrashPoint::Renamed => PackStep::Renamed,
+            CrashPoint::DirectorySynced => PackStep::DirectorySynced,
+            CrashPoint::Committed => PackStep::Committed,
         }
     }
 
@@ -77,7 +80,7 @@ fn crash(at: CrashPoint) -> ! {
     std::process::abort();
 }
 
-/// Publishes an object, stopping the process at `step`.
+/// Publishes one object (a one-frame pack), stopping the process at `step`.
 ///
 /// Every defined crash point aborts, so this function only returns by exiting
 /// the process.
@@ -88,7 +91,7 @@ fn crash(at: CrashPoint) -> ! {
 pub fn put_with_crash_point(store: &Store, role: Role, value: &[u8], step: &str) -> ! {
     let at = CrashPoint::parse(step).expect("known crash point");
     let target_step = at.step();
-    let mut observer = |observed: PublishStep| {
+    let mut observer = |observed: PackStep| {
         if observed == target_step {
             crash(at);
         }
@@ -121,4 +124,27 @@ pub fn open_for_child(root: &std::path::Path) -> StoreResult<Store> {
     } else {
         Store::open(root, OpenMode::Create)
     }
+}
+
+/// Bytes this process has read out of pack files, for the "a single-object read reads one
+/// frame" assertion (ADR-008 §3, acceptance 2.2).
+///
+/// Instrumentation only: it is compiled behind the same feature as the crash points, so a
+/// production build neither pays for it nor can depend on it.
+static PACK_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Records one frame read of `bytes` bytes.
+pub(crate) fn note_pack_read(bytes: u64) {
+    PACK_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// How many pack bytes this process has read since the last [`reset_pack_read_bytes`].
+#[must_use]
+pub fn pack_read_bytes() -> u64 {
+    PACK_READ_BYTES.load(Ordering::Relaxed)
+}
+
+/// Resets the pack-read counter.
+pub fn reset_pack_read_bytes() {
+    PACK_READ_BYTES.store(0, Ordering::Relaxed);
 }

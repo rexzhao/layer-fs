@@ -36,6 +36,16 @@ pub enum StoreError {
         /// What exactly failed.
         cause: CorruptCause,
     },
+    /// A pack file's tail or bytes failed validation (ADR-008 §7).
+    ///
+    /// The pack is named rather than the object: the damage is to the container, so every
+    /// object inside it is suspect and `verify` reports it once per pack.
+    CorruptPack {
+        /// The pack that failed validation.
+        pack_id: String,
+        /// What exactly failed.
+        cause: CorruptCause,
+    },
     /// The Store was opened on disk with a schema version this build does not
     /// support.
     UnsupportedSchemaVersion {
@@ -90,6 +100,8 @@ pub enum CorruptCause {
         /// The identity the bytes actually hash to.
         actual: ObjectId,
     },
+    /// A pack's tail is missing, mismatched or does not hash to its frames.
+    PackTail(String),
     /// The index row's role does not match the role in the object's envelope.
     RoleMismatch {
         /// Role recorded in the index.
@@ -109,6 +121,9 @@ impl fmt::Display for StoreError {
             ),
             StoreError::NotFound { oid } => write!(f, "object {oid} is not in the store"),
             StoreError::Corrupt { oid, cause } => write!(f, "object {oid} is corrupt: {cause}"),
+            StoreError::CorruptPack { pack_id, cause } => {
+                write!(f, "pack {pack_id} is corrupt: {cause}")
+            }
             StoreError::UnsupportedSchemaVersion { found, supported } => write!(
                 f,
                 "store schema version {found} is not supported (this build reads {supported})"
@@ -145,6 +160,7 @@ impl fmt::Display for CorruptCause {
                     "index records role {recorded} but the envelope says {actual}"
                 )
             }
+            CorruptCause::PackTail(what) => write!(f, "pack tail is not valid: {what}"),
         }
     }
 }

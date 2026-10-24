@@ -48,6 +48,22 @@ fn oid_of(role: Role, value: &[u8]) -> ObjectId {
         .expect("hashed")
 }
 
+/// The pack file that holds `oid`, read straight out of the index (ADR-008 §4).
+///
+/// The tests need to damage a *specific* object's bytes, and a pack id is not derivable from
+/// an object id (it carries no content identity), so the index is the only way to ask.
+fn pack_path_of(root: &Path, oid: ObjectId) -> PathBuf {
+    let connection = rusqlite::Connection::open(root.join("store.sqlite")).expect("db");
+    let pack_id: String = connection
+        .query_row(
+            "SELECT location FROM object_location WHERE oid = ?1",
+            [oid.to_string()],
+            |row| row.get(0),
+        )
+        .expect("index row");
+    root.join("packs").join(format!("{pack_id}.pack"))
+}
+
 /// Every file under `directory`, as absolute paths.
 fn files_under(directory: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -150,10 +166,13 @@ fn get_refuses_corrupted_bytes_instead_of_returning_them() {
     let store = Store::open(root.path(), OpenMode::ReadWrite).expect("reopen");
     let published = store.put(Role::Bytes, b"original bytes").expect("put");
 
-    // Flip one payload byte: the frame still decodes, but its identity changes.
-    let path = store.layout().object_path(published.oid);
-    let mut bytes = std::fs::read(&path).expect("read object");
-    let last = bytes.len() - 1;
+    // Flip one payload byte inside the frame (a one-object pack starts its frame at 0):
+    // the frame still decodes, but its identity changes.
+    let path = pack_path_of(root.path(), published.oid);
+    let mut bytes = std::fs::read(&path).expect("read pack");
+    // A one-object pack starts its frame at offset 0, so the frame's last byte is inside
+    // the body — not the tail, whose corruption `verify` (not `get`) is meant to catch.
+    let last = published.frame.len() - 1;
     bytes[last] ^= 0xFF;
     std::fs::write(&path, &bytes).expect("write tampered");
 
@@ -170,20 +189,30 @@ fn get_refuses_corrupted_bytes_instead_of_returning_them() {
 }
 
 #[test]
-fn get_refuses_a_truncated_object_file() {
+fn get_refuses_a_truncated_pack_instead_of_zero_filling() {
     let root = TempRoot::new("truncated");
     let store = Store::open(root.path(), OpenMode::Create).expect("open");
     let published = store.put(Role::Bytes, b"truncate me").expect("put");
-    let path = store.layout().object_path(published.oid);
+    let path = pack_path_of(root.path(), published.oid);
     let bytes = std::fs::read(&path).expect("read");
-    std::fs::write(&path, &bytes[..bytes.len() - 3]).expect("truncate");
 
+    // (a) Losing the tail leaves the frame readable — a read never touches the tail — but
+    // `verify` must name the pack: without the tail the file is not a valid pack.
+    std::fs::write(&path, &bytes[..bytes.len() - 3]).expect("truncate the tail");
+    assert_eq!(
+        store.get(published.oid).expect("frame still intact"),
+        published.frame
+    );
+    let report = store.verify().expect("verify");
+    assert!(!report.is_clean());
+    assert_eq!(report.pack_failures.len(), 1, "the tail is gone");
+
+    // (b) Truncating into the frame itself is a read failure, never zero-filled bytes.
+    std::fs::write(&path, &bytes[..published.frame.len() - 3]).expect("truncate the body");
     assert!(matches!(
         store.get(published.oid),
-        Err(StoreError::Corrupt {
-            cause: CorruptCause::LengthMismatch { .. },
-            ..
-        })
+        Err(StoreError::Io(error))
+            if error.kind() == std::io::ErrorKind::UnexpectedEof
     ));
 }
 
@@ -225,7 +254,7 @@ fn verify_reports_a_clean_store_and_names_a_broken_object() {
     assert!(clean.is_clean());
     assert_eq!(clean.checked, 2);
 
-    let path = store.layout().object_path(two.oid);
+    let path = pack_path_of(root.path(), two.oid);
     std::fs::write(&path, b"not an object at all").expect("break");
     let report = store.verify().expect("verify");
     assert!(!report.is_clean());
@@ -238,7 +267,7 @@ fn verify_does_not_repair_anything() {
     let root = TempRoot::new("verify-readonly");
     let store = Store::open(root.path(), OpenMode::Create).expect("open");
     let published = store.put(Role::Bytes, b"leave me").expect("put");
-    let path = store.layout().object_path(published.oid);
+    let path = pack_path_of(root.path(), published.oid);
     let broken = b"garbage".to_vec();
     std::fs::write(&path, &broken).expect("break");
 
@@ -278,7 +307,7 @@ fn opening_clears_stale_temporaries() {
 }
 
 #[test]
-fn an_orphan_object_file_is_invisible_until_it_is_published() {
+fn a_loose_orphan_file_is_invisible_and_is_never_adopted() {
     let root = TempRoot::new("orphan");
     let store = Store::open(root.path(), OpenMode::Create).expect("open");
     let value = b"orphaned";
@@ -292,33 +321,13 @@ fn an_orphan_object_file_is_invisible_until_it_is_published() {
     assert!(!store.exists(oid).expect("exists"));
     assert!(matches!(store.get(oid), Err(StoreError::NotFound { .. })));
 
-    // A later put adopts it: the file is reused, not rewritten.
+    // A later put publishes the object into a pack: loose writes are retired (ADR-008 §3),
+    // so the leftover file is no longer adopted — it stays until GC removes it.
     let published = store.put(Role::Bytes, value).expect("put");
-    assert_eq!(published.outcome, PutOutcome::AdoptedOrphan);
+    assert_eq!(published.outcome, PutOutcome::Inserted);
     assert_eq!(store.get(oid).expect("get"), frame);
     assert_eq!(store.object_count().expect("count"), 1);
-}
-
-#[test]
-fn a_put_refuses_a_corrupt_orphan_instead_of_overwriting_it() {
-    let root = TempRoot::new("corrupt-orphan");
-    let store = Store::open(root.path(), OpenMode::Create).expect("open");
-    let value = b"expected bytes";
-    let oid = oid_of(Role::Bytes, value);
-    let path = store.layout().object_path(oid);
-    std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
-    std::fs::write(&path, b"a different length entirely").expect("write bad orphan");
-
-    assert!(matches!(
-        store.put(Role::Bytes, value),
-        Err(StoreError::Corrupt { .. })
-    ));
-    // The bad file is still there; nothing was silently replaced.
-    assert_eq!(
-        std::fs::read(&path).expect("read"),
-        b"a different length entirely"
-    );
-    assert!(!store.exists(oid).expect("exists"));
+    assert!(path.is_file(), "the leftover loose file is left alone");
 }
 
 #[test]
@@ -335,7 +344,7 @@ fn opening_refuses_an_unsupported_schema_version() {
     match Store::open(root.path(), OpenMode::ReadWrite) {
         Err(StoreError::UnsupportedSchemaVersion { found, supported }) => {
             assert_eq!(found, 99);
-            assert_eq!(supported, 1);
+            assert_eq!(supported, 3);
         }
         other => panic!("expected UnsupportedSchemaVersion, got {other:?}"),
     }
@@ -422,29 +431,26 @@ fn identify_preserves_the_put_error_classification() {
 }
 
 #[test]
-fn get_reports_an_object_whose_file_disappeared() {
-    // The index has a row but the file is gone: a published object that can no
-    // longer be read is corrupt, not missing.
+fn get_reports_an_object_whose_pack_disappeared() {
+    // The index has rows but the pack is gone: a published object that can no longer be
+    // read is a store failure, not a missing object.
     let root = TempRoot::new("vanished");
     let store = Store::open(root.path(), OpenMode::Create).expect("open");
     let published = store.put(Role::Bytes, b"soon deleted").expect("put");
-    std::fs::remove_file(store.layout().object_path(published.oid)).expect("delete object file");
+    std::fs::remove_file(pack_path_of(root.path(), published.oid)).expect("delete pack");
 
     match store.get(published.oid) {
-        Err(StoreError::Corrupt {
-            cause: CorruptCause::LengthMismatch { expected, actual },
-            ..
-        }) => {
-            assert_eq!(expected, published.frame.len() as u64);
-            assert_eq!(actual, 0);
+        Err(StoreError::Io(error)) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         }
-        other => panic!("expected Corrupt(LengthMismatch), got {other:?}"),
+        other => panic!("expected Io(NotFound), got {other:?}"),
     }
-    // `verify` reports it too, and does not repair it.
+    // `verify` reports it twice: the object cannot be read, and its pack cannot be opened.
     let report = store.verify().expect("verify");
     assert!(!report.is_clean());
     assert_eq!(report.failures.len(), 1);
     assert_eq!(report.failures[0].oid, published.oid);
+    assert_eq!(report.pack_failures.len(), 1);
     // `exists` still answers from the index: publication happened.
     assert!(store.exists(published.oid).expect("exists"));
 }
@@ -739,21 +745,27 @@ fn concurrent_puts_of_one_object_store_it_once() {
 
     let store = Store::open(root.path(), OpenMode::ReadWrite).expect("reopen");
     assert_eq!(store.object_count().expect("count"), 1);
-    assert_eq!(files_under(&root.path().join("objects")).len(), 1);
+    // One index row wins; a loser's frame may sit in its own unreferenced pack for GC.
+    assert!(!files_under(&root.path().join("packs")).is_empty());
     let oid = oid_of(Role::Bytes, value);
     Object::decode(&store.get(oid).expect("get")).expect("decode");
 }
 
 #[test]
-fn different_objects_keep_separate_files_under_distinct_directories() {
+fn every_put_lands_in_a_pack_and_leaves_objects_empty() {
+    // ADR-008 §3: the write path is packs only. Each `put` is a batch of one, so 32 puts
+    // make 32 one-frame packs and `objects/` stays untouched (loose is read-only shape).
     let root = TempRoot::new("many");
     let store = Store::open(root.path(), OpenMode::Create).expect("open");
     for index in 0..32u32 {
         store.put(Role::Bytes, &index.to_be_bytes()).expect("put");
     }
     assert_eq!(store.object_count().expect("count"), 32);
-    assert_eq!(files_under(&root.path().join("objects")).len(), 32);
-    assert!(store.verify().expect("verify").is_clean());
+    assert_eq!(files_under(&root.path().join("objects")).len(), 0);
+    assert_eq!(files_under(&root.path().join("packs")).len(), 32);
+    let report = store.verify().expect("verify");
+    assert!(report.is_clean());
+    assert_eq!(report.packs_checked, 32);
 }
 
 /// **ADR-006 §11.1 (F2)** — `open_with` waits a bounded time, then reports `Busy`.

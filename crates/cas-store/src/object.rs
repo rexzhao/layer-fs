@@ -1,189 +1,24 @@
-//! Putting, getting and verifying objects (ADR-002 §5, §6).
+//! Reading and verifying published objects (ADR-002 §6, ADR-008 §3, §7).
+//!
+//! Objects are published by [`Batch`](crate::Batch): one pack per group of frames, one
+//! `fsync` and one short index transaction per pack. This module is the read side, plus the
+//! index lookups the write side needs. It never writes.
+//!
+//! Two storage shapes are readable:
+//!
+//! - `kind = pack` — the only shape this build writes (ADR-008 §3);
+//! - `kind = loose` — one file per object, the P1/P2a shape. Kept readable because a schema
+//!   v3 Store can still hold rows written before packs existed, and because the P2a fixtures
+//!   are the migration story's evidence (ADR-008 §4). Nothing writes it any more.
 
-use std::fs::File;
-use std::io::Write;
-use std::path::Path;
+use cas_core::{verify_id, ObjectId, Role};
 
-use cas_core::{verify_id, Object, ObjectId, Role};
-
-use crate::durability::{rename_replace, sync_directory, sync_file};
 use crate::error::{CorruptCause, StoreError, StoreResult};
-use crate::layout::{temporary_name, Layout};
+use crate::layout::Layout;
 use crate::objects_scan;
 use crate::open::Database;
-
-/// What a `put` did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PutOutcome {
-    /// The object was already published; nothing was written.
-    AlreadyPresent,
-    /// The object was written and its index row committed.
-    Inserted,
-    /// The object file already existed (a crash between `rename` and the index
-    /// commit) but was not published; its index row was committed now.
-    AdoptedOrphan,
-}
-
-impl PutOutcome {
-    /// Whether this call wrote the object file itself.
-    #[must_use]
-    pub fn wrote_file(self) -> bool {
-        matches!(self, PutOutcome::Inserted)
-    }
-}
-
-/// Publishes `role`/`value` under its identity (ADR-002 §5).
-///
-/// The observable steps of one `put`, in the order they happen.
-///
-/// This enum is the single description of the publication sequence: the
-/// production path and the crash-injection tests both run the same observed put
-/// and differ only in the observer they pass, so a change to the order cannot
-/// leave the tests behind (ADR-002 §13.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PublishStep {
-    /// The staging file has been written inside `tmp/` but not synced.
-    Staged,
-    /// The staging file has been synced; its bytes are durable.
-    StagedSynced,
-    /// The staging file has been renamed into `objects/`.
-    Renamed,
-    /// The parent directory has been synced after the rename.
-    DirectorySynced,
-    /// The index row has been committed: the object is now published.
-    Committed,
-}
-
-/// Receives each [`PublishStep`] as it happens.
-///
-/// Production passes [`NoObservation`], which does nothing; the crash tests pass
-/// a closure that terminates the process when its step arrives.
-pub trait PublishObserver {
-    /// Called immediately after `step` has completed.
-    fn step(&mut self, step: PublishStep);
-}
-
-/// The production observer: records nothing.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoObservation;
-
-impl PublishObserver for NoObservation {
-    fn step(&mut self, _step: PublishStep) {}
-}
-
-impl<F: FnMut(PublishStep)> PublishObserver for F {
-    fn step(&mut self, step: PublishStep) {
-        self(step);
-    }
-}
-
-/// Idempotent: putting an already-published object writes nothing and reports
-/// [`PutOutcome::AlreadyPresent`]. The order of operations is the contract —
-/// object bytes are durable before any index row can point at them — so a
-/// crash at any step leaves either "not published" or "fully published".
-///
-/// [`Store::put`](crate::Store::put) passes [`NoObservation`]; the crash tests
-/// pass an observer that aborts. This is the single implementation of the
-/// sequence for both.
-pub(crate) fn put_observed(
-    database: &Database,
-    layout: &Layout,
-    role: Role,
-    value: &[u8],
-    observer: &mut dyn PublishObserver,
-) -> StoreResult<PutOutcome> {
-    let object = Object::new(role, value)?;
-    let oid = object.id()?;
-    let frame = object.to_vec();
-
-    if published(database, oid)? {
-        return Ok(PutOutcome::AlreadyPresent);
-    }
-
-    let relative = layout.object_relative(oid);
-    let directory = layout.ensure_object_directory(oid)?;
-    let target = directory.join(oid.to_string());
-
-    let outcome = if target.is_file() {
-        // An earlier attempt reached `rename` but not the index commit.
-        // Re-verify before trusting it: a corrupt leftover must be reported,
-        // never overwritten, or the disk problem it signals would be hidden
-        // (ADR-002 §5.2).
-        verify_leftover(oid, &target, &frame)?;
-        PutOutcome::AdoptedOrphan
-    } else {
-        match stage(layout, &frame, &target, observer) {
-            Ok(()) => PutOutcome::Inserted,
-            // A concurrent writer of the same object raced our rename. On
-            // Windows the loser sees either NotFound (its staging file was
-            // consumed) or PermissionDenied (the target is briefly held by the
-            // winner's rename). Either way the bytes at the target are
-            // necessarily identical, because the identity covers them. Verify
-            // that, and report a genuine mismatch as corruption.
-            //
-            // Reachable only under concurrency; exempted from coverage in
-            // docs/reports/p1-baseline.md §9.
-            Err(StoreError::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                verify_leftover(oid, &target, &frame)?;
-                PutOutcome::AdoptedOrphan
-            }
-            Err(other) => return Err(other),
-        }
-    };
-
-    record(database, oid, role, relative, frame.len())?;
-    observer.step(PublishStep::Committed);
-    Ok(outcome)
-}
-
-/// Writes the frame to `tmp/`, makes it durable, then renames it into place.
-fn stage(
-    layout: &Layout,
-    frame: &[u8],
-    target: &Path,
-    observer: &mut dyn PublishObserver,
-) -> StoreResult<()> {
-    let staged = layout.temporaries().join(temporary_name());
-    {
-        let mut file = File::create(&staged)?;
-        file.write_all(frame)?;
-        observer.step(PublishStep::Staged);
-        // The bytes must be on stable storage before any name points at them.
-        sync_file(&file)?;
-        observer.step(PublishStep::StagedSynced);
-    }
-    rename_replace(&staged, target)?;
-    observer.step(PublishStep::Renamed);
-    // Best effort on platforms without a documented directory flush; see the
-    // durability module for exactly what this does and does not promise.
-    sync_directory(target.parent().unwrap_or(layout.objects().as_path()))?;
-    observer.step(PublishStep::DirectorySynced);
-    Ok(())
-}
-
-/// Commits the index row. This call is the publication point.
-fn record(
-    database: &Database,
-    oid: ObjectId,
-    role: Role,
-    relative: String,
-    length: usize,
-) -> StoreResult<()> {
-    let inserted = database.connection.execute(
-        "INSERT INTO object_location (oid, role, length, location) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(oid) DO NOTHING",
-        (oid.to_string(), role.tag(), length as i64, relative),
-    )?;
-    // `inserted == 0` means a concurrent writer published the same object
-    // first; the outcome is identical, so it is still success (ADR-002 §8).
-    let _ = inserted;
-    Ok(())
-}
+use crate::pack;
+use crate::schema;
 
 /// Whether the index has a row for `oid`.
 pub(crate) fn published(database: &Database, oid: ObjectId) -> StoreResult<bool> {
@@ -201,20 +36,33 @@ pub(crate) struct Located {
     pub(crate) oid: ObjectId,
     pub(crate) role: Role,
     pub(crate) length: u64,
-    pub(crate) relative: String,
+    /// [`schema::KIND_LOOSE`] or [`schema::KIND_PACK`].
+    pub(crate) kind: i64,
+    /// Loose: the path relative to the Store root. Pack: the pack id.
+    pub(crate) location: String,
+    /// Pack: the frame's offset inside the pack. Loose: 0.
+    pub(crate) offset: u64,
 }
 
 pub(crate) fn locate(database: &Database, oid: ObjectId) -> StoreResult<Option<Located>> {
     use rusqlite::OptionalExtension;
-    let row: Option<(i64, i64, String)> = database
+    let row: Option<(i64, i64, i64, String, i64)> = database
         .connection
         .query_row(
-            "SELECT role, length, location FROM object_location WHERE oid = ?1",
+            "SELECT role, length, kind, location, offset FROM object_location WHERE oid = ?1",
             [oid.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((role_tag, length, relative)) = row else {
+    let Some((role_tag, length, kind, location, offset)) = row else {
         return Ok(None);
     };
     let role = u8::try_from(role_tag)
@@ -228,28 +76,37 @@ pub(crate) fn locate(database: &Database, oid: ObjectId) -> StoreResult<Option<L
         field: "object_location.length",
         detail: format!("negative length {length}"),
     })?;
+    let offset = u64::try_from(offset).map_err(|_| StoreError::InvalidRecord {
+        field: "object_location.offset",
+        detail: format!("negative offset {offset}"),
+    })?;
+    if kind != schema::KIND_LOOSE && kind != schema::KIND_PACK {
+        return Err(StoreError::InvalidRecord {
+            field: "object_location.kind",
+            detail: format!("unknown storage kind {kind}"),
+        });
+    }
     Ok(Some(Located {
         oid,
         role,
         length,
-        relative,
+        kind,
+        location,
+        offset,
     }))
 }
 
-/// Reads, decodes and verifies one published object (ADR-002 §6).
+/// Reads, decodes and verifies one published object (ADR-002 §6, ADR-008 §3).
+///
+/// A pack object costs one seek and one frame read: the index knows `(offset, length)`, so
+/// neither the pack's tail nor its other frames are touched (ADR-008 §3).
 pub(crate) fn get(database: &Database, layout: &Layout, oid: ObjectId) -> StoreResult<Vec<u8>> {
     let located = locate(database, oid)?.ok_or(StoreError::NotFound { oid })?;
-    let path = layout.root().join(&located.relative);
-    let bytes = std::fs::read(&path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => StoreError::Corrupt {
-            oid,
-            cause: CorruptCause::LengthMismatch {
-                expected: located.length,
-                actual: 0,
-            },
-        },
-        _ => StoreError::Io(error),
-    })?;
+    let bytes = if located.kind == schema::KIND_PACK {
+        pack::read_frame(layout, &located.location, located.offset, located.length)?
+    } else {
+        read_loose(layout, &located)?
+    };
     if bytes.len() as u64 != located.length {
         return Err(StoreError::Corrupt {
             oid,
@@ -281,63 +138,19 @@ pub(crate) fn get(database: &Database, layout: &Layout, oid: ObjectId) -> StoreR
     Ok(bytes)
 }
 
-/// Checks a leftover object file against what we are about to publish.
-///
-/// A crash between `rename` and the index commit leaves a complete file behind.
-/// Reusing it is safe only if it is byte-identical to the frame we would write,
-/// which also means it hashes to `oid`. Any difference is a corrupt leftover and
-/// is reported rather than overwritten, so a disk fault is never masked.
-///
-/// The read is retried a bounded number of times when a concurrent writer is
-/// replacing the same path (Windows reports `NotFound`/`PermissionDenied` for a
-/// moment during another process's rename). This is a read of an immutable file,
-/// not a retry of a write: no operation with an effect is replayed.
-fn verify_leftover(oid: ObjectId, path: &Path, expected_frame: &[u8]) -> StoreResult<()> {
-    const ATTEMPTS: u32 = 50;
-    let mut bytes = None;
-    for attempt in 0..ATTEMPTS {
-        match std::fs::read(path) {
-            Ok(read) => {
-                bytes = Some(read);
-                break;
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) && attempt + 1 < ATTEMPTS =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            Err(error) => return Err(StoreError::Io(error)),
-        }
-    }
-    let Some(bytes) = bytes else {
-        return Err(StoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("object {} vanished while being read", path.display()),
-        )));
-    };
-    if bytes != expected_frame {
-        let cause = if bytes.len() != expected_frame.len() {
-            CorruptCause::LengthMismatch {
-                expected: expected_frame.len() as u64,
-                actual: bytes.len() as u64,
-            }
-        } else {
-            match cas_core::verify_id(oid, &bytes) {
-                Err(cas_core::EnvelopeError::IdentityMismatch { expected, actual }) => {
-                    CorruptCause::IdentityMismatch { expected, actual }
-                }
-                _ => CorruptCause::Envelope(cas_core::EnvelopeError::LengthMismatch {
-                    declared: expected_frame.len() as u64,
-                    actual: bytes.len() as u64,
-                }),
-            }
-        };
-        return Err(StoreError::Corrupt { oid, cause });
-    }
-    Ok(())
+/// Reads an object stored as its own file (P1/P2a shape).
+fn read_loose(layout: &Layout, located: &Located) -> StoreResult<Vec<u8>> {
+    let path = layout.root().join(&located.location);
+    std::fs::read(&path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => StoreError::Corrupt {
+            oid: located.oid,
+            cause: CorruptCause::LengthMismatch {
+                expected: located.length,
+                actual: 0,
+            },
+        },
+        _ => StoreError::Io(error),
+    })
 }
 
 /// One failed object reported by `verify`.
@@ -349,13 +162,26 @@ pub struct VerificationFailure {
     pub reason: String,
 }
 
-/// The result of checking every published object.
+/// One failed pack reported by `verify` (ADR-008 §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackVerificationFailure {
+    /// The pack that failed.
+    pub pack_id: String,
+    /// Why it failed.
+    pub reason: String,
+}
+
+/// The result of checking every published object and every pack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationReport {
     /// How many published objects were checked.
     pub checked: usize,
+    /// How many packs were checked.
+    pub packs_checked: usize,
     /// The objects that failed, in id order.
     pub failures: Vec<VerificationFailure>,
+    /// The packs whose tail or geometry failed, in id order.
+    pub pack_failures: Vec<PackVerificationFailure>,
     /// Entries under `objects/` whose name is not a valid object id.
     ///
     /// ADR-002 §3: that directory holds object files only, so a stray name is
@@ -365,19 +191,20 @@ pub struct VerificationReport {
 }
 
 impl VerificationReport {
-    /// Whether every published object was readable and intact and every entry
-    /// under `objects/` had a valid object name.
+    /// Whether every published object was readable and intact, every pack's tail matched,
+    /// and every entry under `objects/` had a valid object name.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.failures.is_empty() && self.bad_names.is_empty()
+        self.failures.is_empty() && self.pack_failures.is_empty() && self.bad_names.is_empty()
     }
 }
 
-/// Read-only check of every published object (ADR-002 §6, §10).
+/// Read-only check of every published object and every pack (ADR-002 §6, ADR-008 §7).
 ///
-/// Repairs and deletes nothing: it reports. Orphans (files with no index row)
-/// are out of scope because they are not published; files whose *name* is not an
-/// object id are reported separately.
+/// Repairs and deletes nothing: it reports. Per pack it checks the tail's magic, its
+/// recorded length, its BLAKE3, and that every index row pointing into it describes a frame
+/// that starts and ends inside the body and exactly fills one frame. Orphans (files or packs
+/// with no index row) are out of scope because they are not published.
 pub(crate) fn verify_all(database: &Database, layout: &Layout) -> StoreResult<VerificationReport> {
     let mut statement = database
         .connection
@@ -398,10 +225,101 @@ pub(crate) fn verify_all(database: &Database, layout: &Layout) -> StoreResult<Ve
             });
         }
     }
+
+    let mut statement = database
+        .connection
+        .prepare("SELECT pack_id FROM pack ORDER BY pack_id")?;
+    let pack_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut pack_failures = Vec::new();
+    let packs_checked = pack_ids.len();
+    for pack_id in pack_ids {
+        if let Err(error) = verify_pack(database, layout, &pack_id) {
+            pack_failures.push(PackVerificationFailure {
+                pack_id,
+                reason: error.to_string(),
+            });
+        }
+    }
+
     let bad_names = objects_scan::scan_names(&layout.objects())?;
     Ok(VerificationReport {
         checked,
+        packs_checked,
         failures,
+        pack_failures,
         bad_names,
     })
+}
+
+/// Checks one pack: its tail, and that its index rows describe exactly its frames.
+fn verify_pack(database: &Database, layout: &Layout, pack_id: &str) -> StoreResult<()> {
+    let tail = pack::verify(layout, pack_id)?;
+    let mut statement = database.connection.prepare(
+        "SELECT oid, length, offset FROM object_location
+         WHERE kind = ?1 AND location = ?2 ORDER BY offset",
+    )?;
+    let rows = statement
+        .query_map((schema::KIND_PACK, pack_id), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut expected_offset = 0i64;
+    for (oid, length, offset) in rows {
+        if offset != expected_offset {
+            return Err(StoreError::CorruptPack {
+                pack_id: pack_id.to_owned(),
+                cause: CorruptCause::PackTail(format!(
+                    "object {oid} starts at {offset}, expected {expected_offset}: \
+                     frames must be contiguous"
+                )),
+            });
+        }
+        let end = offset + length;
+        if end as u64 > tail.frames_len {
+            return Err(StoreError::CorruptPack {
+                pack_id: pack_id.to_owned(),
+                cause: CorruptCause::PackTail(format!(
+                    "object {oid} ends at {end}, past the pack's {} frame bytes",
+                    tail.frames_len
+                )),
+            });
+        }
+        expected_offset = end;
+    }
+    if expected_offset as u64 != tail.frames_len {
+        return Err(StoreError::CorruptPack {
+            pack_id: pack_id.to_owned(),
+            cause: CorruptCause::PackTail(format!(
+                "index rows cover {expected_offset} bytes, the tail declares {}",
+                tail.frames_len
+            )),
+        });
+    }
+    if tail.count as usize != expected_offset_count(database, pack_id)? {
+        return Err(StoreError::CorruptPack {
+            pack_id: pack_id.to_owned(),
+            cause: CorruptCause::PackTail(format!(
+                "tail declares {} frames, the index has {} rows",
+                tail.count,
+                expected_offset_count(database, pack_id)?
+            )),
+        });
+    }
+    Ok(())
+}
+
+fn expected_offset_count(database: &Database, pack_id: &str) -> StoreResult<usize> {
+    let count: i64 = database.connection.query_row(
+        "SELECT COUNT(*) FROM object_location WHERE kind = ?1 AND location = ?2",
+        (schema::KIND_PACK, pack_id),
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
 }

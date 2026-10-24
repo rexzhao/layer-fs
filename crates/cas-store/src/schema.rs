@@ -10,7 +10,16 @@ use rusqlite::Connection;
 use crate::error::{StoreError, StoreResult};
 
 /// The schema version this build writes and accepts.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
+
+/// How large one pack file may grow before the batch starts a new one (ADR-008 §3).
+pub(crate) const DEFAULT_PACK_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `object_location.kind` for an object stored as its own file (P1/P2a shape, read only).
+pub(crate) const KIND_LOOSE: i64 = 0;
+
+/// `object_location.kind` for an object stored as a frame inside a pack (ADR-008 §3).
+pub(crate) const KIND_PACK: i64 = 1;
 
 /// The format profile name recorded in `store_policy`.
 ///
@@ -18,7 +27,7 @@ pub(crate) const SCHEMA_VERSION: u32 = 1;
 /// object format must not be read as if it used this one.
 pub(crate) const FORMAT_PROFILE: &str = "wcas/object/v1";
 
-/// Every statement that creates a version-1 Store, in order.
+/// Every statement that creates a version-3 Store, in order.
 ///
 /// Comments are excluded deliberately: this text is compared verbatim, so it
 /// must be exactly reproducible.
@@ -36,7 +45,15 @@ CREATE TABLE object_location (
     oid TEXT NOT NULL PRIMARY KEY,
     role INTEGER NOT NULL,
     length INTEGER NOT NULL,
-    location TEXT NOT NULL
+    kind INTEGER NOT NULL,
+    location TEXT NOT NULL,
+    offset INTEGER NOT NULL
+) STRICT;
+CREATE TABLE pack (
+    pack_id TEXT NOT NULL PRIMARY KEY,
+    bytes INTEGER NOT NULL,
+    objects INTEGER NOT NULL,
+    created_ns INTEGER NOT NULL
 ) STRICT;
 ";
 
@@ -54,6 +71,7 @@ pub(crate) fn create(connection: &mut Connection) -> StoreResult<()> {
         ("format_profile", FORMAT_PROFILE.to_owned()),
         ("max_object_len", cas_core::MAX_OBJECT_LEN.to_string()),
         ("schema_version", SCHEMA_VERSION.to_string()),
+        ("pack_max_bytes", DEFAULT_PACK_MAX_BYTES.to_string()),
     ] {
         transaction.execute(
             "INSERT INTO store_policy (key, value) VALUES (?1, ?2)",
@@ -118,7 +136,33 @@ pub(crate) fn validate(connection: &Connection) -> StoreResult<()> {
             what: "store_policy.max_object_len",
         });
     }
+    // The pack limit is a *setting*, not a format constant: a Store may legitimately
+    // have been created with a smaller limit (tests and tools do), so this checks that
+    // the recorded value is a usable limit rather than that it equals this build's
+    // default. A zero would make every batch loop forever.
+    let recorded_pack: String = policy_value(connection, "pack_max_bytes")?;
+    if recorded_pack
+        .parse::<u64>()
+        .map_or(true, |bytes| bytes == 0)
+    {
+        return Err(StoreError::SchemaMismatch {
+            what: "store_policy.pack_max_bytes",
+        });
+    }
     Ok(())
+}
+
+/// The pack size limit recorded in `store_policy` (ADR-008 §3).
+///
+/// Read once at open; a batch splits on it. It is a setting rather than a format constant,
+/// so a Store created with a smaller limit (tests do this) is legitimate and is honoured.
+pub(crate) fn pack_max_bytes(connection: &Connection) -> StoreResult<u64> {
+    let recorded = policy_value(connection, "pack_max_bytes")?;
+    recorded
+        .parse::<u64>()
+        .map_err(|_| StoreError::SchemaMismatch {
+            what: "store_policy.pack_max_bytes",
+        })
 }
 
 fn policy_value(connection: &Connection, key: &'static str) -> StoreResult<String> {
@@ -145,6 +189,7 @@ fn qualified_policy_key(key: &'static str) -> &'static str {
         "format_profile" => "store_policy.format_profile",
         "max_object_len" => "store_policy.max_object_len",
         "schema_version" => "store_policy.schema_version",
+        "pack_max_bytes" => "store_policy.pack_max_bytes",
         _ => "store_policy.<unknown>",
     }
 }
@@ -159,7 +204,7 @@ mod tests {
         // in this hash rather than as a silently different schema.
         assert!(DDL.starts_with("CREATE TABLE store_policy"));
         assert!(DDL.contains("STRICT"));
-        assert_eq!(DDL.matches("CREATE TABLE").count(), 3);
+        assert_eq!(DDL.matches("CREATE TABLE").count(), 4);
     }
 
     #[test]
@@ -257,7 +302,12 @@ mod tests {
         // Guards the class of defect QA found rather than the one instance: each
         // key create() writes must be rejected when its value changes, so a new
         // key cannot be added without a validator.
-        for key in ["format_profile", "max_object_len", "schema_version"] {
+        for key in [
+            "format_profile",
+            "max_object_len",
+            "schema_version",
+            "pack_max_bytes",
+        ] {
             let mut connection = Connection::open_in_memory().expect("open");
             create(&mut connection).expect("create");
             connection

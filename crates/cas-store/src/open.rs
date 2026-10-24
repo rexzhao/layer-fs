@@ -84,8 +84,8 @@ impl std::fmt::Debug for Database {
 
 /// Opens the Store at `root` in `mode`, running the recovery protocol.
 ///
-/// Order (ADR-002 §7): open/create the directory shape, open SQLite, validate
-/// the schema and policy, clear `tmp/`. Orphaned object files are left alone
+/// Order (ADR-002 §7, ADR-008 §4): open/create the directory shape, open SQLite,
+/// validate the schema and policy (before any pragma that writes), clear `tmp/`. Orphaned object files are left alone
 /// (ADR-002 §10).
 pub(crate) fn open(
     root: &Path,
@@ -110,11 +110,17 @@ pub(crate) fn open(
         })?;
 
     let mut connection = Connection::open_with_flags(layout.database(), mode.sqlite_flags())?;
-    configure(&connection, options)?;
 
+    // Validate **before** configuring: `configure` sets `journal_mode = WAL`, which writes
+    // the database header and creates `-wal`/`-shm` files. Refusing a Store must leave its
+    // bytes exactly as they were (ADR-008 §4, acceptance 2.1), so nothing may be written
+    // before the version check has passed.
     if already_present {
         schema::validate(&connection)?;
-    } else {
+    }
+    configure(&connection, options)?;
+
+    if !already_present {
         if !mode.may_write() {
             return Err(StoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,

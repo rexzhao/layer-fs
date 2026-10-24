@@ -36,12 +36,14 @@
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 
+mod batch;
 mod durability;
 mod error;
 mod layout;
 mod object;
 mod objects_scan;
 mod open;
+mod pack;
 mod schema;
 
 /// Crash-point helpers for this crate's own crash-injection tests.
@@ -51,7 +53,9 @@ mod schema;
 #[cfg(feature = "crash-points")]
 pub mod testing;
 
-pub use object::{NoObservation, PublishObserver, PublishStep};
+pub use batch::{Batch, BatchReport, PutOutcome};
+pub use object::{PackVerificationFailure, VerificationFailure, VerificationReport};
+pub use pack::{NoPackObservation, PackObserver, PackStep};
 
 use std::path::Path;
 
@@ -59,7 +63,6 @@ use cas_core::{Object, ObjectId, Role};
 
 pub use error::{CorruptCause, StoreError, StoreResult};
 pub use layout::Layout;
-pub use object::{PutOutcome, VerificationFailure, VerificationReport};
 pub use objects_scan::BadObjectName;
 pub use open::{OpenMode, Opened, StoreOptions};
 
@@ -94,6 +97,8 @@ pub struct Store {
     layout: Layout,
     metadata_path: std::path::PathBuf,
     read_only: bool,
+    /// How large one pack may grow before a batch starts another (ADR-008 §3).
+    pack_max_bytes: u64,
     opened: Opened,
 }
 
@@ -130,11 +135,13 @@ impl Store {
     ) -> StoreResult<Self> {
         let (database, layout, opened) = open::open(root.as_ref(), mode, options)?;
         let metadata_path = layout.database();
+        let pack_max_bytes = schema::pack_max_bytes(&database.connection)?;
         Ok(Self {
             database,
             layout,
             metadata_path,
             read_only: mode == OpenMode::ReadOnly,
+            pack_max_bytes,
             opened,
         })
     }
@@ -180,10 +187,29 @@ impl Store {
         Ok(Object::new(role, value)?.id()?)
     }
 
+    /// The pack size limit this Store was created with (ADR-008 §3).
+    #[must_use]
+    pub fn pack_max_bytes(&self) -> u64 {
+        self.pack_max_bytes
+    }
+
+    /// Starts a batch: many objects, one `fsync` per pack and one short transaction
+    /// per pack (ADR-008 §5).
+    #[must_use]
+    pub fn batch(&self) -> Batch<'_> {
+        Batch::new(
+            &self.database,
+            &self.layout,
+            self.pack_max_bytes,
+            self.read_only,
+        )
+    }
+
     /// Publishes `value` under `role`, returning its identity and frame.
     ///
     /// Idempotent: a second `put` of the same role and value writes nothing and
-    /// reports [`PutOutcome::AlreadyPresent`].
+    /// reports [`PutOutcome::AlreadyPresent`]. This is a batch of one object
+    /// (ADR-008 §5): the object lands in a one-frame pack.
     ///
     /// # Errors
     ///
@@ -193,11 +219,11 @@ impl Store {
     /// leftover file for this object does not match what would be written, and
     /// [`StoreError::Io`]/[`StoreError::Sqlite`] for storage failures.
     pub fn put(&self, role: Role, value: &[u8]) -> StoreResult<Published> {
-        let mut observer = object::NoObservation;
+        let mut observer = pack::NoPackObservation;
         self.put_observed(role, value, &mut observer)
     }
 
-    /// [`Store::put`], reporting each publication step to `observer`.
+    /// [`Store::put`], reporting each pack's publication steps to `observer`.
     ///
     /// This is the one implementation of the publication sequence: [`Store::put`]
     /// is this call with a no-op observer, and the crash-injection tests pass an
@@ -211,15 +237,20 @@ impl Store {
         &self,
         role: Role,
         value: &[u8],
-        observer: &mut dyn object::PublishObserver,
+        observer: &mut dyn PackObserver,
     ) -> StoreResult<Published> {
         if self.read_only {
             return Err(StoreError::ReadOnly);
         }
-        let object = Object::new(role, value)?;
-        let oid = object.id()?;
-        let frame = object.to_vec();
-        let outcome = object::put_observed(&self.database, &self.layout, role, value, observer)?;
+        let mut batch = self.batch();
+        let oid = batch.put(role, value)?;
+        let report = batch.commit_observed(observer)?;
+        let outcome = if report.packs == 0 {
+            PutOutcome::AlreadyPresent
+        } else {
+            PutOutcome::Inserted
+        };
+        let frame = Object::new(role, value)?.to_vec();
         Ok(Published {
             oid,
             frame,

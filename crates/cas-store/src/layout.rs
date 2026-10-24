@@ -8,6 +8,7 @@
 //! <store>/
 //!   store.sqlite
 //!   objects/ab/cd/<oid>     two hex-character levels, file name = ObjectId
+//!   packs/<pack_id>.pack    immutable pack files (ADR-008 §3)
 //!   tmp/<random>            never published; cleared by the next open
 //! ```
 
@@ -18,6 +19,7 @@ use cas_core::ObjectId;
 /// Names of the fixed entries under a Store root.
 pub(crate) const DATABASE_FILE: &str = "store.sqlite";
 pub(crate) const OBJECTS_DIR: &str = "objects";
+pub(crate) const PACKS_DIR: &str = "packs";
 pub(crate) const TEMP_DIR: &str = "tmp";
 
 /// The directory shape of one Store.
@@ -49,6 +51,22 @@ impl Layout {
     #[must_use]
     pub fn objects(&self) -> PathBuf {
         self.root.join(OBJECTS_DIR)
+    }
+
+    /// The directory holding immutable pack files.
+    #[must_use]
+    pub fn packs(&self) -> PathBuf {
+        self.root.join(PACKS_DIR)
+    }
+
+    /// The absolute path of one pack file.
+    ///
+    /// The name carries no content identity (ADR-008 §3): a pack is a storage
+    /// container, and what it holds is the index `pack` row plus its
+    /// `object_location` rows.
+    #[must_use]
+    pub fn pack_path(&self, pack_id: &str) -> PathBuf {
+        self.packs().join(format!("{pack_id}.pack"))
     }
 
     /// The staging directory for objects that are not published yet.
@@ -89,7 +107,12 @@ impl Layout {
     /// present: `create_dir_all` is idempotent, and another process may remove a
     /// `tmp/` entry between our check and our use.
     pub(crate) fn ensure(&self, create: bool) -> std::io::Result<()> {
-        for directory in [self.root.clone(), self.objects(), self.temporaries()] {
+        for directory in [
+            self.root.clone(),
+            self.objects(),
+            self.packs(),
+            self.temporaries(),
+        ] {
             if create {
                 std::fs::create_dir_all(&directory)?;
             } else if !directory.is_dir() {
@@ -100,13 +123,6 @@ impl Layout {
             }
         }
         Ok(())
-    }
-
-    /// Creates the two prefix directories that hold `oid`, if absent.
-    pub(crate) fn ensure_object_directory(&self, oid: ObjectId) -> std::io::Result<PathBuf> {
-        let directory = self.object_directory(oid);
-        std::fs::create_dir_all(&directory)?;
-        Ok(directory)
     }
 }
 

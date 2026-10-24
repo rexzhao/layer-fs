@@ -148,16 +148,22 @@ fn verify_names_an_object_that_is_gone() {
     let commit = workspace.commit("first", false).expect("commit");
     workspace.close().expect("close");
 
-    // Remove the commit's root object from the object tree, leaving the index row behind.
+    // Remove the packs that hold the commit's objects, leaving the index rows behind.
+    // ADR-008 §3: objects live in packs now, so "the object file is gone" means "the pack
+    // that carries it is gone" — and the index still claims it.
     let info = repo.commit_info(&commit).expect("info");
-    let object = root
-        .store()
-        .join("objects")
-        .join(&info.root[0..2])
-        .join(&info.root[2..4])
-        .join(&info.root);
-    assert!(object.is_file(), "expected {} to exist", object.display());
-    std::fs::remove_file(&object).expect("remove the root object");
+    let packs = root.store().join("packs");
+    let removed = std::fs::read_dir(&packs)
+        .expect("packs")
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| std::fs::remove_file(entry.path()).expect("remove pack"))
+        .count();
+    assert!(
+        removed >= 1,
+        "expected at least one pack under {}",
+        packs.display()
+    );
 
     let report = repo.verify(false).expect("verify");
     assert!(!report.is_clean(), "a missing object must be reported");

@@ -214,20 +214,27 @@ fn crash_after_the_staged_file_is_synced_leaves_it_unpublished() {
 }
 
 #[test]
-fn crash_after_the_rename_leaves_an_invisible_orphan() {
+fn crash_after_the_rename_leaves_an_unreferenced_pack() {
     let root = TempRoot::new("renamed");
     drop(Store::open(root.path(), OpenMode::Create).expect("create"));
     kill_child_at(root.path(), "renamed");
-    // The file is on disk but not published.
-    assert_eq!(count_files(&root.path().join("objects")), 1);
+    // ADR-008 §5.1 row 2: the pack is in packs/ but no index row points at it, so nothing
+    // is visible and an ordinary open leaves the file alone (it is GC's business).
+    assert_eq!(count_files(&root.path().join("packs")), 1);
     assert_recovered(root.path(), false, "renamed");
 
-    // A later put adopts it and publishes it without rewriting.
+    // Publishing the object again writes a *second* pack rather than adopting the first:
+    // adoption was the loose-object shape, and a pack is an immutable container.
     let store = Store::open(root.path(), OpenMode::ReadWrite).expect("reopen");
-    let outcome = store.put(Role::Bytes, VALUE).expect("adopting put");
-    assert_eq!(outcome.outcome, PutOutcome::AdoptedOrphan);
+    let outcome = store.put(Role::Bytes, VALUE).expect("second put");
+    assert_eq!(outcome.outcome, PutOutcome::Inserted);
     assert_eq!(store.object_count().expect("count"), 1);
     Object::decode(&store.get(oid()).expect("get")).expect("decode");
+    assert_eq!(
+        count_files(&root.path().join("packs")),
+        2,
+        "the unreferenced pack stays until GC removes it"
+    );
 }
 
 #[test]
@@ -239,13 +246,14 @@ fn crash_before_the_index_commit_leaves_it_unpublished() {
     let root = TempRoot::new("precommit");
     drop(Store::open(root.path(), OpenMode::Create).expect("create"));
     kill_child_at(root.path(), "dirsynced");
-    assert_eq!(count_files(&root.path().join("objects")), 1);
+    assert_eq!(count_files(&root.path().join("packs")), 1);
     assert_recovered(root.path(), false, "dirsynced");
 
-    // The orphan is adopted by the next put, which publishes it.
+    // The last step before the transaction: the pack is durable and unreferenced, and the
+    // next put publishes the object into a new pack (the old one is GC's to reclaim).
     let store = Store::open(root.path(), OpenMode::ReadWrite).expect("reopen");
-    let outcome = store.put(Role::Bytes, VALUE).expect("adopting put");
-    assert_eq!(outcome.outcome, PutOutcome::AdoptedOrphan);
+    let outcome = store.put(Role::Bytes, VALUE).expect("second put");
+    assert_eq!(outcome.outcome, PutOutcome::Inserted);
     assert_eq!(store.object_count().expect("count"), 1);
 }
 
@@ -257,14 +265,14 @@ fn crash_after_the_index_commit_leaves_it_published() {
     let root = TempRoot::new("postcommit");
     drop(Store::open(root.path(), OpenMode::Create).expect("create"));
     kill_child_at(root.path(), "committed");
-    assert_eq!(count_files(&root.path().join("objects")), 1);
+    assert_eq!(count_files(&root.path().join("packs")), 1);
     assert_recovered(root.path(), true, "committed");
 
-    // Re-putting it is a no-op, and no second file appears.
+    // Re-putting it is a no-op, and no second pack appears.
     let store = Store::open(root.path(), OpenMode::ReadWrite).expect("reopen");
     let again = store.put(Role::Bytes, VALUE).expect("repeat put");
     assert_eq!(again.outcome, PutOutcome::AlreadyPresent);
-    assert_eq!(count_files(&root.path().join("objects")), 1);
+    assert_eq!(count_files(&root.path().join("packs")), 1);
 }
 
 #[test]
@@ -277,7 +285,8 @@ fn completing_the_put_after_a_crash_publishes_exactly_one_copy() {
     store.put(Role::Bytes, VALUE).expect("put");
     store.put(Role::Bytes, VALUE).expect("repeat put");
     assert_eq!(store.object_count().expect("count"), 1);
-    assert_eq!(count_files(&root.path().join("objects")), 1);
+    // One *published* pack plus the unreferenced one the crash left behind (GC's business).
+    assert_eq!(count_files(&root.path().join("packs")), 2);
     assert!(store.verify().expect("verify").is_clean());
 }
 
@@ -306,25 +315,23 @@ fn the_crash_path_observes_the_production_sequence() {
     // sequence. This test drives `Store::put` itself with a recording observer
     // and asserts the exact order; the crash child uses the same entry point, so
     // a sequence change shows up here and in the crash tests together.
-    use cas_store::{NoObservation, PublishObserver, PublishStep};
+    use cas_store::{NoPackObservation, PackObserver, PackStep};
 
     let root = TempRoot::new("sequence");
     let store = Store::open(root.path(), OpenMode::Create).expect("open");
 
     let mut steps = Vec::new();
     store
-        .put_observed(Role::Bytes, VALUE, &mut |step: PublishStep| {
-            steps.push(step)
-        })
+        .put_observed(Role::Bytes, VALUE, &mut |step: PackStep| steps.push(step))
         .expect("observed put");
     assert_eq!(
         steps,
         vec![
-            PublishStep::Staged,
-            PublishStep::StagedSynced,
-            PublishStep::Renamed,
-            PublishStep::DirectorySynced,
-            PublishStep::Committed,
+            PackStep::Staged,
+            PackStep::StagedSynced,
+            PackStep::Renamed,
+            PackStep::DirectorySynced,
+            PackStep::Committed,
         ],
         "the production sequence, in order"
     );
@@ -335,18 +342,18 @@ fn the_crash_path_observes_the_production_sequence() {
     assert_eq!(plain.outcome, PutOutcome::AlreadyPresent);
     // The no-op observer accepts every step and does nothing, which is what
     // makes `put` and `put_observed` the same sequence.
-    let mut none = NoObservation;
+    let mut none = NoPackObservation;
     for step in steps.iter().copied() {
-        PublishObserver::step(&mut none, step);
+        PackObserver::step(&mut none, step);
     }
 
     // Every crash point maps onto a step of that sequence.
     for (name, expected) in [
-        ("staged", PublishStep::Staged),
-        ("synced", PublishStep::StagedSynced),
-        ("renamed", PublishStep::Renamed),
-        ("dirsynced", PublishStep::DirectorySynced),
-        ("committed", PublishStep::Committed),
+        ("staged", PackStep::Staged),
+        ("synced", PackStep::StagedSynced),
+        ("renamed", PackStep::Renamed),
+        ("dirsynced", PackStep::DirectorySynced),
+        ("committed", PackStep::Committed),
     ] {
         let point = cas_store::testing::CrashPoint::parse(name).expect("known point");
         assert_eq!(point.step(), expected, "crash point {name}");
@@ -398,17 +405,23 @@ fn a_cross_process_writer_reports_busy_without_retrying() {
 }
 
 #[test]
-fn a_corrupt_orphan_is_reported_rather_than_adopted() {
+fn a_corrupt_loose_leftover_is_ignored_rather_than_adopted() {
+    // Loose writes are retired (ADR-008 §3): a truncated file at the old loose path is not
+    // read, not adopted and not reported — the object is published into a pack instead, and
+    // the leftover is GC's business.
     let root = TempRoot::new("corrupt-orphan");
     let store = Store::open(root.path(), OpenMode::Create).expect("open");
     let id = oid();
     let path = store.layout().object_path(id);
     std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
     std::fs::write(&path, b"truncated").expect("write");
-    match store.put(Role::Bytes, VALUE) {
-        Err(cas_store::StoreError::Corrupt { cause, .. }) => {
-            assert!(matches!(cause, CorruptCause::LengthMismatch { .. }));
-        }
-        other => panic!("expected Corrupt, got {other:?}"),
-    }
+    let published = store.put(Role::Bytes, VALUE).expect("put into a pack");
+    assert_eq!(published.outcome, PutOutcome::Inserted);
+    assert_eq!(
+        Object::decode(&store.get(id).expect("get"))
+            .expect("decode")
+            .value(),
+        VALUE
+    );
+    assert!(store.verify().expect("verify").is_clean());
 }

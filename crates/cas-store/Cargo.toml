@@ -12,6 +12,7 @@ license.workspace = true
 crash-points = []
 
 [dependencies]
+blake3.workspace = true
 cas-core.workspace = true
 rusqlite.workspace = true
 
