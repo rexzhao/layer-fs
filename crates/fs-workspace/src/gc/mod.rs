@@ -105,7 +105,7 @@ impl std::fmt::Debug for GcHooks<'_> {
 /// splitting "what should be there" from "what mark walks" makes D (a missing root) and F
 /// (registered but skipped) constructible, and G is the hook above.
 #[derive(Debug)]
-pub struct GcInput<'a, S: roots::RootSource> {
+pub struct GcInput<'a, S: roots::RootSource + ?Sized = dyn roots::RootSource> {
     /// The roots the caller says must be protected.
     pub declared: &'a RootSet,
     /// The source whose roots `mark` will actually walk.

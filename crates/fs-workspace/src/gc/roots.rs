@@ -134,11 +134,20 @@ impl RootSet {
 /// (drop a snapshot row → G1 must go red; omit a root → G2 must go red; register but skip → G3).
 pub trait RootSource {
     /// The roots this run must protect.
+    /// The roots this run must protect.
     ///
     /// # Errors
     ///
     /// Whatever reading the repository reported.
     fn roots(&self) -> WorkspaceResult<RootSet>;
+}
+
+/// A borrowed source is a source, so `GcInput` can take `&dyn RootSource` (tests pass a reference
+/// to their fixture instead of handing ownership to the collector).
+impl<T: RootSource + ?Sized> RootSource for &T {
+    fn roots(&self) -> WorkspaceResult<RootSet> {
+        (**self).roots()
+    }
 }
 
 /// The production source: every row ADR-008 §6.2 lists.

@@ -258,3 +258,119 @@ fn freeing_only_unreachable_objects_satisfies_all_five() {
     assert!(criteria::g4_freed_is_unreachable(&report).is_ok());
     assert!(criteria::g5_not_vacuous(&report).is_ok());
 }
+
+// -------------------------------------------- §8: independent ground truth + the three-step template
+//
+// The ground truth is built here, by hand, from what the test itself created ("I declared these
+// two roots"), never read back from the implementation. An injected run must then diff against
+// `R_true`, not against a shrunken copy of itself — otherwise counter-example C stays green
+// (proving the subject with the subject).
+
+use std::cell::Cell;
+
+/// A source whose omission of one root can be switched on and off, so the same fixture can run
+/// clean, injected, and clean again.
+struct Toggle {
+    roots: Vec<RootRef>,
+    omit: Cell<bool>,
+}
+
+impl RootSource for Toggle {
+    fn roots(&self) -> fs_workspace::WorkspaceResult<RootSet> {
+        let entries = if self.omit.get() {
+            self.roots.iter().skip(1).cloned().collect()
+        } else {
+            self.roots.clone()
+        };
+        Ok(RootSet::from_entries(entries))
+    }
+}
+
+/// The three-step template (card §8.3): clean → injected (only the named criterion red) → clean.
+#[test]
+fn the_injection_seam_is_consumed_and_leaves_no_residue() {
+    // Ground truth, held by the test: two roots, plus one object that must be collected.
+    let commit = oid("ground-commit");
+    let snap = oid("ground-snapshot");
+    let garbage = oid("ground-garbage");
+    let truth = RootSet::from_entries(vec![
+        RootRef::new(RootKind::Commit, commit, "commit:c1"),
+        RootRef::new(RootKind::Snapshot, snap, "snapshot:s1"),
+    ]);
+    let source = Toggle {
+        roots: truth.entries().to_vec(),
+        omit: Cell::new(false),
+    };
+
+    let run = |omit: bool| {
+        source.omit.set(omit);
+        let mut visited = std::collections::BTreeSet::new();
+        let mut report;
+        {
+            let mut sink = |kind: RootKind, root: ObjectId| {
+                visited.insert((kind, root));
+            };
+            let mut hooks = fs_workspace::gc::GcHooks {
+                on_root_visited: Some(&mut sink),
+                ..Default::default()
+            };
+            let input = fs_workspace::gc::GcInput {
+                declared: &truth,
+                mark_source: &source as &dyn RootSource,
+            };
+            report = input.mark(&mut hooks).expect("mark");
+        }
+        // The test owns the sink's storage (§8.4): the interface stays streaming.
+        assert_eq!(
+            visited.len(),
+            report.visited_oids.len(),
+            "sink saw every visited root"
+        );
+        report.freed.push(garbage);
+        report.roots_declared = truth.entries().iter().map(|e| e.label.clone()).collect();
+        report.root_oids = truth.ids();
+        report.reachable_count = report.reachable.len();
+        report
+    };
+
+    // 1. clean → everything green.
+    let clean = run(false);
+    assert!(criteria::g1_no_live_object_freed(&clean).is_ok());
+    assert!(criteria::g2_mark_covers_declared(&clean).is_ok());
+    assert!(criteria::g3_every_root_visited(&clean).is_ok());
+    assert!(criteria::g4_freed_is_unreachable(&clean).is_ok());
+    assert!(criteria::g5_not_vacuous(&clean).is_ok());
+
+    // 2. injected → only G2/G3 red, the rest still green (no "everything turns red" theatre).
+    let injected = run(true);
+    assert!(
+        criteria::g1_no_live_object_freed(&injected).is_ok(),
+        "G1 unaffected by omission here"
+    );
+    let (missed, _) = criteria::g2_mark_covers_declared(&injected).expect_err("G2 must be red");
+    // `skip(1)` drops the first entry, which is `commit:c1` (entries are sorted by kind: Commit <
+    // Snapshot). Asserting the actual name keeps this honest — a wrong label here would mean the
+    // injection drops a different fact than the test thinks.
+    assert_eq!(
+        missed,
+        vec!["commit:c1".to_owned()],
+        "compared against R_true, not against itself"
+    );
+    assert!(
+        criteria::g3_every_root_visited(&injected).is_err(),
+        "G3 must be red"
+    );
+    assert!(criteria::g4_freed_is_unreachable(&injected).is_ok());
+    assert!(
+        criteria::g5_not_vacuous(&injected).is_ok(),
+        "G5 is about the sweep, not the roots"
+    );
+
+    // 3. injection off again → all green, so the flag was really consumed and nothing leaked.
+    let restored = run(false);
+    assert!(
+        criteria::g2_mark_covers_declared(&restored).is_ok(),
+        "no residue after the injection"
+    );
+    assert!(criteria::g3_every_root_visited(&restored).is_ok());
+}
