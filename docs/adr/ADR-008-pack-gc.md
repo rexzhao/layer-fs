@@ -91,6 +91,13 @@ CREATE TABLE pack (
 > 另：`cas-store/src/open.rs` 现在是 `configure()`（含 `journal_mode = WAL`）在 `validate()` **之前**，
 > 所以"被拒时文件不得被改动"需以字节哈希断言验证，红了就把 `validate` 提前或先以只读连接读版本。
 
+
+`pack_max_bytes` 是**策略值（setting），不是格式常量**：`validate` 不要求它等于本构建的默认值，只要求可解析且
+非 0；修改它不改变格式身份，也不使既有 Store 失效（pack 自描述：尾部 `count`/`frames_len`/BLAKE3 加索引里的
+`offset`/`length` 足以读回，读者不需要知道 `M`）。它的上界是**资源策略**而非格式约束——若 pack 在内存中构建，
+它同时是 staging 峰值内存的上界。今后同类策略值（如 P2b-6 的 `gc_repack_threshold`，建议随该卡加入并校验
+`[0,1]` 范围）按同一规则校验。**判据**：若某值改变会影响"同一批字节应产出哪种规范形态 / 哪个对象 id"，
+它就属于格式常量，必须进 `format_profile` 并由 `validate` 逐字比较；否则就是策略值。
 ## 5. 批量发布（取代 ADR-006 §12）
 
 ```rust
