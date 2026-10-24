@@ -89,3 +89,15 @@ otes\p2b2-fsync-lock-criteria.md`，尾部长度已按
   ② "opener 清扫 vs 发布"（测试里手动清 `tmp/` 模拟并发 opener）；
 - **探针按 attempt 作用域**：失败尝试零 `TxnBegin`，只有成功尝试进 V1–V7 与 `2k` 计数。
 - GC 标记库不得放进 `tmp/`（ADR-008 §6.3，实现归 P2b-6）。
+
+## 6. 验收口径补充（2026-10-24，manager 裁决）
+
+- **E 的死字节按物理帧计**：并发 `INSERT OR IGNORE` 跳过时，被跳过的帧仍占字节。因此
+  `Σ pack.bytes == Σ(物理帧长) + 48k`，而 `object_location` 行数可少于 `count`。`count ≥ 行数` 是正确断言，
+  **不得**断言相等（参见 KI-10：`verify` 曾因要求"铺满"而把健康 Store 判为损坏）。
+- **D 的边缘处理**：Windows 上 `S`（20 次 `sync_file` 中位）自身可能抖动。判据仍是 `m ≤ S/10` 且
+  `H(1000) ≤ 100·S`，但**数据齐、阈值边缘（2 倍以内）**时记为"观察项"而非 FAIL；"每对象一次 fsync"
+  （`m ≈ S`）这种数量级差异仍必须判红。
+- **A 的探针归属**：允许验证方在**自己的 worktree**里加 additive、feature 默认关闭的探针来独立观测，
+  条件是证明"开/关探针时 pack 字节、索引行与 `verify` 结果完全一致"；能交叉核对的部分（事务边界）必须
+  用 `rusqlite::trace` 这种**不改产品代码**的观察器复算。

@@ -7,8 +7,12 @@
 
 ## 1. 范围（按此顺序交付）
 
-1. **`source()` 结构（主项，先做）**：`fs-overlay/src/error.rs`、`fs-snapshot/src/error.rs`、
-   `fs-workspace/src/error.rs` 三处 `source()` 都用了 `_ => None` 兜底。后果：新增**包裹型**变体时 Display 会因
+1. **`source()` 结构（主项，先做）**：**五处** `source()` 用了 `_ => None` 兜底——
+   `fs-overlay/src/error.rs:84`、`fs-snapshot/src/error.rs:88`、`fs-workspace/src/error.rs:120`、
+   **`cas-store/src/error.rs:178`**、**`fs-namespace/src/error.rs:176`**。
+   （QA 第一版只报了前三处，重扫补出后两处：`cas-store` 是 P2b-6 扩变体的靶心，必须现在改；
+   `fs-namespace` 的 `Display` 已穷举而 `source()` 兜底，属同类两套标准。
+   **`fs-api/src/error.rs` 已是正确形制（7/7 穷举无兜底），照它写。**）后果：新增**包裹型**变体时 Display 会因
    穷举而编译报错（好），但 `source()` 会静默变 `None`，错误链断掉且无人提醒。
    **要求**：去掉三处 `_ => None`，非包裹变体逐个列出返回 `None`（新增变体时两处 match 都强制人做决定）。
    **设计口径（architect 裁决，不需新 ADR）**：

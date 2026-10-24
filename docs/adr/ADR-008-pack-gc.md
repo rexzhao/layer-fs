@@ -53,7 +53,7 @@ mailbox `manager/c7yba9ud6s`、`manager/taek3xts1d`）：
 ## 3. Pack 格式
 
 ```text
-<store>/packs/<pack_id>.pack        pack_id = 随机 128 bit hex（名字不承载内容身份）
+<store>/packs/<pack_id>.pack        pack_id = 128 bit hex 名字（**单 Store 内唯一即可，不承载内容身份，不要求密码学随机**）
   对象帧 × n                         每帧 = ADR-001 的完整规范帧（WCAS 头 + 值），首尾相接
   尾部：magic "WPK1" | u32 count | u64 frames_len | 32 B BLAKE3(全部帧字节)
 ```
