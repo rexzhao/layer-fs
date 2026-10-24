@@ -79,3 +79,62 @@ K9 死字节允许重打包回收、不得报 corrupt（KI-10）；K10 空 pack 
 
 architect 将提供：根集合反例构造的细节、schema 漂移 tripwire、以及"mark 阶段访问完整性"的判据形式。**开工不受阻**：
 先落"根枚举可注入"的测试骨架（决定 GC 架构，事后补不了），再等他这一段并入。
+
+## 6. 追加条款 A（interface，QA + architect 独立同构，**开工前必须满足**）
+
+`gc(roots)` 这种签名只能构造反例 C；D/F/G **造不出来**。接口至少要能分离三件事：
+
+```rust
+gc(
+    declared_roots: &[RootRef],              // 「应该有哪些根」——G2 右侧
+    mark_source: impl Fn() -> Vec<RootRef>,  // mark 实际遍历的根——反例 D 的注入点
+    hooks: GcHooks,                          // on_root_visited / extra_free_candidates
+) -> GcReport
+```
+
+`GcReport` 必须能直接支撑 G1–G5（**不靠解析日志**）：
+
+- `roots_declared` / `roots_visited`（G2/G3 直接比较）；
+- `freed: Vec<ObjectId>`（**逐 ID**：G4 要交集，G5 要"某个确定不可达者被回收）；只报计数不够；
+- `reachable_count`、`packs_repacked`、`packs_deleted`、`freed_bytes`、`duration`；
+- `roots_by_kind` / `visited_by_kind`（按来源类的计数，抓"UNION 了但按 kind 分派时漏了"）；
+- `gc-test-hooks` 下另给**流式回调** `visit_sink(kind, oid)`（测试收集成 `BTreeSet`），**不要**返回全量 `Vec`
+  （大库会破坏 ADR §5.4 的内存判据）。
+
+**G3 的表达**：以根 **oid 去重集合**为准，不是按行：
+
+```
+distinct_oids(visited) == distinct_oids(roots)
+且 roots_by_kind[k] > 0 ⇒ visited_by_kind[k] > 0
+```
+
+## 7. 追加条款 B（architect：注入缝与 tripwire）
+
+**前提**：所有注入缝走同一个 feature `gc-test-hooks`（默认关，照 `crash-points` 先例），且**只能"少给/跳过/多删"**，
+不得替换 mark 遍历或 sweep 算法本身（否则测的是平行实现）。
+
+| 反例 | 注入面 | 注入内容 | 必须红 |
+| --- | --- | --- | --- |
+| C 根来源漏掉 | 来源注册表 `const ROOT_SOURCES` 上的 `omit_source(RootSource::X)` | 去掉**某一类**来源 | G1、G2（及该类金丝雀） |
+| D 少给一个根 | `omit_root(oid)` | 只去掉一个 oid | G1、G2、G3 |
+| E 不可达对象 | **无需注入**（数据级：失败发布 / 被 drop 的 snapshot / 被 discard 的 workspace） | — | G5（且 G1 仍成立） |
+| F 登记但跳过访问 | mark 循环内 `skip_visit(oid)` | 根仍在枚举集合、visit 不计数 | **G3**（若闭包未标记 → G2；对象被回收 → G1） |
+| G freed 混入 reachable | sweep 删除集合 seam `force_free(oid)` | 把 mark 集里的 oid 强行加入删除集 | **G4**、G1；事后 `verify` 必须报 `MissingPack`（同时是 K8 的反面） |
+
+两条硬约束：
+
+1. **反例 C 不能用"删根表行"构造**：根行被删后回收它是**正确**的，G1 红反而是测试错。C 必须注入在"查询/来源注册"
+   这一层（模拟 `roots()` 漏了一个来源），不是"数据里少了一行"。
+2. **每个注入用例必须自带阳性对照**：同一 fixture 先跑**不注入**的 GC 并断言 G1–G5 全绿，再跑注入版并断言指定判据红。
+   否则缝可能是空的（注入没生效、或者红在别的原因上）。
+
+### schema 漂移 tripwire（三层）
+
+- **T1 列级 allowlist**：测试枚举 `sqlite_master` + `pragma_table_info` 的**两个库**（主库与每个 `workspaces/*/overlay.sqlite`），
+  凡列名匹配 `(^|_)(root|oid|content)($|_)` 的必须出现在测试源码的显式表里，分类为 `RootSource(..)` 或
+  `NotARoot(理由)`；**新列未分类 → 红**。
+- **T2 注册表 ↔ 判据映射**：每个 `RootSource` 在 T1 里至少对应一列，且**至少被一条金丝雀 K** 覆盖（K 矩阵按
+  `RootSource` 索引）→ "加了来源没加测试""加了列没加来源"都会红。
+- **T3 值域启发**：T1 判为 `RootSource` 的列抽样至多 N 行，断言值可解析为 ObjectId（64 hex）。
+- T1 必须覆盖 **overlay**（`ov_meta.pending_root`、Seal 落地后的 `ov_inode.sealed_content`）。`sealed_content` 目前
+  不存在——**卡里写死**：Seal 合入时若 T1 未分类，tripwire 必须红（这是分两次做的护栏）。
