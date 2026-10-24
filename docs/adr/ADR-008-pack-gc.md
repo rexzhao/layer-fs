@@ -129,11 +129,13 @@ batch.commit()?;                             // 下面的 1–4
 
 ### 5.2 发布期的 pin（KI-11）
 
-> 步骤 2 的 `rename` 返回后、步骤 3 的 `COMMIT` 返回前，实现以**不共享 DELETE 的句柄**持有该 pack（平台模块
-> `durability`）。Windows 上该窗口内文件不可被删除或改名，使"索引提交时 pack 必定存在"成为 **OS 强制**的不变量；
+> 步骤 2 的 `rename` 返回后**立即、在 `sync_directory` 之前**、步骤 3 的 `COMMIT` 返回前，实现以**不共享 DELETE 的
+> 句柄**持有该 pack（平台模块 `durability`）。Windows 上该窗口内文件不可被删除或改名，使"索引提交时 pack 必定存在"成为 **OS 强制**的不变量；
 > POSIX 无此保证（`unlink` 不受打开句柄影响）。`rename` 与 pin 之间有数微秒未保护窗口，`COMMIT` 之后的删除也不在
 > 本保证内——两者都按 §7 以 `MissingPack` 暴露。**不采用"发布期可见性复查 + 重新 staging"**：复查不消除窗口，
 > 重试会把数据丢失降级为延迟暴露，并给发布路径引入第二条失败语义。
+> `pin` 打开失败（即文件在 `rename`→pin 的窗口内已被删）→ `MissingPack { pack_id }`；本次发布**不写任何索引行**，
+> `packs/` 中留下的无行文件由 GC 回收。发布失败向上报告，**不在此处重试**。
 
 ## 6. GC
 
