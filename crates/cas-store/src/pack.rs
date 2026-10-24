@@ -242,8 +242,10 @@ pub(crate) fn write(
         // removed (link survives) or the whole directory entry went with it.
         let evidence = layout.packs().join(format!("{pack_id}.pack.evidence"));
         match std::fs::hard_link(layout.pack_path(pack_id), &evidence) {
-            Ok(()) => {}
-            Err(error) => eprintln!("staging-audit: no evidence link for {pack_id}: {error}"),
+            Ok(()) => eprintln!("staging-audit: evidence link OK for {pack_id}"),
+            Err(error) => {
+                eprintln!("staging-audit: evidence link FAILED for {pack_id}: {error}")
+            }
         }
     }
     observer.step(PackStep::Renamed);
