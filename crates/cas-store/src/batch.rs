@@ -191,6 +191,23 @@ impl<'a> Batch<'a> {
                 .collect();
             let encoded = pack::encode(&mut frames);
             pack::write(self.layout, &pack_id, &encoded.bytes, observer)?;
+            // Diagnostic (`staging-audit`): hold the pack open **without** `FILE_SHARE_DELETE`
+            // from here until the index commit returns. On Windows a delete of a file with such
+            // a handle must fail; if the symptom disappears, something external was deleting it.
+            #[cfg(all(feature = "staging-audit", windows))]
+            let _pin = {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                const FILE_SHARE_READ: u32 = 0x0000_0001;
+                const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .open(self.layout.pack_path(&pack_id))
+                    .map_err(|error| {
+                        eprintln!("staging-audit: cannot pin {pack_id}: {error}");
+                        StoreError::Io(error)
+                    })?
+            };
             let size = encoded.bytes.len() as u64;
             record_pack(
                 self.database,
