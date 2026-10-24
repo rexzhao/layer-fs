@@ -146,9 +146,15 @@ P2b-2c 的第一次取证发现：用 dev-dependency 打开诊断 feature **不�
 删掉。合入前必须跑：
 
 ```bash
+git fetch origin                                # 先更新本地 ref，否则下面两条查的是旧快照
 git merge-base --is-ancestor origin/main HEAD   # 必须成功，否则先 rebase
 git diff origin/main..HEAD -- docs/             # 不得出现 D（删除）
 ```
+
+**`fetch` 不是可选项**：`--is-ancestor` 只回答"在你本地看到的 `origin/main` 上是不是祖先"，本地 ref 陈旧时它会
+给出"通过"而实际已落后。同一轮里出现过三次（删 4 份文档、删判据、删编号列），全部是"检查正确、ref 陈旧"。
+另：**manager 也不要在转交 QA 期间往 main 提文档**——那会让分支基座在 review 中途失效；要么等合入，要么在转交
+前先告知 worker 需要 rebase。
 
 第二条能抓到"分支里根本没有这些文档"的另一种形态（分支从旧基座切出）。**这两条与"两臂跑在已提交干净 SHA"
 同属机械检查，不依赖判断力，因此必须每次执行。**
