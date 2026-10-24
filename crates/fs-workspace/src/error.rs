@@ -183,3 +183,125 @@ impl From<cas_store::StoreError> for WorkspaceError {
 
 /// The result of a workspace operation.
 pub type WorkspaceResult<T> = Result<T, WorkspaceError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    /// `Display` and `source` for every variant (C6); expected strings come from QA's probe.
+    #[test]
+    fn every_variant_has_a_display_and_a_source() {
+        let cases: Vec<(WorkspaceError, &str, Option<&str>)> = vec![
+            (
+                WorkspaceError::BranchMoved { branch: "main".into(), expected: "aaa".into(), actual: "bbb".into() },
+                "branch main moved: expected commit aaa, found bbb",
+                None,
+            ),
+            (
+                WorkspaceError::NothingToCommit,
+                "the workspace's view already equals its base",
+                None,
+            ),
+            (WorkspaceError::AlreadyExists { name: "/x".into() }, "already exists: /x", None),
+            (WorkspaceError::NotFound { what: "commit abc".into() }, "not found: commit abc", None),
+            (
+                WorkspaceError::WorkspaceDirty,
+                "the workspace has changes; discard them first",
+                None,
+            ),
+            (
+                WorkspaceError::Busy { waited_ms: 5000 },
+                "the main database stayed locked for 5000 ms",
+                None,
+            ),
+            (
+                WorkspaceError::Inconsistent { detail: "overlay gone".into() },
+                "inconsistent state: overlay gone",
+                None,
+            ),
+            (
+                WorkspaceError::SchemaMismatch { expected: "v2".into(), found: "v1".into() },
+                "workspace schema mismatch: expected v2, found v1",
+                None,
+            ),
+            (
+                WorkspaceError::NotInitialised,
+                "the store has no workspace schema; run init first",
+                None,
+            ),
+            (
+                WorkspaceError::Namespace(fs_namespace::NamespaceError::NotFound { path: "/y".into() }),
+                "no such path: /y",
+                Some("no such path: /y"),
+            ),
+            (
+                WorkspaceError::Overlay(fs_overlay::OverlayError::NestedTransaction),
+                "an overlay scope was entered while another was still open",
+                Some("an overlay scope was entered while another was still open"),
+            ),
+            (
+                WorkspaceError::Snapshot(fs_snapshot::SnapshotError::Malformed { detail: "z".into() }),
+                "malformed snapshot value: z",
+                Some("malformed snapshot value: z"),
+            ),
+            (
+                WorkspaceError::Store(cas_store::StoreError::Busy),
+                "store is busy: another writer holds the write lane; the operation did not take effect",
+                Some("store is busy: another writer holds the write lane; the operation did not take effect"),
+            ),
+            (
+                WorkspaceError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
+                "Query returned no rows",
+                Some("Query returned no rows"),
+            ),
+        ];
+        for (error, display, source) in cases {
+            assert_eq!(error.to_string(), display, "Display for {error:?}");
+            assert_eq!(
+                error.source().map(std::string::ToString::to_string),
+                source.map(str::to_owned),
+                "source for {error:?}"
+            );
+            let text = error.to_string();
+            assert!(
+                !text.ends_with("()") && !text.ends_with("None"),
+                "Display must not end with a placeholder: {text}"
+            );
+        }
+    }
+
+    /// A four-layer chain, end to end: the point of C6 is that `chain()` does not stop early.
+    #[test]
+    fn a_four_layer_chain_reports_four_names() {
+        let error = WorkspaceError::Overlay(fs_overlay::OverlayError::Namespace(
+            fs_namespace::NamespaceError::Store(cas_store::StoreError::Busy),
+        ));
+        // Walk `source()` explicitly: this is exactly what `Error::chain()` yields, spelled out so
+        // the assertion does not depend on a std convenience method.
+        let mut names = vec![error.to_string()];
+        let mut cursor: Option<&(dyn std::error::Error + 'static)> = error.source();
+        while let Some(link) = cursor {
+            names.push(link.to_string());
+            cursor = link.source();
+        }
+        assert_eq!(
+            names.len(),
+            4,
+            "workspace -> overlay -> namespace -> store: {names:?}"
+        );
+        // Four links, and every wrapper forwards its inner text — so the messages are the same
+        // while the *types* differ. That is a property of these `Display` impls (each writes
+        // `{inner}`), not of the chain: the count is what proves nothing was skipped.
+        assert!(
+            names[3].starts_with("store is busy"),
+            "innermost: {}",
+            names[3]
+        );
+        assert!(
+            names.iter().all(|name| name == &names[3]),
+            "wrappers forward the inner message: {names:?}"
+        );
+        assert!(names.len() < 10, "the chain must terminate");
+    }
+}

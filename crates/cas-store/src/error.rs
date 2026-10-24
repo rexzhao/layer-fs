@@ -263,6 +263,38 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 #[cfg(test)]
 mod tests {
+
+    /// `Corrupt` has two branch kinds (C6): only the `Envelope` cause wraps a nested error.
+    #[test]
+    fn corrupt_reports_a_source_only_for_the_envelope_cause() {
+        use cas_core::EnvelopeError;
+        use std::error::Error as _;
+
+        let oid = cas_core::ObjectId::from_bytes([0xCD; 32]);
+        let envelope = StoreError::Corrupt {
+            oid,
+            cause: CorruptCause::Envelope(EnvelopeError::LengthMismatch {
+                declared: 10,
+                actual: 4,
+            }),
+        };
+        assert!(
+            envelope.source().is_some(),
+            "an envelope failure is a nested error and must be reported"
+        );
+
+        let bytes = StoreError::Corrupt {
+            oid,
+            cause: CorruptCause::LengthMismatch {
+                expected: 10,
+                actual: 4,
+            },
+        };
+        assert!(
+            bytes.source().is_none(),
+            "a byte-level cause describes bytes; it has no nested error"
+        );
+    }
     use super::*;
 
     #[test]

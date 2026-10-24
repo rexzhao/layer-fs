@@ -133,3 +133,85 @@ impl From<cas_store::StoreError> for OverlayError {
 
 /// The result of an overlay operation.
 pub type OverlayResult<T> = Result<T, OverlayError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    /// `Display` and `source` for every variant (C6). The expected strings come from QA's probe
+    /// output, not from re-deriving them here: an assertion must pin the text a user sees.
+    #[test]
+    fn every_variant_has_a_display_and_a_source() {
+        let cases: Vec<(OverlayError, &str, Option<&str>)> = vec![
+            (
+                OverlayError::WorkspaceInUse {
+                    path: "/o.sqlite".into(),
+                },
+                "workspace overlay is already open: /o.sqlite",
+                None,
+            ),
+            (
+                OverlayError::SchemaMismatch {
+                    expected: "v3".into(),
+                    found: "v1".into(),
+                },
+                "overlay schema mismatch: expected v3, found v1",
+                None,
+            ),
+            (
+                OverlayError::PragmaNotApplied {
+                    pragma: "journal_mode",
+                    found: "delete".into(),
+                },
+                "pragma journal_mode did not take effect (found delete)",
+                None,
+            ),
+            (
+                OverlayError::NestedTransaction,
+                "an overlay scope was entered while another was still open",
+                None,
+            ),
+            (
+                OverlayError::InvalidRecord {
+                    field: "page",
+                    detail: "bad".into(),
+                },
+                "invalid overlay record in page: bad",
+                None,
+            ),
+            (
+                OverlayError::Namespace(fs_namespace::NamespaceError::NotFound {
+                    path: "/x".into(),
+                }),
+                "no such path: /x",
+                Some("no such path: /x"),
+            ),
+            (
+                OverlayError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
+                "Query returned no rows",
+                Some("Query returned no rows"),
+            ),
+            (
+                OverlayError::Base(fs_snapshot::SnapshotError::Malformed {
+                    detail: "root".into(),
+                }),
+                "base snapshot: malformed snapshot value: root",
+                Some("malformed snapshot value: root"),
+            ),
+        ];
+        for (error, display, source) in cases {
+            assert_eq!(error.to_string(), display, "Display for {error:?}");
+            assert_eq!(
+                error.source().map(std::string::ToString::to_string),
+                source.map(str::to_owned),
+                "source for {error:?}"
+            );
+            let text = error.to_string();
+            assert!(
+                !text.ends_with("()") && !text.ends_with("None"),
+                "Display ends badly: {text}"
+            );
+        }
+    }
+}

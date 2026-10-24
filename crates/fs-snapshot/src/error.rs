@@ -122,3 +122,48 @@ pub(crate) fn malformed(detail: impl Into<String>) -> SnapshotError {
         detail: detail.into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    /// `Display` and `source` for every variant (C6); expected strings come from QA's probe.
+    #[test]
+    fn every_variant_has_a_display_and_a_source() {
+        let cases: Vec<(SnapshotError, &str, Option<&str>)> = vec![
+            (
+                SnapshotError::WrongRole { expected: "Directory", found: "Bytes" },
+                "expected a Directory page, found Bytes",
+                None,
+            ),
+            (SnapshotError::UnsupportedFormat { found: 9 }, "unsupported value format 9", None),
+            (SnapshotError::Malformed { detail: "short".into() }, "malformed snapshot value: short", None),
+            (SnapshotError::Unsorted { detail: "keys".into() }, "keys are not strictly increasing: keys", None),
+            (SnapshotError::Corrupt { detail: "child".into() }, "corrupt snapshot structure: child", None),
+            (
+                SnapshotError::UnsupportedProfile { found: "0x02".to_owned() },
+                "snapshot written under an unknown profile 0x02",
+                None,
+            ),
+            (
+                SnapshotError::TopologyViolation { detail: "cycle".into() },
+                "topology violation: cycle",
+                None,
+            ),
+            (
+                SnapshotError::Store(cas_store::StoreError::Busy),
+                "store is busy: another writer holds the write lane; the operation did not take effect",
+                Some("store is busy: another writer holds the write lane; the operation did not take effect"),
+            ),
+        ];
+        for (error, display, source) in cases {
+            assert_eq!(error.to_string(), display, "Display for {error:?}");
+            assert_eq!(
+                error.source().map(std::string::ToString::to_string),
+                source.map(str::to_owned),
+                "source for {error:?}"
+            );
+        }
+    }
+}
