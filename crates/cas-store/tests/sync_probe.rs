@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cas_core::Role;
+use cas_core::{Object, Role};
 use cas_store::probe::{self, Event};
 use cas_store::{OpenMode, Store};
 
@@ -91,6 +91,7 @@ impl Counts {
         let mut counts = Self::default();
         for event in events {
             match event {
+                Event::Attempt(_) => {}
                 Event::PackWrite => counts.pack_write += 1,
                 Event::SyncFile => counts.sync_file += 1,
                 Event::SyncDir => counts.sync_dir += 1,
@@ -122,6 +123,11 @@ impl Counts {
 /// criteria map onto the checks below, each one its own assertion message.
 fn violations(events: &[Event]) -> Vec<String> {
     let mut found = Vec::new();
+    let events = match published_events(events) {
+        Ok(events) => events,
+        Err(problems) => return problems,
+    };
+    let events = events.as_slice();
     let counts = Counts::of(events);
 
     // V3: transactions must not nest or dangle.
@@ -204,11 +210,57 @@ fn violations(events: &[Event]) -> Vec<String> {
 
 fn label(event: &Event) -> &'static str {
     match event {
+        Event::Attempt(_) => "Attempt",
         Event::PackWrite => "PackWrite",
         Event::SyncFile => "SyncFile",
         Event::SyncDir => "SyncDir",
         Event::Rename => "Rename",
         Event::Sql(_) => "SQL",
+    }
+}
+
+/// Splits the log into staging attempts (ADR-002 §7.0).
+///
+/// A retry writes a fresh staging file, so its events repeat `PackWrite`/`SyncFile` and must
+/// not be counted as another pack. An attempt that never reached `Rename` published nothing:
+/// its events are dropped from the counts but still checked for the one thing a failed attempt
+/// must never do — open a transaction.
+fn attempts(events: &[Event]) -> Vec<Vec<Event>> {
+    let mut groups: Vec<Vec<Event>> = Vec::new();
+    for event in events {
+        if matches!(event, Event::Attempt(_)) {
+            groups.push(Vec::new());
+        } else if let Some(last) = groups.last_mut() {
+            last.push(event.clone());
+        } else {
+            groups.push(vec![event.clone()]);
+        }
+    }
+    groups
+}
+
+/// The events of the attempts that published a pack, plus the retry-scope check.
+fn published_events(events: &[Event]) -> Result<Vec<Event>, Vec<String>> {
+    let mut kept = Vec::new();
+    let mut problems = Vec::new();
+    for group in attempts(events) {
+        let published = group.iter().any(|event| matches!(event, Event::Rename));
+        if published {
+            kept.extend(group);
+        } else if group
+            .iter()
+            .any(|event| event.is_begin() || event.is_commit())
+        {
+            problems.push(
+                "retry: a failed staging attempt opened a transaction; retries must wrap                  staging only (ADR-002 §7.0)"
+                    .to_owned(),
+            );
+        }
+    }
+    if problems.is_empty() {
+        Ok(kept)
+    } else {
+        Err(problems)
     }
 }
 
@@ -237,7 +289,7 @@ fn a_pack_costs_one_sync_and_one_short_transaction() {
         let events = probe::events();
 
         assert_eq!(report.packs, expected_packs);
-        let counts = Counts::of(&events);
+        let counts = Counts::of(&published_events(&events).expect("no retry-scope violation"));
         // V6: a batch that publishes something must have written a pack.
         assert!(counts.pack_write >= 1, "the probe saw no pack write at all");
         assert_eq!(counts.pack_write, expected_packs, "PackWrite");
@@ -419,4 +471,106 @@ fn the_transaction_does_not_grow_with_the_object_count() {
         h1000 <= 100.0 * sync,
         "H(1000) = {h1000:.0} ns is more than 100 fsyncs: the transaction is doing per-object work"
     );
+}
+
+/// The retry path, deterministically: an opener sweeps `tmp/` between `PackWrite` and the
+/// rename (ADR-002 §7.0). The publish must succeed, the index must hold one row, and the
+/// failed attempt must not have opened a transaction.
+#[test]
+fn a_swept_staging_file_is_retried_without_publishing_twice() {
+    let _guard = serialised();
+    let root = TempRoot::new("swept");
+    let store = Store::open(root.store(), OpenMode::Create).expect("open");
+
+    cas_store::testing::reset_staging_retries();
+    cas_store::testing::sweep_temporaries_on_next_staging();
+    probe::reset();
+    let report = publish(&store, 1);
+    let retries = cas_store::testing::staging_retries();
+    let events = probe::events();
+
+    assert_eq!(report.packs, 1, "the pack is published exactly once");
+    assert!(retries >= 1, "the armed sweep did force a retry");
+    assert_eq!(
+        violations(&events),
+        Vec::<String>::new(),
+        "the successful attempt is clean and the failed one opened no transaction"
+    );
+    // Exactly one `Rename` and one transaction, even though staging ran twice.
+    let counts = Counts::of(&published_events(&events).expect("no violation"));
+    assert_eq!(counts.rename, 1);
+    assert_eq!(counts.txn_begin, 1);
+    assert_eq!(store.object_count().expect("count"), 1);
+    assert!(store.verify().expect("verify").is_clean());
+}
+
+/// N threads publishing the same object: one index row, a pack on disk, `verify` clean.
+///
+/// Repeated 20 times because the failure this guards (a swept staging file, a lost
+/// `INSERT OR IGNORE` race) only appears when the timing lands — a single green run would not
+/// tell us anything. Retry counts are reported rather than asserted: the race is legitimate,
+/// and how often it had to be absorbed is the interesting number.
+#[test]
+fn concurrent_publishers_of_one_object_leave_one_row_and_a_clean_store() {
+    let root = TempRoot::new("concurrent");
+    let value = vec![0x5Au8; 700];
+    let mut total_retries = 0u64;
+    for round in 0..20 {
+        let _guard = serialised();
+        let round_root = root.store().join(format!("round-{round}"));
+        drop(Store::open(&round_root, OpenMode::Create).expect("create"));
+        cas_store::testing::reset_staging_retries();
+        // One handle per thread: a `Store` owns a SQLite connection, which is neither `Send`
+        // nor `Sync`, so contention is exercised the way the API allows — several openers of
+        // the same files (ADR-002 §8).
+        let store = Store::open(&round_root, OpenMode::ReadWrite).expect("open");
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let round_root = round_root.clone();
+                    let value = value.clone();
+                    scope.spawn(
+                        move || match Store::open(&round_root, OpenMode::ReadWrite) {
+                            Ok(store) => store.put(Role::Bytes, &value),
+                            Err(error) => Err(error),
+                        },
+                    )
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("thread"))
+                .collect()
+        });
+        for outcome in outcomes {
+            match outcome {
+                Ok(_) => {}
+                Err(cas_store::StoreError::Busy) => {}
+                Err(other) => panic!("round {round}: unexpected failure {other:?}"),
+            }
+        }
+        let retries = cas_store::testing::staging_retries();
+        total_retries += retries;
+        assert_eq!(
+            store.object_count().expect("count"),
+            1,
+            "round {round}: the object must have exactly one index row"
+        );
+        let report = store.verify().expect("verify");
+        assert!(report.is_clean(), "round {round}: {report:?}");
+        assert!(report.packs_checked >= 1, "round {round}: the pack exists");
+        assert_eq!(
+            &Object::decode(
+                &store
+                    .get(cas_store::Store::identify(Role::Bytes, &value).expect("identify"))
+                    .expect("get")
+            )
+            .expect("decode")
+            .value()
+            .to_vec(),
+            &value,
+            "round {round}: identical bytes"
+        );
+    }
+    eprintln!("20 rounds, 4 threads each: {total_retries} staging retries in total");
 }

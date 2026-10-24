@@ -148,3 +148,45 @@ pub fn pack_read_bytes() -> u64 {
 pub fn reset_pack_read_bytes() {
     PACK_READ_BYTES.store(0, Ordering::Relaxed);
 }
+
+/// How many staging attempts had to be retried because a concurrent opener swept `tmp/`.
+static STAGING_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Records one retried staging attempt.
+pub(crate) fn note_staging_retry() {
+    STAGING_RETRIES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Staging attempts retried since the last [`reset_staging_retries`].
+#[must_use]
+pub fn staging_retries() -> u64 {
+    STAGING_RETRIES.load(Ordering::Relaxed)
+}
+
+/// Resets the retry counter.
+pub fn reset_staging_retries() {
+    STAGING_RETRIES.store(0, Ordering::Relaxed);
+}
+
+/// Arms one deterministic sweep of `tmp/` inside the next staging attempt.
+///
+/// This is the "concurrent opener cleans `tmp/` while a pack is being staged" case
+/// (ADR-002 §7.0) without relying on thread timing: the sweep happens between `PackWrite` and
+/// the rename, which is exactly the window a second process opening the Store hits.
+static SWEEP_ONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Arms the sweep for the next staging attempt.
+pub fn sweep_temporaries_on_next_staging() {
+    SWEEP_ONCE.store(1, Ordering::Relaxed);
+}
+
+/// Called by the write path right after `PackWrite`; sweeps `tmp/` when armed.
+pub(crate) fn run_staging_sweep(temporaries: &std::path::Path) {
+    if SWEEP_ONCE.swap(0, Ordering::Relaxed) == 1 {
+        if let Ok(entries) = std::fs::read_dir(temporaries) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}

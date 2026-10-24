@@ -253,12 +253,18 @@ pub(crate) fn verify_all(database: &Database, layout: &Layout) -> StoreResult<Ve
     })
 }
 
-/// Checks one pack: its tail, and that its index rows describe exactly its frames.
+/// Checks one pack: its tail, and that every index row points at a frame inside the body.
+///
+/// The rows do **not** have to tile the body. Two publishers racing on the same object both
+/// write a frame; the loser's `INSERT OR IGNORE` is ignored, so its frame stays in its pack as
+/// dead bytes for GC's repack to reclaim (ADR-008 §5, §6.3). What must hold is the weaker,
+/// checkable claim of ADR-008 §7: each row's `(offset, length)` lies inside the body (before
+/// the tail) and no two rows overlap, so every row addresses exactly one frame.
 fn verify_pack(database: &Database, layout: &Layout, pack_id: &str) -> StoreResult<()> {
     let tail = pack::verify(layout, pack_id)?;
     let mut statement = database.connection.prepare(
         "SELECT oid, length, offset FROM object_location
-         WHERE kind = ?1 AND location = ?2 ORDER BY offset",
+         WHERE kind = ?1 AND location = ?2 ORDER BY offset, length",
     )?;
     let rows = statement
         .query_map((schema::KIND_PACK, pack_id), |row| {
@@ -270,18 +276,17 @@ fn verify_pack(database: &Database, layout: &Layout, pack_id: &str) -> StoreResu
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut expected_offset = 0i64;
+    let mut previous_end = 0i64;
     for (oid, length, offset) in rows {
-        if offset != expected_offset {
+        if offset < 0 || length <= 0 {
             return Err(StoreError::CorruptPack {
                 pack_id: pack_id.to_owned(),
                 cause: CorruptCause::PackTail(format!(
-                    "object {oid} starts at {offset}, expected {expected_offset}: \
-                     frames must be contiguous"
+                    "object {oid} has a non-positive frame {offset}+{length}"
                 )),
             });
         }
-        let end = offset + length;
+        let end = offset.saturating_add(length);
         if end as u64 > tail.frames_len {
             return Err(StoreError::CorruptPack {
                 pack_id: pack_id.to_owned(),
@@ -291,35 +296,15 @@ fn verify_pack(database: &Database, layout: &Layout, pack_id: &str) -> StoreResu
                 )),
             });
         }
-        expected_offset = end;
-    }
-    if expected_offset as u64 != tail.frames_len {
-        return Err(StoreError::CorruptPack {
-            pack_id: pack_id.to_owned(),
-            cause: CorruptCause::PackTail(format!(
-                "index rows cover {expected_offset} bytes, the tail declares {}",
-                tail.frames_len
-            )),
-        });
-    }
-    if tail.count as usize != expected_offset_count(database, pack_id)? {
-        return Err(StoreError::CorruptPack {
-            pack_id: pack_id.to_owned(),
-            cause: CorruptCause::PackTail(format!(
-                "tail declares {} frames, the index has {} rows",
-                tail.count,
-                expected_offset_count(database, pack_id)?
-            )),
-        });
+        if offset < previous_end {
+            return Err(StoreError::CorruptPack {
+                pack_id: pack_id.to_owned(),
+                cause: CorruptCause::PackTail(format!(
+                    "object {oid} starts at {offset}, inside the frame that ends at {previous_end}"
+                )),
+            });
+        }
+        previous_end = end;
     }
     Ok(())
-}
-
-fn expected_offset_count(database: &Database, pack_id: &str) -> StoreResult<usize> {
-    let count: i64 = database.connection.query_row(
-        "SELECT COUNT(*) FROM object_location WHERE kind = ?1 AND location = ?2",
-        (schema::KIND_PACK, pack_id),
-        |row| row.get(0),
-    )?;
-    Ok(count as usize)
 }

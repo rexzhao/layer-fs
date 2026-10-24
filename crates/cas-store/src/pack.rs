@@ -30,9 +30,9 @@ pub(crate) const TAIL_BYTES: u64 = 4 + 4 + 8 + 32;
 
 /// The observable steps of writing one pack, in the order they happen.
 ///
-/// Like [`PublishStep`](crate::PublishStep), this is the single description of the
-/// sequence: production passes [`NoPackObservation`], the crash-injection tests pass an
-/// observer that aborts, and both run the same code.
+/// This is the single description of the sequence: production passes
+/// [`NoPackObservation`], the crash-injection tests pass an observer that aborts, and both run
+/// the same code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackStep {
     /// The complete pack (frames + tail) has been written to `tmp/`, not synced.
@@ -118,14 +118,22 @@ pub(crate) fn write(
     // The staging file can legitimately disappear underneath us: `tmp/` is a *shared*
     // directory and every open of the Store sweeps it (ADR-002 §7). A second process opening
     // the same Store while this pack is being staged therefore deletes our staging file
-    // between `create` and `rename`, which is the same race the retired loose path handled by
-    // adopting the target. Nothing has been published at that point, so staging again is not
-    // a replay of an effect — it is the same, still-unpublished write. Bounded, because a
-    // store whose `tmp/` is being cleared in a loop is a different problem.
+    // between `create` and `rename`. ADR-002 §7.0 decides the shape of the answer, and this is
+    // its (d): retry the staging segment under three conditions —
+    //
+    // 1. each attempt uses a **new** staging name and rewrites the pack from the start (never
+    //    appends to a file another process may have truncated);
+    // 2. the retry wraps **only** staging + rename: no database transaction, nothing on the
+    //    read path, is ever replayed;
+    // 3. only `NotFound`/`PermissionDenied` are retried, and when the attempts are exhausted
+    //    the **original** error is reported, not a later symptom.
+    //
+    // P2b-6 replaces this with "ordinary opens do not sweep; the offline GC reclaims tmp/".
     const ATTEMPTS: u32 = 20;
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
+    let mut first_failure: Option<StoreError> = None;
+    for attempt in 1..=ATTEMPTS {
+        #[cfg(feature = "sync-probe")]
+        crate::probe::begin_attempt();
         let staged = layout.temporaries().join(temporary_name());
         let staged_result = (|| -> StoreResult<()> {
             {
@@ -137,6 +145,11 @@ pub(crate) fn write(
                 sync_file(&file)?;
                 observer.step(PackStep::StagedSynced);
             }
+            // The staging file is closed here, which is the window a concurrent opener's
+            // `tmp/` sweep actually interrupts (on Windows a sweep while the handle is open
+            // fails instead). The hook runs at that exact point.
+            #[cfg(feature = "crash-points")]
+            crate::testing::run_staging_sweep(&layout.temporaries());
             rename_replace(&staged, &layout.pack_path(pack_id)).map_err(StoreError::Io)
         })();
         match staged_result {
@@ -148,9 +161,28 @@ pub(crate) fn write(
                         std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
                     ) =>
             {
+                if first_failure.is_none() {
+                    first_failure = Some(StoreError::Io(error));
+                }
+                #[cfg(feature = "crash-points")]
+                crate::testing::note_staging_retry();
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            Err(other) => return Err(other),
+            Err(other) => {
+                // A different failure, or the last attempt: report the first error we saw if
+                // this is the same *kind* of transient failure, otherwise this one.
+                return Err(match (&first_failure, &other) {
+                    (Some(first), StoreError::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                        ) =>
+                    {
+                        clone_store_error(first)
+                    }
+                    _ => other,
+                });
+            }
         }
     }
     observer.step(PackStep::Renamed);
@@ -232,6 +264,16 @@ pub(crate) fn verify(layout: &Layout, pack_id: &str) -> StoreResult<PackTail> {
         ));
     }
     Ok(PackTail { count, frames_len })
+}
+
+/// Rebuilds the original error for the caller (the retry needs it after the fact).
+fn clone_store_error(error: &StoreError) -> StoreError {
+    match error {
+        StoreError::Io(inner) => {
+            StoreError::Io(std::io::Error::new(inner.kind(), inner.to_string()))
+        }
+        other => StoreError::Io(std::io::Error::other(other.to_string())),
+    }
 }
 
 fn corrupt_pack(pack_id: &str, what: &str) -> StoreError {

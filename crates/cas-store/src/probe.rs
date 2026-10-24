@@ -20,6 +20,10 @@ use std::sync::{Mutex, OnceLock};
 /// One observable event, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// A staging attempt starts. Failed attempts (a concurrent opener swept `tmp/`) are
+    /// reported separately so they cannot pollute the per-pack counts: the acceptance
+    /// criteria count *published* packs, and a failed attempt publishes nothing.
+    Attempt(u32),
     /// A pack's bytes were written to `tmp/` (frames + tail), not yet synced.
     PackWrite,
     /// `durability::sync_file` was called.
@@ -75,6 +79,13 @@ impl Event {
 fn log() -> &'static Mutex<Vec<Event>> {
     static LOG: OnceLock<Mutex<Vec<Event>>> = OnceLock::new();
     LOG.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Starts a staging attempt and records its number (1-based, process-wide).
+pub(crate) fn begin_attempt() {
+    static ATTEMPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let number = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    record(Event::Attempt(number));
 }
 
 /// Appends one event. Called from the production functions; does nothing else.

@@ -43,9 +43,14 @@ pub(crate) fn sync_file(file: &File) -> io::Result<()> {
 /// Both paths must be on the same filesystem; a cross-device rename fails with
 /// an error rather than being emulated by copy-and-delete (ADR-002 §3).
 pub(crate) fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
+    let result = std::fs::rename(from, to);
+    // Record only a rename that happened: a failed rename is part of a staging attempt that
+    // publishes nothing, and the sequence checker must be able to tell those apart.
     #[cfg(feature = "sync-probe")]
-    crate::probe::record(crate::probe::Event::Rename);
-    std::fs::rename(from, to)
+    if result.is_ok() {
+        crate::probe::record(crate::probe::Event::Rename);
+    }
+    result
 }
 
 /// Makes a directory's entries durable, best effort (see the module docs).
