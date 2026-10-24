@@ -192,7 +192,14 @@ impl<'a> Batch<'a> {
             let encoded = pack::encode(&mut frames);
             pack::write(self.layout, &pack_id, &encoded.bytes, observer)?;
             let size = encoded.bytes.len() as u64;
-            record_pack(self.database, &pack_id, &frames, size, observer)?;
+            record_pack(
+                self.database,
+                self.layout,
+                &pack_id,
+                &frames,
+                size,
+                observer,
+            )?;
             packs += 1;
             new_objects += frames.len();
         }
@@ -237,6 +244,7 @@ fn split(pending: Vec<Pending>, limit: u64) -> Vec<Vec<Pending>> {
 /// repack to reclaim (ADR-008 §5, §6.3). Both callers still succeed.
 fn record_pack(
     database: &Database,
+    layout: &Layout,
     pack_id: &str,
     frames: &[PackedFrame],
     bytes: u64,
@@ -261,6 +269,21 @@ fn record_pack(
     #[cfg(feature = "sync-probe")]
     crate::probe::run_injection();
 
+    // Diagnostic (feature `staging-audit`, default off): the file must exist before any index
+    // row names it. If this fires, the write path broke the "pack row == pack file" invariant.
+    #[cfg(feature = "staging-audit")]
+    {
+        let path = layout.pack_path(pack_id);
+        let meta = std::fs::metadata(&path).unwrap_or_else(|error| {
+            panic!("staging-audit: {pack_id} missing before commit: {error}")
+        });
+        assert_eq!(
+            meta.len(),
+            bytes,
+            "staging-audit: {pack_id} is {} bytes, expected {bytes}",
+            meta.len()
+        );
+    }
     write_rows(&transaction, pack_id, frames, bytes)?;
     transaction.commit()?;
     #[cfg(any(feature = "sync-probe", feature = "lock-probe"))]

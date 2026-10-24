@@ -17,6 +17,9 @@ sync-probe = ["rusqlite/trace"]
 # Transaction timings only: no `trace`, so the measurement is not polluted by a per-statement
 # callback inside the very window it measures (ADR-008 §5 acceptance D).
 lock-probe = []
+# Diagnostics only (default off): asserts that a pack file exists before its index rows are
+# committed, so "index names a missing pack" can be attributed to the write path.
+staging-audit = []
 
 [dependencies]
 blake3.workspace = true
