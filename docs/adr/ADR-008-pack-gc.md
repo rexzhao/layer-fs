@@ -62,6 +62,8 @@ mailbox `manager/c7yba9ud6s`、`manager/taek3xts1d`）：
   照旧解码并校验身份（ADR-002 §6）——单对象读无放大；
 - pack 写完即不可变；只会被整体删除（GC）；
 - 单个 pack 的大小上限 64 MiB（写入 `store_policy.pack_max_bytes`），一批超出则顺序切成多个 pack。
+  **该上限约束帧体（frame body）**；48 B 的尾部不计入，因此实际文件可达 `pack_max_bytes + 48`。切分判据
+  （§5、§9 测试 2）按帧长累加计算，与实现一致。
 
 ## 4. 元数据 schema v3（cas-store）
 
