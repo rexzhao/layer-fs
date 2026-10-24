@@ -435,8 +435,13 @@ VerificationReport { checked: 9, packs_checked: 3,
   实时防护位为 1；Defender 不是主防护），其 `Get-MpThreatDetection` = 0、`ExclusionPath` = 空、MPLog 不存在。
   该第三方 AV 是**首要嫌疑但不是结论**（未抓到具体进程）。早期记录保留：`Get-MpComputerStatus`
   在本机失败 ⇒ 只能说"没有可见的 Defender 处置痕迹"，不能说"AV 无关"。
-- **产品侧处置**：不修"删除"（非本仓库可控），改为让损坏**可诊断**（P2b-2d：`MissingPack` typed 语义）；
-  发布期可见性确认/有界重 staging 是否做，待 architect 判定（P2b-2e）。
+- **产品侧处置（已合入 main `6b2c201`）**：
+  1. **可诊断**（P2b-2d）：`MissingPack { pack_id }` typed 语义，四类错误（`NotFound` / `MissingPack` /
+     `Corrupt` / `Io`）互不退化；`verify` 的 `missing_packs` 与 `kind == Missing` 条数绑死；受影响对象各一条失败。
+  2. **不发生**（P2b-2e）：发布期 **pin**（Windows 不共享 `FILE_SHARE_DELETE`）把 `rename → COMMIT` 窗口内"pack 必定存在"
+     下沉为 **OS 保证**（ADR-008 §5.2）。architect 明确**否决**"可见性复查 + 重新 staging"：复查不消除窗口，
+     重试会把数据丢失降级为延迟暴露。
+  3. 详见 `docs/reports/p2b2d-2e-merge.md`（含证据边界：10 连全绿**不**背书容忍逻辑，真正的反证是 T2b/T3）。
 - **对不变式的影响**：`pack` 行 ⇒ 文件存在，**在本机环境下不成立**。P2b-6 的 GC 设计不得静默依赖它：
   mark/sweep 遇到"行在文件缺"必须按"存储损坏"计数并报告，不得当成"没有对象"或"孤儿文件"处理。
 
