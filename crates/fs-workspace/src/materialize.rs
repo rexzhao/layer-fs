@@ -61,14 +61,16 @@ const PAGE_LIMIT: usize = 256;
 /// caller — a typed `Busy`. So the failure is kept aside and substituted by [`publish`],
 /// which is what every encoder call goes through.
 pub(crate) struct StoreSink<'a> {
-    pub(crate) store: &'a Store,
+    /// The batch this materialisation publishes through: one `fsync` per pack and one short
+    /// transaction per pack (ADR-008 §5), instead of one of each per object.
+    batch: Option<cas_store::Batch<'a>>,
     failure: Option<cas_store::StoreError>,
 }
 
 impl<'a> StoreSink<'a> {
     pub(crate) fn new(store: &'a Store) -> Self {
         Self {
-            store,
+            batch: Some(store.batch()),
             failure: None,
         }
     }
@@ -77,12 +79,36 @@ impl<'a> StoreSink<'a> {
     fn take_failure(&mut self) -> Option<cas_store::StoreError> {
         self.failure.take()
     }
+
+    /// Publishes every object put through this sink, in pack order (ADR-008 §5).
+    ///
+    /// Until this returns, nothing the sink accepted is published: a traversal that fails
+    /// halfway leaves no visible objects at all, which is stronger than the loose-object
+    /// order it replaces (that one left unreferenced files behind).
+    pub(crate) fn commit(&mut self) -> Result<cas_store::BatchReport, cas_store::StoreError> {
+        match self.batch.take() {
+            Some(batch) => batch.commit(),
+            // Committing twice is a caller bug, not a storage failure; the empty report is
+            // the truthful answer (everything this sink had was already published).
+            None => Ok(cas_store::BatchReport {
+                new_objects: 0,
+                already_present: 0,
+                packs: 0,
+            }),
+        }
+    }
 }
 
 impl PageSink for StoreSink<'_> {
     fn put(&mut self, role: Role, value: &[u8]) -> SnapshotResult<ObjectId> {
-        match self.store.put(role, value) {
-            Ok(published) => Ok(published.oid),
+        let Some(batch) = self.batch.as_mut() else {
+            return Err(SnapshotError::Malformed {
+                detail: "the batch was already committed; no object may be added after it"
+                    .to_owned(),
+            });
+        };
+        match batch.put(role, value) {
+            Ok(oid) => Ok(oid),
             Err(error) => {
                 self.failure = Some(error);
                 Err(SnapshotError::Malformed {
@@ -213,7 +239,7 @@ pub(crate) fn encode(
     let table = publish(&mut sink, |sink| {
         encode_inode_table(&profile, records.into_values(), sink)
     })?;
-    publish(&mut sink, |sink| {
+    let root = publish(&mut sink, |sink| {
         encode_root(
             &profile,
             &RootValue {
@@ -222,7 +248,11 @@ pub(crate) fn encode(
             },
             sink,
         )
-    })
+    })?;
+    // One commit for the whole tree: every page of this snapshot lands in one pack (or a few,
+    // if it exceeds `pack_max_bytes`) with one `fsync` and one short transaction each.
+    sink.commit().map_err(WorkspaceError::from)?;
+    Ok(root)
 }
 
 fn encode_dir(sink: &mut StoreSink<'_>, node: &Node, profile: Profile) -> WorkspaceResult<Content> {

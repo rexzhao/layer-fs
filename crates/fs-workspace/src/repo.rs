@@ -761,7 +761,7 @@ impl Repo {
         let table = crate::materialize::publish(&mut sink, |sink| {
             encode_inode_table(&profile, records.into_iter(), sink)
         })?;
-        crate::materialize::publish(&mut sink, |sink| {
+        let root = crate::materialize::publish(&mut sink, |sink| {
             encode_root(
                 &profile,
                 &RootValue {
@@ -770,7 +770,9 @@ impl Repo {
                 },
                 sink,
             )
-        })
+        })?;
+        sink.commit().map_err(WorkspaceError::from)?;
+        Ok(root)
     }
 
     /// The serial scope a published tree was allocated in.

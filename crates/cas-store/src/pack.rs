@@ -115,16 +115,42 @@ pub(crate) fn write(
     bytes: &[u8],
     observer: &mut dyn PackObserver,
 ) -> StoreResult<()> {
-    let staged = layout.temporaries().join(temporary_name());
-    {
-        let mut file = File::create(&staged)?;
-        file.write_all(bytes)?;
-        observer.step(PackStep::Staged);
-        sync_file(&file)?;
-        observer.step(PackStep::StagedSynced);
+    // The staging file can legitimately disappear underneath us: `tmp/` is a *shared*
+    // directory and every open of the Store sweeps it (ADR-002 §7). A second process opening
+    // the same Store while this pack is being staged therefore deletes our staging file
+    // between `create` and `rename`, which is the same race the retired loose path handled by
+    // adopting the target. Nothing has been published at that point, so staging again is not
+    // a replay of an effect — it is the same, still-unpublished write. Bounded, because a
+    // store whose `tmp/` is being cleared in a loop is a different problem.
+    const ATTEMPTS: u32 = 20;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let staged = layout.temporaries().join(temporary_name());
+        let staged_result = (|| -> StoreResult<()> {
+            {
+                let mut file = File::create(&staged)?;
+                file.write_all(bytes)?;
+                observer.step(PackStep::Staged);
+                sync_file(&file)?;
+                observer.step(PackStep::StagedSynced);
+            }
+            rename_replace(&staged, &layout.pack_path(pack_id)).map_err(StoreError::Io)
+        })();
+        match staged_result {
+            Ok(()) => break,
+            Err(StoreError::Io(error))
+                if attempt < ATTEMPTS
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(other) => return Err(other),
+        }
     }
-    let target = layout.pack_path(pack_id);
-    rename_replace(&staged, &target)?;
     observer.step(PackStep::Renamed);
     sync_directory(&layout.packs())?;
     observer.step(PackStep::DirectorySynced);

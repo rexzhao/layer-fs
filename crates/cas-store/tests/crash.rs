@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use cas_core::{Object, ObjectId, Role};
-use cas_store::{CorruptCause, OpenMode, PutOutcome, Store};
+use cas_store::{OpenMode, PutOutcome, Store};
 
 /// The child's entry point. Runs before every test in this binary.
 #[test]
