@@ -1,0 +1,356 @@
+//! `references` tests: the edge primitive garbage collection marks with (P2b-6 §11, §12b).
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use cas_core::{ObjectId, Role};
+use cas_store::Store;
+use fs_snapshot::{
+    encode_directory, encode_extents, encode_inode_table, encode_root, Content, DirEntry, Extent,
+    InodeRecord, Kind, PageSink, Profile, RootValue, SnapshotError, SnapshotReader, SnapshotResult,
+};
+
+struct TempRoot {
+    path: std::path::PathBuf,
+}
+
+impl TempRoot {
+    fn new(label: &str) -> Self {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "fs-snapshot-references-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("temp root");
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+struct StoreSink<'a> {
+    store: &'a Store,
+}
+
+impl PageSink for StoreSink<'_> {
+    fn put(&mut self, role: Role, value: &[u8]) -> SnapshotResult<ObjectId> {
+        Ok(self.store.put(role, value)?.oid)
+    }
+}
+
+fn inode(serial: u64, kind: Kind, size: u64, content: Content) -> InodeRecord {
+    InodeRecord {
+        serial,
+        kind,
+        size,
+        created_ns: 1_000 + serial as i64,
+        modified_ns: 2_000 + serial as i64,
+        content,
+    }
+}
+
+/// Every object id the fixture plants, recorded **as it is created**.
+///
+/// The point of collecting them here rather than by walking is the same as §8's hand-built ground
+/// truth: expectations must not be produced by the code under test.
+struct Expected {
+    root: ObjectId,
+    table: ObjectId,
+    dir_leaf: ObjectId,
+    blob: ObjectId,
+    chunk: ObjectId,
+    /// Two extent trees that point at the *same* chunk, for the shared-child case.
+    extent_leaf_a: ObjectId,
+    extent_leaf_b: ObjectId,
+}
+
+/// root dir (leaf) with two files: one blob, one extent tree; plus an empty directory inode.
+///
+/// `file_a` and `file_b` share one chunk object, which is what C11' is about.
+fn fixture(store: &Store, profile: &Profile) -> Expected {
+    let mut sink = StoreSink { store };
+    let blob = store.put(Role::Bytes, b"hello").expect("put").oid;
+    let chunk = store
+        .put(Role::Bytes, &vec![7u8; profile.block_bytes as usize])
+        .expect("put")
+        .oid;
+
+    let shared_extent = || Extent {
+        logical_start: 0,
+        length: profile.block_bytes,
+        object: chunk,
+        source_offset: 0,
+    };
+    let extent_leaf_a = encode_extents(profile, std::iter::once(shared_extent()), &mut sink)
+        .expect("encode extents")
+        .expect("non-empty");
+    let extent_leaf_b = encode_extents(profile, std::iter::once(shared_extent()), &mut sink)
+        .expect("encode extents")
+        .expect("non-empty");
+
+    let dir_leaf = encode_directory(
+        profile,
+        vec![
+            DirEntry {
+                name: b"a".to_vec(),
+                child_serial: 1,
+            },
+            DirEntry {
+                name: b"b".to_vec(),
+                child_serial: 2,
+            },
+            DirEntry {
+                name: b"empty".to_vec(),
+                child_serial: 3,
+            },
+        ]
+        .into_iter(),
+        &mut sink,
+    )
+    .expect("encode dir")
+    .expect("non-empty");
+
+    let records = vec![
+        inode(0, Kind::Directory, 0, Content::Dir(dir_leaf)),
+        inode(1, Kind::File, 5, Content::Blob(blob)),
+        inode(
+            2,
+            Kind::File,
+            profile.block_bytes,
+            Content::Extents(extent_leaf_a),
+        ),
+        // A second file over the same chunk: the shared-subtree case.
+        inode(
+            3,
+            Kind::File,
+            profile.block_bytes,
+            Content::Extents(extent_leaf_b),
+        ),
+        // An empty directory and a zero-length file both carry `Empty`.
+        inode(4, Kind::Directory, 0, Content::Empty),
+        inode(5, Kind::File, 0, Content::Empty),
+    ];
+    let table = encode_inode_table(profile, records.into_iter(), &mut sink).expect("encode table");
+    let root = encode_root(
+        profile,
+        &RootValue {
+            scope_id: [1u8; 32],
+            inode_table: table,
+        },
+        &mut sink,
+    )
+    .expect("encode root");
+
+    Expected {
+        root,
+        table,
+        dir_leaf,
+        blob,
+        chunk,
+        extent_leaf_a,
+        extent_leaf_b,
+    }
+}
+
+fn set(ids: Vec<ObjectId>) -> std::collections::BTreeSet<ObjectId> {
+    ids.into_iter().collect()
+}
+
+// ------------------------------------------------------------------- postive cases
+
+#[test]
+fn a_root_references_exactly_its_inode_table() {
+    let root = TempRoot::new("root");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+
+    let reader = SnapshotReader::open(&store, expected.root, profile).expect("open reader");
+    assert_eq!(
+        reader.references(expected.root).expect("refs"),
+        vec![expected.table]
+    );
+}
+
+/// C10': a file's inode must yield its **content** objects. If only directory children came back,
+/// every file's bytes would look unreachable and one sweep would delete them all.
+#[test]
+fn an_inode_leaf_references_every_content_root() {
+    let root = TempRoot::new("inodes");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+
+    let reader = SnapshotReader::open(&store, expected.root, profile).expect("open reader");
+    let refs = set(reader.references(expected.table).expect("refs"));
+
+    // Exactly the six content roots (two of which are `Empty` and contribute nothing).
+    assert_eq!(
+        refs,
+        set(vec![
+            expected.dir_leaf,
+            expected.blob,
+            expected.extent_leaf_a,
+            expected.extent_leaf_b,
+        ]),
+        "an inode leaf must reference every content root and nothing else"
+    );
+}
+
+#[test]
+fn an_extent_leaf_references_the_chunks_it_points_at() {
+    let root = TempRoot::new("extents");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+
+    let reader = SnapshotReader::open(&store, expected.root, profile).expect("open reader");
+    assert_eq!(
+        set(reader.references(expected.extent_leaf_a).expect("refs")),
+        set(vec![expected.chunk])
+    );
+}
+
+/// A directory page holds inode **serials**, not object ids. Returning nothing here is correct and
+/// the reason the inode table level is where the `serial -> content` edge is collected.
+#[test]
+fn a_directory_leaf_references_no_objects() {
+    let root = TempRoot::new("dirdir");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+
+    let reader = SnapshotReader::open(&store, expected.root, profile).expect("open reader");
+    assert!(
+        reader
+            .references(expected.dir_leaf)
+            .expect("refs")
+            .is_empty(),
+        "a directory leaf must reference no objects: its entries are serials"
+    );
+}
+
+/// `Bytes`/`Chunk` are the graph's leaves: their bytes are the payload, and a non-empty result here
+/// would mean the walker keeps descending into data.
+#[test]
+fn a_byte_object_references_nothing() {
+    let root = TempRoot::new("bytes");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+
+    let reader = SnapshotReader::open(&store, expected.root, profile).expect("open reader");
+    assert!(reader.references(expected.blob).expect("refs").is_empty());
+    assert!(reader.references(expected.chunk).expect("refs").is_empty());
+}
+
+/// C11': two parents over one object must each see it. Nothing is remembered between calls — if it
+/// were, the second parent would report "no children" and the shared subtree would be swept.
+#[test]
+fn a_shared_object_is_reported_for_both_parents() {
+    let root = TempRoot::new("shared");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+
+    let reader = SnapshotReader::open(&store, expected.root, profile).expect("open reader");
+    assert_eq!(
+        set(reader.references(expected.extent_leaf_a).expect("refs")),
+        set(vec![expected.chunk]),
+        "first parent must see the shared chunk"
+    );
+    assert_eq!(
+        set(reader.references(expected.extent_leaf_b).expect("refs")),
+        set(vec![expected.chunk]),
+        "second parent must see the same chunk; a cache here would hide it"
+    );
+}
+
+/// C8': the call is a pure read — same oid, same list, and the store's bytes do not move.
+#[test]
+fn references_is_idempotent_and_writes_nothing() {
+    let root = TempRoot::new("pure");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+
+    let before = fingerprint(root.path());
+    let reader = SnapshotReader::open(&store, expected.root, profile).expect("open reader");
+    let first = reader.references(expected.table).expect("refs");
+    let second = reader.references(expected.table).expect("refs");
+    assert_eq!(first, second, "references must be idempotent");
+    let after = fingerprint(root.path());
+    assert_eq!(before, after, "references must not write to the store");
+}
+
+/// `{(relative path, length)}` over the store directory: an external measure, so "writes nothing"
+/// cannot be satisfied by the code under test lying about its own bookkeeping.
+fn fingerprint(dir: &std::path::Path) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current).expect("read dir").flatten() {
+            let meta = entry.metadata().expect("metadata");
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                let relative = entry
+                    .path()
+                    .strip_prefix(dir)
+                    .expect("inside")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                // Shared memory between connections has no durable content; ADR-008 §6.1.
+                if !relative.ends_with("-shm") {
+                    out.push((relative, meta.len()));
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+// ------------------------------------------------------------------- damage is not emptiness
+
+/// §12: a damaged object must be an **error**, never "no children".
+///
+/// The positive control is in the same test: the same call on a sound table succeeds and returns a
+/// non-empty list. Without it, a `references` that always failed would "pass" this test.
+#[test]
+fn a_damaged_object_is_an_error_not_an_empty_leaf() {
+    let root = TempRoot::new("damaged");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+    let reader = SnapshotReader::open(&store, expected.root, profile).expect("open reader");
+
+    // Positive control: the sound object answers.
+    assert!(!reader
+        .references(expected.table)
+        .expect("sound table")
+        .is_empty());
+
+    // A value published as an inode table but truncated: a well-formed header claiming one record,
+    // then nothing. The format byte is right, so the failure is the truncated record itself and not
+    // an earlier refusal.
+    let damaged = store
+        .put(Role::InodeTable, &[profile.fmt, 0u8, 1, 0, 0, 0])
+        .expect("put")
+        .oid;
+    let error = reader
+        .references(damaged)
+        .expect_err("a truncated inode page must not read as an empty leaf");
+    assert!(
+        matches!(error, SnapshotError::Malformed { .. }),
+        "expected a typed Malformed, got {error:?}"
+    );
+}

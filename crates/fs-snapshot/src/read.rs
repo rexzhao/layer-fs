@@ -193,6 +193,173 @@ impl<'a> SnapshotReader<'a> {
         })
     }
 
+    /// The objects `oid` **directly** references - not `oid` itself (ADR-008 section 6.3).
+    ///
+    /// This is the one edge primitive garbage collection needs, and nothing more: it does not
+    /// descend, it does not remember what it returned across calls, and it does not need to know
+    /// who the caller is. Descending and de-duplicating are the *mark* algorithm's job, because
+    /// its marked set is the evidence a sweep is judged by (P2b-6 section 11). A library that
+    /// de-duplicated internally would make "the shared subtree was walked once" unobservable.
+    ///
+    /// What counts as an edge, per domain:
+    ///
+    /// - filesystem root: the inode table page, nothing else (profile, scope and root serial are
+    ///   values, not objects);
+    /// - inode table leaf: each inode's **content root** (`Blob`/`Extents`/`Dir`); a branch page:
+    ///   its child pages;
+    /// - directory page leaf: **nothing**. Entries carry inode *serials*, not object ids; the
+    ///   `serial -> content root` edge lives at the inode table level. This must not be read as
+    ///   "a directory references nothing";
+    /// - extent leaf: the chunk objects it points at; an extent branch: its child pages;
+    /// - `Bytes`/`Chunk`: nothing (leaves of the graph).
+    ///
+    /// Duplicates inside a single page are collapsed - a page naming one object twice is one edge
+    /// as far as this call goes. Across calls nothing is remembered, so an object reached from two
+    /// parents is returned both times (P2b-6 C11').
+    ///
+    /// # Errors
+    ///
+    /// Any store or decode failure is returned. A damaged object is **never** treated as a leaf:
+    /// "no children" and "children unknown" lead to opposite actions - one deletes a subtree, the
+    /// other must abort (P2b-6 section 12).
+    pub fn references(&self, oid: ObjectId) -> SnapshotResult<Vec<ObjectId>> {
+        let role = role_of(self.store, oid)?;
+        match role {
+            Role::FilesystemRoot => {
+                let value = fetch(self.store, oid, Role::FilesystemRoot, "filesystem root")?;
+                let mut reader = Reader::new(&value);
+                reader.format(self.profile.fmt)?;
+                let _profile = reader.take(32)?;
+                let _scope = reader.take(32)?;
+                let _root_serial = reader.u64()?;
+                let inode_table = reader.oid()?;
+                reader.finish()?;
+                Ok(vec![inode_table])
+            }
+            Role::InodeTable => {
+                let value = fetch(self.store, oid, Role::InodeTable, "inode table")?;
+                let mut reader = Reader::new(&value);
+                reader.format(self.profile.fmt)?;
+                check_page_size(&value, &self.profile)?;
+                let mut out = Vec::new();
+                match reader.u8()? {
+                    // Leaf: every record's content root is an edge.
+                    0 => {
+                        let count = reader.u32()?;
+                        for _ in 0..count {
+                            let record = decode_inode(&mut reader, self.profile)?;
+                            match record.content {
+                                Content::Empty => {}
+                                Content::Blob(child)
+                                | Content::Extents(child)
+                                | Content::Dir(child) => out.push(child),
+                            }
+                        }
+                    }
+                    // Branch: the child pages are the edges. Their records come later, one fetch
+                    // at a time; that is the whole point of not descending here.
+                    1 => {
+                        let height = reader.u8()?;
+                        if height == 0 {
+                            return Err(malformed("an inode branch height must be at least 1"));
+                        }
+                        let count = reader.u32()?;
+                        if count == 0 {
+                            return Err(malformed("an inode branch may not be empty"));
+                        }
+                        for _ in 0..count {
+                            let _first_serial = reader.u64()?;
+                            out.push(reader.oid()?);
+                            let _subtree_count = reader.u64()?;
+                        }
+                    }
+                    other => {
+                        return Err(malformed(format!("unknown inode page node byte {other}")));
+                    }
+                }
+                reader.finish()?;
+                Ok(without_duplicates(out))
+            }
+            Role::DirectoryLeaf => {
+                // Decoded so a damaged leaf still fails loudly, but it yields no object
+                // references: entries hold serials.
+                let value = fetch(self.store, oid, Role::DirectoryLeaf, "directory leaf")?;
+                let mut reader = Reader::new(&value);
+                reader.format(self.profile.fmt)?;
+                check_page_size(&value, &self.profile)?;
+                let count = reader.u32()?;
+                for _ in 0..count {
+                    let _name = reader.name(self.profile.name_max)?;
+                    let _child_serial = reader.u64()?;
+                }
+                reader.finish()?;
+                Ok(Vec::new())
+            }
+            Role::DirectoryBranch => {
+                let value = fetch(self.store, oid, Role::DirectoryBranch, "directory branch")?;
+                let mut reader = Reader::new(&value);
+                reader.format(self.profile.fmt)?;
+                check_page_size(&value, &self.profile)?;
+                let height = reader.u8()?;
+                if height == 0 {
+                    return Err(malformed("a directory branch height must be at least 1"));
+                }
+                let count = reader.u32()?;
+                if count == 0 {
+                    return Err(malformed("a directory branch may not be empty"));
+                }
+                let mut out = Vec::new();
+                for _ in 0..count {
+                    let _first_name = reader.name(self.profile.name_max)?;
+                    out.push(reader.oid()?);
+                    let _subtree_count = reader.u64()?;
+                }
+                reader.finish()?;
+                Ok(without_duplicates(out))
+            }
+            Role::ExtentLeaf => {
+                let value = fetch(self.store, oid, Role::ExtentLeaf, "extent leaf")?;
+                let mut reader = Reader::new(&value);
+                reader.format(self.profile.fmt)?;
+                check_page_size(&value, &self.profile)?;
+                let count = reader.u32()?;
+                let mut out = Vec::new();
+                for _ in 0..count {
+                    let _start = reader.u64()?;
+                    let _length = reader.u64()?;
+                    out.push(reader.oid()?);
+                    let _source_offset = reader.u64()?;
+                }
+                reader.finish()?;
+                Ok(without_duplicates(out))
+            }
+            Role::ExtentBranch => {
+                let value = fetch(self.store, oid, Role::ExtentBranch, "extent branch")?;
+                let mut reader = Reader::new(&value);
+                reader.format(self.profile.fmt)?;
+                check_page_size(&value, &self.profile)?;
+                let height = reader.u8()?;
+                if height == 0 {
+                    return Err(malformed("an extent branch height must be at least 1"));
+                }
+                let count = reader.u32()?;
+                if count == 0 {
+                    return Err(malformed("an extent branch may not be empty"));
+                }
+                let mut out = Vec::new();
+                for _ in 0..count {
+                    let _first_start = reader.u64()?;
+                    out.push(reader.oid()?);
+                    let _covered_end = reader.u64()?;
+                }
+                reader.finish()?;
+                Ok(without_duplicates(out))
+            }
+            // The graph's leaves: their bytes are the payload, nothing hangs off them.
+            Role::Bytes | Role::Chunk => Ok(Vec::new()),
+        }
+    }
+
     /// Looks up a name in a directory.
     ///
     /// # Errors
@@ -489,6 +656,20 @@ impl<'a> SnapshotReader<'a> {
             }),
         }
     }
+}
+
+/// Collapses duplicates while keeping first-seen order.
+///
+/// Within one page only: two parents reaching the same object must both see it (P2b-6 C11'),
+/// so nothing is remembered between calls.
+fn without_duplicates(ids: Vec<ObjectId>) -> Vec<ObjectId> {
+    let mut out: Vec<ObjectId> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 fn role_of(store: &Store, oid: ObjectId) -> SnapshotResult<Role> {
