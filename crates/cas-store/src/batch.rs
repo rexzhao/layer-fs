@@ -244,7 +244,7 @@ fn split(pending: Vec<Pending>, limit: u64) -> Vec<Vec<Pending>> {
 /// repack to reclaim (ADR-008 §5, §6.3). Both callers still succeed.
 fn record_pack(
     database: &Database,
-    layout: &Layout,
+    _layout: &Layout,
     pack_id: &str,
     frames: &[PackedFrame],
     bytes: u64,
@@ -273,7 +273,7 @@ fn record_pack(
     // row names it. If this fires, the write path broke the "pack row == pack file" invariant.
     #[cfg(feature = "staging-audit")]
     {
-        let path = layout.pack_path(pack_id);
+        let path = _layout.pack_path(pack_id);
         let meta = std::fs::metadata(&path).unwrap_or_else(|error| {
             panic!("staging-audit: {pack_id} missing before commit: {error}")
         });

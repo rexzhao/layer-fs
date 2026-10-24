@@ -185,6 +185,16 @@ pub(crate) fn write(
             }
         }
     }
+    #[cfg(feature = "staging-audit")]
+    {
+        // Evidence link: if the file later "disappears", this tells us whether the *name* was
+        // removed (link survives) or the whole directory entry went with it.
+        let evidence = layout.packs().join(format!("{pack_id}.pack.evidence"));
+        match std::fs::hard_link(layout.pack_path(pack_id), &evidence) {
+            Ok(()) => {}
+            Err(error) => eprintln!("staging-audit: no evidence link for {pack_id}: {error}"),
+        }
+    }
     observer.step(PackStep::Renamed);
     sync_directory(&layout.packs())?;
     observer.step(PackStep::DirectorySynced);
@@ -203,6 +213,51 @@ pub(crate) fn read_frame(
     length: u64,
 ) -> StoreResult<Vec<u8>> {
     let path = layout.pack_path(pack_id);
+    #[cfg(feature = "staging-audit")]
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            // One short retry, then the full picture: the exact path, every directory entry
+            // with *its own* error (Windows can fail a per-entry read while the directory is
+            // being modified — `.flatten()` would silently hide that), and the canonical root.
+            let mut line = format!(
+                "staging-audit: pack frame read failed for {pack_id}: {error}; path={}; root={:?}",
+                path.display(),
+                layout.root().canonicalize()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            match File::open(&path) {
+                Ok(file) => {
+                    eprintln!("{line}; RETRY SUCCEEDED (visibility delay)");
+                    file
+                }
+                Err(second) => {
+                    line.push_str(&format!("; retry failed: {second}; entries="));
+                    match std::fs::read_dir(layout.packs()) {
+                        Ok(entries) => {
+                            let mut listed = Vec::new();
+                            for entry in entries {
+                                match entry {
+                                    Ok(entry) => listed.push(format!(
+                                        "{:?}(len={:?})",
+                                        entry.file_name(),
+                                        entry.metadata().map(|meta| meta.len())
+                                    )),
+                                    Err(entry_error) => {
+                                        listed.push(format!("ENTRY-ERROR({entry_error})"))
+                                    }
+                                }
+                            }
+                            line.push_str(&format!("{listed:?}"));
+                        }
+                        Err(dir_error) => line.push_str(&format!("READDIR-ERROR({dir_error})")),
+                    }
+                    panic!("{line}");
+                }
+            }
+        }
+    };
+    #[cfg(not(feature = "staging-audit"))]
     let mut file = File::open(&path)?;
     let mut bytes = vec![0u8; usize::try_from(length).unwrap_or(0)];
     file.seek(SeekFrom::Start(offset))?;
@@ -305,6 +360,17 @@ pub(crate) fn new_pack_id() -> String {
     hasher.update(&nanos.to_le_bytes());
     hasher.update(&sequence.to_le_bytes());
     let digest = hasher.finalize();
+    #[cfg(feature = "staging-audit")]
+    eprintln!(
+        "staging-audit: pack_id pid={} nanos={} counter={} id={}",
+        std::process::id(),
+        nanos,
+        sequence,
+        digest.as_bytes()[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
     digest.as_bytes()[..16]
         .iter()
         .map(|byte| format!("{byte:02x}"))
