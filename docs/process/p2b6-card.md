@@ -270,3 +270,16 @@ C10' 只覆盖"文件内容"一种 kind；同样的漏读可以发生在任何 k
 fixture 仍要写，但 tripwire 保证不漏 kind。
 
 理由：K1/K5 只覆盖"最终可读"，覆盖不到"中间层漏边但根仍可读"——而后者正是"删掉一半数据后 `verify` 仍干净"的来源。
+
+## 15. `GcReport` 计数语义（architect，2026-10-24；写死字段含义，防 G5 被"重打包"喂饱）
+
+- `freed_objects` = **被判为不可达而删除的 oid 数**（sweep a 删的行 / 整体删除的 pack 里的行）。**重打包不增加它**：死帧里的
+  oid 本来就没有索引行，重打包只是搬运存活帧、回收死字节。
+- `freed_bytes` **分成两个数**（或一个结构），不要混：
+  - `freed_object_bytes`：不可达对象按索引 `length` 累计（能对应到 oid）；
+  - `reclaimed_dead_bytes`：重打包回收的帧内死字节（含无行帧、空包）。
+  理由：K9 的判据会含糊——"重打包腾出 10 KiB"与"删掉 3 个对象"是两种事实。
+- **G5 非真空用 `freed_objects > 0` 或 `marked_objects > 0` 判，不得用 `freed_bytes > 0`**：K9 场景（只有死字节、没有不可达
+  对象）应当 `freed_objects == 0` 且 `packs_repacked == 1`——这正是一条反向断言，能抓"把重打包算成删除"的实现。
+- `packs_deleted`：因**存活率为 0** 而整体删除的 pack；`packs_repacked`：阈值内**拷贝式重打包**的 pack。两者**互斥**
+  （同一 pack 不得同时出现在两数里），测试断言 `packs_deleted + packs_repacked <= packs_before`。
