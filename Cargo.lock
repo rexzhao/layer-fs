@@ -165,6 +165,7 @@ dependencies = [
  "fs-namespace",
  "fs-overlay",
  "fs-snapshot",
+ "fs-workspace",
  "rusqlite",
 ]
 

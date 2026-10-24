@@ -176,7 +176,6 @@ pub struct RootRow {
 /// (drop a snapshot row → G1 must go red; omit a root → G2 must go red; register but skip → G3).
 pub trait RootSource {
     /// The roots this run must protect.
-    /// The roots this run must protect.
     ///
     /// # Errors
     ///

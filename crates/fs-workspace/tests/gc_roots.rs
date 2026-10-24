@@ -380,7 +380,6 @@ fn the_injection_seam_is_consumed_and_leaves_no_residue() {
 
 // ------------------------------------------------ §7 injections that need live seams (F, label conflict)
 
-#[cfg(feature = "gc-test-hooks")]
 #[test]
 fn skip_root_makes_counter_example_f_constructible() {
     // F: the root stays in the declared set, but mark refuses to visit it. Only G3's per-kind /

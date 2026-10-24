@@ -19,3 +19,9 @@ fs-snapshot.workspace = true
 fs-overlay.workspace = true
 rusqlite.workspace = true
 blake3.workspace = true
+
+[dev-dependencies]
+# Self-reference so `cargo test -p fs-workspace` compiles the GC injection seams (ADR-008 §5.4,
+# P2b-6 §7). Same precedent as `cas-store`'s `crash-points`: the feature is off for every
+# consumer, and on for this crate's own tests, so the F counter-example actually runs.
+fs-workspace = { path = ".", features = ["gc-test-hooks"] }
