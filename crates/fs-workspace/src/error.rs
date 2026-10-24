@@ -109,13 +109,23 @@ impl fmt::Display for WorkspaceError {
 
 impl std::error::Error for WorkspaceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Exhaustive on purpose (C6): direct cause only, no recursion, and every wrapping
+        // variant listed so `chain()` cannot lose one.
         match self {
             WorkspaceError::Namespace(error) => Some(error),
             WorkspaceError::Overlay(error) => Some(error),
             WorkspaceError::Snapshot(error) => Some(error),
             WorkspaceError::Store(error) => Some(error),
             WorkspaceError::Sqlite(error) => Some(error),
-            _ => None,
+            WorkspaceError::BranchMoved { .. }
+            | WorkspaceError::NothingToCommit
+            | WorkspaceError::AlreadyExists { .. }
+            | WorkspaceError::NotFound { .. }
+            | WorkspaceError::WorkspaceDirty
+            | WorkspaceError::Busy { .. }
+            | WorkspaceError::Inconsistent { .. }
+            | WorkspaceError::SchemaMismatch { .. }
+            | WorkspaceError::NotInitialised => None,
         }
     }
 }

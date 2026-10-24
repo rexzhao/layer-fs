@@ -83,9 +83,18 @@ impl fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Exhaustive on purpose: a new variant that wraps a cause must be listed here, or a
+        // `chain()` walks past it and the cause disappears (architect's C6 rule). Only the
+        // *direct* cause is returned — never a recursive walk.
         match self {
             SnapshotError::Store(error) => Some(error),
-            _ => None,
+            SnapshotError::WrongRole { .. }
+            | SnapshotError::UnsupportedFormat { .. }
+            | SnapshotError::Malformed { .. }
+            | SnapshotError::Unsorted { .. }
+            | SnapshotError::Corrupt { .. }
+            | SnapshotError::UnsupportedProfile { .. }
+            | SnapshotError::TopologyViolation { .. } => None,
         }
     }
 }

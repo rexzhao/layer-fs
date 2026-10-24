@@ -181,15 +181,30 @@ impl fmt::Display for CorruptCause {
 
 impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Exhaustive on purpose (C6). Two branch kinds here, and both are tested:
+        //  - the wrapped cause is an `Error` (Io/Sqlite/InvalidObject);
+        //  - `Corrupt` delegates to its `CorruptCause`, and **only** the `Envelope` cause is an
+        //    `Error` — the others describe bytes, not a nested failure.
         match self {
             StoreError::Io(error) => Some(error),
             StoreError::Sqlite(error) => Some(error),
             StoreError::InvalidObject(error) => Some(error),
+            // `CorruptCause` is a description, not an `Error`: only the envelope branch wraps a
+            // real nested cause. Both branches are covered by tests (C6).
             StoreError::Corrupt {
                 cause: CorruptCause::Envelope(error),
                 ..
             } => Some(error),
-            _ => None,
+            StoreError::Corrupt { .. } => None,
+            StoreError::Busy
+            | StoreError::NotFound { .. }
+            | StoreError::MissingPack { .. }
+            | StoreError::CorruptPack { .. }
+            | StoreError::UnsupportedSchemaVersion { .. }
+            | StoreError::SchemaMismatch { .. }
+            | StoreError::ReadOnly
+            | StoreError::TooLarge { .. }
+            | StoreError::InvalidRecord { .. } => None,
         }
     }
 }

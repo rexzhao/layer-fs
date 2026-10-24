@@ -170,10 +170,22 @@ impl std::error::Error for InvalidPath {}
 
 impl std::error::Error for NamespaceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Exhaustive on purpose (C6): direct cause only.
         match self {
             NamespaceError::Store(error) => Some(error),
-            NamespaceError::InvalidPath(_) => None,
-            _ => None,
+            NamespaceError::NotFound { .. }
+            | NamespaceError::AlreadyExists { .. }
+            | NamespaceError::NotADirectory { .. }
+            | NamespaceError::IsADirectory { .. }
+            | NamespaceError::DirectoryNotEmpty { .. }
+            | NamespaceError::IntoOwnSubtree { .. }
+            | NamespaceError::IsRoot
+            | NamespaceError::InvalidPath(_)
+            | NamespaceError::NamespaceNotFound { .. }
+            | NamespaceError::SchemaMismatch { .. }
+            | NamespaceError::ReadOnly
+            | NamespaceError::InvalidRecord { .. }
+            | NamespaceError::NestedTransaction => None,
         }
     }
 }

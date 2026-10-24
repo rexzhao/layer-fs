@@ -77,11 +77,17 @@ impl fmt::Display for OverlayError {
 
 impl std::error::Error for OverlayError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Exhaustive on purpose (C6): a new variant that wraps a cause must be added here, or
+        // `chain()` would silently skip it. Direct cause only, no recursion.
         match self {
             OverlayError::Base(error) => Some(error),
             OverlayError::Namespace(error) => Some(error),
             OverlayError::Sqlite(error) => Some(error),
-            _ => None,
+            OverlayError::WorkspaceInUse { .. }
+            | OverlayError::SchemaMismatch { .. }
+            | OverlayError::PragmaNotApplied { .. }
+            | OverlayError::NestedTransaction
+            | OverlayError::InvalidRecord { .. } => None,
         }
     }
 }
