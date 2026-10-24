@@ -307,3 +307,21 @@ fixture 仍要写，但 tripwire 保证不漏 kind。
 
 **Y21a 的取向**（采纳 QA）：正向"GC 期间撞 `SQLITE_BUSY`"有窗口难题（0 次撞上 ≠ 通过），反向"先持锁再 GC"可确定性复现，
 同样证明"权威在 SQLite"。
+
+## 17. ⑤ 前基线（QA 只读测于 `b73f413`，2026-10-24）
+
+```
+cargo test --workspace --no-fail-fast → 299 passed / 0 failed / 6 ignored
+gc_roots --list     = 14
+gc_exclusive --list = 2   (其中 1 条当时 ignore；④ 完成后已摘)
+四件套              = build 0 / clippy 0 / fmt 0 / doc 0
+```
+
+用途：⑤ 交上来后跑同一套对照。**新增/减少的测试数必须可解释**（`--list` 原文 + "新增可见测试 N 个"），
+`gc_roots` 若从 14 变化，逐个名字对 Y1–Y22，防"多了一个测试但不覆盖任何 Y"。
+
+**独占面现状**：`gc_exclusive` 只有 2 个用例；卡里 8 条独占必测中，有 4 条依赖 ⑤ 的真实 GC 运行态。报告须注明
+"独占面共 2 用例、其中 4 条断言依赖 ⑤ 运行态"，避免读者误以为独占已全覆盖。
+
+**转交注意**：`b73f413` 已与 main 分叉，`git diff origin/main..b73f413 -- docs/` 会显示 **`p2b6-mark-handoff.md` 被删**，
+也就是说**从 `b73f413` 直接开工的人本地没有这份交接材料**。恢复工作第一件事必须是 `git fetch && git rebase origin/main`。
