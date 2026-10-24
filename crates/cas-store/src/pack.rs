@@ -50,11 +50,22 @@ pub(crate) fn audit(stage: &str, layout: &Layout, pack_id: &str, bytes: u64) {
             }
             Err(dir_error) => listing.push_str(&format!("READDIR-ERROR({dir_error})")),
         }
+        // Path identity, both raw and canonicalised, plus a listing of the store root: if the
+        // publisher and the verifier disagree about *where* `packs/` is (junction, 8.3 name,
+        // relative vs absolute root), that shows up here and nowhere else.
+        let mut root_listing = String::new();
+        if let Ok(entries) = std::fs::read_dir(layout.root()) {
+            for entry in entries.flatten() {
+                root_listing.push_str(&format!("{:?} ", entry.file_name()));
+            }
+        }
         panic!(
-            "staging-audit[{stage}]: {pack_id} missing; path={}; packs={}; tmp={}; root={:?};              evidence_exists={}; entries=[{listing}]",
+            "staging-audit[{stage}]: {pack_id} missing; path={}; packs={}; packs_canon={:?};              tmp={}; root={}; root_canon={:?}; root_entries=[{root_listing}];              evidence_exists={}; entries=[{listing}]",
             path.display(),
             layout.packs().display(),
+            layout.packs().canonicalize(),
             layout.temporaries().display(),
+            layout.root().display(),
             layout.root().canonicalize(),
             evidence.exists(),
         );
@@ -247,6 +258,7 @@ pub(crate) fn write(
                 eprintln!("staging-audit: evidence link FAILED for {pack_id}: {error}")
             }
         }
+        audit("after-evidence", layout, pack_id, bytes.len() as u64);
     }
     observer.step(PackStep::Renamed);
     #[cfg(feature = "staging-audit")]
