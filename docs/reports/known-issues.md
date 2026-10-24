@@ -431,7 +431,9 @@ VerificationReport { checked: 9, packs_checked: 3,
 - 已排除：路径不一致（发布方 raw/canonical 同目录）、跨用例 static 串扰（`--test-threads=1` 仍红）、
   写路径未落地（rename 后审计仍见文件）、目录级清理（同目录另两个 pack 一直在）、"`%TEMP%` 特殊性"
   （换卷同率 2/200 vs 2/200；但**不能**排除全局 AV/EDR——Defender 扫所有卷）。
-- **未确认删除者**：`Get-MpThreatDetection` = 0、`ExclusionPath` = 空，但 MPLog 不存在、`Get-MpComputerStatus`
+- **删除者**：本机由**第三方安全软件**提供实时防护（`SecurityCenter2.AntiVirusProduct.productState = 266240`，
+  实时防护位为 1；Defender 不是主防护），其 `Get-MpThreatDetection` = 0、`ExclusionPath` = 空、MPLog 不存在。
+  该第三方 AV 是**首要嫌疑但不是结论**（未抓到具体进程）。早期记录保留：`Get-MpComputerStatus`
   在本机失败 ⇒ 只能说"没有可见的 Defender 处置痕迹"，不能说"AV 无关"。
 - **产品侧处置**：不修"删除"（非本仓库可控），改为让损坏**可诊断**（P2b-2d：`MissingPack` typed 语义）；
   发布期可见性确认/有界重 staging 是否做，待 architect 判定（P2b-2e）。

@@ -127,6 +127,14 @@ batch.commit()?;                             // 下面的 1–4
 > **新临时名从零重新 staging**，不发布任何部分内容；重试有界（20×2 ms，仅 `NotFound`/`PermissionDenied`），
 > 耗尽后向上报原始错误。P2b-6 起 `tmp/` 回收由离线 GC 独占负责，常规 `open` 不再清扫。
 
+### 5.2 发布期的 pin（KI-11）
+
+> 步骤 2 的 `rename` 返回后、步骤 3 的 `COMMIT` 返回前，实现以**不共享 DELETE 的句柄**持有该 pack（平台模块
+> `durability`）。Windows 上该窗口内文件不可被删除或改名，使"索引提交时 pack 必定存在"成为 **OS 强制**的不变量；
+> POSIX 无此保证（`unlink` 不受打开句柄影响）。`rename` 与 pin 之间有数微秒未保护窗口，`COMMIT` 之后的删除也不在
+> 本保证内——两者都按 §7 以 `MissingPack` 暴露。**不采用"发布期可见性复查 + 重新 staging"**：复查不消除窗口，
+> 重试会把数据丢失降级为延迟暴露，并给发布路径引入第二条失败语义。
+
 ## 6. GC
 
 ### 6.1 离线（P5）
@@ -206,6 +214,21 @@ GcReport { roots, marked_objects, freed_objects, freed_bytes, packs_repacked, pa
 - 单对象：按 `kind` 读 loose 或 pack 帧，校验身份；
 - pack：尾部 BLAKE3 校验；索引指向的 `(offset, length)` 在 pack 范围内且恰好一帧；
 - `verify --deep`：对 §6.2 的全部根执行 ADR-005 V1–V6（含 overlay 的封存引用）。
+
+### 7.1 错误分型（P2b-2d，KI-11）
+
+索引指向的 pack 文件缺失属于**存储损坏（数据丢失）**，与"对象不存在"是两类错误。判定只看索引：
+
+| 情形 | 错误 |
+| --- | --- |
+| 无索引行 | `NotFound`（对象从未发布） |
+| 有行且文件缺失 | `MissingPack { pack_id }`（存储损坏，外部原因） |
+| 文件在但尾部/帧几何/身份不符 | `CorruptPack` / `Corrupt` |
+| 文件打不开（权限、共享冲突） | `Io` |
+
+`verify` 对每个缺失 pack 记一条 `kind = Missing` 的 pack 失败，并仍为其中每个对象记一条对象失败；`is_clean` 不因
+"缺失来自外部原因"而放行。**GC（§6）遇到"有行无文件"必须报告并以失败（或 dry-run 告警）退出，不得通过删除
+索引行来"修复"**——那会把可追查的丢失变成静默消失。
 
 ## 8. 未实现 / 推迟
 
