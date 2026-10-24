@@ -25,7 +25,7 @@
 | §5 | `Store::put` = 单对象 batch | `Store::put_observed` → `batch` 一个对象 | `tests/store.rs::every_put_lands_in_a_pack…`（32 put → 32 pack） | 一致 |
 | §5.1 | 四个崩溃点 | pack 五步（Staged/StagedSynced/Renamed/DirectorySynced/Committed）逐点注入 | `tests/crash.rs`（5 例，重开 + verify） | 一致 |
 | §7 | verify：单对象按 kind 读并校验身份 | `object::get` 分派 loose/pack，`verify_id` + role 校验 | `tests/store.rs`（损坏/截断/消失三例） | 一致 |
-| §7 | pack：尾部 BLAKE3；索引 `(offset,length)` 在范围内且**恰好一帧** | `object::verify_pack`：尾校验 + 帧连续性 + 覆盖 `frames_len` + `count == 行数` | `tests/pack.rs`（尾部损坏）；`tests/store.rs`（截尾/截体） | 一致（实现更强：还要求帧连续且无空洞） |
+| §7 | pack：尾部 BLAKE3；索引 `(offset,length)` 在范围内且**恰好一帧** | `object::verify_pack`：尾校验 + 每行在 body 内、非零、互不重叠（**不要求铺满**，死帧合法）+ `count >= 行数`（必要条件，**不是等式**） | `tests/pack.rs`（尾部损坏；空洞/重叠/越界/零长四例；`count=3` 干净、`count=1` 报错）；`tests/store.rs`（截尾/截体） | 一致（`count` 为必要条件：败者死帧只让物理帧更多） |
 | §5.1（②） | 四注入点 → 重开 → verify 干净 + 全部根可读 | `fs-workspace/tests/crash.rs::every_commit_crash_point_recovers_to_a_clean_store_with_all_roots_readable` | 4 个注入点逐个真进程 abort；每个分支 head 根、workspace base root、每个 snapshot 行经 `SnapshotReader` 读取 | 一致 |
 | §5（③） | 并发发布同一对象：`INSERT OR IGNORE`，两边成功、索引唯一 | `fs-workspace/tests/pack_concurrency.rs`：两个 workspace（main/b2）并发发布同一内容 ×5 轮 | 每 oid 恰好一行、`verify` 干净、各分支根可读；败者帧是合法死字节（行数可 < `count`） | 一致 |
 | §6 | GC（mark/sweep/重打包/独占） | **未实现** | — | 不在本卡（P2b-6） |
