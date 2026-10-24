@@ -829,3 +829,58 @@ fn k6_writing_past_eof_after_a_shrink_keeps_the_cut_region_zeroed() {
     );
     assert_eq!(&read[190..], &[0x11; 4][..], "the write itself");
 }
+
+/// **K6 coverage, not an A/B judge** — aligned shrink, then growth past the boundary.
+///
+/// An aligned shrink keeps no straddling page: `keep_bytes == 0` skips the zeroing branch and
+/// `boundary = ⌈2·page/page⌉` deletes `page_index ≥ 2`, which is exactly the delete logic the
+/// unfixed tree had. So this test **passes on the unfixed tree too** — it pins the *other*
+/// chain: "deleted pages + `base_limit` never rises ⇒ reads at or past the base limit are
+/// zero", which no zeroing covers and which a future sparse-page / partial-page refactor could
+/// silently break (the extension must not quietly recreate a page here either).
+#[test]
+fn k6_aligned_shrink_then_growth_reads_zeros_without_new_pages() {
+    let fixture = Fixture::new("k6-aligned-grow");
+    let page = fs_overlay::schema::PAGE_BYTES;
+    fixture.store().create_file(&p("/f")).expect("create");
+    let body: Vec<u8> = (0..page * 3).map(|index| (index % 251) as u8).collect();
+    fixture
+        .store()
+        .write_at(&p("/f"), 0, &body)
+        .expect("write three pages");
+
+    fixture
+        .store()
+        .truncate(&p("/f"), page * 2)
+        .expect("aligned shrink");
+    let after_shrink = fixture.store().content_state(&p("/f")).expect("state");
+    assert_eq!(
+        after_shrink.pages, 2,
+        "page 2 is dropped whole, not trimmed"
+    );
+
+    fixture
+        .store()
+        .truncate(&p("/f"), page * 3)
+        .expect("grow past the boundary");
+
+    let read = fixture
+        .store()
+        .read_at(&p("/f"), 0, (page * 3) as usize)
+        .expect("read");
+    assert_eq!(&read[..(page * 2) as usize], &body[..(page * 2) as usize]);
+    assert_eq!(
+        &read[(page * 2) as usize..],
+        &vec![0u8; page as usize][..],
+        "the dropped page must come back as zeros"
+    );
+    assert_eq!(
+        fixture
+            .store()
+            .content_state(&p("/f"))
+            .expect("state")
+            .pages,
+        after_shrink.pages,
+        "growth must not secretly recreate a page"
+    );
+}
