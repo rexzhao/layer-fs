@@ -141,8 +141,22 @@ batch.commit()?;                             // 下面的 1–4
 
 ### 6.1 离线（P5）
 
-- 打开方式：`Repo::open_exclusive`：主库连接 `locking_mode=EXCLUSIVE` 并立即取写锁；随后**逐个独占打开**
-  `workspaces/*/overlay.sqlite`。任何一步失败 → `StoreInUse` / `WorkspaceInUse`，不做任何修改；
+- 打开方式（**维护模式单连接集**，2026-10-24 裁决）：维护模式用**一条连接**同时承担 cas-store 的 store 元数据与
+  fs-workspace 的主库表；日常 `Repo` 的双连接**完全不动**（`architecture.md` §4 的"同库双连接"裁决只对日常路径生效，
+  维护模式是唯一例外）。顺序固定为：打开连接（`busy_timeout=0`）→ `locking_mode=EXCLUSIVE`（只设标志，不写文件）→
+  `journal_mode`/`synchronous`/`foreign_keys`（v3 本就是 WAL，通常 no-op）→ `schema::validate`（只读）→
+  `BEGIN IMMEDIATE` 取写锁（`Busy` → `StoreInUse`，立即失败不等待）→ `COMMIT`（EXCLUSIVE 文件锁不释放）→ GC。
+  **先锁后校验**：校验所需的读取在锁内进行，看到的是稳定状态；`validate` 仍先于任何数据写入。随后**逐个独占打开**
+  `workspaces/*/overlay.sqlite`，失败 → `WorkspaceInUse`，不做任何修改；
+- **"有任何使用者即拒绝"的精确化**：GC 在取锁时拒绝任何**活跃写入者**与任何**已打开的 overlay**；已经打开但空闲的
+  主库连接不会被"提前拒绝"，其**下一次访问**会得到 typed `StoreError::Busy` / `WorkspaceError::Busy`，在 GC 期间
+  无法读写。GC 的排他锁是权威：包括 `sqlite3` 在内的任何其他连接在此期间都拿到 `SQLITE_BUSY`，**不依赖调用方
+  自觉检查锁**（这是否决"文件锁方案"的理由：锁的权威来源不能从 SQLite 变成我们自己维护的检查清单）；
+- **错误语义分离**：维护模式只报 `StoreInUse` / `WorkspaceInUse`，**永不报 `Busy`**；日常 `Repo`/`Store` 继续报
+  `WorkspaceError::Busy` / `StoreError::Busy`。二者不得互相冒充——`Busy` 表示"稍后重试可能成功"，
+  `StoreInUse` 表示"现在有维护者在运行，不要重试"；
+- `gc(self)` **消费**维护句柄：返回时连接关闭、锁释放；`Drop` 同样释放。维护句柄不得长命（否则 GC 结束后
+  `Repo::open` 仍会被拒）；
 - 运行期间其他进程的 `Repo::open` 失败（不等待：GC 可能很长，有界等待没有意义）；
 - 理由：在线 GC 的经典竞争——物化中 put 一个"索引里已有"的对象（`AlreadyPresent`，不写），GC 恰好把它
   当垃圾删掉，随后发布的根引用了它 → 悬空。离线排除了一切并发写入者，正确性论证最简单；
