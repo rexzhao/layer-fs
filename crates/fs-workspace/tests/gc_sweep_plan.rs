@@ -203,3 +203,199 @@ fn a_pack_file_without_a_row_is_an_orphan() {
         "a pack file no row claims can never be read"
     );
 }
+
+// ------------------------------------------------------------------- apply
+
+use fs_workspace::gc::apply;
+
+/// A store with one reachable packed object and one **loose** (legacy-shape) object: the small case
+/// that exercises both storage kinds in one apply.
+///
+/// Writes always produce packs now, so a loose row can only be produced the way a legacy store has
+/// one: a file under `objects/ab/cd/` plus a `KIND_LOOSE` row. `KIND_LOOSE` is "read only, P1/P2a
+/// shape", which is exactly why the collector has to handle it.
+fn packed_and_loose(label: &str) -> (TempRoot, cas_core::ObjectId, cas_core::ObjectId) {
+    let root = TempRoot::new(label);
+    let store = Store::open(root.store(), OpenMode::Create).expect("open store");
+    let keep = store.put(Role::Bytes, b"reachable").expect("put").oid;
+
+    let framed = cas_core::Object::new(Role::Bytes, b"legacy loose object")
+        .expect("framed")
+        .to_vec();
+    let garbage = cas_core::Object::decode(&framed)
+        .expect("decode")
+        .id()
+        .expect("id");
+    assert_ne!(keep, garbage);
+    let layout = cas_store::Layout::new(root.store());
+    let path = layout.object_path(garbage);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+    std::fs::write(&path, &framed).expect("write loose object");
+    let connection = rusqlite::Connection::open(root.store().join("store.sqlite")).expect("index");
+    connection
+        .execute(
+            "INSERT INTO object_location (oid, role, length, kind, location, offset)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            rusqlite::params![
+                garbage.to_string(),
+                i64::from(Role::Bytes.tag()),
+                i64::try_from(framed.len()).expect("fits"),
+                cas_store::index::kind_loose(),
+                layout.object_relative(garbage),
+            ],
+        )
+        .expect("insert loose row");
+    drop(connection);
+    (root, keep, garbage)
+}
+
+#[test]
+fn apply_deletes_a_loose_object_file_and_its_row() {
+    let (root, keep, garbage) = packed_and_loose("apply-loose");
+    // Positive control: the loose object is readable *before* the sweep, so "it is gone afterwards"
+    // is a change and not a fixture that never had it.
+    {
+        let store = Store::open(root.store(), OpenMode::ReadWrite).expect("reopen");
+        assert!(store.get(garbage).is_ok(), "the loose object reads before");
+        assert!(store.get(keep).is_ok(), "the packed object reads before");
+    }
+
+    let marker = marker_with(&root.store(), &[keep]);
+    let mut connection = index(&root.store());
+    let decided = plan(&connection, &marker, &root.store(), 0.5).expect("plan");
+    assert_eq!(
+        decided.dead_objects,
+        vec![garbage],
+        "only the loose object is unreachable"
+    );
+
+    let layout = cas_store::Layout::new(root.store());
+    assert!(
+        layout.object_path(garbage).exists(),
+        "the file is there before"
+    );
+
+    let applied = apply(&mut connection, &decided, &root.store()).expect("apply");
+    assert_eq!(applied.index_rows_deleted, 1);
+    assert_eq!(applied.loose_files_deleted, 1);
+    assert!(
+        !layout.object_path(garbage).exists(),
+        "the dead object's file must be gone"
+    );
+
+    let store = Store::open(root.store(), OpenMode::ReadWrite).expect("reopen");
+    assert!(store.get(keep).is_ok(), "the survivor is still readable");
+    assert!(
+        store.get(garbage).is_err(),
+        "the deleted object must no longer be readable"
+    );
+
+    // A second plan over the same marker has nothing left to free.
+    let again = plan(&index(&root.store()), &marker, &root.store(), 0.5).expect("plan again");
+    assert!(again.dead_objects.is_empty(), "{:?}", again.dead_objects);
+}
+
+#[test]
+fn apply_removes_an_empty_pack_rows_first_then_file() {
+    let root = TempRoot::new("apply-pack");
+    let store = Store::open(root.store(), OpenMode::Create).expect("open store");
+    let mut batch = store.batch();
+    batch.put(Role::Bytes, b"one").expect("put");
+    batch.put(Role::Bytes, b"two").expect("put");
+    batch.commit().expect("commit batch");
+
+    let marker = marker_with(&root.store(), &[]);
+    let mut connection = index(&root.store());
+    let decided = plan(&connection, &marker, &root.store(), 0.5).expect("plan");
+    assert_eq!(decided.packs_delete.len(), 1, "{:?}", decided);
+    let pack_path = decided.packs_delete[0].path.clone();
+    assert!(pack_path.exists());
+
+    let applied = apply(&mut connection, &decided, &root.store()).expect("apply");
+    assert_eq!(applied.packs_deleted, 1);
+    assert_eq!(applied.index_rows_deleted, 2, "both frames' rows");
+    assert!(!pack_path.exists(), "the pack file must be gone");
+    let packs_left: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pack", [], |row| row.get(0))
+        .expect("count packs");
+    assert_eq!(packs_left, 0, "no pack row may outlive its file");
+}
+
+/// A plan that needs a copy-repack must be refused **before** any deletion: a half-applied plan is
+/// worse than no plan at all.
+#[test]
+fn apply_refuses_a_plan_that_needs_a_repack_and_changes_nothing() {
+    let root = TempRoot::new("apply-repack");
+    let store = Store::open(root.store(), OpenMode::Create).expect("open store");
+    let mut batch = store.batch();
+    let first = batch.put(Role::Bytes, b"one").expect("put");
+    let second = batch.put(Role::Bytes, b"two").expect("put");
+    batch.commit().expect("commit batch");
+
+    let marker = marker_with(&root.store(), &[first]);
+    let mut connection = index(&root.store());
+    let decided = plan(&connection, &marker, &root.store(), 0.6).expect("plan");
+    assert_eq!(decided.packs_repack.len(), 1);
+    assert_eq!(decided.dead_objects, vec![second]);
+
+    let before = fingerprint(&root.store());
+    let error = apply(&mut connection, &decided, &root.store())
+        .expect_err("a repack plan must be refused by a build that cannot repack");
+    assert!(
+        matches!(error, fs_workspace::WorkspaceError::Inconsistent { .. }),
+        "expected a typed refusal, got {error:?}"
+    );
+    assert_eq!(
+        before,
+        fingerprint(&root.store()),
+        "a refusal must not change a byte"
+    );
+}
+
+#[test]
+fn apply_removes_orphan_packs_and_temporaries() {
+    let root = TempRoot::new("apply-orphans");
+    let store = Store::open(root.store(), OpenMode::Create).expect("open store");
+    let keep = store.put(Role::Bytes, b"reachable").expect("put").oid;
+    let orphan = root.store().join("packs").join("orphan.pack");
+    std::fs::write(&orphan, b"nobody claims this").expect("write orphan");
+    let temporary = root.store().join("tmp").join("half-written.pack");
+    std::fs::write(&temporary, b"half").expect("write temp");
+
+    let marker = marker_with(&root.store(), &[keep]);
+    let mut connection = index(&root.store());
+    let decided = plan(&connection, &marker, &root.store(), 0.5).expect("plan");
+    assert_eq!(decided.orphan_pack_files, vec![orphan.clone()]);
+
+    let applied = apply(&mut connection, &decided, &root.store()).expect("apply");
+    assert_eq!(applied.orphan_pack_files_deleted, 1);
+    assert_eq!(applied.temporaries_deleted, 1);
+    assert!(!orphan.exists(), "the orphan pack is gone");
+    assert!(!temporary.exists(), "tmp/ holds nothing worth keeping");
+}
+
+/// `{(relative path, length)}`, `-shm` excluded (ADR-008 §6.1).
+fn fingerprint(dir: &std::path::Path) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current).expect("read dir").flatten() {
+            let meta = entry.metadata().expect("metadata");
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                let relative = entry
+                    .path()
+                    .strip_prefix(dir)
+                    .expect("inside")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if !relative.ends_with("-shm") {
+                    out.push((relative, meta.len()));
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
