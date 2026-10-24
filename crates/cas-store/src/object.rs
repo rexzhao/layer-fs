@@ -182,6 +182,11 @@ pub struct VerificationReport {
     pub failures: Vec<VerificationFailure>,
     /// The packs whose tail or geometry failed, in id order.
     pub pack_failures: Vec<PackVerificationFailure>,
+    /// How many of `pack_failures` are **missing files** rather than damaged ones.
+    ///
+    /// Separated because the two mean different things to an operator: damage needs a restore,
+    /// a missing pack needs to be found (it was deleted or lost after publication).
+    pub missing_packs: usize,
     /// Entries under `objects/` whose name is not a valid object id.
     ///
     /// ADR-002 §3: that directory holds object files only, so a stray name is
@@ -233,9 +238,13 @@ pub(crate) fn verify_all(database: &Database, layout: &Layout) -> StoreResult<Ve
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     let mut pack_failures = Vec::new();
+    let mut missing_packs = 0;
     let packs_checked = pack_ids.len();
     for pack_id in pack_ids {
         if let Err(error) = verify_pack(database, layout, &pack_id) {
+            if matches!(error, StoreError::MissingPack { .. }) {
+                missing_packs += 1;
+            }
             pack_failures.push(PackVerificationFailure {
                 pack_id,
                 reason: error.to_string(),
@@ -249,6 +258,7 @@ pub(crate) fn verify_all(database: &Database, layout: &Layout) -> StoreResult<Ve
         packs_checked,
         failures,
         pack_failures,
+        missing_packs,
         bad_names,
     })
 }

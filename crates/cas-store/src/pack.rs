@@ -282,6 +282,8 @@ pub(crate) fn read_frame(
     length: u64,
 ) -> StoreResult<Vec<u8>> {
     let path = layout.pack_path(pack_id);
+    #[cfg(not(feature = "staging-audit"))]
+    let mut file = open_pack(&path, pack_id)?;
     #[cfg(feature = "staging-audit")]
     let mut file = match File::open(&path) {
         Ok(file) => file,
@@ -326,8 +328,7 @@ pub(crate) fn read_frame(
             }
         }
     };
-    #[cfg(not(feature = "staging-audit"))]
-    let mut file = File::open(&path)?;
+
     let mut bytes = vec![0u8; usize::try_from(length).unwrap_or(0)];
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(&mut bytes)
@@ -344,6 +345,19 @@ pub(crate) fn read_frame(
     #[cfg(feature = "crash-points")]
     crate::testing::note_pack_read(length);
     Ok(bytes)
+}
+
+/// Opens a pack, reporting a missing file as [`StoreError::MissingPack`].
+///
+/// A published pack that cannot be opened is storage damage (see [`StoreError::MissingPack`]),
+/// never `Io`: the index said it was there, so the caller needs the damage, not an errno.
+pub(crate) fn open_pack(path: &std::path::Path, pack_id: &str) -> StoreResult<File> {
+    File::open(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => StoreError::MissingPack {
+            pack_id: pack_id.to_owned(),
+        },
+        _ => StoreError::Io(error),
+    })
 }
 
 /// What checking one pack found.
@@ -366,7 +380,12 @@ pub(crate) struct PackTail {
 /// [`CorruptCause`] with the pack named, so `verify` can say which pack is broken.
 pub(crate) fn verify(layout: &Layout, pack_id: &str) -> StoreResult<PackTail> {
     let path = layout.pack_path(pack_id);
-    let bytes = std::fs::read(&path)?;
+    let bytes = std::fs::read(&path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => StoreError::MissingPack {
+            pack_id: pack_id.to_owned(),
+        },
+        _ => StoreError::Io(error),
+    })?;
     let length = bytes.len() as u64;
     if length < TAIL_BYTES {
         return Err(corrupt_pack(pack_id, "file is shorter than a pack tail"));

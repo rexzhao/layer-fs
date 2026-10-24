@@ -411,3 +411,85 @@ fn verify_uses_the_tail_count_as_a_necessary_condition() {
         report.pack_failures[0].reason
     );
 }
+
+// ------------------------------------------------------- ADR-008 §7: a missing pack is damage
+//
+// Deleting a pack file is the one *legitimate* way to simulate damage: the index keeps its
+// rows, so the store claims bytes it does not have. This must surface as a typed
+// `MissingPack { pack_id }` — never as `Io(os error 2)` and never as "object not found",
+// because those send a caller looking for the wrong thing.
+
+/// Deletes the pack that holds `oid`, leaving the index alone.
+fn delete_pack_of(store: &Path, oid: &cas_core::ObjectId) -> String {
+    let connection = rusqlite::Connection::open(store.join("store.sqlite")).expect("db");
+    let pack_id: String = connection
+        .query_row(
+            "SELECT location FROM object_location WHERE oid = ?1",
+            [oid.to_string()],
+            |row| row.get(0),
+        )
+        .expect("index row");
+    std::fs::remove_file(store.join("packs").join(format!("{pack_id}.pack"))).expect("delete pack");
+    pack_id
+}
+
+#[test]
+fn a_missing_pack_is_reported_as_damage_with_its_id() {
+    let root = TempRoot::new("missing-pack");
+    let store = Store::open(root.store(), OpenMode::Create).expect("open");
+    let published = store.put(Role::Bytes, &payload(4, 400)).expect("put");
+    let pack_id = delete_pack_of(&root.store(), &published.oid);
+
+    match store.get(published.oid) {
+        Err(cas_store::StoreError::MissingPack { pack_id: named }) => {
+            assert_eq!(
+                named, pack_id,
+                "the error names the pack, so it can be found"
+            )
+        }
+        other => panic!("a deleted pack is storage damage, got {other:?}"),
+    }
+
+    let report = store.verify().expect("verify");
+    assert!(!report.is_clean());
+    assert_eq!(report.missing_packs, 1, "the summary counts missing packs");
+    assert_eq!(report.pack_failures.len(), 1);
+    assert!(
+        report.pack_failures[0]
+            .reason
+            .contains("storage damage, not a missing object"),
+        "the message must say what kind of failure this is: {}",
+        report.pack_failures[0].reason
+    );
+    // The object-level failure is reported too, and it is the same damage — not `NotFound`.
+    assert_eq!(report.failures.len(), 1);
+    assert!(
+        report.failures[0].reason.contains(&pack_id),
+        "the object failure points at the pack: {}",
+        report.failures[0].reason
+    );
+}
+
+#[test]
+fn a_damaged_pack_is_not_counted_as_missing() {
+    let root = TempRoot::new("damaged-not-missing");
+    let store = Store::open(root.store(), OpenMode::Create).expect("open");
+    store.put(Role::Bytes, &payload(5, 400)).expect("put");
+    let path = {
+        let rows = pack_rows(&root.store());
+        root.store()
+            .join("packs")
+            .join(format!("{}.pack", rows[0].0))
+    };
+    let mut bytes = std::fs::read(&path).expect("read");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    std::fs::write(&path, &bytes).expect("corrupt tail");
+
+    let report = store.verify().expect("verify");
+    assert_eq!(report.pack_failures.len(), 1);
+    assert_eq!(
+        report.missing_packs, 0,
+        "a corrupt pack is present; only an absent one is missing"
+    );
+}

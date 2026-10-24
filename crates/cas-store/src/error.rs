@@ -36,6 +36,16 @@ pub enum StoreError {
         /// What exactly failed.
         cause: CorruptCause,
     },
+    /// The index names a pack whose file is not there (ADR-008 §7).
+    ///
+    /// This is **storage damage**, not "the object does not exist": the index says the pack
+    /// was published, so its absence means the bytes were lost or removed after publication
+    /// (an external deleter, a filesystem fault, a bad restore). Reporting it as `NotFound`
+    /// would send a caller looking for a missing *object* that the index claims to have.
+    MissingPack {
+        /// The pack the index points at.
+        pack_id: String,
+    },
     /// A pack file's tail or bytes failed validation (ADR-008 §7).
     ///
     /// The pack is named rather than the object: the damage is to the container, so every
@@ -121,6 +131,10 @@ impl fmt::Display for StoreError {
             ),
             StoreError::NotFound { oid } => write!(f, "object {oid} is not in the store"),
             StoreError::Corrupt { oid, cause } => write!(f, "object {oid} is corrupt: {cause}"),
+            StoreError::MissingPack { pack_id } => write!(
+                f,
+                "pack {pack_id} is missing: the index names it, the file is not there                  (storage damage, not a missing object)"
+            ),
             StoreError::CorruptPack { pack_id, cause } => {
                 write!(f, "pack {pack_id} is corrupt: {cause}")
             }
@@ -304,6 +318,9 @@ mod tests {
             },
             StoreError::SchemaMismatch {
                 what: "store_policy.max_object_len",
+            },
+            StoreError::MissingPack {
+                pack_id: "0123456789abcdef0123456789abcdef".to_owned(),
             },
             StoreError::ReadOnly,
             StoreError::TooLarge {
