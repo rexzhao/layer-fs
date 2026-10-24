@@ -704,6 +704,58 @@ impl Repo {
         Ok(roots)
     }
 
+    /// Every root row, labelled by the row that holds it (ADR-008 §6.2).
+    ///
+    /// Distinct from [`Repo::roots`] (which returns bare ids for `verify`): GC needs to know *which
+    /// row* produced a root, because G2 compares the enumeration with what `mark` visited and a
+    /// missing row must be nameable.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures, or a stored value that is not an object id.
+    pub(crate) fn root_rows(&self) -> WorkspaceResult<Vec<crate::gc::roots::RootRow>> {
+        let connection = self.db.lock();
+        let mut rows = Vec::new();
+        {
+            let mut statement = connection.prepare("SELECT commit_id, root_oid FROM \"commit\"")?;
+            for row in statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (id, root) = row?;
+                rows.push(crate::gc::roots::RootRow {
+                    kind: crate::gc::roots::RootKind::Commit,
+                    root: parse_oid(&root)?,
+                    label: format!("commit:{id}"),
+                });
+            }
+        }
+        {
+            let mut statement = connection.prepare("SELECT DISTINCT root_oid FROM snapshot")?;
+            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                let root = row?;
+                rows.push(crate::gc::roots::RootRow {
+                    kind: crate::gc::roots::RootKind::Snapshot,
+                    root: parse_oid(&root)?,
+                    label: format!("snapshot:{root}"),
+                });
+            }
+        }
+        {
+            let mut statement = connection.prepare("SELECT name, base_root FROM workspace")?;
+            for row in statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (name, root) = row?;
+                rows.push(crate::gc::roots::RootRow {
+                    kind: crate::gc::roots::RootKind::WorkspaceBase,
+                    root: parse_oid(&root)?,
+                    label: format!("workspace:{name}"),
+                });
+            }
+        }
+        Ok(rows)
+    }
+
     /// The root a commit publishes.
     pub(crate) fn commit_root(&self, id: &str) -> WorkspaceResult<ObjectId> {
         let connection = self.db.lock();

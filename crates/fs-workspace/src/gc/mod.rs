@@ -12,7 +12,7 @@
 pub mod criteria;
 pub mod roots;
 
-pub use roots::{RepoRoots, RootKind, RootRef, RootSet, RootSource};
+pub use roots::{RepoRoots, RootKind, RootRef, RootRow, RootSet, RootSource};
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -87,7 +87,13 @@ impl GcReport {
 pub struct GcHooks<'a> {
     /// Called once per visited root (streaming; a test collects it into a set).
     pub on_root_visited: Option<&'a mut dyn FnMut(RootKind, ObjectId)>,
-    /// Test seam (injection F): return `true` to *skip* visiting a root that was declared.
+    /// Test seam (injection F): the predicate answers **"should this root be skipped?"** —
+    /// `true` = skip it, `false` = visit it as usual.
+    ///
+    /// One direction only, and it is the *skip* direction: a root that the filter rejects is
+    /// therefore absent from `roots_visited` / `visited_by_kind`, which is what makes G3 (and, when
+    /// mark never reports the label, G2) go red. A predicate that returned "should visit" would
+    /// make an empty closure mean "visit nothing" — a silent way to fail every run.
     ///
     /// Only compiled with `gc-test-hooks`, so a production build has no way to lie about what it
     /// visited.

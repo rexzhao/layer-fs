@@ -159,6 +159,17 @@ impl RootSet {
     }
 }
 
+/// One root row, as the repository stores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootRow {
+    /// Which kind of row produced it.
+    pub kind: RootKind,
+    /// The tree it protects.
+    pub root: ObjectId,
+    /// A label naming the row (for example `commit:<id>`).
+    pub label: String,
+}
+
 /// Where a GC run gets its roots from.
 ///
 /// Production uses [`RepoRoots`]; tests substitute a double to construct the negative cases
@@ -193,10 +204,16 @@ pub struct RepoRoots<'a> {
 }
 
 impl RootSource for RepoRoots<'_> {
+    /// Enumerates the main-database sources of ADR-008 §6.2, **each row as its own label**.
+    ///
+    /// Labels name the row (`commit:<id>`, `snapshot:<id>`, `workspace:<name>`), not the tree: two
+    /// rows protecting one tree are two facts, and G2 compares facts. The overlay sources
+    /// (`ov_meta.pending_root`, `ov_inode.sealed_content`) join here when the overlay/Seal work
+    /// lands; `RootKind` already has their variants so the enumeration stays comparable.
     fn roots(&self) -> WorkspaceResult<RootSet> {
         let mut entries = Vec::new();
-        for root in self.repo.roots()? {
-            entries.push(RootRef::new(RootKind::Commit, root, format!("root:{root}")));
+        for row in self.repo.root_rows()? {
+            entries.push(RootRef::new(row.kind, row.root, row.label));
         }
         RootSet::try_from_entries(entries)
     }

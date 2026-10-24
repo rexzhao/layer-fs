@@ -431,3 +431,91 @@ fn a_label_naming_two_trees_is_an_error_not_two_facts() {
         "the message names the label: {message}"
     );
 }
+
+// ------------------------------------------------------ T1 (tripwire): every root-ish column is classified
+//
+// A new column that carries a root and is not classified here means the enumeration silently
+// missed a source: the collector would then look correct while protecting nothing. The table below
+// is the classification; the test fails when the schema grows a column nobody classified.
+
+#[test]
+fn every_root_shaped_column_is_classified() {
+    // (table, column) → which RootSource covers it, or why it is not a root.
+    // Keep this in sync with `RootKind`; T2 (registry ↔ criterion mapping) builds on it.
+    const CLASSIFIED: &[(&str, &str, &str)] = &[
+        ("commit", "root_oid", "RootSource(Commit)"),
+        ("snapshot", "root_oid", "RootSource(Snapshot)"),
+        ("workspace", "base_root", "RootSource(WorkspaceBase)"),
+        (
+            "workspace",
+            "base_commit",
+            "NotARoot(points at a commit row, whose root_oid is the root)",
+        ),
+        ("branch", "head_commit", "NotARoot(points at a commit row)"),
+        (
+            "branch_log",
+            "old_commit",
+            "NotARoot(points at a commit row; its root_oid is the root)",
+        ),
+        (
+            "branch_log",
+            "new_commit",
+            "NotARoot(points at a commit row)",
+        ),
+        (
+            "object_location",
+            "oid",
+            "NotARoot(the CAS index's own object id — the *marked* side, not a root)",
+        ),
+        (
+            "pack",
+            "pack_id",
+            "NotARoot(pack names the container; the objects inside are rows of object_location)",
+        ),
+    ];
+
+    let root = TempRoot::new("t1-columns");
+    let repo = Repo::open(root.store(), true).expect("open");
+    repo.init().expect("init");
+    let connection = rusqlite::Connection::open(repo.metadata_path()).expect("db");
+
+    let mut statement = connection
+        .prepare(
+            "SELECT m.name, p.name FROM sqlite_master AS m
+             JOIN pragma_table_info(m.name) AS p
+             WHERE m.type = 'table'",
+        )
+        .expect("prepare");
+    let columns: Vec<(String, String)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("collect");
+
+    let looks_like_a_root = |column: &str| {
+        let lower = column.to_ascii_lowercase();
+        lower == "root"
+            || lower.starts_with("root_")
+            || lower.ends_with("_root")
+            || lower == "oid"
+            || lower.ends_with("_oid")
+            || lower.contains("content")
+    };
+
+    let mut unclassified = Vec::new();
+    for (table, column) in &columns {
+        if !looks_like_a_root(column) {
+            continue;
+        }
+        let known = CLASSIFIED
+            .iter()
+            .any(|(known_table, known_column, _)| known_table == table && known_column == column);
+        if !known {
+            unclassified.push(format!("{table}.{column}"));
+        }
+    }
+    assert!(
+        unclassified.is_empty(),
+        "root-shaped columns added without classification: {unclassified:?}"
+    );
+}
