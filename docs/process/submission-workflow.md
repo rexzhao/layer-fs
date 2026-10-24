@@ -65,9 +65,24 @@ mailbox_connect as='manager' 再处理任何内部邮件；若需处理外部邮
 main 直提同样推送。特性分支默认不推（本地保留审阅历史即可）；需要时按需推。
 ## 角色分工（owner 指示，2026-10-23）
 
-- **architect**：架构设计与分析归口——阶段设计、架构问题咨询、ADR 设计输入。不写产品代码、不合入、不 push；验证用 Git Bash + arch-* 前缀隔离 worktree。
+- **architect**：架构设计与分析归口——阶段设计、架构问题咨询、ADR 设计输入。不写产品代码、不合入、不 push；验证用 Git Bash + arch-* 前缀隔离 worktree（**一律基于特性分支，不占 `main` 检出**，否则 manager 的文档直提 worktree 无法建立）。分析产物以 `docs/reports/` 文档形式提交到 arch-* 分支，由 manager cherry-pick 进 main；scratch 测试不提交。
 - **manager**：任务分配与验收（含架构合规 review），架构问题转 architect。
 - **worker / qa**：职责不变（实现 / 独立验收）。
+
+### 会话失活后的接手流程（manager 经验，2026-10-24）
+
+会话崩溃（DSH 崩、卡死、上下文耗尽）后，**接力断点几乎总在 manager**：worker 的新会话在等卡、QA 的发现已发出但没人转发，全队静默。观察到的一次实例：worker 与 manager 会话同时卡死，QA 的 FAIL 级分诊请求悬空 4.5 小时。
+
+接手的 manager 按以下顺序恢复（不必等任何人通知）：
+
+1. **git**：`git log --oneline -15`、`git status`、`git branch -vv`、`git worktree list`（worktree 列表是发现别人在做什么的最快线索）。
+2. **文档**：`docs/process/`（任务卡、本文件）、`docs/reports/known-issues.md`、相关 ADR。
+3. **邮箱**：`mailbox_list` 通读最近线程，先找**未闭环的请求**（别人的提问、失败报告、待派卡）。
+4. **先补接力，再做别的**：把悬空任务重派给当前在线的角色会话（卡必须自包含——新会话没有历史）。
+5. **核对在途工作**：`git status` / worktree 里别人的未提交改动，避免重复实现（同一缺陷两条线同时动手很常见）。
+6. 对外部（qclaw）状态汇报要在发出前核对 worktree 与 git，别把"空闲"写成结论。
+
+规则：不因这次断链而加"FAIL 双发 + 超时升级"（owner 2026-10-24 决定），保持 manager 单点转达；可靠性靠上面这套恢复流程，而不是增加分发面。
 
 ### Worker 上下文管理（owner 指示，2026-10-23）
 
