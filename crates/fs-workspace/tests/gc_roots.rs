@@ -68,7 +68,7 @@ fn the_root_set_deduplicates_by_fact_not_by_object_id() {
         RootRef::new(RootKind::Snapshot, tree, "snapshot:s1"),
     ]);
     assert_eq!(set.entries().len(), 2, "two rows, two facts");
-    assert_eq!(set.ids(), vec![tree], "one object to walk");
+    assert_eq!(set.by_root(), vec![tree], "one object to walk");
 
     let duplicates = RootSet::from_entries(vec![
         RootRef::new(RootKind::Snapshot, tree, "snapshot:s1"),
@@ -105,8 +105,8 @@ fn dropping_a_row_is_visible_as_a_set_difference() {
         "the diff names what vanished"
     );
     assert_eq!(
-        injected.ids(),
-        complete.ids(),
+        injected.by_root(),
+        complete.by_root(),
         "the id set alone cannot see this — which is why G2 compares facts"
     );
 }
@@ -129,7 +129,7 @@ fn a_replaceable_source_is_what_the_collector_consumes() {
     let lie = oid("not-in-the-repo");
     let injected = Fixed(vec![RootRef::new(RootKind::Commit, lie, "commit:fake")]);
     let from_test = injected.roots().expect("roots");
-    assert_eq!(from_test.ids(), vec![lie]);
+    assert_eq!(from_test.by_root(), vec![lie]);
     assert_ne!(
         from_test, from_repo,
         "the two sources disagree, which is exactly what an injection needs"
@@ -198,8 +198,8 @@ fn visiting_a_root_without_counting_it_is_caught_by_g3_per_kind() {
     let report = fs_workspace::gc::GcReport {
         roots_declared: declared.entries().iter().map(|e| e.label.clone()).collect(),
         roots_visited: declared.entries().iter().map(|e| e.label.clone()).collect(),
-        root_oids: declared.ids(),
-        visited_oids: declared.ids(),
+        root_oids: declared.by_root(),
+        visited_oids: declared.by_root(),
         roots_by_kind: [(RootKind::Snapshot, 1), (RootKind::Commit, 1)].into(),
         visited_by_kind: [(RootKind::Commit, 1)].into(),
         ..Default::default()
@@ -310,6 +310,9 @@ fn the_injection_seam_is_consumed_and_leaves_no_residue() {
             let mut sink = |kind: RootKind, root: ObjectId| {
                 visited.insert((kind, root));
             };
+            // With `gc-test-hooks` off, `on_root_visited` is the only field; with it on, the
+            // defaults cover the seams (no skip, nothing forced), so this stays valid both ways.
+            #[allow(clippy::needless_update)]
             let mut hooks = fs_workspace::gc::GcHooks {
                 on_root_visited: Some(&mut sink),
                 ..Default::default()
@@ -328,7 +331,7 @@ fn the_injection_seam_is_consumed_and_leaves_no_residue() {
         );
         report.freed.push(garbage);
         report.roots_declared = truth.entries().iter().map(|e| e.label.clone()).collect();
-        report.root_oids = truth.ids();
+        report.root_oids = truth.by_root();
         report.reachable_count = report.reachable.len();
         report
     };
@@ -373,4 +376,58 @@ fn the_injection_seam_is_consumed_and_leaves_no_residue() {
         "no residue after the injection"
     );
     assert!(criteria::g3_every_root_visited(&restored).is_ok());
+}
+
+// ------------------------------------------------ §7 injections that need live seams (F, label conflict)
+
+#[cfg(feature = "gc-test-hooks")]
+#[test]
+fn skip_root_makes_counter_example_f_constructible() {
+    // F: the root stays in the declared set, but mark refuses to visit it. Only G3's per-kind /
+    // oid comparison can see this — G2 compares the declared set against what mark *reports*, and
+    // mark reports nothing here, so the label is simply absent.
+    use fs_workspace::gc::{GcHooks, GcInput};
+
+    let truth = RootSet::from_entries(vec![
+        RootRef::new(RootKind::Commit, oid("f-commit"), "commit:c1"),
+        RootRef::new(RootKind::Snapshot, oid("f-snap"), "snapshot:s1"),
+    ]);
+    let source = Fixed(truth.entries().to_vec());
+
+    let mut skip = |entry: &RootRef| entry.kind == RootKind::Snapshot;
+    let mut hooks = GcHooks {
+        skip_root: Some(&mut skip),
+        ..Default::default()
+    };
+    let input = GcInput {
+        declared: &truth,
+        mark_source: &source as &dyn RootSource,
+    };
+    let report = input.mark(&mut hooks).expect("mark");
+
+    assert!(
+        criteria::g3_every_root_visited(&report).is_err(),
+        "G3 must be red: a declared root was never visited"
+    );
+    assert!(
+        criteria::g2_mark_covers_declared(&report).is_err(),
+        "G2 is red too, because mark never reported the label"
+    );
+    assert_eq!(report.visited_by_kind.get(&RootKind::Snapshot), None);
+}
+
+#[test]
+fn a_label_naming_two_trees_is_an_error_not_two_facts() {
+    // Without this, a mistyped label silently becomes two "facts" and G2's set comparison stops
+    // meaning what it says.
+    let error = RootSet::try_from_entries(vec![
+        RootRef::new(RootKind::Snapshot, oid("one"), "snapshot:s1"),
+        RootRef::new(RootKind::Snapshot, oid("two"), "snapshot:s1"),
+    ])
+    .expect_err("a label must name one tree");
+    let message = error.to_string();
+    assert!(
+        message.contains("snapshot:s1"),
+        "the message names the label: {message}"
+    );
 }

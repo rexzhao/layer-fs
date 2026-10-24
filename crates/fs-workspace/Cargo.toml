@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Test-only seams for the offline GC (P2b-6 §7): skip visiting a declared root, force an id into
+# the free set. Off by default, so a production build cannot lie about the root set.
+gc-test-hooks = []
+
 [dependencies]
 cas-core.workspace = true
 cas-store.workspace = true

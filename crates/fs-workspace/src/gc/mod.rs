@@ -65,7 +65,7 @@ impl GcReport {
         }
         Self {
             roots_declared: declared.entries().iter().map(|e| e.label.clone()).collect(),
-            root_oids: declared.ids(),
+            root_oids: declared.by_root(),
             roots_by_kind,
             ..Self::default()
         }
@@ -87,15 +87,25 @@ impl GcReport {
 pub struct GcHooks<'a> {
     /// Called once per visited root (streaming; a test collects it into a set).
     pub on_root_visited: Option<&'a mut dyn FnMut(RootKind, ObjectId)>,
-    /// Under `gc-test-hooks`: ids forced into the free set (injection G).
+    /// Test seam (injection F): return `true` to *skip* visiting a root that was declared.
+    ///
+    /// Only compiled with `gc-test-hooks`, so a production build has no way to lie about what it
+    /// visited.
+    #[cfg(feature = "gc-test-hooks")]
+    pub skip_root: Option<&'a mut dyn FnMut(&RootRef) -> bool>,
+    /// Test seam (injection G): ids forced into the free set.
+    #[cfg(feature = "gc-test-hooks")]
     pub extra_free_candidates: Vec<ObjectId>,
 }
 
 impl std::fmt::Debug for GcHooks<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GcHooks")
-            .field("extra_free_candidates", &self.extra_free_candidates.len())
-            .finish_non_exhaustive()
+        let mut debug = f.debug_struct("GcHooks");
+        #[cfg(feature = "gc-test-hooks")]
+        debug
+            .field("skip_root", &self.skip_root.is_some())
+            .field("extra_free_candidates", &self.extra_free_candidates.len());
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -125,6 +135,12 @@ impl<S: roots::RootSource> GcInput<'_, S> {
         let mut report = GcReport::skeleton(self.declared);
         let walked = self.mark_source.roots()?;
         for entry in walked.entries() {
+            #[cfg(feature = "gc-test-hooks")]
+            if let Some(skip) = hooks.skip_root.as_mut() {
+                if skip(entry) {
+                    continue;
+                }
+            }
             report.record_visit(entry);
             report.reachable.push(entry.root);
             if let Some(sink) = hooks.on_root_visited.as_mut() {

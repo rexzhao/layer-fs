@@ -85,7 +85,8 @@ impl RootRef {
 /// The roots one GC run must protect.
 ///
 /// Deduplicated **by label**, not by object id: two rows protecting the same tree are two facts,
-/// and G2 compares facts (`M = R`). `by_root()` gives the id set the sweep actually needs.
+/// and G2 compares facts (`M = R`). [`RootSet::by_root`] gives the deduplicated start set the sweep
+/// walks — it is *not* every id in `entries()`, which may repeat an object under two labels.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RootSet {
     entries: Vec<RootRef>,
@@ -98,12 +99,39 @@ impl RootSet {
         Self::default()
     }
 
-    /// Builds a set from entries, deduplicating by label and sorting for stable diffs.
-    #[must_use]
-    pub fn from_entries(mut entries: Vec<RootRef>) -> Self {
+    /// Builds a set from entries, deduplicating **by label** and sorting for stable diffs.
+    ///
+    /// Two entries with the same label but different roots are an inconsistent state (the label is
+    /// supposed to name the row): reporting them instead of keeping both keeps G2 honest — a
+    /// mistyped `snapshot:<id>` must not look like two facts.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::WorkspaceError::Inconsistent`] when a label names two different roots.
+    pub fn try_from_entries(mut entries: Vec<RootRef>) -> WorkspaceResult<Self> {
         entries.sort();
-        entries.dedup();
-        Self { entries }
+        for pair in entries.windows(2) {
+            if pair[0].label == pair[1].label && pair[0].root != pair[1].root {
+                return Err(crate::error::WorkspaceError::Inconsistent {
+                    detail: format!(
+                        "root label {} names two different trees ({} and {})",
+                        pair[0].label, pair[0].root, pair[1].root
+                    ),
+                });
+            }
+        }
+        entries.dedup_by(|left, right| left.label == right.label);
+        Ok(Self { entries })
+    }
+
+    /// [`RootSet::try_from_entries`] for fixtures, where a conflicting label is a test bug.
+    ///
+    /// # Panics
+    ///
+    /// When a label names two different roots.
+    #[must_use]
+    pub fn from_entries(entries: Vec<RootRef>) -> Self {
+        Self::try_from_entries(entries).expect("fixture root labels must be unique")
     }
 
     /// The entries, in stable order.
@@ -112,9 +140,12 @@ impl RootSet {
         &self.entries
     }
 
-    /// The distinct object ids the marks must start from.
+    /// The deduplicated object ids the marks must start from.
+    ///
+    /// Named `by_root` rather than `ids` because it is the *root* set the sweep walks, not every
+    /// id in `entries()`: two labels may point at one tree.
     #[must_use]
-    pub fn ids(&self) -> Vec<ObjectId> {
+    pub fn by_root(&self) -> Vec<ObjectId> {
         let mut ids: Vec<ObjectId> = self.entries.iter().map(|entry| entry.root).collect();
         ids.sort();
         ids.dedup();
@@ -167,6 +198,6 @@ impl RootSource for RepoRoots<'_> {
         for root in self.repo.roots()? {
             entries.push(RootRef::new(RootKind::Commit, root, format!("root:{root}")));
         }
-        Ok(RootSet::from_entries(entries))
+        RootSet::try_from_entries(entries)
     }
 }
