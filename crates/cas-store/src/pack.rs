@@ -170,7 +170,7 @@ pub(crate) fn write(
     pack_id: &str,
     bytes: &[u8],
     observer: &mut dyn PackObserver,
-) -> StoreResult<()> {
+) -> StoreResult<crate::durability::Pin> {
     // The staging file can legitimately disappear underneath us: `tmp/` is a *shared*
     // directory and every open of the Store sweeps it (ADR-002 §7). A second process opening
     // the same Store while this pack is being staged therefore deletes our staging file
@@ -267,7 +267,16 @@ pub(crate) fn write(
     observer.step(PackStep::DirectorySynced);
     #[cfg(feature = "staging-audit")]
     audit("after-sync-dir", layout, pack_id, bytes.len() as u64);
-    Ok(())
+    // ADR-008 §5.2: deny deletion from here until the index row exists. A failure to hold the
+    // handle means the file is already gone, which is exactly `MissingPack`; nothing has been
+    // committed at this point, so the batch can be abandoned cleanly (no retry: a visibility
+    // re-check would not close the window, and retrying would turn data loss into latency).
+    crate::durability::Pin::hold(&layout.pack_path(pack_id)).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => StoreError::MissingPack {
+            pack_id: pack_id.to_owned(),
+        },
+        _ => StoreError::Io(error),
+    })
 }
 
 /// Reads exactly one frame at `(offset, length)`.

@@ -82,6 +82,19 @@ fn pack_rows(store: &Path) -> Vec<(String, u64, u64)> {
         .expect("collect")
 }
 
+/// The pack file that holds `oid`.
+fn pack_path_of_pack(store: &Path, oid: &cas_core::ObjectId) -> PathBuf {
+    let connection = rusqlite::Connection::open(store.join("store.sqlite")).expect("db");
+    let pack_id: String = connection
+        .query_row(
+            "SELECT location FROM object_location WHERE oid = ?1",
+            [oid.to_string()],
+            |row| row.get(0),
+        )
+        .expect("index row");
+    store.join("packs").join(format!("{pack_id}.pack"))
+}
+
 /// Rewrites `store_policy.pack_max_bytes`, so a test can force splits without 64 MiB of data.
 fn set_pack_max_bytes(store: &Path, bytes: u64) {
     let connection = rusqlite::Connection::open(store.join("store.sqlite")).expect("db");
@@ -492,4 +505,37 @@ fn a_damaged_pack_is_not_counted_as_missing() {
         report.missing_packs, 0,
         "a corrupt pack is present; only an absent one is missing"
     );
+}
+
+// ------------------------------------------------- ADR-008 §5.2: the publication pin
+//
+// A pack is renamed into `packs/` before its index rows exist. An external deleter can remove
+// it inside that window (that is exactly what KI-11 observed), so the write path holds the file
+// open without `FILE_SHARE_DELETE` until the commit returns.
+
+/// While a pack is pinned, another attempt to delete it fails; readers still work.
+#[cfg(windows)]
+#[test]
+fn a_pinned_pack_cannot_be_deleted_but_can_be_read() {
+    let root = TempRoot::new("pin");
+    let store = Store::open(root.store(), OpenMode::Create).expect("open");
+    let published = store.put(Role::Bytes, &payload(6, 300)).expect("put");
+    let path = pack_path_of_pack(&root.store(), &published.oid);
+
+    let pin = cas_store::durability_pin_for_test(&path).expect("pin");
+    let delete = std::fs::remove_file(&path);
+    assert_eq!(
+        delete
+            .expect_err("a pinned file must not be deletable")
+            .raw_os_error(),
+        Some(32),
+        "ERROR_SHARING_VIOLATION (32) is the expected refusal"
+    );
+    // The pin denies deletion only; reading keeps working.
+    assert_eq!(
+        store.get(published.oid).expect("get while pinned"),
+        published.frame
+    );
+    drop(pin);
+    std::fs::remove_file(&path).expect("after the pin is dropped the file can be deleted");
 }

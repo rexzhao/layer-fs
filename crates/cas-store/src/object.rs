@@ -162,11 +162,25 @@ pub struct VerificationFailure {
     pub reason: String,
 }
 
+/// Why one pack failed verification (ADR-008 §7).
+///
+/// Programmatic, so an operator (or a test) does not have to parse prose to tell "the file is
+/// gone" from "the file is damaged": those need different actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackFailureKind {
+    /// The index names the pack, the file is not there.
+    Missing,
+    /// The file is there and failed validation (tail, geometry, checksum).
+    Corrupt,
+}
+
 /// One failed pack reported by `verify` (ADR-008 §7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackVerificationFailure {
     /// The pack that failed.
     pub pack_id: String,
+    /// Whether it is missing or damaged.
+    pub kind: PackFailureKind,
     /// Why it failed.
     pub reason: String,
 }
@@ -242,15 +256,29 @@ pub(crate) fn verify_all(database: &Database, layout: &Layout) -> StoreResult<Ve
     let packs_checked = pack_ids.len();
     for pack_id in pack_ids {
         if let Err(error) = verify_pack(database, layout, &pack_id) {
-            if matches!(error, StoreError::MissingPack { .. }) {
+            let kind = if matches!(error, StoreError::MissingPack { .. }) {
                 missing_packs += 1;
-            }
+                PackFailureKind::Missing
+            } else {
+                PackFailureKind::Corrupt
+            };
             pack_failures.push(PackVerificationFailure {
                 pack_id,
+                kind,
                 reason: error.to_string(),
             });
         }
     }
+    // One truth, two views: the count and the per-pack kinds must agree, or a caller summing
+    // `kind == Missing` and a caller reading `missing_packs` would disagree.
+    debug_assert_eq!(
+        missing_packs,
+        pack_failures
+            .iter()
+            .filter(|failure| failure.kind == PackFailureKind::Missing)
+            .count(),
+        "missing_packs disagrees with the per-pack kinds"
+    );
 
     let bad_names = objects_scan::scan_names(&layout.objects())?;
     Ok(VerificationReport {

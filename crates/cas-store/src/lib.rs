@@ -50,6 +50,21 @@ mod schema;
 ///
 /// Compiled only with the `crash-points` feature, which the crate enables for
 /// its own tests and no consumer receives by default (ADR-002 §13.1).
+/// The publication pin, exposed for the test that asserts it denies deletion (ADR-008 §5.2).
+///
+/// Behind the same feature as the crash points: a production consumer never gets it.
+#[cfg(feature = "crash-points")]
+pub fn durability_pin_for_test(path: &std::path::Path) -> std::io::Result<PinForTest> {
+    durability::Pin::hold(path).map(|pin| PinForTest { _pin: pin })
+}
+
+/// A held pin. Dropping it releases the file (ADR-008 §5.2).
+#[cfg(feature = "crash-points")]
+#[derive(Debug)]
+pub struct PinForTest {
+    _pin: durability::Pin,
+}
+
 #[cfg(feature = "crash-points")]
 pub mod testing;
 
@@ -60,7 +75,9 @@ pub mod testing;
 pub mod probe;
 
 pub use batch::{Batch, BatchReport, PutOutcome};
-pub use object::{PackVerificationFailure, VerificationFailure, VerificationReport};
+pub use object::{
+    PackFailureKind, PackVerificationFailure, VerificationFailure, VerificationReport,
+};
 pub use pack::{NoPackObservation, PackObserver, PackStep};
 
 use std::path::Path;

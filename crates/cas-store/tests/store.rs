@@ -439,11 +439,10 @@ fn get_reports_an_object_whose_pack_disappeared() {
     let published = store.put(Role::Bytes, b"soon deleted").expect("put");
     std::fs::remove_file(pack_path_of(root.path(), published.oid)).expect("delete pack");
 
+    // A deleted pack is storage damage with a name (P2b-2d), not an errno.
     match store.get(published.oid) {
-        Err(StoreError::Io(error)) => {
-            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-        }
-        other => panic!("expected Io(NotFound), got {other:?}"),
+        Err(StoreError::MissingPack { pack_id }) => assert!(!pack_id.is_empty()),
+        other => panic!("expected MissingPack, got {other:?}"),
     }
     // `verify` reports it twice: the object cannot be read, and its pack cannot be opened.
     let report = store.verify().expect("verify");

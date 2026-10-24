@@ -31,6 +31,52 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// A handle that stops other processes from deleting a freshly published pack (ADR-008 §5.2).
+///
+/// A new pack is written, renamed into `packs/` and then named by an index row. Between the
+/// rename and that commit, an external deleter (a real-time AV scanner is the observed case)
+/// can remove the file, and the store would then hold rows pointing at nothing. Holding the
+/// file open **without** `FILE_SHARE_DELETE` makes such a delete fail for its lifetime.
+///
+/// The lifetime is deliberately narrow: acquired right after the rename, dropped as soon as
+/// the index transaction has committed. It adds no `fsync` and changes no publication step; it
+/// only denies deletion during the window in which the file is not yet referenced.
+#[derive(Debug)]
+pub(crate) struct Pin {
+    // The handle only has to exist; nothing is read through it.
+    _file: File,
+}
+
+impl Pin {
+    /// Opens `path` for reading with a share mode that forbids deletion.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the platform reports; the caller decides what a failure means.
+    pub(crate) fn hold(path: &Path) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(path)?;
+            Ok(Self { _file: file })
+        }
+        // On Unix an open handle does not deny unlinking (the name can be removed while the
+        // inode lives on), so this makes **no promise** there: it is compiled so the call sites
+        // are platform-independent, and the test that asserts the guarantee is `cfg(windows)`.
+        #[cfg(not(windows))]
+        {
+            Ok(Self {
+                _file: File::open(path)?,
+            })
+        }
+    }
+}
+
 /// Makes a file's contents durable.
 pub(crate) fn sync_file(file: &File) -> io::Result<()> {
     #[cfg(feature = "sync-probe")]
