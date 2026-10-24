@@ -35,8 +35,8 @@ impl TreeStore for OverlayStore {
         body: impl FnOnce(&mut Self::Write<'_>) -> NamespaceResult<T>,
     ) -> NamespaceResult<T> {
         let _guard = ScopeGuard::enter().map_err(into_namespace)?;
-        // The label is audit data; the overlay has no chain of publications to record
-        // it in (that is the table backend's D+ representation). Accepted and dropped.
+        // The label is audit data; the overlay has no chain of publications to record it in
+        // (that was the retired table backend's D+ representation). Accepted and dropped.
         let _ = op;
         let mut connection = self.lock();
         let transaction = connection

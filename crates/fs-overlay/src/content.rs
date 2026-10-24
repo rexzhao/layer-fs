@@ -19,7 +19,7 @@
 //!   its overlay row, or its base bytes.
 //!
 //! These operations are **not** part of [`fs_namespace::TreeStore`]: the overlay's
-//! content representation is its own, exactly as the table backend's extents are
+//! content representation is its own, exactly as the retired table backend's extents were
 //! (ADR-006 §7.1). They are atomic because each one runs in a single overlay
 //! transaction, which is what makes a concurrent `write_at` never half-visible (§7.4).
 
@@ -109,7 +109,7 @@ impl OverlayStore {
 
     /// Creates an empty regular file.
     ///
-    /// `fs_namespace::Rules` has no `create_file`: on the table backend creating a file
+    /// `fs_namespace::Rules` has no `create_file`: in the retired table backend creating a file
     /// and creating a directory differ only in the inode's `kind` and in the content
     /// row that follows, so it lived with the content paths there. The overlay has the
     /// same split, so it provides the same shape.

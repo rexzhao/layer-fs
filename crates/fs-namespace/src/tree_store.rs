@@ -1,17 +1,18 @@
 //! The storage contract the path rules are written against (ADR-006 §7.1).
 //!
 //! The rules in [`crate::operations`] — R1–R12, the violation forms, the ordering of
-//! checks — know nothing about SQLite. They talk to this trait, and each backend
-//! supplies its own implementation: the SQLite table backend (P1, transitional) and
-//! the overlay backend (P2a-4).
+//! checks — know nothing about SQLite. They talk to this trait, and each concrete store
+//! supplies its own implementation: the overlay backend (`fs-overlay`, P2a-4) and the
+//! snapshot-backed store (`fs-workspace`, P2b).
 //!
 //! # What is deliberately *not* here
 //!
 //! Content operations (`update_inode`, the extent methods) are absent by design. The
 //! overlay represents a file's bytes as pages plus a `base_limit`, with no
 //! `content_root` and no extent rows; a trait that demanded `content_root` would force
-//! the overlay to imitate P1's tables — the thing it exists to avoid. Those methods
-//! live on the table backend as inherent methods and disappear with it in P2a-7.
+//! the overlay to imitate P1's tables — the thing it exists to avoid. Content lives on
+//! each store as its own API instead (`fs-overlay`'s page methods, `fs-workspace`'s
+//! materialiser).
 //! The rules here only ever change *name bindings* and *inode existence*.
 //!
 //! # Atomicity
@@ -59,9 +60,9 @@ pub trait TreeRead {
 
     /// Whether a directory has no entries.
     ///
-    /// Separate from `read_dir(dir, None, 1)` because the two backends cannot both
-    /// answer that cheaply by scanning: the table backend has a `COUNT(*)`, and the
-    /// overlay keeps a per-inode entry count. On the overlay, listing is not O(1) —
+    /// Separate from `read_dir(dir, None, 1)` because an implementation may answer it
+    /// much more cheaply than by scanning: the overlay keeps a per-inode entry count.
+    /// Listing is not O(1) there —
     /// it merges the base directory with overlay rows and must skip whiteouts, so
     /// proving a directory is empty can require visiting every tombstone.
     ///
@@ -127,8 +128,8 @@ pub trait TreeWrite: TreeRead {
 /// only for the duration of the call).
 ///
 /// Spelling it `fn write<'a, T>(&'a self, … Self::Write<'a> …)` therefore does not
-/// compile for the table backend, and adding `where Self: 'a` to the GATs only moves
-/// the error. Keep the elided form.
+/// compile for a store whose transaction borrows its connection, and adding
+/// `where Self: 'a` to the GATs only moves the error. Keep the elided form.
 pub trait TreeStore {
     /// The read view handed to [`TreeStore::read`].
     type Read<'t>: TreeRead;
@@ -149,9 +150,8 @@ pub trait TreeStore {
     /// Runs `body` as one atomic change.
     ///
     /// `body` returning `Ok` commits; returning `Err`, or panicking, leaves the tree
-    /// as it was. `op` labels the change for the backend's own bookkeeping — the
-    /// table backend appends a D+ root record with it, the overlay only logs it. The
-    /// label is **not** a publication decision.
+    /// as it was. `op` labels the change for the implementation's own bookkeeping — the
+    /// overlay only logs it. The label is **not** a publication decision.
     ///
     /// # Errors
     ///

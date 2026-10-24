@@ -3,7 +3,7 @@
 //! Deliberately narrower than [`crate::Stat`]: no `content_root`. A file's bytes are
 //! a backend concern — P1 keeps an object id in the inode row, the overlay keeps
 //! pages over a base — and the rules in [`crate::operations`] never look at them.
-//! Content lives behind the table backend's inherent methods until P2a-7 retires it.
+//! Content lives behind each store's own API; this view only carries inode metadata.
 
 use crate::{FileId, Kind};
 

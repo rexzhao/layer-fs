@@ -36,8 +36,8 @@ impl<S: TreeStore> Rules<S> {
 
     /// The backend, for the capabilities that are not part of the tree contract.
     ///
-    /// The table backend exposes its D+ root accessors and its content paths here;
-    /// they are P1 representation, not tree rules.
+    /// The backing store's content API is reached through here; it is storage
+    /// representation, not tree rules.
     pub fn backend(&self) -> &S {
         &self.store
     }
