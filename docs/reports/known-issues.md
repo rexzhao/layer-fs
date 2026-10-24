@@ -385,7 +385,7 @@ workspace.truncate("/f", 181)?;               // 扩展：按 POSIX/ADR-006 §7.
 
 ---
 
-## KI-11：并发发布下 `verify` 可观察到"`pack` 行存在、文件缺失"（**未定性，P2b-2 收口为已知不变量缺口**）
+## KI-11：并发发布下 `verify` 可观察到"`pack` 行存在、文件缺失"（**已定性：外部删除，2026-10-24**）
 
 **发现于**：P2b-2 的并发发布验收（`fs-workspace/tests/pack_concurrency.rs`，两条用例），QA 独立复现。
 
@@ -420,6 +420,23 @@ VerificationReport { checked: 9, packs_checked: 3,
 
 **已做的处置**：两条并发用例标 `#[ignore]`（理由写明"索引可指向缺失 pack"），`staging-audit` 诊断 feature
 （默认关；含 verify 侧 ENOENT 重试 + 完整路径 + 逐条 entry error、rename 后 evidence 硬链接、`pack_id` 实样）。
+
+**定性结论（P2b-2c，2026-10-24）：外部删除（本机某进程删除新建的 `.pack`）**
+
+- 现场（µs 级忙轮询 + 产品内 `staging-audit`）：rename 返回 Ok 后文件在 `packs/` 存在约 **100 µs**，随后连同
+  `evidence` 硬链接一起消失；索引行已提交 → `verify` 看到"`pack` 行在、文件 ENOENT"。
+- **决定性实验**：从 rename 返回到索引 `COMMIT` 持有 `share_mode(READ|WRITE)`（**不含** `FILE_SHARE_DELETE`）的
+  句柄 → **12/12 干净**（同 harness 基线 4/12）。Windows 上该句柄存在时删除必然失败，且 pin 不改变目录可枚举性
+  ⇒ 只能是"阻止了删除"。
+- 已排除：路径不一致（发布方 raw/canonical 同目录）、跨用例 static 串扰（`--test-threads=1` 仍红）、
+  写路径未落地（rename 后审计仍见文件）、目录级清理（同目录另两个 pack 一直在）、"`%TEMP%` 特殊性"
+  （换卷同率 2/200 vs 2/200；但**不能**排除全局 AV/EDR——Defender 扫所有卷）。
+- **未确认删除者**：`Get-MpThreatDetection` = 0、`ExclusionPath` = 空，但 MPLog 不存在、`Get-MpComputerStatus`
+  在本机失败 ⇒ 只能说"没有可见的 Defender 处置痕迹"，不能说"AV 无关"。
+- **产品侧处置**：不修"删除"（非本仓库可控），改为让损坏**可诊断**（P2b-2d：`MissingPack` typed 语义）；
+  发布期可见性确认/有界重 staging 是否做，待 architect 判定（P2b-2e）。
+- **对不变式的影响**：`pack` 行 ⇒ 文件存在，**在本机环境下不成立**。P2b-6 的 GC 设计不得静默依赖它：
+  mark/sweep 遇到"行在文件缺"必须按"存储损坏"计数并报告，不得当成"没有对象"或"孤儿文件"处理。
 
 **已知非缺陷但需记**：`Repo::open(create=false)` 会打开**两次** `Store`（先 probe `busy_timeout`，再正式开），
 每次 `open` 都执行 `clear_temporaries()`——一次 commit 期间可能有 4 次 `tmp/` 清扫插进来，这解释了并发下
