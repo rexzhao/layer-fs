@@ -171,3 +171,26 @@ distinct_oids(visited) == distinct_oids(roots)
 5. **`verify --deep` 覆盖 snapshot 表 + workspace base**（卡里的硬要求），本组是它的第一个实战场景。
 
 **意图备注**：这组用例同时是"GC 是否把 snapshot 表当根"的活体检测——若实现只从 branch head 出发，丢一个 snapshot 根后共享页仍会被回收。写进注释，避免后人当成 K5 的重复。
+
+## 10. 追加验收（QA，2026-10-24）
+
+- **I6「到达点号 == 期望点号」**：崩溃注入的老坑是"注入了但没走到那个点"——只断言"重开后 `verify` 干净"不够
+  （没走到也会干净）。每个注入点必须打印**实际到达的步骤号**并与期望比对。
+- **G1c「dry-run 无副作用」**：`gc --dry-run` 之后，除**标记库**外 store 内每个文件的哈希不变。它同时验证两件事：
+  dry-run 真的只读；标记库位置正确（若写进 `packs/` 或 `tmp/`，哈希就会变）。
+
+## 11. 接口新增（mark 依赖，manager 批准 + architect 复核中）
+
+`fs-snapshot` 公开 visitor 式遍历（**不在 GC 里复制格式知识**，与 KI-10 同类风险）：
+
+```rust
+/// Visits every object reachable from `root`, in no particular order.
+/// Visitor-based on purpose: a `Vec<ObjectId>` return would make the caller hold the whole closure
+/// in memory (ADR-008 §5.4). The same object may be visited more than once through a shared
+/// subtree — deduplication is the **caller's** job (GC inserts into a `BTreeSet`).
+pub fn for_each_object(root: ObjectId, visit: impl FnMut(ObjectId, Role)) -> SnapshotResult<()>
+```
+
+约束：① 只访问不返回；② 不暴露 pager 内部（`Entry`/`Shape`/`build_tree` 仍 `pub(crate)`）；③ 允许重复访问并写进文档，
+**去重留在 GC**（"去重后访问了几个"是 G2/G3 的判据本身）；④ 单测须证明**共享子树节点被访问多次**（否则 G3 的 per-kind
+断言会失真）；⑤ 纯新增，不改既有 API 语义。
