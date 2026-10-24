@@ -322,3 +322,69 @@ fn a_crash_during_discard_is_swept_on_reopen() {
         "the sweep removed the orphan directory"
     );
 }
+
+/// **P2b-2 / ADR-008 §5.1** — every commit crash point, then: the store verifies and **all
+/// roots read back**.
+///
+/// The per-point tests above assert the recovery protocol for one aspect each. This one is the
+/// grouped claim the pack/publish card asks for: whatever the injection point, reopening must
+/// leave (a) a store whose objects *and packs* verify, and (b) every root the repository still
+/// names — each branch head's commit root, the workspace's base root, and every `snapshot` row
+/// — readable through `SnapshotReader`, i.e. without any of our tables.
+#[test]
+fn every_commit_crash_point_recovers_to_a_clean_store_with_all_roots_readable() {
+    for point in [
+        "during-materialise",
+        "after-materialise",
+        "after-intent",
+        "after-publish",
+    ] {
+        let (_root, dir, _head) = prepared(&format!("roots-{point}"));
+        run_child(&dir, "commit", point);
+        let (repo, workspace) = recovered(&dir);
+
+        // (a) objects and packs verify; a concurrent loser's dead frame is legal, a broken
+        // pack is not.
+        let store = Store::open(&dir, OpenMode::ReadOnly).expect("store");
+        let report = store.verify().expect("verify");
+        assert!(report.is_clean(), "{point}: store is not clean: {report:?}");
+        drop(store);
+
+        // (b) every root is readable. Commit ids first, then snapshot roots (already oids).
+        let mut roots: Vec<cas_core::ObjectId> = Vec::new();
+        for branch in repo.branches().expect("branches") {
+            let info = repo.commit_info(&branch.head).expect("commit info");
+            roots.push(info.root.parse().expect("root id"));
+        }
+        let base = repo
+            .commit_info(workspace.base_commit())
+            .expect("base commit info");
+        roots.push(base.root.parse().expect("root id"));
+        let connection = rusqlite::Connection::open(repo.metadata_path()).expect("db");
+        let mut statement = connection
+            .prepare("SELECT root_oid FROM snapshot")
+            .expect("prepare");
+        for row in statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("rows")
+        {
+            roots.push(row.expect("root id").parse().expect("oid"));
+        }
+        assert!(!roots.is_empty(), "{point}: no roots to check");
+        for root in roots {
+            let store = Store::open(&dir, OpenMode::ReadOnly).expect("store");
+            let reader = SnapshotReader::open_any(&store, root)
+                .unwrap_or_else(|error| panic!("{point}: root {root} is unreadable: {error:?}"));
+            let root_inode = reader.inode(0).expect("root inode").expect("present");
+            // A root may legitimately be an empty tree (the repository's initial commit), so
+            // the claim is "readable", plus "if it names /f, its bytes are intact".
+            if let Some(serial) = reader.lookup(&root_inode, b"f").expect("lookup") {
+                let inode = reader.inode(serial).expect("inode").expect("present");
+                assert_eq!(inode.size, 7, "{point}: root {root} lost /f's bytes");
+            }
+        }
+
+        // The recovered workspace still reads its file through the overlay.
+        assert_eq!(read_file(&workspace, "/f"), b"payload", "{point}");
+    }
+}
