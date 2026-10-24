@@ -29,14 +29,17 @@ impl TempRoot {
         // The clock is part of the name, not just the pid: a later run of this binary can
         // reuse the pid, and reusing an earlier run's leftover store would make the test
         // depend on history instead of on this run.
-        let path = std::env::temp_dir().join(format!(
-            "fs-workspace-pack-concurrency-{label}-{}-{}-{sequence}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0)
-        ));
+        let path = std::env::var_os("WCAS_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "fs-workspace-pack-concurrency-{label}-{}-{}-{sequence}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or(0)
+            ));
         std::fs::create_dir_all(&path).expect("temp root");
         assert!(
             std::fs::read_dir(&path)

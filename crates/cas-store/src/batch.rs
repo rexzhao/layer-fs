@@ -275,7 +275,31 @@ fn record_pack(
     {
         let path = _layout.pack_path(pack_id);
         let meta = std::fs::metadata(&path).unwrap_or_else(|error| {
-            panic!("staging-audit: {pack_id} missing before commit: {error}")
+            let evidence = _layout.packs().join(format!("{pack_id}.pack.evidence"));
+            let mut listing = String::new();
+            match std::fs::read_dir(_layout.packs()) {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(entry) => listing.push_str(&format!(
+                                "{:?}(len={:?}) ",
+                                entry.file_name(),
+                                entry.metadata().map(|meta| meta.len())
+                            )),
+                            Err(entry_error) => {
+                                listing.push_str(&format!("ENTRY-ERROR({entry_error}) "))
+                            }
+                        }
+                    }
+                }
+                Err(dir_error) => listing.push_str(&format!("READDIR-ERROR({dir_error})")),
+            }
+            panic!(
+                "staging-audit: {pack_id} missing before commit: {error}; path={}; root={:?};                  evidence_exists={}; entries=[{listing}]",
+                path.display(),
+                _layout.root().canonicalize(),
+                evidence.exists()
+            )
         });
         assert_eq!(
             meta.len(),
