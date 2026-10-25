@@ -121,6 +121,16 @@ pub fn run(store_dir: impl AsRef<Path>, options: GcOptions) -> WorkspaceResult<G
         .map(|pack| pack.objects.saturating_sub(pack.survivors))
         .sum();
 
+    // K8a: a `pack` row whose file is gone is a **finding**, never something to repair by deleting the
+    // row. A real run refuses before touching anything; a dry run says so and continues, because
+    // "tell me what you would do" must still be answerable on a damaged store.
+    if !options.dry_run && !decided.missing_packs.is_empty() {
+        let pack_id = decided.missing_packs[0].clone();
+        return Err(crate::WorkspaceError::Store(
+            cas_store::StoreError::MissingPack { pack_id },
+        ));
+    }
+
     let applied = if options.dry_run {
         None
     } else {

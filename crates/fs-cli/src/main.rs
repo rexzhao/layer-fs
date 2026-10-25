@@ -282,6 +282,9 @@ fn gc(store: &std::path::Path, arguments: &[String]) -> Result<(), Box<dyn std::
         "  packs: {} deleted, {} repacked",
         summary.packs_deleted, summary.packs_repacked
     );
+    for pack in &summary.missing_packs {
+        println!("  warning: pack {pack} has a row but no file (not repaired: a missing file is a finding)");
+    }
     Ok(())
 }
 

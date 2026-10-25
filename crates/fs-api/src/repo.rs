@@ -76,6 +76,7 @@ pub fn gc(store_dir: impl AsRef<Path>, dry_run: bool) -> ApiResult<GcSummary> {
         packs_deleted: outcome.report.packs_deleted,
         packs_repacked: outcome.report.packs_repacked,
         planned_objects: outcome.plan.dead_objects.len(),
+        missing_packs: outcome.plan.missing_packs.clone(),
     })
 }
 
@@ -87,7 +88,7 @@ pub const DEFAULT_REPACK_THRESHOLD: f64 = 0.5;
 /// Flat on purpose: the CLI prints it, and `GcReport`/`SweepPlan` are GC internals that must not leak
 /// into the CLI. `planned_objects` and `freed_objects` differ only in a dry run — that difference is
 /// the whole reason both fields exist.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GcSummary {
     /// Whether anything was actually deleted.
     pub dry_run: bool,
@@ -107,6 +108,8 @@ pub struct GcSummary {
     pub packs_repacked: usize,
     /// Objects the sweep decided to free (present in a dry run too).
     pub planned_objects: usize,
+    /// Packs whose row has no file. Reported, never "repaired" by dropping the row (K8a).
+    pub missing_packs: Vec<String>,
 }
 
 impl Repo {
