@@ -463,3 +463,27 @@ impl SnapshotReader<'_> {
 
 **测试**：fake source 返回截断/坏信封 → `references` 报错而不是返回空；返回 role 不符 → `WrongRole`；
 维护 source 与 `&Store` 对同一 root 的答案逐元素相等（worker 已实现后半条）。
+
+## 25. `gc::run` 之后的收尾提醒（manager；邮件正文常不到 worker 处，以本节为准）
+
+### A. 三条防返工提醒
+
+1. **K5c 不要依赖 `verify --deep` 覆盖 `pending_root`**：ADR §6.2 已写死 `verify --deep` 只覆盖主库可达根（`commit` /
+   `snapshot` / `workspace.base_root`）；overlay 未提交根的存活必须由 K5c 自己验。
+2. **崩溃五点每条都要打印"实际到达点号"并与期望比对**（I6）：只验"重开后 `verify --deep` 干净"不够——**没走到那个点也会干净**。
+3. **`gc --dry-run` 后除标记库外 store 文件哈希不变**（G1c），且标记库不得落在 `packs/` 或 `tmp/`。
+
+### B. `gc::run` 的验收补充（除已实现四项外）
+
+4. **dry-run 不产生 `freed`**（`freed` 只在真的 apply 之后填）——这一条已实现，写成断言而非注释；
+5. **句柄不长寿**：`gc(self)` 返回后 `Repo::open` 立即可用（已实现）；再加一条"`gc` 返回后 `Repo::open_exclusive` 也能拿到"
+   （两个方向都释放）；
+6. **报告可对账**：`marked_objects == report.reachable_count`；`packs_deleted + packs_repacked <= packs_before`；
+   `reclaimed_dead_bytes` 只在有死帧时非零（K9 场景）。
+
+### C. CLI 的验收
+
+7. `gc_repack_threshold` 从 policy 读；范围 `[0,1]`（含端点）合法，越界/NaN → typed `Inconsistent`，且**拒绝先于任何移动**；
+8. `snapshot drop` 后：该根不可达的对象在**下一次** GC 被回收，其它根仍逐字节可读；
+9. `branch delete <b>` **保留 `branch_log`**（P7）：被删分支的历史提交仍为根 → 对象**存活**（这条同时钉住"`Repo::roots()`
+   取全部 commit 行"的超集性质）。
