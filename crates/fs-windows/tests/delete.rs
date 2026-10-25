@@ -86,6 +86,38 @@ fn a_mark_can_be_cancelled_by_another_handle() {
     ));
 }
 
+/// `Cleanup` decrements the handle count on both clean and pending entries, and never removes anything —
+/// the count direction is the thing to get right: an implementation that *increments* on cleanup would let a
+/// deleted entry stay open forever.
+#[test]
+fn cleanup_decrements_the_handle_count_on_both_states() {
+    assert_eq!(
+        step(State::Clean { handles: 2 }, Event::Cleanup),
+        Step::Next(State::Clean { handles: 1 }),
+        "cell clean/handles=2 cleanup"
+    );
+    assert_eq!(
+        step(State::Clean { handles: 1 }, Event::Cleanup),
+        Step::Next(State::Clean { handles: 0 }),
+        "cell clean/handles=1 cleanup"
+    );
+    assert_eq!(
+        step(State::Pending { handles: 2 }, Event::Cleanup),
+        Step::Next(State::Pending { handles: 1 }),
+        "cell pending/handles=2 cleanup: the mark survives, only the count moves"
+    );
+    assert_eq!(
+        step(State::Pending { handles: 1 }, Event::Cleanup),
+        Step::Next(State::Pending { handles: 0 }),
+        "cell pending/handles=1 cleanup: still marked, still present"
+    );
+    assert_eq!(
+        step(State::Pending { handles: 0 }, Event::Cleanup),
+        Step::Next(State::PendingDropped),
+        "cell pending/handles=0 cleanup: a mark with no handles becomes droppable"
+    );
+}
+
 /// A cleanup on a **clean** entry never removes it, no matter how many handles are left: without the mark,
 /// `CleanupDelete` is an ordinary cleanup. Deleting here would let any handle delete a file nobody marked.
 #[test]

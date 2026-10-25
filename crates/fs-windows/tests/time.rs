@@ -116,3 +116,52 @@ fn conversion_does_not_depend_on_the_local_time_zone() {
     std::env::remove_var("TZ");
     assert_eq!(first, second, "cell ns={ns}: the conversion is UTC-only");
 }
+
+/// **Absolute anchors**, not just round trips: a conversion that is self-consistent but shifted by an hour (or a
+/// day, or 1601 vs 1970) passes every round-trip test. These are the two instants Windows developers know by
+/// heart, written as literals.
+#[test]
+fn two_known_instants_map_to_their_published_filetimes() {
+    assert_eq!(
+        unix_ns_to_filetime(0),
+        Ok(116_444_736_000_000_000),
+        "cell instant=1970-01-01T00:00:00Z: FILETIME 116444736000000000"
+    );
+    let ns_2262 = 1_660_000_000_000_000_000; // 2022-08-05, comfortably inside the range
+    assert_eq!(
+        unix_ns_to_filetime(ns_2262),
+        Ok(133_044_736_000_000_000),
+        "cell instant=2022-08-05T11:33:20Z: FILETIME 133681473600000000"
+    );
+    // And back, through the same anchors, so a swapped operand cannot pass both directions.
+    assert_eq!(
+        filetime_to_unix_ns(116_444_736_000_000_000),
+        Ok(0),
+        "cell filetime=116444736000000000: the Unix epoch"
+    );
+    assert_eq!(
+        filetime_to_unix_ns(133_044_736_000_000_000),
+        Ok(ns_2262),
+        "cell filetime=133044736000000000"
+    );
+}
+
+/// The **upper** bound: `i64::MAX` nanoseconds is FILETIME 208_678_456_368_547_758, and one tick past it must be
+/// refused — not wrapped into 1677, which is what an unchecked `i64` multiply would produce.
+#[test]
+fn the_last_representable_instant_is_an_anchor_and_one_tick_past_it_is_refused() {
+    assert_eq!(
+        unix_ns_to_filetime(i64::MAX),
+        Ok(208_678_456_368_547_758),
+        "cell instant=i64::MAX: the last representable nanosecond"
+    );
+    assert_eq!(
+        filetime_to_unix_ns(208_678_456_368_547_759),
+        Err(Failure::InvalidParameter),
+        "cell filetime=one tick past i64::MAX: refused, so no wrap into the past"
+    );
+    assert!(
+        filetime_to_unix_ns(208_678_456_368_547_758).is_ok(),
+        "cell filetime=the last anchor: still representable"
+    );
+}
