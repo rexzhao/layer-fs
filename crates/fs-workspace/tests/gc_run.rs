@@ -256,3 +256,52 @@ fn the_report_reconciles_with_a_hand_counted_store() {
         "this store has no dead frames, so nothing was reclaimed by repacking"
     );
 }
+
+/// §29: two labels on **one tree** must both be recorded.
+///
+/// The most ordinary way this happens is a workspace created on a commit: its `base_root` is that
+/// commit's tree, so `commit:<id>` and `workspace:<name>` name the same object. Marking must not walk the
+/// tree twice (§13.1), and the report must still say both facts were covered — otherwise G2 cannot tell
+/// "a shared tree" from "a missed root", and the criterion stops being evidence.
+#[test]
+fn two_labels_on_one_tree_are_both_recorded_and_the_tree_is_walked_once() {
+    let root = TempRoot::new("shared-label");
+    let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
+    repo.init().expect("init");
+    // A workspace on `main` shares its base tree with the initial commit — the QA reproduction.
+    let _workspace = repo.workspace_create("w1", "main").expect("create");
+    drop(_workspace);
+    drop(repo);
+
+    let outcome = run(root.store(), GcOptions::default()).expect("run");
+
+    let declared: std::collections::BTreeSet<&String> =
+        outcome.report.roots_declared.iter().collect();
+    let visited: std::collections::BTreeSet<&String> =
+        outcome.report.roots_visited.iter().collect();
+    assert_eq!(
+        declared, visited,
+        "every declared label must be recorded as visited: declared {declared:?} vs visited {visited:?}"
+    );
+    assert!(
+        outcome.report.roots_declared.len() > outcome.report.root_oids.len()
+            || outcome.report.roots_declared.len() >= 2,
+        "the fixture must have more than one label"
+    );
+    assert!(
+        outcome
+            .report
+            .visited_by_kind
+            .values()
+            .all(|count| *count > 0),
+        "per-kind counts must include every kind that was declared: {:?}",
+        outcome.report.visited_by_kind
+    );
+
+    // The tree was still walked once: the marked set is a set of objects, not of labels.
+    assert_eq!(
+        outcome.report.marked_objects,
+        outcome.report.reachable.len(),
+        "the marked set stays deduplicated"
+    );
+}

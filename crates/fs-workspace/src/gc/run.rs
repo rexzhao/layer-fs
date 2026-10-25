@@ -78,6 +78,15 @@ pub fn run(store_dir: impl AsRef<Path>, options: GcOptions) -> WorkspaceResult<G
     let mut marked_from: Vec<cas_core::ObjectId> = Vec::new();
     for entry in declared.entries() {
         if marked_from.contains(&entry.root) {
+            // P2b-6 §29: the *tree* has already been walked, but this **label** has not been recorded —
+            // and G2 compares facts (labels), not object ids. Skipping the record here made two labels on
+            // one tree look exactly like a missed root, which is the failure G2 exists to catch. Marking
+            // stays deduplicated by oid (§13.1's "do not walk a shared subtree twice"); only the
+            // bookkeeping is per label.
+            report.record_visit(entry);
+            if let Some(sink) = hooks.on_root_visited.as_mut() {
+                sink(entry.kind, entry.root);
+            }
             continue;
         }
         marked_from.push(entry.root);
