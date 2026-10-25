@@ -449,7 +449,12 @@ fn fingerprint(dir: &std::path::Path) -> Vec<(String, u64)> {
                     .expect("inside")
                     .to_string_lossy()
                     .replace('\\', "/");
-                if !relative.ends_with("-shm") {
+                // The marker is the collector's own scratch: reading it is allowed to grow its file,
+                // and its `-wal` is created and checkpointed at SQLite's discretion. Excluding it (and
+                // its companions) is what makes "the plan changed nothing" a statement about the
+                // *store*, which is what it is meant to be.
+                let is_marker = relative.starts_with(fs_workspace::gc::Marker::FILE_NAME);
+                if !relative.ends_with("-shm") && !is_marker {
                     out.push((relative, meta.len()));
                 }
             }

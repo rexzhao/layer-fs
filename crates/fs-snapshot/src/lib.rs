@@ -48,5 +48,5 @@ pub use encode::{encode_directory, encode_extents, encode_inode_table, encode_ro
 pub use error::{SnapshotError, SnapshotResult};
 pub use pager::PageSink;
 pub use profile::{Chunker, Profile, TreeDomain};
-pub use read::SnapshotReader;
+pub use read::{ObjectSource, SnapshotReader};
 pub use record::{Content, DirEntry, Extent, InodeRecord, Kind, RootValue};

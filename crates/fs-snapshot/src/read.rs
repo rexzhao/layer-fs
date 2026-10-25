@@ -12,12 +12,64 @@ use crate::error::{malformed, SnapshotError, SnapshotResult};
 use crate::profile::Profile;
 use crate::record::{Content, DirEntry, Extent, InodeRecord, Kind, RootValue};
 
+/// The only thing the reader needs from a store: fetch one object's raw value.
+///
+/// Split out because a *maintenance* caller (offline GC) owns the store's single connection and must
+/// not open a second one (ADR-008 §6.1: one connection serves one database). With this trait the
+/// reader can be handed that connection instead of a `&Store`, and `&Store` still satisfies it, so
+/// every existing call site keeps working unchanged.
+pub trait ObjectSource {
+    /// The framed bytes of `oid`, verified as usual.
+    ///
+    /// # Errors
+    ///
+    /// A store failure (missing pack, unreadable file) or an identity that does not match.
+    fn get(&self, oid: ObjectId) -> SnapshotResult<Vec<u8>>;
+}
+
+impl ObjectSource for Store {
+    fn get(&self, oid: ObjectId) -> SnapshotResult<Vec<u8>> {
+        Ok(Store::get(self, oid)?)
+    }
+}
+
+// Callers hold their store behind a lock or an `Arc` (ADR-006 §7.4's lock order), so the trait has to
+// reach *through* those wrappers: without these, every existing call site would have to be rewritten,
+// and the signature change would leak out of this crate.
+impl<T: ObjectSource + ?Sized> ObjectSource for &T {
+    fn get(&self, oid: ObjectId) -> SnapshotResult<Vec<u8>> {
+        (**self).get(oid)
+    }
+}
+
+impl<T: ObjectSource + ?Sized> ObjectSource for std::sync::Arc<T> {
+    fn get(&self, oid: ObjectId) -> SnapshotResult<Vec<u8>> {
+        (**self).get(oid)
+    }
+}
+
+impl<T: ObjectSource + ?Sized> ObjectSource for std::sync::MutexGuard<'_, T> {
+    fn get(&self, oid: ObjectId) -> SnapshotResult<Vec<u8>> {
+        (**self).get(oid)
+    }
+}
+
 /// Reads a snapshot from a store.
-#[derive(Debug)]
 pub struct SnapshotReader<'a> {
-    store: &'a Store,
+    source: &'a dyn ObjectSource,
     profile: Profile,
     root: RootValue,
+}
+
+impl std::fmt::Debug for SnapshotReader<'_> {
+    /// Written by hand: the source is a trait object (a store, or a maintenance connection), and
+    /// printing a connection tells a reader nothing.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotReader")
+            .field("profile", &self.profile)
+            .field("inode_table", &self.root.inode_table)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> SnapshotReader<'a> {
@@ -32,8 +84,8 @@ impl<'a> SnapshotReader<'a> {
     ///
     /// `WrongRole`, `UnsupportedFormat`, `UnsupportedProfile`, `Malformed`, or a store
     /// failure.
-    pub fn open_any(store: &'a Store, root: ObjectId) -> SnapshotResult<Self> {
-        let value = fetch(store, root, Role::FilesystemRoot, "filesystem root")?;
+    pub fn open_any(source: &'a dyn ObjectSource, root: ObjectId) -> SnapshotResult<Self> {
+        let value = fetch(source, root, Role::FilesystemRoot, "filesystem root")?;
         let mut probe = Reader::new(&value);
         probe.format(Profile::V1.fmt)?;
         // Layout (ADR-005 §3.1): fmt (1 byte, consumed by `format`), profile id (32),
@@ -46,7 +98,7 @@ impl<'a> SnapshotReader<'a> {
             .ok_or_else(|| SnapshotError::UnsupportedProfile {
                 found: hex(recorded),
             })?;
-        Self::open(store, root, profile)
+        Self::open(source, root, profile)
     }
 
     /// Opens a snapshot under a *specific* profile, refusing a root that does not match.
@@ -59,8 +111,12 @@ impl<'a> SnapshotReader<'a> {
     ///
     /// `WrongRole`, `UnsupportedFormat`, `UnsupportedProfile`, `Malformed`, or a store
     /// failure.
-    pub fn open(store: &'a Store, root: ObjectId, profile: Profile) -> SnapshotResult<Self> {
-        let value = fetch(store, root, Role::FilesystemRoot, "filesystem root")?;
+    pub fn open(
+        source: &'a dyn ObjectSource,
+        root: ObjectId,
+        profile: Profile,
+    ) -> SnapshotResult<Self> {
+        let value = fetch(source, root, Role::FilesystemRoot, "filesystem root")?;
         let mut reader = Reader::new(&value);
         reader.format(profile.fmt)?;
         let found = reader.take(32)?;
@@ -75,7 +131,7 @@ impl<'a> SnapshotReader<'a> {
         let inode_table = reader.oid()?;
         reader.finish()?;
         Ok(Self {
-            store,
+            source,
             profile,
             root: RootValue {
                 scope_id,
@@ -105,7 +161,7 @@ impl<'a> SnapshotReader<'a> {
         let mut pointer = self.root.inode_table;
         // Descend until a leaf, then search it.
         loop {
-            let page = fetch(self.store, pointer, Role::InodeTable, "inode table")?;
+            let page = fetch(self.source, pointer, Role::InodeTable, "inode table")?;
             let mut reader = Reader::new(&page);
             reader.format(self.profile.fmt)?;
             // The fourth and last caller: `lookup`, `read_dir` and `extents_in_range`
@@ -227,7 +283,7 @@ impl<'a> SnapshotReader<'a> {
         // it again to decode the page, doubling the I/O of the whole mark phase on a large store.
         // Role and value come from the same decoded envelope; the role is deliberately not returned
         // (ADR-008 6.3) precisely because the caller never needs it back.
-        let bytes = self.store.get(oid)?;
+        let bytes = self.source.get(oid)?;
         let object = Object::decode(&bytes)?;
         self.references_of(object.role(), object.value())
     }
@@ -406,8 +462,8 @@ impl<'a> SnapshotReader<'a> {
             // `DirectoryLeaf` rejects every branch page and leaves the branch arm
             // below unreachable (P2a-1-QA-1). `read_dir` and `extents_in_range`
             // already worked this way; this one did not.
-            let role = role_of(self.store, pointer)?;
-            let page = fetch(self.store, pointer, role, "directory")?;
+            let role = role_of(self.source, pointer)?;
+            let page = fetch(self.source, pointer, role, "directory")?;
             let mut reader = Reader::new(&page);
             reader.format(self.profile.fmt)?;
             check_page_size(&page, &self.profile)?;
@@ -523,8 +579,8 @@ impl<'a> SnapshotReader<'a> {
         limit: usize,
         out: &mut Vec<DirEntry>,
     ) -> SnapshotResult<()> {
-        let role = role_of(self.store, page)?;
-        let value = fetch(self.store, page, role, "directory")?;
+        let role = role_of(self.source, page)?;
+        let value = fetch(self.source, page, role, "directory")?;
         let mut reader = Reader::new(&value);
         reader.format(self.profile.fmt)?;
         check_page_size(&value, &self.profile)?;
@@ -605,8 +661,8 @@ impl<'a> SnapshotReader<'a> {
         to: u64,
         out: &mut Vec<Extent>,
     ) -> SnapshotResult<()> {
-        let role = role_of(self.store, page)?;
-        let value = fetch(self.store, page, role, "extent tree")?;
+        let role = role_of(self.source, page)?;
+        let value = fetch(self.source, page, role, "extent tree")?;
         let mut reader = Reader::new(&value);
         reader.format(self.profile.fmt)?;
         check_page_size(&value, &self.profile)?;
@@ -701,19 +757,19 @@ fn without_duplicates(ids: Vec<ObjectId>) -> Vec<ObjectId> {
     out
 }
 
-fn role_of(store: &Store, oid: ObjectId) -> SnapshotResult<Role> {
-    let bytes = store.get(oid)?;
+fn role_of(source: &dyn ObjectSource, oid: ObjectId) -> SnapshotResult<Role> {
+    let bytes = source.get(oid)?;
     let object = Object::decode(&bytes)?;
     Ok(object.role())
 }
 
 fn fetch(
-    store: &Store,
+    source: &dyn ObjectSource,
     oid: ObjectId,
     expected: Role,
     what: &'static str,
 ) -> SnapshotResult<Vec<u8>> {
-    let bytes = store.get(oid)?;
+    let bytes = source.get(oid)?;
     let object = Object::decode(&bytes)?;
     if object.role() != expected {
         return Err(SnapshotError::WrongRole {

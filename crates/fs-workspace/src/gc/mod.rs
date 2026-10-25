@@ -13,11 +13,13 @@ pub mod apply;
 pub mod criteria;
 pub mod mark;
 pub mod roots;
+pub mod source;
 pub mod sweep;
 
 pub use apply::{apply, Applied};
 pub use mark::{mark_roots, Marker};
 pub use roots::{MaintenanceRoots, RepoRoots, RootKind, RootRef, RootRow, RootSet, RootSource};
+pub use source::MaintenanceSource;
 pub use sweep::{plan, PackDecision, SweepPlan};
 
 use std::collections::BTreeMap;

@@ -385,3 +385,45 @@ fn a_stale_marker_is_replaced_not_inherited() {
         "a new run must start from an empty marked set"
     );
 }
+
+// ------------------------------------------- reading through the maintenance connection (§23)
+
+/// P2b-6 §23 acceptance: both `ObjectSource` implementations answer the same for the same root, and
+/// each is stable across two calls.
+///
+/// The maintenance side is the one that matters: it reads pack frames through the connection that
+/// holds the store's lock, which is the only way marking can work during an offline sweep.
+#[test]
+fn the_maintenance_source_answers_what_the_store_answers() {
+    let (root, repo) = repository("source");
+    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    put_file(&workspace, "/f", b"bytes that both sources must read");
+    workspace.commit("one", false).expect("commit");
+    drop(workspace);
+    let root_oid = head_root(&repo);
+    drop(repo);
+
+    let maintenance = fs_workspace::MaintenanceRepo::open(root.store()).expect("maintenance");
+    let source = fs_workspace::gc::MaintenanceSource::new(maintenance.connection(), root.store());
+    let via_maintenance =
+        SnapshotReader::open_any(&source, root_oid).expect("open through the maintenance source");
+    let first = via_maintenance.references(root_oid).expect("references");
+    let second = via_maintenance
+        .references(root_oid)
+        .expect("references again");
+    assert_eq!(first, second, "the same root must read the same twice");
+    assert!(
+        !first.is_empty(),
+        "a commit root references its inode table"
+    );
+    drop(maintenance);
+
+    // The same question through a `&Store` — a different implementation, the same answer.
+    let store = Store::open(root.store(), OpenMode::ReadWrite).expect("open store");
+    let via_store = SnapshotReader::open_any(&store, root_oid).expect("open through the store");
+    assert_eq!(
+        via_store.references(root_oid).expect("references"),
+        first,
+        "the two ObjectSource implementations must agree"
+    );
+}
