@@ -384,3 +384,30 @@ workspace 都让根枚举失败（`Inconsistent: object id ""`）。空串是"�
 - GC 的带标签枚举（`RepoRoots`）在有活 overlay 时**报 typed `Busy`**（先等满默认 `busy_timeout` ≈5.5 s）。这是**正确**的：
   **一个被静默丢掉的 overlay 根 = 一棵会被删掉的子树**，宁可整次枚举失败，也不能少一行。
 - 交互式调用嫌等待长属 API 取舍，P2b-6 **不改**（若将来要改，另开卡并保留"不得静默少行"这条）。
+
+## 21. T3 加强 + kind 侧的三个条件（architect，2026-10-24）
+
+### T3：值不只要"能解析为 ObjectId"，还要"能解析到一条已发布的索引行"
+
+`commit_id` / `branch.head_commit` / `commit.parent_commit` 都是 64 位十六进制，**`ObjectId` 也能解析成功** → 只做"可解析"
+会让**误分类**蒙混过关（worker 实测发现）。因此对每个 `RootSource` 列：
+
+> 采样值不仅能解析为 `ObjectId`，还必须**在 `object_location` 里有一行**（只查索引，**不查文件**——避免 KI-11 的外部删除
+> 把判据弄红）。
+
+- 真根（`commit.root_oid`、`snapshot.root_oid`、`workspace.base_root`、`ov_meta.pending_root`、`sealed_content`）在索引里 → 通过；
+- commit/branch 那类"格式相同、语义不同"的列 → 索引里没有 → **误分类当场红**，不再依赖人工写的理由；
+- 采样仍设上限 N 行，避免大库拖慢。
+
+### kind 侧（不建第二张表）的三个条件
+
+1. `references` **以及任何按 `Role` 分类（而非仅转发）的代码，不得有 `_ =>` 兜底**；一旦出现兜底，就退回"表 + 一致性测试"；
+2. 保留 C12' 的按 kind **行为** fixture —— 编译器只证明"表态了"，不证明"表得对"；
+3. 加一条 **`Role::ALL` 遍历用例**：对每个 role 构造/选用一个对象，断言 `references` 返回定义好的结果（空或有边）且不 panic。
+
+### 全列清单的两个过滤器（已实现，证据在测）
+
+- 排除 SQLite 记账表（`sqlite_sequence`、`sqlite_stat1` 等）与 `temp` schema；
+- 排除隐藏列：必须用 **`pragma_table_xinfo`**（`pragma_table_info` **根本不报告**隐藏/生成列，用它加 `hidden = 0` 会
+  "什么都没滤掉"却看起来像滤过了）；
+- 每个过滤器都要有"**确实滤掉了东西**"的证据 + "真列仍在"的对照，否则过滤器会变成装饰。
