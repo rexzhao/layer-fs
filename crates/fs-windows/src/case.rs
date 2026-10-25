@@ -44,10 +44,15 @@ pub fn lookup<'a>(entries: &[&'a str], wanted: &str) -> Lookup<'a> {
         .copied()
         .filter(|entry| fold(entry) == folded_wanted)
         .collect();
-    match matches.len() {
-        0 => Lookup::Missing,
-        1 => Lookup::Folded(matches[0]),
-        _ => Lookup::Ambiguous,
+    // Spelled out rather than a wildcard on the count: a fallback arm would silently absorb "impossible"
+    // counts too, and the reviewer would have to reason about which arm it is. (P3-1 QA: no fallback in
+    // code that classifies — even when the domain is `usize`.)
+    if matches.is_empty() {
+        Lookup::Missing
+    } else if matches.len() == 1 {
+        Lookup::Folded(matches[0])
+    } else {
+        Lookup::Ambiguous
     }
 }
 

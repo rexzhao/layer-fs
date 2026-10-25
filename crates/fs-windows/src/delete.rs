@@ -10,20 +10,6 @@
 
 use crate::error::Failure;
 
-/// Whether the entry is marked for deletion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Marked {
-    /// Not marked.
-    Clean,
-    /// `SetDelete(TRUE)` was called and not undone.
-    Pending,
-}
-
-impl Marked {
-    /// Both states, for the completeness walk.
-    pub const ALL: [Marked; 2] = [Marked::Clean, Marked::Pending];
-}
-
 /// What happened to the entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {

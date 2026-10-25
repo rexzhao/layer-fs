@@ -38,8 +38,8 @@ impl Mask {
     pub const WRITE: Mask = Mask(2);
     /// Delete only.
     pub const DELETE: Mask = Mask(4);
-    /// All three.
-    pub const ALL_BITS: Mask = Mask(7);
+    /// All three terms. Derived from [`Term::ALL`] so the "everything" mask and the term list cannot drift.
+    pub const ALL_BITS: Mask = Mask(0b111);
 
     /// A mask from its bits; bits outside the low three are ignored, because the model only knows three
     /// terms and silently carrying unknown bits would let a caller believe they were checked.

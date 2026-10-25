@@ -1,6 +1,6 @@
 //! `delete` tests (P3-1 §1): every state × event cell, then the three properties that matter.
 
-use fs_windows::delete::{step, Event, Marked, State, Step};
+use fs_windows::delete::{step, Event, State, Step};
 use fs_windows::error::Failure;
 use std::collections::BTreeSet;
 
@@ -43,12 +43,15 @@ fn every_state_and_event_has_a_defined_transition() {
             }
         }
     }
+    // Literals: 6 states × 5 events. Deriving both sides from the enums would let a new event slip in
+    // without changing the assertion (QA, P3-1).
+    assert_eq!(STATES.len(), 6, "the walk must enumerate six states");
+    assert_eq!(Event::ALL.len(), 5, "enum cardinality: five cleanup events");
     assert_eq!(
         cells.len(),
-        STATES.len() * Event::ALL.len(),
-        "missing cell: the walk must cover states × events = {} × {}",
-        STATES.len(),
-        Event::ALL.len()
+        30,
+        "missing cell: the walk must cover 6 states × 5 events = 30 cells, found {}",
+        cells.len()
     );
 }
 
@@ -112,5 +115,4 @@ fn a_deleted_entry_refuses_every_event() {
             "cell state=Deleted event={event:?}"
         );
     }
-    let _ = Marked::ALL;
 }

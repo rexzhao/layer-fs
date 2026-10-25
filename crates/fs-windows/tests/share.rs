@@ -90,6 +90,35 @@ fn the_first_open_is_always_admitted() {
     }
 }
 
+/// `ALL_BITS` is the mask that admits every term — asserted against the terms, not against a literal, so a
+/// fourth term cannot leave it behind.
+#[test]
+fn the_all_bits_mask_covers_every_term() {
+    for term in Term::ALL {
+        assert!(
+            Mask::ALL_BITS.has(term),
+            "cell term={term:?}: ALL_BITS must contain every term"
+        );
+    }
+    assert_eq!(
+        Mask::ALL_BITS,
+        admit_all_bits(),
+        "cell ALL_BITS: the mask must equal the union of the terms"
+    );
+}
+
+fn admit_all_bits() -> Mask {
+    let mut bits = 0u8;
+    for term in Term::ALL {
+        bits |= match term {
+            Term::Read => 1,
+            Term::Write => 2,
+            Term::Delete => 4,
+        };
+    }
+    Mask::from_bits(bits)
+}
+
 /// Bits outside the three known terms are dropped rather than carried, so a caller cannot believe an
 /// unknown access bit was checked.
 #[test]

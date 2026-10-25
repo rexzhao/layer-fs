@@ -68,8 +68,10 @@ const TABLE: [Row; 10] = [
     },
     Row {
         rule: Rule::ComponentTooLong,
-        accept: (Case::Ascii(MAX_COMPONENT_UTF16), None),
-        reject: Some(Case::Ascii(MAX_COMPONENT_UTF16 + 1)),
+        // Literals, not the constant: the table must state the Windows numbers (255 legal, 256 not), and
+        // the constant is checked against them separately below.
+        accept: (Case::Ascii(255), None),
+        reject: Some(Case::Ascii(256)),
     },
     Row {
         rule: Rule::VerbatimPrefix,
@@ -91,10 +93,17 @@ const TABLE: [Row; 10] = [
 /// **Cardinality = enum cardinality** (§5): one row per rule, exactly.
 #[test]
 fn the_table_has_exactly_one_row_per_rule() {
+    // Literal on the right: the enum's own length would move with the table (QA, P3-1). The two checks are
+    // separate so a failure says which side changed.
+    assert_eq!(Rule::ALL.len(), 10, "enum cardinality: ten path rules");
+    assert_eq!(
+        MAX_COMPONENT_UTF16, 255,
+        "the component limit is 255 UTF-16 units (Windows), stated once and checked against the literal table"
+    );
     assert_eq!(
         TABLE.len(),
-        Rule::ALL.len(),
-        "one row per rule: deleting a row (QA's mutation) must be red"
+        10,
+        "one row per rule, and exactly ten rules: deleting a row (QA's mutation) must be red"
     );
     for rule in Rule::ALL {
         assert_eq!(

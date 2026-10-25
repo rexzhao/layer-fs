@@ -143,8 +143,10 @@ pub enum Failure {
     Internal,
 }
 
-/// The mapping. **Exhaustive on purpose** — no `_ =>` arm, so a new [`Failure`] variant is a compile error
-/// until somebody decides what Windows should see (P3-1 §1 `error`, §2.1).
+/// The mapping. **Exhaustive on purpose**: every `Failure` names its own `NtStatus`, and there is no
+/// fallback arm, so a new variant is a compile error until somebody decides what Windows should see
+/// (P3-1 §1 `error`, §2.1). `tests/no_wildcards.rs` scans these sources so the fallback cannot come back —
+/// not even in a comment, because the scan is textual and a human has to be able to trust it.
 #[must_use]
 pub const fn to_status(failure: Failure) -> NtStatus {
     match failure {
