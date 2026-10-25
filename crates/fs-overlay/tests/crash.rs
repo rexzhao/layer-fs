@@ -46,8 +46,12 @@ impl TempRoot {
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
             .join(format!(
-                "fs-overlay-crash-{label}-{}-{sequence}",
-                std::process::id()
+                "fs-overlay-crash-{label}-{}-{sequence}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or(0)
             ));
         std::fs::create_dir_all(&path).expect("temp root");
         Self { path }

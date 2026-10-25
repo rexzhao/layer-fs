@@ -65,8 +65,6 @@ pub struct GcReport {
     pub packs_repacked: usize,
     /// Packs deleted because nothing in them survived.
     pub packs_deleted: usize,
-    /// Bytes reclaimed.
-    pub freed_bytes: u64,
     /// Wall-clock duration of the run.
     pub duration: Duration,
     /// Declared roots per source kind (G3's second half).
