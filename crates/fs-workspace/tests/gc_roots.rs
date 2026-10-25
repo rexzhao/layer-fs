@@ -768,25 +768,42 @@ fn fixture(label: &str) -> (TempRoot, PathBuf) {
     (root, dir)
 }
 
+/// Every `(table, column)` a database actually has, as SQLite reports it.
+///
+/// One function so T1 and any later tripwire cannot drift apart in *how* they enumerate — the
+/// interesting disagreement should be about classification, never about which columns were looked at.
+///
+/// Two filters, both deliberate:
+///
+/// - `type = 'table'` and name not starting with `sqlite_`: SQLite's own bookkeeping
+///   (`sqlite_sequence`, `sqlite_stat1`, …) is not part of any schema this project can add a root to;
+/// - `hidden = 0` via `pragma_table_xinfo`: `table_info` also lists **hidden** columns (a virtual
+///   table's, and generated ones). A hidden column cannot be selected by a plain query, so calling it
+///   a root source would describe protection the collector cannot implement.
+fn schema_columns(connection: &rusqlite::Connection) -> Vec<(String, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT m.name, p.name FROM sqlite_master AS m
+             JOIN pragma_table_xinfo(m.name) AS p
+             WHERE m.type = 'table'
+               AND m.name NOT LIKE 'sqlite_%'
+               AND p.hidden = 0",
+        )
+        .expect("prepare a schema query");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("collect")
+}
+
 #[test]
 fn t1_every_column_of_every_database_is_classified() {
     let (_root, dir) = fixture("t1-columns");
 
     let mut actual: Vec<(String, String, String)> = Vec::new();
     for (database, connection) in databases(&dir) {
-        let mut statement = connection
-            .prepare(
-                "SELECT m.name, p.name FROM sqlite_master AS m
-                 JOIN pragma_table_info(m.name) AS p
-                 WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'",
-            )
-            .expect("prepare");
-        let columns: Vec<(String, String)> = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .expect("rows")
-            .collect::<Result<_, _>>()
-            .expect("collect");
-        for (table, column) in columns {
+        for (table, column) in schema_columns(&connection) {
             actual.push((database.clone(), table, column));
         }
     }
@@ -917,4 +934,62 @@ fn t3_root_source_values_parse_as_object_ids() {
         }
     }
     assert!(checked > 0, "T3 sampled nothing, so it proves nothing");
+}
+
+/// The enumerator's two filters are **live**, not decorative: each is shown to exclude something real,
+/// and the unfiltered query is shown to include it (otherwise a filter that excluded everything, or
+/// nothing, would pass).
+#[test]
+fn the_column_enumerator_applies_both_filters() {
+    let connection = rusqlite::Connection::open_in_memory().expect("memory db");
+    connection
+        .execute_batch(
+            "CREATE TABLE with_generated (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 base INTEGER NOT NULL,
+                 derived INTEGER GENERATED ALWAYS AS (base * 2) VIRTUAL
+             ) STRICT;",
+        )
+        .expect("ddl");
+
+    let filtered = schema_columns(&connection);
+    let unfiltered: Vec<(String, String)> = connection
+        .prepare(
+            "SELECT m.name, p.name FROM sqlite_master AS m
+             JOIN pragma_table_xinfo(m.name) AS p",
+        )
+        .expect("prepare")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("collect");
+
+    assert!(
+        filtered
+            .iter()
+            .any(|(table, column)| table == "with_generated" && column == "base"),
+        "a real column must survive both filters"
+    );
+    assert!(
+        unfiltered
+            .iter()
+            .any(|(table, column)| table == "with_generated" && column == "derived"),
+        "the unfiltered catalog query sees the generated column, so the filter has something to remove"
+    );
+    assert!(
+        !filtered.iter().any(|(_, column)| column == "derived"),
+        "a generated (hidden) column is not selectable, so it cannot be a root source"
+    );
+    assert!(
+        !filtered
+            .iter()
+            .any(|(table, _)| table.starts_with("sqlite_")),
+        "SQLite's own bookkeeping tables are not part of this schema"
+    );
+    assert!(
+        unfiltered
+            .iter()
+            .any(|(table, _)| table == "sqlite_sequence"),
+        "the AUTOINCREMENT table made SQLite create sqlite_sequence, so that filter bites too"
+    );
 }
