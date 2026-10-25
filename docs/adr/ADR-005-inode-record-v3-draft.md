@@ -1,6 +1,7 @@
 # ADR-005 修订草案：inode record v3（P3 元数据）
 
-- 状态：**草案（Proposed）**——architect；供 ADR-005/ADR-009 评审后并入
+- 状态：**Accepted（设计定稿，2026-10-25）**。P3-2 实现前生效；实现完成后另做一次落地核对（与 ADR-008 同做法），
+  核对结论记入 `docs/reports/`，并在本行补"落地核对完成 <日期/提交>"。
 - 日期：2026-10-25
 - 依据：ADR-005 §3.2（inode 记录）/§5（profile）/§7（解码拒绝）/§10（未实现清单）、ADR-009 §10.1（owner 选 A：profile v3）、
   spec §2 P3（时间戳、ACL/安全描述符、Windows 属性）
@@ -140,7 +141,7 @@ content_role=chunk;max_object_value=16777216;name_max=255;hash=blake3;domains=in
    - 返回 `UnsupportedProfile { found: <v2 id> }`；
    - 拒绝前后 `store.sqlite` + `-wal` 的字节哈希不变（`-shm` 不计，理由同 ADR-008 §6.1 度量口径）；
    - 连续两次打开都拒绝（无半迁移）。
-2. **v1 夹具**（若仓库仍保留）：同样拒绝。
+2. **v1 夹具：不可构造**。P1 写路径已删除，当前仓库无法生成真实 v1 store；只能用**合成 `profile_id` 的根**验证"profile 不符即拒"的同一代码路径，并在测试名/注释里标注"合成，不是真实旧库"。**真实旧库的拒绝证明由 v2 夹具承担**；不得把合成夹具写成"v1 旧库已验证"。
 3. **正向**：v3 根往返；新写入的根 `profile_id == BLAKE3(§2.3 串)`。
 4. **格式内自识别**：把 v3 根的 inode 页 `fmt` 改成 1 → `UnsupportedFormat`（证明不是只靠 profile）。
 5. **前向**：v2 读取器读 v3 根 → `UnsupportedProfile`（用旧构建/夹具验证一次）。
@@ -159,6 +160,10 @@ content_role=chunk;max_object_value=16777216;name_max=255;hash=blake3;domains=in
 8. 前端转换：**1601 不可表示 → 拒绝**；1970/2262 边界；i128 中间值防溢出；100ns 向下取整；越界不夹取。
 
 ---
+
+## 修订记录
+
+- 2026-10-25：Proposed → **Accepted（设计定稿）**；同时把 §8.2 的 v1 夹具从"若保留则同样拒绝"改为"不可构造，只能合成 profile 字段验证同一拒绝路径"。判据影响：无（P3-2 尚未开工；v1 夹具项从"未覆盖"改为"合成覆盖 + 明示局限"，真实旧库由 v2 夹具证明）。
 
 ## 10. 风险与遗留
 

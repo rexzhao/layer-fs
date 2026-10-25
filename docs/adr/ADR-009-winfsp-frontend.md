@@ -112,14 +112,16 @@ adapter **禁止**：解析 CAS 对象、访问 `store.sqlite`/`overlay.sqlite`�
 
 ### 4.2 Create disposition 表（NT → 核心动作 / 状态）
 
-| disposition \ 存在 | 不存在 | 文件 | 目录（请求文件/目录） |
+| disposition \ 目标 | 不存在 | 文件（同路径） | 目录（请求文件/目录） |
 | --- | --- | --- | --- |
-| SUPERSEDE | 创建 | 截断为 0（保留 FileId） | `STATUS_FILE_IS_A_DIRECTORY` |
-| OPEN | `OBJECT_NAME_NOT_FOUND` | 打开 | 打开 |
+| SUPERSEDE | 创建（新 FileId） | **替换：删除旧名字/旧 inode 并创建新 inode（默认新 FileId）**；旧 FileId 的打开句柄先过 share 检查（不满足 → `STATUS_SHARING_VIOLATION`）；属性按 Create 参数重置（以 L2 的 NTFS 对照确认） | `STATUS_FILE_IS_A_DIRECTORY` |
+| OPEN | `OBJECT_NAME_NOT_FOUND` | 打开（保留 FileId） | 打开 |
 | CREATE | 创建 | `OBJECT_NAME_COLLISION` | `OBJECT_NAME_COLLISION` |
-| OPEN_IF | 创建 | 打开 | 打开 |
-| OVERWRITE | `OBJECT_NAME_NOT_FOUND` | 截断为 0 | `STATUS_FILE_IS_A_DIRECTORY` |
-| OVERWRITE_IF | 创建 | 截断为 0 | `STATUS_FILE_IS_A_DIRECTORY` |
+| OPEN_IF | 创建 | 打开（保留 FileId） | 打开 |
+| OVERWRITE | `OBJECT_NAME_NOT_FOUND` | 截断为 0（**保留 FileId**） | `STATUS_FILE_IS_A_DIRECTORY` |
+| OVERWRITE_IF | 创建 | 截断为 0（**保留 FileId**） | `STATUS_FILE_IS_A_DIRECTORY` |
+
+SUPERSEDE 与 OVERWRITE/OVERWRITE_IF 的区别是**FileId**：前者按 NT 语义替换（旧文件删除后重建），后者打开并截断同一文件。QA 预审指出"18 格表缺 FileId 列"——两种 disposition 在外部（`GetFileInformationByHandle::FileIndex`）必须可区分，L2 用 NTFS 对照确认：`CREATE_ALWAYS` 命中既有文件时 FileIndex 变化、`TRUNCATE_EXISTING` 不变。若实测 NTFS 与"新 FileId"不符，以实测为准并在 ADR 记修订。
 
 目录请求（`FILE_DIRECTORY_FILE`）与上表交叉：对"文件"目标一律 `STATUS_NOT_A_DIRECTORY`；对"目录"目标的覆盖类 disposition 一律 `STATUS_FILE_IS_A_DIRECTORY`。**整表由 L1 穷举，不得缺格**。
 
@@ -232,7 +234,9 @@ G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后
 - 总读字节 == 这些帧的长度之和（单对象读 == 恰好一帧）；
 - **不得触及 pack 尾部 48 B**（ADR-008 §3：magic 4 + count 4 + frames_len 8 + BLAKE3 32）。
 
-用**计数 source** 做阳性对照（故意读整个 pack 必须红）；rename 之后、删除 pending 期间，同一 FileId 的读必须继续满足该判据。
+用**计数 source** 做阳性对照（故意读整个 pack 必须红）。rename 之后同一 FileId 的读必须继续满足该判据（name 绑定变了，inode 未变）。
+
+**delete-pending 期间的读不属于 G2**：两段删除（W7）把真正的 `remove` 推迟到最后一个句柄的 `Cleanup`，所以核心不存在"已 unlink 但句柄仍开"的状态；pending 期间的读只是普通 FileId 读，由 **adapter 的句柄表**保证有效。G2 不要求核心支持"已 unlink 的 inode 读取"；若将来支持 POSIX unlink，再改 ADR。
 
 ---
 
