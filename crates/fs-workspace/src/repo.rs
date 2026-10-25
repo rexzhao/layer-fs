@@ -1128,11 +1128,14 @@ pub struct SnapshotRow {
 /// documented exception: one connection owns the file's lock, because two connections setting
 /// `locking_mode = EXCLUSIVE` lock each other out.
 ///
-/// Order is fixed by the ADR: open (`busy_timeout = 0`) → `locking_mode = EXCLUSIVE` (a flag, no
-/// write) → `journal_mode`/`synchronous`/`foreign_keys` (usually no-ops on a v3 store) →
-/// `validate` (read-only) → `BEGIN IMMEDIATE` (a competing writer becomes `StoreInUse`, not
-/// `Busy`) → `COMMIT` (the exclusive file lock survives the commit) → the caller's work. Every
-/// overlay is then taken exclusively; any refusal happens **before** any modification.
+/// Order is fixed by the ADR (§6.1 as amended): open (`busy_timeout = 0`) → `locking_mode = EXCLUSIVE`
+/// (a flag, no write) → **`BEGIN IMMEDIATE` takes the lock** (a competing writer becomes `StoreInUse`,
+/// not `Busy`) → `COMMIT` (the exclusive *file* lock survives the commit) → `synchronous` /
+/// `foreign_keys`, and `journal_mode` **only now** (it cannot be set inside a transaction, and setting
+/// it earlier would write the file before we know we are alone). Schema validation happens **after**
+/// that, still inside the held lock — "lock first, then check" is what makes the checked state stable.
+/// Every overlay is then taken exclusively by the same helper; any refusal happens **before** any
+/// modification.
 ///
 /// Errors are `StoreInUse` / `WorkspaceInUse` only: maintenance never reports `Busy`, because
 /// "try again later" would be wrong advice while a collector is running.
@@ -1157,13 +1160,6 @@ impl MaintenanceRepo {
         let connection = open_exclusively(&store_dir.join("store.sqlite"), "the main database")?;
         // The store's own schema check, inside the lock: it cannot move while we hold it, and it is
         // read-only, so nothing is written before the check passes.
-        cas_store::validate_schema_over(&connection).map_err(|error| {
-            WorkspaceError::StoreInUse {
-                what: format!("the main database schema ({error})"),
-            }
-        })?;
-
-        // Schema checks happen **inside** the lock, so what is validated cannot move underneath.
         cas_store::validate_schema_over(&connection).map_err(|error| {
             WorkspaceError::StoreInUse {
                 what: format!("the main database schema ({error})"),
@@ -1276,11 +1272,11 @@ fn open_exclusively(path: &Path, what: &str) -> WorkspaceResult<rusqlite::Connec
     let connection =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(refuse)?;
-    // ADR's order, and the order matters twice over: `busy_timeout = 0` before anything else so a
-    // competing writer fails immediately; `locking_mode = EXCLUSIVE` **before** the lock, because
-    // the mode changes when the next lock is taken; `journal_mode` **after** the lock, because it
-    // cannot be set inside a transaction and setting it first would write the file before we know
-    // we are alone.
+    // ADR's order, and each step's position has a reason: `busy_timeout = 0` first so a competing
+    // writer fails immediately instead of waiting on a collector that may run for minutes;
+    // `locking_mode = EXCLUSIVE` **before** the lock, because the mode takes effect on the next lock;
+    // then the lock itself. Schema validation is the *caller's* step, and it runs after this returns —
+    // inside the lock, which is the only place where "what I validated" cannot move underneath.
     connection
         .pragma_update(None, "busy_timeout", 0)
         .and_then(|()| connection.pragma_update(None, "locking_mode", "EXCLUSIVE"))
