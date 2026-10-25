@@ -100,12 +100,12 @@ pub fn step(state: State, event: Event) -> Step {
         // CleanupDelete is the only event that removes bytes, and the removal happens on the **last**
         // handle: with one left, this call consumes it and the entry goes; with more, it only decrements.
         (PendingDropped, Event::CleanupDelete) => Step::Next(Deleted),
-        (Clean { handles }, Event::CleanupDelete) => Step::Next(if handles <= 1 {
-            Deleted
-        } else {
-            Clean {
-                handles: handles - 1,
-            }
+        // A clean entry is **never** removed by a cleanup: `CleanupDelete` means "this handle closed and it
+        // had asked for deletion", so without the mark it is an ordinary cleanup. Deleting here would let a
+        // handle remove a file nobody marked — the exact bug the two-phase design exists to prevent.
+        (Clean { handles: 0 }, Event::CleanupDelete) => Step::Next(Clean { handles: 0 }),
+        (Clean { handles }, Event::CleanupDelete) => Step::Next(Clean {
+            handles: handles - 1,
         }),
         (Pending { handles }, Event::CleanupDelete) => Step::Next(if handles <= 1 {
             Deleted

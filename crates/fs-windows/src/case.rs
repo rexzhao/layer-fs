@@ -6,9 +6,20 @@
 //! happen to look alike — this model keeps that, because a frontend that normalized would report collisions
 //! the store never had.
 //!
-//! The fold used here is `to_ascii_uppercase` on ASCII and "leave everything else alone": that is a model of
-//! `CompareStringOrdinal(TRUE)`, not a copy of the NT upcase table, and the module says so instead of
-//! pretending otherwise.
+//! ## The Unicode policy, stated once
+//!
+//! [`fold`] upper-cases **ASCII only**; every non-ASCII character is left exactly as it is. That means
+//! `Ä`/`ä` are two different names in this model, while `A`/`a` are one.
+//!
+//! This is a **documented deviation** from Windows, which folds non-ASCII with its invariant upcase table
+//! (so `Ä`/`ä` *are* one name there). The reason is not laziness: reproducing that table means shipping a
+//! data table per Unicode version, and a wrong copy is worse than an explicit gap — it would make the
+//! frontend reject names Windows accepts, with no way for a user to tell why. The deviation is therefore
+//! **narrow and visible**: one function, one test, and it can only ever make the frontend *stricter* about
+//! collisions (it never merges two names Windows considers distinct).
+//!
+//! When the table is available (P3-4, after the FFI is in), the change is local to `fold` and the test that
+//! pins the current policy is the one that has to be updated.
 
 /// How a lookup found its entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +34,8 @@ pub enum Lookup<'a> {
     Missing,
 }
 
-/// Folds one name for comparison: ASCII case only, **no** Unicode normalization, no trimming.
+/// Folds one name for comparison: ASCII case only (see the module note on the Unicode policy), **no** Unicode
+/// normalization, and no trimming.
 #[must_use]
 pub fn fold(name: &str) -> String {
     name.to_ascii_uppercase()

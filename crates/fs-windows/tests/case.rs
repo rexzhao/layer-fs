@@ -46,6 +46,31 @@ fn two_entries_that_fold_together_are_ambiguous_not_merged() {
     );
 }
 
+/// The Unicode policy, pinned: ASCII folds, non-ASCII does not. Written as an assertion (not a comment), so
+/// the documented deviation cannot drift silently — when a real upcase table lands, this is the test that has
+/// to change.
+#[test]
+fn folding_is_ascii_only_and_that_is_the_documented_policy() {
+    assert_eq!(fold("Readme"), fold("readme"), "cell ASCII: case folds");
+    assert_ne!(
+        fold("\u{00C4}"),
+        fold("\u{00E4}"),
+        "cell Latin-1 supplement: not folded (documented gap)"
+    );
+    assert_ne!(
+        fold("\u{0410}"),
+        fold("\u{0430}"),
+        "cell Cyrillic: not folded (documented gap)"
+    );
+    // The deviation can only make this model *stricter*: two names Windows would merge stay distinct here,
+    // never the other way round (which would let a collision through).
+    assert_eq!(
+        lookup(&["\u{00C4}"], "\u{00E4}"),
+        Lookup::Missing,
+        "cell wanted=lower-a-umlaut alongside upper: distinct in this model"
+    );
+}
+
 #[test]
 fn unicode_is_not_normalized() {
     // U+00E9 vs "e" + U+0301: Windows treats these as different names, and so must this model.

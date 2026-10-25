@@ -86,6 +86,27 @@ fn a_mark_can_be_cancelled_by_another_handle() {
     ));
 }
 
+/// A cleanup on a **clean** entry never removes it, no matter how many handles are left: without the mark,
+/// `CleanupDelete` is an ordinary cleanup. Deleting here would let any handle delete a file nobody marked.
+#[test]
+fn a_clean_entry_is_never_removed_by_a_cleanup() {
+    assert_eq!(
+        step(State::Clean { handles: 1 }, Event::CleanupDelete),
+        Step::Next(State::Clean { handles: 0 }),
+        "cell clean/handles=1 cleanup-delete: the last handle closes, nothing is removed"
+    );
+    assert_eq!(
+        step(State::Clean { handles: 2 }, Event::CleanupDelete),
+        Step::Next(State::Clean { handles: 1 }),
+        "cell clean/handles=2 cleanup-delete: only the count moves"
+    );
+    assert_eq!(
+        step(State::Clean { handles: 0 }, Event::CleanupDelete),
+        Step::Next(State::Clean { handles: 0 }),
+        "cell clean/handles=0 cleanup-delete: nothing to do, and no removal"
+    );
+}
+
 /// Only the last handle's `CleanupDelete` removes the entry; with a handle left, it merely decrements.
 #[test]
 fn removal_happens_only_on_the_last_cleanup_delete() {
