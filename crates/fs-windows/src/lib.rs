@@ -15,6 +15,7 @@
 //! Both are stronger than "a few representative cases": a variant or cell that nobody thought about is
 //! exactly what these checks refuse to let through.
 
+pub mod attrs;
 pub mod case;
 pub mod delete;
 pub mod dirent;
@@ -24,3 +25,4 @@ pub mod length;
 pub mod path;
 pub mod share;
 pub mod time;
+pub mod volume;

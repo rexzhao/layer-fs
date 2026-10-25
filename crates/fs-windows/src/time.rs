@@ -2,7 +2,13 @@
 //!
 //! FILETIME counts **100 ns since 1601-01-01 UTC**; the store counts **i64 nanoseconds since 1970**. Two
 //! boundaries fall out of that and both are refusals rather than clamping: a timestamp before 1601 cannot be
-//! represented, and one whose 100 ns value exceeds `u64` cannot either. The conversion also **floors** to the
+//! represented, and one whose 100 ns value exceeds `u64` cannot either.
+//!
+//! **Why the arithmetic is `i128`** (a bug this module shipped for one commit): the 1601→1970 offset is
+//! ~1.164e19 ns, which is **larger than `i64::MAX`** (~9.223e18 ns). Computing it in `i64` therefore failed for
+//! *every* input, not just edge cases, and the earliest representable Unix instant is about 1677-09-21 — so
+//! `FILETIME 0` has no `i64` counterpart at all. The lesson is the one this project keeps relearning: an
+//! untested boundary does not give "mostly right", it gives "wrong everywhere". The conversion also **floors** to the
 //! 100 ns tick, because rounding up would make a file look newer than the store says it is, and `robocopy`-style
 //! tools react to that.
 
