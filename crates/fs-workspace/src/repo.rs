@@ -1116,6 +1116,14 @@ impl MaintenanceRepo {
         &self.connection
     }
 
+    /// The same connection, mutable — the collector's apply needs a transaction.
+    ///
+    /// Deliberately not a `&mut Self` method: the caller borrows the connection for the duration of one
+    /// statement sequence, while the rest of the handle (the overlays' connections) stays usable.
+    pub(crate) fn connection_mut(&mut self) -> &mut rusqlite::Connection {
+        &mut self.connection
+    }
+
     /// How many overlays are held (one per active workspace directory).
     #[must_use]
     pub fn overlays_held(&self) -> usize {
