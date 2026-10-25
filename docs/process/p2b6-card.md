@@ -130,9 +130,13 @@ distinct_oids(visited) == distinct_oids(roots)
 
 ### schema 漂移 tripwire（三层）
 
-- **T1 列级 allowlist**：测试枚举 `sqlite_master` + `pragma_table_info` 的**两个库**（主库与每个 `workspaces/*/overlay.sqlite`），
-  凡列名匹配 `(^|_)(root|oid|content)($|_)` 的必须出现在测试源码的显式表里，分类为 `RootSource(..)` 或
-  `NotARoot(理由)`；**新列未分类 → 红**。
+- **T1 全列黄金清单**（2026-10-24 修订，取代"正则筛 + 命中项分类"）：在测试里冻结**完整**的 `(table, column)` 清单
+  （主库 + 每个 `overlay.sqlite` 的 `sqlite_master` / `pragma_table_info`），每项带分类 `RootSource(kind)` 或
+  `NotARoot(理由)`。判据：**实际列集合 == 冻结清单**（多一列、少一列、改名都红），且每个 `RootSource` 至少被一条
+  金丝雀覆盖（T2）。
+  理由：按列名正则（`root|oid|content`）筛会漏网——Seal 完全可能把引用列命名为 `seal`、`chunk_set`、`payload_ref`
+  之类，不匹配正则就不会被要求分类，于是**静默漏根**；而"P2b-6 不等 Seal 先落地"的安全性正建立在"不加分类就红"上。
+  成本一次机械列举（几十列），换来"任何新引用列都逃不掉"。
 - **T2 注册表 ↔ 判据映射**：每个 `RootSource` 在 T1 里至少对应一列，且**至少被一条金丝雀 K** 覆盖（K 矩阵按
   `RootSource` 索引）→ "加了来源没加测试""加了列没加来源"都会红。
 - **T3 值域启发**：T1 判为 `RootSource` 的列抽样至多 N 行，断言值可解析为 ObjectId（64 hex）。
