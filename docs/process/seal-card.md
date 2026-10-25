@@ -143,3 +143,8 @@ P2b-6 的实际行为：`snapshot_drop` 只删行，被 drop 的 workspace 若�
 - **profile**：chunk/extent 根没有 profile ⇒ 给 `SnapshotReader` 加不读根的构造 `for_objects(source, profile)`，profile 取自
   `workspace_policy.snapshot_profile`（打开时已校验），**不要**为树根保留 `open_any` 特判（两套 profile 来源会漂）。
 - **空编码**：`sealed_content` 的 `empty` 编码 → **无根**，解析时不得造出空 oid（与 `pending_root` 空串同一条规则）。
+
+## 11. 追记（2026-10-24）：P2 收口时转入 backlog
+
+本卡在 P2b 收口时登记为 `docs/process/backlog.md` **B-1**，不在 P2 内。内容保持完整（判据、实现顺序、规格裁定），
+拾起时直接派发，不必重新推导。P3 的卡序**没有**把它塞回来（owner 决定）。
