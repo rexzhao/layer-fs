@@ -83,16 +83,19 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 
 ## 5. 顺带清理（`PACK_TAIL_BYTES`）
 
-- `cas-store` 导出 `pub const PACK_TAIL_BYTES: u64`（+ 需要的 `PACK_TAIL_MAGIC`），文档注明"由 ADR-008 §3 定义"；
+- `cas-store` 导出 `pub const PACK_TAIL_BYTES: u64`，文档注明"由 ADR-008 §3 定义"；**不要顺手导出 `PACK_TAIL_MAGIC`**——
+  它当前无测试消费者，导出会变成第二个"无人引用的常量"（假绿风险）；若确为 adapter 预留，须注明"当前无消费者"；
 - 删掉 `cas-store/tests/pack.rs` 与 `tests/sync_probe.rs` 的本地 `const TAIL_BYTES: usize = 48`；
 - 只留一处断言 `PACK_TAIL_BYTES == 48`。
 
 **验收用语义检查，不用 `grep 48`**（`48` 可能是别的数，会假红/假绿）：
 
-1. 常量在 `cas-store` 的公开面可见（`lib.rs` re-export 或 `pub use`）；
-2. `grep -rn 'const TAIL_BYTES' crates/*/tests/` = **0**；
-3. 唯一一条 `PACK_TAIL_BYTES == 48` 断言在场；
-4. **使用点必须引用常量**：数 `PACK_TAIL_BYTES` 的命中数，而不是数 `48`。
+1. `grep -n 'pub use.*PACK_TAIL_BYTES' crates/cas-store/src/lib.rs` = **1 行**；
+2. `grep -rn 'const TAIL_BYTES' crates/*/tests/` = **0 行**；
+3. `grep -rn 'PACK_TAIL_BYTES == 48' crates/` = **1 行**，且**不是** `assert!(PACK_TAIL_BYTES > 0)` 这类弱断言；
+4. `grep -rn 'PACK_TAIL_BYTES' crates/ | wc -l` = **11**（1 定义 + 1 导出 + 4 src + 5 tests）：
+   逐文件 `src/pack.rs` 5、`src/lib.rs` 1、`tests/pack.rs` 4、`tests/sync_probe.rs` 1。
+   **给绝对数比“≥ 使用点数”硬**：少一处 = 漏改（别名常量还在，仍能编译）；多一处 = 多留副本。
 
 ## 6. 判据预审四问（QA，开工前逐条答完）
 
@@ -107,82 +110,7 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
   G4 的三条（含指纹）；§5 的四条语义检查；
 - QA 按 §6 与逐条"怎么红"验收，`L1/L2/L3` 与"待环境/未验证"分档照 P3 骨架。
 
-## 8. 待填（QA 预审时提供）
+## 8. §8 已并入 §11
 
-- 每页 inode 数：`floor(4096 / inode_old)` 与 `floor(4096 / inode_new)` 的具体数值（改前/改后）；
-- 10 万 inode 的基线阈值具体值（按 §3 公式算出的页数上限与耗时上限）。
-
-## 9. 前置事实与实现顺序（worker 对照现有代码的核对结果，2026-10-24）
-
-1. **`PACK_TAIL_BYTES` 现在是 `pub(crate)`**（`cas-store/src/pack.rs:85` 的 `TAIL_BYTES`）。G2 判据要断言“不触及 48 B 尾部”，
-   测试需要它 ⇒ **P3-2 的第一件事**就是把 `cas-store` 的公开面收敛到这里：
-   - 导出 `pub const PACK_TAIL_BYTES: u64`（+ 需要的 `PACK_TAIL_MAGIC`），文档注明“由 ADR-008 §3 定义”；
-   - 断言 `PACK_TAIL_BYTES == 48` **只在** `cas-store` 一处；
-   - 删掉 `tests/pack.rs` / `tests/sync_probe.rs` 的本地 `const TAIL_BYTES`；使用点必须引用常量（§5 的四条语义检查）。
-2. **G2 不是从零造类型**：`fs_snapshot::SnapshotReader::inode(serial)`、`root_serial()` 已有（`read.rs:151/160`），
-   `fs_namespace::FileId` 已贯穿 `materialize.rs:46`。G2 的工作是**把路径入口换成 serial 入口**，并补齐判据。
-3. **G1 复用同一张语义表，不写第二份矩阵**：`fs-windows::disposition::{Disposition, Exists, Action, Outcome, TABLE, decide}`
-   已存在（P3-1）。**裁决：把这张表与 `decide` 上移到核心 crate（`fs-namespace`，`fs-api` 再导出），`fs-windows` 改为 re-export**。
-   理由：分层方向只能是 adapter 依赖核心（`fs-windows → core`），不能反过来；两份矩阵必然漂移。
-   验收：`fs-windows` 里不再有独立的 `TABLE` 定义，只有 `pub use`；P3-1 的 18 格用例仍绿（证明搬运无行为变化）。
-4. **FileId 期望列排在 G3 之前**：`SUPERSEDE → 新 FileId`、`OVERWRITE_IF → 保留` 这一列与 `Stat` 字段集合、overlay 的 serial
-   分配语义互相牵连 ⇒ **先定 FileId 语义与列，再动 G3**，否则实现顺序会来回改表。
-
-**因此实现顺序**：§9.1（常量收敛）→ G1（含表上移）→ G2（serial 入口 + 读放大）→ G4（条件 rename）→ G3（profile v3 + 基线）。
-
-## 10. 两条字面约束（worker 建议，manager 采纳）
-
-1. **L1 测试不得使用 adapter 的 handle 表**：G2 只证明“FileId 解析在 rename 后稳定”（L1 代理）；若 L1 借用 adapter 的 handle 表，
-   等于提前“证明”了 P3-3a 的 L2 判据，变成自证。
-2. **旧根拒绝的度量口径**：`-wal` 在**只读打开**时也可能被创建/截断（P3-0c 实测到 `-shm`/`-wal` 会被 SQLite 造出来）。
-   度量写成：**`store.sqlite` 与“已存在的 `-wal`”的内容哈希**，并对 `-shm`/`-wal` 的**出现/消失**明确豁免——与 ADR-008 §6.1 一致。
-
-## 11. §8 的数字（QA 实测，非估算；编码器临时插 24 B 跑完已还原）
-
-### 每页 inode 容量
-
-```
-guard = max_page_bytes(16384) − max_entry_bytes
-max_entry = name_max(255) + 8 + 32 + 8 + 8 = 311  ⇒ guard = 16073
-leaf_overhead = 1 + node(0) + 4 = 5
-capacity(rec) = ceil((16073 − 5) / rec)
-```
-
-| 记录类型 | v2 长 | v2 每页 | v3 长 | v3 每页 | 降幅 |
-| --- | --- | --- | --- | --- | --- |
-| 有内容（带 32 B oid） | 66 B | **244** | 90 B | **179** | −26.6% |
-| 无内容（空文件/空目录） | 34 B | **473** | 58 B | **278** | −41.2% |
-
-**但页数只涨 +4.1%（不是容量降幅）**：`mask_bits = 6` 的哈希切分在**平均 69 条/页**处就切开，远早于字节容量 244 ⇒
-**v2 的 inode 表页数由哈希切分主导，不是字节预算**。实测 99,999 inode：leaf 1448 → 1511、总页 1472 → 1533。
-因此 **§3 的基线报告必须同时给 `mask_bits` 与"平均每页条数"**，否则 "+4%" 不可解释。
-
-### 基线阈值（10 万 inode、带内容、最坏情况）
-
-| 指标 | 基线（v2 实测） | 红 |
-| --- | --- | --- |
-| 树高 | 2 | **> 2** |
-| leaf 页数 | 1448 | **> 1521**（+5%） |
-| 总页数 | 1472 | **> 1546**（+5%） |
-| inode 表字节 | ≈ 6.60 MB | **> 6.94 MB**（+5%） |
-| **单页最大字节** | 16109（≤16384） | **> 16384**（越界即红） |
-| 编码耗时（本机 debug） | ≈0.34 s / 99,999 条 | **> 基线 × 1.2** |
-
-**更正**：早前写的 "1 + 24/4096" 是"按 4096 页"的错觉（实际 `max_page_bytes = 16384`、且哈希切分主导），**以本节为准**。
-
-**为什么必须有"单页最大字节"这条**：`encode.rs:106-109` 注释记载第一次 scale run 曾出现 **16440 > 16384**——装填规则真的溢出过。
-所以它不是形式条款，而是回归防线：记录变大时同类 bug 会以"+24 B"的形式再现。
-
-### 报告必须给的两个原始数
-
-1. **v3 每页容量实测值**（应为 **179 / 278**）——不符即说明字段布局没按 ADR-005 §2.2；
-2. **`mask_bits` + 分析形状**（有内容/无内容各多少条）——否则页数无法解读。
-
-## 12. G1 的表放哪：`fs-namespace`（manager 裁决，2026-10-24）
-
-- **表与 `decide` 上移到 `fs-namespace`**（`fs-api` 再导出）；`fs-windows` 改为 `pub use`，**不得保留副本**；
-- 依赖方向：`fs-windows → fs-namespace`（adapter 依赖核心，方向正确）；**P3-1 README 里 "no deps" 的表述同卡改成
-  "依赖核心的语义表、无 FFI、无平台依赖"**（这是事实修正，不是退让）；
-- `share`（NT 共享位矩阵）**留在 `fs-windows`**：它只有 adapter 用，核心不需要；
-- 验收：`fs-windows` 无独立 `TABLE`（只有 re-export）；P3-1 的 18 格用例仍绿（搬运无行为变化）；`fs-namespace` 的表有
-  "缺格即红"基数断言（6×3，rows/columns 分开）。
+原“待填（每页 inode 数 `floor(4096 / rec)`）”一节**已删除**：inode 表用的是 `max_page_bytes = 16384`（不是 `PAGE_BYTES = 4096`），
+且容量是 `ceil((16384 − 311 − 6) / rec)`。**一切以 §11 为准**——若有人按 `floor(4096/66) = 62` 算，那是把页大小搞错了。
