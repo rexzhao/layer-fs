@@ -66,3 +66,34 @@ fs-snapshot 对象 ⇒ **GC 看不见这条边 ⇒ 静默漏标 ⇒ 删数据**�
 3. §4 的金丝雀；
 4. §3/§6 的裁决落 ADR（我直提，worker 只改代码与测试）；
 5. 常规四件套 + 全量 + 崩溃五点回归。
+
+## 8. 实现前必须定死的四点（worker 复核 b7f2f05 后补充，2026-10-24）
+
+### 8.1 `sealed_content` 的 schema 形态：建议**单独一张表** `ov_sealed(serial, oid)`
+
+现读法是 `SELECT DISTINCT sealed_content FROM ov_inode WHERE … AND sealed_content <> ''`，只在"一个 inode 只有一个 id"时成立。
+**一个 inode 封存一整段内容完全可能是多个 chunk**；若该列存列表/JSON，`parse_oid` 失败会让 GC 拒绝整次运行。
+
+- (a) 列 = 单个 id（一 inode 一 chunk / 一 extent 根）→ 现有读法可用；
+- **(b) 单独一张 `ov_sealed(serial, oid)`**（一 inode 多 chunk 的天然形态）→ 枚举读该表；T1 清单加整表列，T2 仍映射到
+  一个 `RootSource(SealedContent)`。
+
+**本卡倾向 (b)**：避免未来为"一 inode 多 chunk"再做一次 schema 升级，且 T1 的分类粒度更清楚。**形态未定前不动枚举代码。**
+
+### 8.2 label 必须含 inode serial
+
+现 label 是 `sealed:{workspace}:{root}`，而 `:root` 是对象 id、不是行 id。**两个不同 inode 封存同一个 chunk 时 label 相同**，
+而 `RootSet::try_from_entries` 是**按 label 去重**的 ⇒ 两条事实被合并成一条 ⇒ `roots_declared` 少一条。
+这正是 §29 修掉的"看不到"缺陷，只是这次出在 label 生成上。
+
+**要求**：`sealed:{workspace}:{serial}:{root}`（行 id 进 label）。`pending_root` 无此问题（一个 workspace 一行）。
+
+### 8.3 不留"树根快路径"
+
+草稿 §2 允许"若是 `FilesystemRoot` 则 `open_any`"。**不要**：两条路径意味着"树根走 A、裸根走 B"，判据只覆盖其中一条时另一条是盲区；
+而 `references(oid)` 对树根同样正确。直接删掉 `run` 里的 `open_any`，`visited_oids`/`reachable` 语义不变。
+
+### 8.4 "被 drop 的 workspace 仍持有 sealed 内容"的回收时机必须写成可判的
+
+P2b-6 的实际行为：`snapshot_drop` 只删行，被 drop 的 workspace 若仍持 `sealed_content`，其对象**仍可达**（overlay 根还在），
+直到该 workspace 行被 `workspace discard`。**两种回收时机都能"通过"不可分辨的测试 ⇒ 必须在本卡写明是哪一种**，并据此写用例。
