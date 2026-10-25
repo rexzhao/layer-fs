@@ -152,11 +152,19 @@ fn a_missing_pack_file_is_reported_and_its_rows_are_left_alone() {
         .expect("count");
 
     let marker = marker_with(&root.store(), &[]);
+    // After the marker exists: the comparison is about what *the plan* touches, not about the
+    // fixture's own files.
+    let before_bytes = fingerprint(&root.store());
     let decided = plan(&index(&root.store()), &marker, &root.store(), 0.5).expect("plan");
     assert_eq!(
         decided.missing_packs.len(),
         1,
         "K8a: the row's file is gone"
+    );
+    assert_eq!(
+        before_bytes,
+        fingerprint(&root.store()),
+        "a plan is a pure read: deciding must not touch the store"
     );
     let after = index(&root.store())
         .query_row("SELECT COUNT(*) FROM object_location", [], |row| {
@@ -321,34 +329,81 @@ fn apply_removes_an_empty_pack_rows_first_then_file() {
     assert_eq!(packs_left, 0, "no pack row may outlive its file");
 }
 
-/// A plan that needs a copy-repack must be refused **before** any deletion: a half-applied plan is
-/// worse than no plan at all.
+/// Copy-repacking: the survivor moves to a new pack, the dead frame's row goes, and the old file is
+/// gone only after no row names it.
 #[test]
-fn apply_refuses_a_plan_that_needs_a_repack_and_changes_nothing() {
+fn apply_repacks_a_half_surviving_pack_and_the_survivor_still_reads() {
     let root = TempRoot::new("apply-repack");
     let store = Store::open(root.store(), OpenMode::Create).expect("open store");
     let mut batch = store.batch();
-    let first = batch.put(Role::Bytes, b"one").expect("put");
-    let second = batch.put(Role::Bytes, b"two").expect("put");
+    let survivor = batch.put(Role::Bytes, b"one").expect("put");
+    let dead = batch.put(Role::Bytes, b"two").expect("put");
     batch.commit().expect("commit batch");
+    let survivor_bytes = store.get(survivor).expect("survivor reads before");
+    drop(store);
 
-    let marker = marker_with(&root.store(), &[first]);
+    let marker = marker_with(&root.store(), &[survivor]);
     let mut connection = index(&root.store());
     let decided = plan(&connection, &marker, &root.store(), 0.6).expect("plan");
-    assert_eq!(decided.packs_repack.len(), 1);
-    assert_eq!(decided.dead_objects, vec![second]);
+    assert_eq!(decided.packs_repack.len(), 1, "{decided:?}");
+    let old = decided.packs_repack[0].clone();
+    assert_eq!(decided.dead_objects, vec![dead]);
 
-    let before = fingerprint(&root.store());
-    let error = apply(&mut connection, &decided, &root.store())
-        .expect_err("a repack plan must be refused by a build that cannot repack");
+    let applied = apply(&mut connection, &decided, &root.store()).expect("apply");
+    assert_eq!(applied.packs_repacked, 1);
+
+    // The old pack file is gone, and no row names it any more.
     assert!(
-        matches!(error, fs_workspace::WorkspaceError::Inconsistent { .. }),
-        "expected a typed refusal, got {error:?}"
+        !old.path.exists(),
+        "the repacked-away pack must be unlinked"
     );
+    let old_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM object_location WHERE location = ?1",
+            [&old.pack_id],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(old_rows, 0, "no row may still point at the old pack");
+    let old_pack: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pack WHERE pack_id = ?1",
+            [&old.pack_id],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(old_pack, 0, "the old pack's row is gone");
+
+    // Exactly one pack row remains, and it is the replacement.
+    let pack_rows: Vec<(String, i64)> = connection
+        .prepare("SELECT pack_id, objects FROM pack")
+        .expect("prepare")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("collect");
+    assert_eq!(pack_rows.len(), 1, "{pack_rows:?}");
+    assert_ne!(pack_rows[0].0, old.pack_id, "the row names a new pack");
+    assert_eq!(pack_rows[0].1, 1, "the replacement holds only the survivor");
+
+    // The dead object's row is gone, and the survivor is byte-identical.
+    let dead_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM object_location WHERE oid = ?1",
+            [dead.to_string()],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(dead_rows, 0);
+    let reopened = Store::open(root.store(), OpenMode::ReadWrite).expect("reopen");
     assert_eq!(
-        before,
-        fingerprint(&root.store()),
-        "a refusal must not change a byte"
+        reopened.get(survivor).expect("survivor reads after"),
+        survivor_bytes,
+        "repacking must move bytes, not rewrite them"
+    );
+    assert!(
+        reopened.get(dead).is_err(),
+        "the dead object must not be readable through its old coordinates"
     );
 }
 

@@ -49,6 +49,8 @@ pub struct SweepPlan {
     pub orphan_pack_files: Vec<PathBuf>,
     /// Index rows examined, for a non-vacuous check.
     pub rows_checked: usize,
+    /// Every object the marker called reachable (needed by the repack step to know what to copy).
+    pub live_objects: Vec<ObjectId>,
 }
 
 impl SweepPlan {
@@ -56,6 +58,12 @@ impl SweepPlan {
     #[must_use]
     pub fn freed_objects(&self) -> usize {
         self.dead_objects.len()
+    }
+
+    /// The reachable ids as a set, for the repack step.
+    #[must_use]
+    pub fn reachable_ids(&self) -> std::collections::BTreeSet<ObjectId> {
+        self.live_objects.iter().copied().collect()
     }
 
     /// Whether there is nothing to do at all.
@@ -105,6 +113,7 @@ pub fn plan(
     for row in &rows {
         let oid = parse_oid(&row.oid)?;
         if marker.contains(oid)? {
+            out.live_objects.push(oid);
             if row.kind == cas_store::index::kind_pack() {
                 *survivors.entry(row.location.clone()).or_insert(0) += 1;
             }

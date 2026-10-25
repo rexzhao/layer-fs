@@ -45,6 +45,7 @@ mod object;
 mod objects_scan;
 mod open;
 mod pack;
+pub mod repack;
 mod schema;
 
 /// Crash-point helpers for this crate's own crash-injection tests.
@@ -99,6 +100,7 @@ pub use object::{
     PackFailureKind, PackVerificationFailure, VerificationFailure, VerificationReport,
 };
 pub use pack::{NoPackObservation, PackObserver, PackStep};
+pub use repack::{RepackFrame, RepackResult};
 
 use std::path::Path;
 
