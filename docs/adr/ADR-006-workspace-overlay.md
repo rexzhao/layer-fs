@@ -545,3 +545,7 @@ verify [--deep <commit|root>] ; stats
 11. **性能**（spec §8-6，三次重复报 P50，注明载荷特征）：write_at / flush 的 P50/P95/P99；snapshot
     耗时对树规模（1k/10k/100k 文件）与变更量（1 文件 / 1% / 100%）；每次 snapshot 新增对象数与字节数；
     dirty_bytes 与写放大。
+
+
+> 若增加引用已封存 chunk 的 `ov_page` 行类型，**必须**满足 ADR-007 §6.1 的 **S1**（overlay 对 CAS 对象的引用只能由
+> `ov_inode.sealed_content` 的根表达，页行不存对象 id）；因此**不需要**为 overlay 单独实现 GC 引用读取器。

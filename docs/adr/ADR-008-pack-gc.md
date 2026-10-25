@@ -183,7 +183,8 @@ batch.commit()?;                             // 下面的 1–4
 | 主库 `workspace` | `base_root`、root(`base_commit`) |
 | 每个 overlay | `ov_meta.pending_root`（非空时）、`ov_inode.sealed_content` 引用的对象（Blob 的 chunk，或 Extents 树根） |
 
-**GC 的根集合**由 `RootSource`/`RootRows` 带标签枚举，覆盖上表全部来源（含 overlay 的 `pending_root`、`sealed_content`）；**`verify --deep` 仍以 `Repo::roots()` 为输入，只覆盖主库可达根**（`commit` / `snapshot` / `workspace.base_root`）——它不打开任何 `overlay.sqlite`，因此**不静默宣称**覆盖 overlay 未提交根。overlay 根的存活由 GC 的 K5c 用例单独覆盖。
+**GC 的根集合**由 `RootSource`/`RootRows` 带标签枚举，覆盖上表全部来源（含 overlay 的 `pending_root`、`sealed_content`）；**`verify --deep` 仍以 `Repo::roots()` 为输入，只覆盖主库可达根**（`commit` / `snapshot` / `workspace.base_root`）——它不打开任何 `overlay.sqlite`，因此**不静默宣称**覆盖 overlay 未提交根。overlay 根的存活由 GC 的 K5c 用例单独覆盖。**`verify --deep` 不覆盖 overlay 的 `pending_root`/`sealed_content`**：
+sealed 内容由 Seal 卡的"闭包完整"构造不变量与 workspace 读取路径负责；将来若需要覆盖，另开卡并显式命名（不得静默宣称）。
 
 `pending_root` 为空/缺失是**正常状态**（没有未完成的发布），根枚举按"无引用"处理；不得把空串解析成对象 id，也不得把它
 当损坏。**合法的"没有"不是错误**——与 K8/KI-10 同一条原则。

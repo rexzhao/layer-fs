@@ -199,6 +199,22 @@ O(变更数 × 树深) 的页读写 + 脏区间附近的 chunk I/O。KI-8 的"�
 
 ## 6. Seal（C8/C9，spec P2.5）
 
+### 6.1 S1：overlay 的引用面（2026-10-24 裁定）
+
+> **S1**：overlay 对 CAS 对象的引用**只能**由 `ov_inode.sealed_content` 的根表达；`ov_page` 行只保存字节或对
+> `sealed_content` 的偏移，**不保存对象 id**。将来增加"页引用已封存 chunk"的行类型时（ADR-006 §15），这些 chunk 必须落在
+> 该 inode 的 `sealed_content` 闭包内，并与 `sealed_content` 在同一 overlay 事务内可见；任何新增的对象引用列都必须进入
+> GC 的 T1 全列分类。
+
+理由：今天的实现天然满足 S1（页没有 oid），GC 的 `references` 从 `sealed_content` 根出发即可覆盖全部 chunk/extent 节点，
+**不需要**给 GC 一个 overlay 侧引用读取器（那是第二份格式知识 + 新判据 + 新 tripwire，只为一种尚未存在、且可以用"不存 oid"避免的
+行类型）。
+
+**生命周期**：`sealed_content` **只**跟随其 `workspace` 行——`workspace_discard` 删行后其 sealed 对象成为不可达垃圾，由下一次 GC
+回收；`snapshot drop` 与 `branch delete` **不影响** sealed 内容（不同引用域），GC 的根集合按 ADR-008 §6.2 分别覆盖。
+
+
+
 ### 6.1 overlay schema 扩展（overlay `schema_version` 2，旧 overlay 拒绝）
 
 `ov_inode` 增加：
