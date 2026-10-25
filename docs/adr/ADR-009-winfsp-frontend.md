@@ -217,13 +217,22 @@ conflict ⇔ (H.desired & N.share) != 0 || (N.desired & H.share) != 0
 | # | 缺口 | 内容 | 归属 |
 | --- | --- | --- | --- |
 | G1 | 原子 open/create | `OpenDisposition`（§4.2）+ 目录/文件 + 一个 overlay 事务；返回 `{stat, created}` | fs-overlay/fs-api |
-| G2 | 按 FileId 的操作 | `stat_id` / `read_at_id` / `write_at_id` / `truncate_id` / `remove_id` / `open_id`（返回 FileId 的 open） | fs-overlay/fs-api |
+| G2 | 按 FileId 的操作 | `stat_id` / `read_at_id`（range；见下方读放大判据）/ `write_at_id` / `truncate_id` / `remove_id` / `open_id`（返回 FileId 的 open） | fs-overlay/fs-api |
 | G3 | 元数据写 | `set_times`（creation/write，若 §10.1 扩展则 access/change）、`set_attributes`；`stat` 暴露 FileId | fs-namespace（profile v3，若批准） |
 | G4 | 条件 rename | `rename(..., replace: bool)` 原子；替换/不替换语义同 ADR-003 R3–R7 | fs-namespace/fs-api |
 | G5 | 枚举游标 | 可选 `read_dir_after(path, after)`；否则 adapter 缓存整目录（保持"一次枚举期间一致"） | fs-overlay（可选） |
 | G6 | 通知挂钩 | 无需核心；adapter 从自己的调用点发 | — |
 
 G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后句柄）；G3 取决于 §10.1；G5 可选。
+
+**G2 的读放大判据（P3 继承 ADR-008 §7）**：`read_at_id(offset, len)` 只能读取覆盖 `[offset, offset+len)` 的帧；
+观测点在 pack 读取器的 `read_exact_at(offset,len)`（**不是** `Store::get` 返回处）：
+
+- 读取区间并集 ⊆ 覆盖帧的 `(offset,length)` 并集；
+- 总读字节 == 这些帧的长度之和（单对象读 == 恰好一帧）；
+- **不得触及 pack 尾部 48 B**（ADR-008 §3：magic 4 + count 4 + frames_len 8 + BLAKE3 32）。
+
+用**计数 source** 做阳性对照（故意读整个 pack 必须红）；rename 之后、删除 pending 期间，同一 FileId 的读必须继续满足该判据。
 
 ---
 
