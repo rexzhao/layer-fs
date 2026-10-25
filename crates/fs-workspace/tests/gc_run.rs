@@ -305,3 +305,121 @@ fn two_labels_on_one_tree_are_both_recorded_and_the_tree_is_walked_once() {
         "the marked set stays deduplicated"
     );
 }
+
+/// §32: the *mark* is what de-duplicates — a shared subtree is fetched **once** even though two roots
+/// reach it.
+///
+/// Paired with `fs-snapshot`'s `references_fetches_the_same_object_on_every_call` (the library remembers
+/// nothing), this pins down which layer owns the de-duplication instead of asserting it in prose.
+#[test]
+fn a_subtree_reached_from_two_roots_is_fetched_once() {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    struct Counting<'a> {
+        inner: &'a Store,
+        counts: Rc<RefCell<BTreeMap<cas_core::ObjectId, usize>>>,
+    }
+
+    impl fs_snapshot::ObjectSource for Counting<'_> {
+        fn get(&self, oid: cas_core::ObjectId) -> fs_snapshot::SnapshotResult<Vec<u8>> {
+            *self.counts.borrow_mut().entry(oid).or_insert(0) += 1;
+            fs_snapshot::ObjectSource::get(self.inner, oid)
+        }
+    }
+
+    let root = TempRoot::new("mark-dedupe");
+    let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
+    repo.init().expect("init");
+    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    put_file(&workspace, "/f", b"one tree, two labels");
+    workspace.commit("one", false).expect("commit");
+    // A second workspace on the same branch: its `base_root` is the same tree, so two labels name it.
+    drop(workspace);
+    let _second = repo.workspace_create("w2", "main").expect("create");
+    drop(_second);
+    drop(repo);
+
+    let store = Store::open(root.store(), OpenMode::ReadOnly).expect("open store");
+    let counts = Rc::new(RefCell::new(BTreeMap::new()));
+    let counting = Counting {
+        inner: &store,
+        counts: Rc::clone(&counts),
+    };
+    let declared = {
+        let handle = Repo::open(root.store(), false).expect("open repo for roots");
+        let roots = fs_workspace::gc::RepoRoots { repo: &handle };
+        <fs_workspace::gc::RepoRoots<'_> as fs_workspace::gc::RootSource>::roots(&roots)
+            .expect("roots")
+    };
+
+    let mut marker = fs_workspace::gc::Marker::create_in(root.store()).expect("marker");
+    let shared_tree = declared.entries()[0].root;
+    let reader = fs_snapshot::SnapshotReader::open_any(&counting, shared_tree).expect("reader");
+    let report = fs_workspace::gc::mark_roots(
+        &declared,
+        &declared,
+        &reader,
+        &mut marker,
+        &mut fs_workspace::gc::GcHooks::default(),
+    )
+    .expect("mark");
+
+    assert!(
+        report.roots_declared.len() >= 2,
+        "the fixture needs two labels on one tree: {:?}",
+        report.roots_declared
+    );
+    assert_eq!(
+        report.roots_declared.len(),
+        report.roots_visited.len(),
+        "every label is recorded (§29)"
+    );
+    let with_two_labels = counts.borrow().get(&shared_tree).copied().unwrap_or(0);
+    marker
+        .remove()
+        .expect("close the first marker; Windows will not delete an open file");
+    // The property that matters is not the absolute number (opening the reader fetches the root once, and
+    // `references` fetches it again — both are by design). It is that the number does **not grow with the
+    // labels**: a third workspace on the same tree must not add a single fetch.
+    let repo = Arc::new(Repo::open(root.store(), false).expect("open repo"));
+    let _third = repo.workspace_create("w3", "main").expect("create");
+    drop(_third);
+    drop(repo);
+    let declared = {
+        let handle = Repo::open(root.store(), false).expect("open repo for roots");
+        let roots = fs_workspace::gc::RepoRoots { repo: &handle };
+        <fs_workspace::gc::RepoRoots<'_> as fs_workspace::gc::RootSource>::roots(&roots)
+            .expect("roots")
+    };
+    assert!(
+        declared.entries().len() > report.roots_declared.len(),
+        "the fixture must have gained a label"
+    );
+    let counts_again = Rc::new(RefCell::new(BTreeMap::new()));
+    let counting_again = Counting {
+        inner: &store,
+        counts: Rc::clone(&counts_again),
+    };
+    let mut marker = fs_workspace::gc::Marker::create_in(root.store()).expect("marker");
+    let reader =
+        fs_snapshot::SnapshotReader::open_any(&counting_again, shared_tree).expect("reader");
+    fs_workspace::gc::mark_roots(
+        &declared,
+        &declared,
+        &reader,
+        &mut marker,
+        &mut fs_workspace::gc::GcHooks::default(),
+    )
+    .expect("mark");
+    let with_three_labels = counts_again
+        .borrow()
+        .get(&shared_tree)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        with_two_labels, with_three_labels,
+        "an extra label on the same tree must not add a fetch: de-duplication belongs to the mark"
+    );
+}

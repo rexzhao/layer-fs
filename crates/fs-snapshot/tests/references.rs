@@ -577,3 +577,59 @@ fn a_frame_of_the_wrong_role_is_refused_by_the_reader() {
     let sound = Fake::from_store(&store, &[expected.root]);
     SnapshotReader::open_any(&sound, expected.root).expect("the sound root opens");
 }
+
+// ------------------------------------------------- §32: count the source, do not trust the shape
+
+/// A source that counts how often each object is fetched.
+///
+/// §32's point: a `references` implementation with a `HashMap` cache would pass every topological fixture,
+/// because the topology is identical either way. Counting the fetches is what distinguishes "the caller
+/// de-duplicates" from "the library de-duplicates".
+struct Counting<'a> {
+    inner: &'a Store,
+    counts: std::cell::RefCell<std::collections::BTreeMap<ObjectId, usize>>,
+}
+
+impl Counting<'_> {
+    fn count(&self, oid: ObjectId) -> usize {
+        self.counts.borrow().get(&oid).copied().unwrap_or(0)
+    }
+}
+
+impl fs_snapshot::ObjectSource for Counting<'_> {
+    fn get(&self, oid: ObjectId) -> SnapshotResult<Vec<u8>> {
+        *self.counts.borrow_mut().entry(oid).or_insert(0) += 1;
+        fs_snapshot::ObjectSource::get(self.inner, oid)
+    }
+}
+
+/// C11' (§32): two calls to `references` on the same oid must fetch it **twice**.
+///
+/// If the answer comes from a cache, the second call fetches nothing — and no fixture shape could tell
+/// that apart from a correct one.
+#[test]
+fn references_fetches_the_same_object_on_every_call() {
+    let root = TempRoot::new("counting");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+    let counting = Counting {
+        inner: &store,
+        counts: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+    };
+
+    let reader = SnapshotReader::open_any(&counting, expected.root).expect("open reader");
+    let first = reader.references(expected.table).expect("first");
+    assert_eq!(
+        counting.count(expected.table),
+        1,
+        "the first call fetches the object once"
+    );
+    let second = reader.references(expected.table).expect("second");
+    assert_eq!(
+        counting.count(expected.table),
+        2,
+        "the second call must fetch it again: `references` remembers nothing between calls"
+    );
+    assert_eq!(first, second, "and it must answer the same thing");
+}
