@@ -431,3 +431,41 @@ fn reference_counts_reconcile_with_a_hand_counted_fixture() {
     );
     assert_eq!(visited.len(), 7, "hand-counted object total");
 }
+
+/// Card §21, kind side condition 3: every role in `Role::ALL` gets a call, and the answer is a
+/// defined one — `Ok` with a defined edge set, or a **typed** error. Never a panic.
+///
+/// The compiler already forces `references` to mention every variant; this test is what forces the
+/// *answers* to be defined. Bytes and chunks are the two roles with a defined empty edge set; the page
+/// roles are given bytes that are not a page, and must say so instead of guessing.
+#[test]
+fn every_role_answers_its_own_way_and_never_panics() {
+    let root = TempRoot::new("roles");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+    let reader = SnapshotReader::open(&store, expected.root, profile).expect("open reader");
+
+    let mut answers = Vec::new();
+    for role in cas_core::Role::ALL {
+        // A payload that is *not* a page: the point is the answer, not a successful decode.
+        let oid = store.put(role, b"not a page").expect("put").oid;
+        let answer = reader.references(oid);
+        match (role, &answer) {
+            (cas_core::Role::Bytes | cas_core::Role::Chunk, Ok(edges)) => {
+                assert!(
+                    edges.is_empty(),
+                    "{role:?} is a leaf of the graph, so it has no edges"
+                );
+            }
+            (_, Err(_)) => {}
+            (other, Ok(edges)) => panic!("{other:?} accepted junk bytes and returned {edges:?}"),
+        }
+        answers.push(role);
+    }
+    assert_eq!(
+        answers.len(),
+        cas_core::Role::ALL.len(),
+        "every role was asked"
+    );
+}

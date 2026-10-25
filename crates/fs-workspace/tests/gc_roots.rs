@@ -893,8 +893,9 @@ fn t2_every_classified_root_source_has_a_kind_and_a_kind_has_a_column() {
 }
 
 #[test]
-fn t3_root_source_values_parse_as_object_ids() {
+fn t3_root_source_values_parse_as_object_ids_and_are_published() {
     let (_root, dir) = fixture("t3-values");
+    let index = rusqlite::Connection::open(dir.join("store.sqlite")).expect("index");
     let mut checked = 0usize;
 
     for (database, table, column, classification) in CLASSIFIED {
@@ -927,9 +928,24 @@ fn t3_root_source_values_parse_as_object_ids() {
             .expect("collect");
         for value in values {
             checked += 1;
-            assert!(
-                value.parse::<ObjectId>().is_ok(),
-                "{database}:{table}.{column} holds {value:?}, which is not an object id"
+            let oid = value.parse::<ObjectId>().unwrap_or_else(|_| {
+                panic!("{database}:{table}.{column} holds {value:?}, which is not an object id")
+            });
+            // Card §21: "parses as an ObjectId" is too weak — a commit id is 64 hex characters too,
+            // so `commit.commit_id` would pass while being the wrong classification. A real root has
+            // an index row. Only the index is consulted, never the file, so KI-11's external deleter
+            // cannot make this criterion red.
+            let published: i64 = index
+                .query_row(
+                    "SELECT COUNT(*) FROM object_location WHERE oid = ?1",
+                    [oid.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("index lookup");
+            assert_eq!(
+                published, 1,
+                "{database}:{table}.{column} holds {value:?}, which has no index row: a value that \
+                 merely looks like an object id is the signature of a misclassified column"
             );
         }
     }
