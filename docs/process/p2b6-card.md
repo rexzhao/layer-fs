@@ -567,3 +567,32 @@ pub fn repack_observed(..., observer: &mut dyn RepackObserver) -> StoreResult<Re
 - 两条用例都必须打印**实际到达的点号**并与期望比对（I6），并断言"重开后 `verify --deep` 干净 + 全部主库根逐字节不变"。
 
 **否决**"在 `repack` 调用前后各打一枪"：那不是 3/4 的位置，测出来的是另一件事。
+
+## 29. QA 独立复现抓到的 G2 缺陷（2026-10-24）：oid 去重把 label 丢了
+
+**现场**（`276593a`，普通 store、无注入）：一个 commit → `branch_create(side, main)` → 一个无引用对象。`workspace:w1` 的
+`base_root` 与初始 commit 的 root 是**同一棵树**，于是两个 label 指向同一 oid：
+
+```
+roots_declared: 3 (commit:a, commit:b, workspace:w1)
+roots_visited:  2 (commit:a, commit:b)      ← workspace:w1 被丢掉
+```
+
+**机制**：`gc::run` 里"同一 oid 已标记就 `continue`"同时跳过了该 entry 的 label 记录。标记本身正确（同树不走两遍，§13.1 的
+性能要求），但 `roots_visited` 因此不再等于 `roots_declared`。
+
+**为什么这比"少一条断言"严重**：G2 的意义是抓**漏标**；现在它被**良性**的 oid 去重触发，于是"真漏标"与"良性共享"在报告里
+无法区分——判据失效，而不是判据报错。
+
+**裁决（方案 1）**：**label 记录与 oid 标记解耦**——在 `continue` 之前把该 entry 的 label 补进 `roots_visited`（含 `visited_by_kind`），
+因为它确实被"覆盖"了，只是没有再走一遍。**不改 G2**（不改成 oid 集合比较）：G2 的语义是"每个声明的事实都被覆盖"，事实是 label。
+
+**验收**：新增一条用例——两个 label 指向同一棵树（workspace 基于某 commit 是最常见形态）→ `roots_declared == roots_visited`
+且 `visited_by_kind` 两类都非零；同时保留"真漏标"（omit_source）仍然红。
+
+## 30. I6 的措辞更正（QA，2026-10-24）
+
+原文「每点必须**打印**实际到达的步骤号」。QA 指出 worker 的用例用 `assert!(reached.contains("gc step N"))` **断言**到达点号、
+没有 `println`，而**断言比打印强**（打印能被忽略，断言不能）。故改为：
+
+> **可观测**：要么打印，要么断言失败信息里包含该点号。断言形式优先。
