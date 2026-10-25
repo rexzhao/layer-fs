@@ -544,3 +544,26 @@ K9 的断言保持反向形式：`freed_objects == 0 && packs_repacked == 1`，�
 
 K 矩阵按 `RootSource` 索引：每个来源至少一条金丝雀覆盖，缺覆盖即红（`SealedContent` 是 `sealed_content` 未落地前的
 唯一允许 pending 项）。
+
+## 28. 崩溃点 3/4 的注入方式（manager，2026-10-24）
+
+**问题**：点 3（新 pack fsync 完成、切换事务之前）与点 4（切换事务之后、删旧 pack 之前）都在 `cas-store::repack` 内部；
+现有 `PackObserver::step` 返回 `()`，只能观察不能中止。
+
+**裁决：(a) 可返回错误的步骤回调**，形状照本项目既有先例 `Batch::commit_observed`：
+
+```rust
+pub trait RepackObserver {
+    fn step(&mut self, step: RepackStep) -> StoreResult<()>;   // Err = 中止本次重打包
+}
+pub fn repack(...)                  // 生产入口，内部传 NoRepackObservation
+pub fn repack_observed(..., observer: &mut dyn RepackObserver) -> StoreResult<Repacked>
+```
+
+- 中止是 **typed `Err`**，不是 panic（**否决** `catch_unwind`：把中止伪装成 panic，且 unwind 穿过事务边界不安全）；
+- 点 3 中止：切换事务**未开**，新 pack 无行 → 下次 GC 当孤儿回收；旧 pack 与索引不变；
+- 点 4 中止：切换事务**已提交**，旧 pack 文件仍在但无 `pack` 行 → 下次 GC 删除；此时每个对象恰有一个位置（新 pack），
+  **不得**出现"两个位置"或"零个位置"；
+- 两条用例都必须打印**实际到达的点号**并与期望比对（I6），并断言"重开后 `verify --deep` 干净 + 全部主库根逐字节不变"。
+
+**否决**"在 `repack` 调用前后各打一枪"：那不是 3/4 的位置，测出来的是另一件事。
