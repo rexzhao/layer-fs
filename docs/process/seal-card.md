@@ -97,3 +97,14 @@ fs-snapshot 对象 ⇒ **GC 看不见这条边 ⇒ 静默漏标 ⇒ 删数据**�
 
 P2b-6 的实际行为：`snapshot_drop` 只删行，被 drop 的 workspace 若仍持 `sealed_content`，其对象**仍可达**（overlay 根还在），
 直到该 workspace 行被 `workspace discard`。**两种回收时机都能"通过"不可分辨的测试 ⇒ 必须在本卡写明是哪一种**，并据此写用例。
+
+### 8.5 若选 `ov_sealed` 表：T1 按**列**分类，不按整表
+
+新增表的列要逐列分类：`oid` → `RootSource(SealedContent)`；`serial` → `NotARoot(overlay inode identity)`（可能还有 `created_ns`）。
+**不要**把整张表算成一个根来源：否则 T3 会去抽样 `serial`，而它"能解析成 hex 但查不到索引行"⇒ 误红。
+
+### 8.6 删掉 `open_any` 之后，"裸根不失败"必须有独立证据
+
+`gc::run` 删掉 `open_any` 后不再有任何地方校验"根是不是树"。这不影响判据（G1/G3 比 oid 集合），但要留一条**独立**用例：
+把"根是 Bytes 对象"与"根是 chunk"两种裸根各跑一次 mark，断言 `references` 分别给出**空边集**与**真实边集**——
+这样"裸根不失败"是**有证据**的，而不是"删掉了检查所以不会报错"。
