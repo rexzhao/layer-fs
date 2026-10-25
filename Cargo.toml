@@ -9,6 +9,7 @@ members = [
     "crates/fs-workspace",
     "crates/fs-api",
     "crates/fs-cli",
+    "crates/fs-windows",
 ]
 
 [workspace.package]

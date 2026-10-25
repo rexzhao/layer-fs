@@ -1,0 +1,11 @@
+[package]
+name = "fs-windows"
+description = "Driver-independent Windows filesystem semantics for the Workspace CAS filesystem (P3-1, L1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# No dependencies on purpose: this crate is a pure model. No FFI, no `cfg(windows)`-only crate, no
+# WinFsp — so `cargo test -p fs-windows` runs on every platform and in CI without an SDK (P3-1 §1).
+[dependencies]
