@@ -391,7 +391,13 @@ impl<'a> SnapshotReader<'a> {
             // "不为空目录生成空页"), so looking into one finds nothing rather than being a
             // malformed value. Only a non-directory content here is a real error.
             Content::Empty if dir.kind == Kind::Directory => return Ok(None),
-            _ => return Err(malformed("lookup needs an inode whose content is Dir")),
+            // Spelled out rather than `_ =>`: a wildcard here would also swallow a *new* `Content`
+            // variant, and "the reader did not expect this" would then look like "malformed input"
+            // instead of "the reader is out of date" (P2b-6 §21's no-fallback rule, applied to the
+            // content domain as well).
+            Content::Empty | Content::Blob(_) | Content::Extents(_) => {
+                return Err(malformed("lookup needs an inode whose content is Dir"));
+            }
         };
         let mut pointer = root;
         loop {
@@ -501,7 +507,9 @@ impl<'a> SnapshotReader<'a> {
             // An empty directory has no page tree at all (ADR-005 §3.2), so it lists
             // nothing — not an error.
             Content::Empty if dir.kind == Kind::Directory => return Ok(Vec::new()),
-            _ => return Err(malformed("read_dir needs an inode whose content is Dir")),
+            Content::Empty | Content::Blob(_) | Content::Extents(_) => {
+                return Err(malformed("read_dir needs an inode whose content is Dir"));
+            }
         };
         let mut out = Vec::new();
         self.collect_dir(root, after, limit, &mut out)?;
@@ -581,7 +589,9 @@ impl<'a> SnapshotReader<'a> {
             // `Empty` covers both a zero-length file and a file whose blocks are all
             // zero (ADR-005 §3.2); either way no extent covers any range.
             Content::Empty if file.kind == Kind::File => return Ok(Vec::new()),
-            _ => return Err(malformed("extents_in_range needs Extents content")),
+            Content::Empty | Content::Blob(_) | Content::Dir(_) => {
+                return Err(malformed("extents_in_range needs Extents content"));
+            }
         };
         let mut out = Vec::new();
         self.collect_extents(root, from, to, &mut out)?;
