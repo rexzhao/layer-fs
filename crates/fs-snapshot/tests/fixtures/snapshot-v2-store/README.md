@@ -12,7 +12,7 @@ degrade into "synthesise a v2 root by editing a header" — which tests self-ide
 - snapshot root: eed636c6225f5a685457f8eec2d9a642d5d60fbd9f8bde867902c7d69890192f
 - content length: 32768
 - content blake3: b88eeed285256715c3a0ae2c46d69407628efbab876974c9728c8a404c5bbe33
-- objects: 12 published objects (see the manifest for the bytes on disk)
+- objects: 7 published objects in 2 packs (plus 2 commit rows and 1 snapshot row)
 - total fixture bytes: 189106
 
 ## How it was generated
@@ -24,8 +24,26 @@ V2_FIXTURE_OUT=crates/fs-snapshot/tests/fixtures/snapshot-v2-store \
   cargo test -p fs-workspace --test v2_fixture_generator -- --ignored --nocapture
 ```
 
-The generator is kept (ignored) for provenance only: running it at that commit must reproduce the same root id.
-Running it to "fix" a failing manifest check destroys the property this fixture exists for.
+The generator is kept (ignored) for provenance only. Running it to "fix" a failing manifest check destroys the
+property this fixture exists for.
+
+### What re-running the generator does and does not reproduce
+
+**The root id is not reproducible, and this fixture does not claim it is.** `InodeRecord.created_ns` and
+`modified_ns` are wall-clock values and are part of the encoded tree, so two runs at the same commit produce
+different (equally valid) roots. Measured, running the generator a second time at the commit above:
+
+| property | this fixture | second run | reproducible? |
+| --- | --- | --- | --- |
+| root id | `eed636c6…90192f` | `95b2b7e0…e356f3` | **no** (timestamps are in the tree) |
+| commit id | `cf35ea5a…c2b219` | `b83dd2d3…d9b8cbf3` | no (derived from the root) |
+| content bytes (blake3) | `b88eeed2…5bbe33` | `b88eeed2…5bbe33` | **yes** |
+| content length | 32768 | 32768 | yes |
+| objects / packs / commits / snapshots | 7 / 2 / 2 / 1 | 7 / 2 / 2 / 1 | **yes** |
+
+So the claim this fixture makes is: **it was written by the v2 writer, its shape is reproducible, and its bytes are
+pinned by the manifest below** — not "the same root id comes out again". A determinism harness (injected clock)
+does not exist in this build, and inventing one for a fixture would be a product change the card forbids.
 
 ## What it contains
 
