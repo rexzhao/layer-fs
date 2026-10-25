@@ -100,7 +100,7 @@ fn the_table_has_exactly_one_row_per_rule() {
         assert_eq!(
             TABLE.iter().filter(|row| row.rule == rule).count(),
             1,
-            "{rule:?} must have exactly one row"
+            "cell rule={rule:?}: this rule must have exactly one row (§5: missing row and missing column are              separate failures; the path table has one column, so a missing rule is a missing row)"
         );
     }
 }
