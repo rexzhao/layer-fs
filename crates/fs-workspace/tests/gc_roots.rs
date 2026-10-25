@@ -444,69 +444,259 @@ fn a_label_naming_two_trees_is_an_error_not_two_facts() {
 //   T3 checks the value domain of every column classified as a root source, in whichever database
 //      it lives.
 
-/// `(database, table, column) → classification`.
+/// The **complete** column inventory of every database a store has, each column classified.
 ///
 /// `RootSource(<Kind>)` means "this column holds a root and a `RootKind` covers it"; `NotARoot(..)`
-/// records why it is not one. Adding a root-shaped column without a row here is what T1 catches.
+/// records why it is not one. This is a golden list on purpose (card §7): a regex over column names
+/// only catches names that happen to look root-ish, and Seal could name its reference column
+/// `seal`, `chunk_set` or `payload_ref` — none of which a regex would ask about, so the root would be
+/// silently unprotected. Comparing the **whole** inventory means a new column cannot be added
+/// without a decision here, whatever it is called.
 type Classification = (&'static str, &'static str, &'static str, &'static str);
 
 const CLASSIFIED: &[Classification] = &[
+    (
+        "main",
+        "branch",
+        "head_commit",
+        "NotARoot(a commit id; that commit row’s root_oid is the root)",
+    ),
+    (
+        "main",
+        "branch",
+        "name",
+        "NotARoot(a branch name, not a tree)",
+    ),
+    (
+        "main",
+        "branch",
+        "scope_id",
+        "NotARoot(a scope id, not a tree)",
+    ),
+    ("main", "branch_log", "branch", "NotARoot(a branch name)"),
+    (
+        "main",
+        "branch_log",
+        "created_ns",
+        "NotARoot(audit timestamp)",
+    ),
+    (
+        "main",
+        "branch_log",
+        "new_commit",
+        "NotARoot(a commit id; the commit table enumerates its root)",
+    ),
+    (
+        "main",
+        "branch_log",
+        "old_commit",
+        "NotARoot(a commit id; the commit table enumerates its root)",
+    ),
+    ("main", "branch_log", "op", "NotARoot(the audit verb)"),
+    (
+        "main",
+        "branch_log",
+        "seq",
+        "NotARoot(an audit sequence number)",
+    ),
+    (
+        "main",
+        "commit",
+        "commit_id",
+        "NotARoot(the commit’s own identity)",
+    ),
+    ("main", "commit", "created_ns", "NotARoot(metadata)"),
+    ("main", "commit", "message", "NotARoot(metadata)"),
+    (
+        "main",
+        "commit",
+        "parent_commit",
+        "NotARoot(a commit id; the commit table enumerates its root)",
+    ),
     ("main", "commit", "root_oid", "RootSource(Commit)"),
+    (
+        "main",
+        "object_location",
+        "kind",
+        "NotARoot(index bookkeeping)",
+    ),
+    (
+        "main",
+        "object_location",
+        "length",
+        "NotARoot(index bookkeeping)",
+    ),
+    (
+        "main",
+        "object_location",
+        "location",
+        "NotARoot(index bookkeeping)",
+    ),
+    (
+        "main",
+        "object_location",
+        "offset",
+        "NotARoot(index bookkeeping)",
+    ),
+    (
+        "main",
+        "object_location",
+        "oid",
+        "NotARoot(the index’s own id: the marked side, never a root)",
+    ),
+    (
+        "main",
+        "object_location",
+        "role",
+        "NotARoot(index bookkeeping)",
+    ),
+    ("main", "pack", "bytes", "NotARoot(pack bookkeeping)"),
+    ("main", "pack", "created_ns", "NotARoot(pack bookkeeping)"),
+    ("main", "pack", "objects", "NotARoot(pack bookkeeping)"),
+    (
+        "main",
+        "pack",
+        "pack_id",
+        "NotARoot(names the container; its contents are object_location rows)",
+    ),
+    (
+        "main",
+        "schema_definition",
+        "ddl",
+        "NotARoot(schema bookkeeping)",
+    ),
+    (
+        "main",
+        "schema_definition",
+        "id",
+        "NotARoot(schema bookkeeping)",
+    ),
+    (
+        "main",
+        "schema_definition",
+        "schema_version",
+        "NotARoot(schema bookkeeping)",
+    ),
+    (
+        "main",
+        "scope_allocator",
+        "next_serial",
+        "NotARoot(a serial allocator)",
+    ),
+    (
+        "main",
+        "scope_allocator",
+        "scope_id",
+        "NotARoot(a scope id, not a tree)",
+    ),
+    (
+        "main",
+        "snapshot",
+        "created_ns",
+        "NotARoot(snapshot bookkeeping)",
+    ),
     ("main", "snapshot", "root_oid", "RootSource(Snapshot)"),
+    (
+        "main",
+        "snapshot",
+        "workspace",
+        "NotARoot(a workspace name)",
+    ),
+    ("main", "store_policy", "key", "NotARoot(a policy key)"),
+    (
+        "main",
+        "store_policy",
+        "value",
+        "NotARoot(policy scalars; a key/value store is not a tree)",
+    ),
+    (
+        "main",
+        "workspace",
+        "base_commit",
+        "NotARoot(a commit id; the commit table enumerates that root)",
+    ),
     (
         "main",
         "workspace",
         "base_root",
         "RootSource(WorkspaceBase)",
     ),
+    ("main", "workspace", "branch", "NotARoot(a branch name)"),
     (
         "main",
         "workspace",
-        "base_commit",
-        "NotARoot(points at a commit row, whose root_oid is the root)",
+        "created_ns",
+        "NotARoot(workspace bookkeeping)",
+    ),
+    ("main", "workspace", "id", "NotARoot(workspace bookkeeping)"),
+    (
+        "main",
+        "workspace",
+        "name",
+        "NotARoot(workspace bookkeeping)",
     ),
     (
         "main",
-        "branch",
-        "head_commit",
-        "NotARoot(points at a commit row)",
+        "workspace",
+        "state",
+        "NotARoot(workspace bookkeeping)",
     ),
-    (
-        "main",
-        "branch_log",
-        "old_commit",
-        "NotARoot(points at a commit row; its root_oid is the root)",
-    ),
-    (
-        "main",
-        "branch_log",
-        "new_commit",
-        "NotARoot(points at a commit row)",
-    ),
-    (
-        "main",
-        "object_location",
-        "oid",
-        "NotARoot(the CAS index's own id — the marked side, not a root)",
-    ),
-    (
-        "main",
-        "pack",
-        "pack_id",
-        "NotARoot(names the container; the objects inside are object_location rows)",
-    ),
-    ("overlay", "ov_meta", "value", "RootSource(OverlayPending)"),
-    (
-        "main",
-        "store_policy",
-        "value",
-        "NotARoot(key/value policy scalars; keys are not trees)",
-    ),
+    ("main", "workspace_policy", "key", "NotARoot(a policy key)"),
     (
         "main",
         "workspace_policy",
         "value",
-        "NotARoot(key/value policy scalars; keys are not trees)",
+        "NotARoot(policy scalars; a key/value store is not a tree)",
+    ),
+    (
+        "overlay",
+        "ov_entry",
+        "child",
+        "NotARoot(an inode serial inside the overlay, not an object id)",
+    ),
+    ("overlay", "ov_entry", "name", "NotARoot(a name)"),
+    ("overlay", "ov_entry", "parent", "NotARoot(an inode serial)"),
+    (
+        "overlay",
+        "ov_inode",
+        "base_limit",
+        "NotARoot(overlay bookkeeping)",
+    ),
+    (
+        "overlay",
+        "ov_inode",
+        "created_ns",
+        "NotARoot(overlay bookkeeping)",
+    ),
+    (
+        "overlay",
+        "ov_inode",
+        "entries",
+        "NotARoot(overlay bookkeeping)",
+    ),
+    (
+        "overlay",
+        "ov_inode",
+        "kind",
+        "NotARoot(overlay bookkeeping)",
+    ),
+    (
+        "overlay",
+        "ov_inode",
+        "live",
+        "NotARoot(overlay bookkeeping)",
+    ),
+    (
+        "overlay",
+        "ov_inode",
+        "modified_ns",
+        "NotARoot(overlay bookkeeping)",
+    ),
+    (
+        "overlay",
+        "ov_inode",
+        "origin",
+        "NotARoot(overlay bookkeeping)",
     ),
     (
         "overlay",
@@ -514,6 +704,32 @@ const CLASSIFIED: &[Classification] = &[
         "serial",
         "NotARoot(inode identity inside the overlay, not a tree root)",
     ),
+    (
+        "overlay",
+        "ov_inode",
+        "size",
+        "NotARoot(overlay bookkeeping)",
+    ),
+    (
+        "overlay",
+        "ov_meta",
+        "key",
+        "NotARoot(the selector; the root lives in `value` under key `pending_root`)",
+    ),
+    ("overlay", "ov_meta", "value", "RootSource(OverlayPending)"),
+    (
+        "overlay",
+        "ov_page",
+        "data",
+        "NotARoot(overlay page bytes stored inline, not an object reference)",
+    ),
+    (
+        "overlay",
+        "ov_page",
+        "page_index",
+        "NotARoot(page bookkeeping)",
+    ),
+    ("overlay", "ov_page", "serial", "NotARoot(page bookkeeping)"),
 ];
 
 /// Opens every database a store has: the metadata one plus each workspace overlay.
@@ -553,28 +769,16 @@ fn fixture(label: &str) -> (TempRoot, PathBuf) {
 }
 
 #[test]
-fn t1_every_root_shaped_column_in_every_database_is_classified() {
+fn t1_every_column_of_every_database_is_classified() {
     let (_root, dir) = fixture("t1-columns");
 
-    let looks_like_a_root = |column: &str| {
-        let lower = column.to_ascii_lowercase();
-        lower == "root"
-            || lower.starts_with("root_")
-            || lower.ends_with("_root")
-            || lower == "oid"
-            || lower.ends_with("_oid")
-            || lower.contains("content")
-            || lower == "value" // `ov_meta.value` holds the pending root (ADR-008 §6.2)
-            || lower == "pending_root"
-    };
-
-    let mut unclassified = Vec::new();
+    let mut actual: Vec<(String, String, String)> = Vec::new();
     for (database, connection) in databases(&dir) {
         let mut statement = connection
             .prepare(
                 "SELECT m.name, p.name FROM sqlite_master AS m
                  JOIN pragma_table_info(m.name) AS p
-                 WHERE m.type = 'table'",
+                 WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'",
             )
             .expect("prepare");
         let columns: Vec<(String, String)> = statement
@@ -583,20 +787,44 @@ fn t1_every_root_shaped_column_in_every_database_is_classified() {
             .collect::<Result<_, _>>()
             .expect("collect");
         for (table, column) in columns {
-            if !looks_like_a_root(&column) {
-                continue;
-            }
-            let known = CLASSIFIED.iter().any(|(db, known_table, known_column, _)| {
-                *db == database && *known_table == table && *known_column == column
-            });
-            if !known {
-                unclassified.push(format!("{database}:{table}.{column}"));
-            }
+            actual.push((database.clone(), table, column));
         }
     }
+    actual.sort();
+
+    let frozen: Vec<(String, String, String)> = {
+        let mut list: Vec<(String, String, String)> = CLASSIFIED
+            .iter()
+            .map(|(db, table, column, _)| {
+                ((*db).to_owned(), (*table).to_owned(), (*column).to_owned())
+            })
+            .collect();
+        list.sort();
+        list
+    };
+
+    // Both directions matter: an unclassified new column is a root that escapes the enumeration, and
+    // a frozen column that no longer exists means the list describes a schema nobody has.
+    let unclassified: Vec<_> = actual
+        .iter()
+        .filter(|entry| !frozen.contains(entry))
+        .collect();
+    let vanished: Vec<_> = frozen
+        .iter()
+        .filter(|entry| !actual.contains(entry))
+        .collect();
     assert!(
         unclassified.is_empty(),
-        "root-shaped columns added without classification: {unclassified:?}"
+        "columns added without a classification: {unclassified:?}"
+    );
+    assert!(
+        vanished.is_empty(),
+        "the frozen list names columns that no longer exist: {vanished:?}"
+    );
+    assert_eq!(
+        actual.len(),
+        CLASSIFIED.len(),
+        "one row per column, exactly"
     );
 }
 
