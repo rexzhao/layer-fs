@@ -25,12 +25,44 @@ fn every_cell_of_the_product_has_a_row_and_matches_decide() {
             );
         }
     }
-    assert_eq!(cells, 18, "6 dispositions × 3 states");
+    // Literals for every boundary (card §5, c4de819): deriving any of these from the enums would let a new
+    // disposition move both sides of the comparison at once. Rows, columns and the product are asserted
+    // **separately**, so a failure says which kind of gap it is.
+    let rows: std::collections::BTreeSet<Disposition> = TABLE
+        .iter()
+        .map(|(disposition, _, _)| *disposition)
+        .collect();
+    let columns: std::collections::BTreeSet<Exists> =
+        TABLE.iter().map(|(_, exists, _)| *exists).collect();
+    assert_eq!(
+        Disposition::ALL.len(),
+        6,
+        "enum cardinality: six dispositions"
+    );
+    assert_eq!(
+        Exists::ALL.len(),
+        3,
+        "enum cardinality: three existence states"
+    );
+    assert_eq!(
+        rows.len(),
+        6,
+        "missing row: {} of the six dispositions appear in the table",
+        rows.len()
+    );
+    assert_eq!(
+        columns.len(),
+        3,
+        "missing column: {} of the three existence states appear in the table",
+        columns.len()
+    );
     assert_eq!(
         TABLE.len(),
-        cells,
-        "the table must have exactly one row per cell"
+        18,
+        "missing cell: the table must hold 6 × 3 = 18 rows, found {}",
+        TABLE.len()
     );
+    assert_eq!(cells, 18, "6 dispositions × 3 states");
 }
 
 /// The two dispositions that both truncate an existing file are not the same: one replaces the entry, the
