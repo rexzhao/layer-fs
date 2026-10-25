@@ -450,3 +450,16 @@ impl SnapshotReader<'_> {
 
 **验收**：`ObjectSource` 的 `&Store` impl 与维护 impl 都要有一条"同一 root 两次读结果相同"的用例；`SnapshotReader`
 的既有用例全绿（证明强制转换没有改变调用语义）。
+
+## 24. `ObjectSource` 的四条落地条件（architect，2026-10-24）
+
+1. **trait 契约写"返回已验证的规范帧"**：`get` 的字节必须满足"身份 == oid、role 来自信封"，即 `Store::get` 的语义；
+   `references`/`fetch` 只解码、不校验身份——它们**信任 source**。因此维护侧的 source 必须**复用 cas-store 的对象读取路径**
+   （把读路径抽成接受 `&Connection` 的函数，让 `Store::get` 与维护 source 共用同一份代码），**不得自己写 SQL 取原始字节**。
+2. 保留：`references` 遇损坏对象**报错中止**（不当叶子）；页内去重、跨调用不去重。
+3. ADR-005 记一句（已直提）：读取器只经 `ObjectSource` 取已验证的规范帧；profile/scope/root serial 来自根值；维护模式把
+   自有连接包装成 `ObjectSource`，故"一个库一条连接"在读取路径上同样成立。
+4. **不要把 `ObjectSource` 扩成泛用存储接口**：只保留 `get`。
+
+**测试**：fake source 返回截断/坏信封 → `references` 报错而不是返回空；返回 role 不符 → `WrongRole`；
+维护 source 与 `&Store` 对同一 root 的答案逐元素相等（worker 已实现后半条）。

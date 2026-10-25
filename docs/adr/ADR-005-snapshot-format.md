@@ -365,3 +365,10 @@ architect 的推理得到实测确认：固定条数下页边界由位置决定�
   不整份驻留输入（§8 要求 O(N/64)），但当前实现为了简化把条目先收集进 `Vec`——**实际的输入
   驻留是 O(N)**。这与 §8 的"1 GiB 文件的 extent 流与 10 万 inode 流都不需要整份驻留"不符，
   记为已知偏差，见 `docs/reports/known-issues.md` 的 KI-4。
+
+## 读取接口：`ObjectSource`（2026-10-24，P2b-6 引入）
+
+读取器只经 `ObjectSource` 取得**已验证的规范帧**（身份与角色来自信封）；profile、scope、root serial 都来自**根值**，不读存储
+元数据。`&Store` 实现该 trait；维护模式把自有连接包装成 `ObjectSource`，因此"一个库一条连接"（ADR-008 §6.1）在读取路径上
+同样成立。`ObjectSource` 只有 `get` 一个方法——**不得**扩成泛用存储接口（加 `list`/`exists`/`put` 会让"最小能力"的价值消失）。
+
