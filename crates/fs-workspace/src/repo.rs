@@ -704,6 +704,27 @@ impl Repo {
         Ok(roots)
     }
 
+    /// One policy value, or `None` when the store does not set it.
+    ///
+    /// Used by the collector for `gc_repack_threshold`: a policy value is data in the store, not a
+    /// constant in the binary, so an operator can change it without a rebuild — and the collector must
+    /// therefore *read* it rather than assume it.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures.
+    pub fn policy_or_none(&self, key: &str) -> WorkspaceResult<Option<String>> {
+        let connection = self.db.lock();
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT value FROM store_policy WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
     /// Every root row, labelled by the row that holds it (ADR-008 §6.2).
     ///
     /// Distinct from [`Repo::roots`] (which returns bare ids for `verify`): GC needs to know *which

@@ -13,3 +13,6 @@ path = "src/main.rs"
 [dependencies]
 fs-api.workspace = true
 fs-workspace.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

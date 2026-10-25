@@ -125,6 +125,7 @@ version = "0.1.0"
 dependencies = [
  "fs-api",
  "fs-workspace",
+ "rusqlite",
 ]
 
 [[package]]

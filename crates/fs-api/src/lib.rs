@@ -50,7 +50,10 @@ mod workspace;
 
 pub use error::{ApiError, ApiResult};
 pub use read_view::ReadView;
-pub use repo::{BranchInfo, CommitInfo, Repo, WorkspaceStatus, WorkspaceSummary};
+pub use repo::{
+    gc, BranchInfo, CommitInfo, GcSummary, Repo, WorkspaceStatus, WorkspaceSummary,
+    DEFAULT_REPACK_THRESHOLD,
+};
 pub use stats::Stats;
 pub use verify::{Dangling, VerifyReport};
 pub use workspace::Workspace;

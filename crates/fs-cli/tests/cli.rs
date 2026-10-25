@@ -247,3 +247,57 @@ fn a_branch_can_start_from_a_commit() {
     );
     assert_eq!(root.ok(&["cat", &format!("{first}:/f")]), "payload");
 }
+
+/// `gc` end to end: a dry run decides but changes nothing, and a real run collects.
+#[test]
+fn gc_dry_run_and_real_run_are_different_commands() {
+    let root = TempRoot::new("gc");
+    root.init();
+    root.ok(&["checkout", "main"]);
+    std::fs::write(root.file("a.txt"), b"kept").expect("write");
+    root.ok(&["put", root.file("a.txt").to_str().expect("utf8"), "/a.txt"]);
+    root.commit("one");
+
+    let dry = root.ok(&["gc", "--dry-run"]);
+    assert!(dry.contains("dry run"), "{dry}");
+    assert!(dry.contains("planned objects:"), "{dry}");
+
+    let real = root.ok(&["gc"]);
+    assert!(real.contains("gc: done"), "{real}");
+    assert!(real.contains("freed objects:       0"), "{real}");
+
+    // The store is usable afterwards: the collector's handle did not linger.
+    root.ok(&["status"]);
+}
+
+/// A `gc_repack_threshold` that cannot be a ratio is refused, and the message says why.
+///
+/// The policy is store data, so this is reachable by editing the store rather than by a flag — which is
+/// exactly why the collector has to validate it at run time instead of trusting a constant.
+#[test]
+fn an_impossible_repack_threshold_is_reported_and_not_acted_on() {
+    let root = TempRoot::new("gc-threshold");
+    root.init();
+    root.ok(&["checkout", "main"]);
+    std::fs::write(root.file("a.txt"), b"kept").expect("write");
+    root.ok(&["put", root.file("a.txt").to_str().expect("utf8"), "/a.txt"]);
+    root.commit("one");
+
+    let connection =
+        rusqlite::Connection::open(root.store().join("store.sqlite")).expect("open index");
+    connection
+        .execute(
+            "INSERT INTO store_policy (key, value) VALUES ('gc_repack_threshold', '2')",
+            [],
+        )
+        .expect("plant the policy");
+    drop(connection);
+
+    let stderr = root.fails(&["gc"]);
+    assert!(
+        stderr.contains("outside [0, 1]"),
+        "the refusal must name the range: {stderr}"
+    );
+    // Nothing was collected: the command failed before the sweep.
+    root.ok(&["status"]);
+}

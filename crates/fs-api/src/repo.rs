@@ -18,6 +18,97 @@ pub struct Repo {
     pub(crate) inner: Arc<fs_workspace::Repo>,
 }
 
+/// Runs the offline collector over `store_dir`.
+///
+/// A **free function**, not a method on [`Repo`], and that is not a style choice: the collector takes
+/// the store exclusively (ADR-008 §6.1), while a live `Repo` holds two connections to it — so a
+/// `repo.gc()` would refuse its own caller. The policy is read through a short-lived handle that is
+/// dropped before the collector opens anything.
+///
+/// `gc_repack_threshold` is store data (a **policy value**, not a constant in the binary): when unset,
+/// [`DEFAULT_REPACK_THRESHOLD`] applies. A value that is not a number, or is outside `[0, 1]`, is
+/// refused **before anything moves**.
+///
+/// # Errors
+///
+/// A typed refusal when a writer or an open workspace holds the store, when the policy is not a ratio,
+/// or whatever the collector reported.
+pub fn gc(store_dir: impl AsRef<Path>, dry_run: bool) -> ApiResult<GcSummary> {
+    let store_dir = store_dir.as_ref().to_path_buf();
+    let threshold = {
+        let repo = Repo::open(&store_dir)?;
+        match repo.inner.policy_or_none("gc_repack_threshold")? {
+            Some(text) => {
+                let value: f64 = text.trim().parse().map_err(|_| {
+                    fs_workspace::WorkspaceError::Inconsistent {
+                        detail: format!("gc_repack_threshold {text:?} is not a number"),
+                    }
+                })?;
+                if !(0.0..=1.0).contains(&value) {
+                    return Err(fs_workspace::WorkspaceError::Inconsistent {
+                        detail: format!(
+                            "gc_repack_threshold {text} is outside [0, 1]: a survivor ratio cannot \
+                             exceed one, and a negative one would repack every pack forever"
+                        ),
+                    }
+                    .into());
+                }
+                value
+            }
+            None => DEFAULT_REPACK_THRESHOLD,
+        }
+    };
+
+    let outcome = fs_workspace::gc::run(
+        &store_dir,
+        fs_workspace::gc::GcOptions {
+            dry_run,
+            repack_threshold: threshold,
+        },
+    )?;
+    Ok(GcSummary {
+        dry_run,
+        repack_threshold: threshold,
+        marked_objects: outcome.report.marked_objects,
+        freed_objects: outcome.report.freed.len(),
+        freed_object_bytes: outcome.report.freed_object_bytes,
+        reclaimed_dead_bytes: outcome.report.reclaimed_dead_bytes,
+        packs_deleted: outcome.report.packs_deleted,
+        packs_repacked: outcome.report.packs_repacked,
+        planned_objects: outcome.plan.dead_objects.len(),
+    })
+}
+
+/// The default `gc_repack_threshold`, used when the store's policy does not set one.
+pub const DEFAULT_REPACK_THRESHOLD: f64 = 0.5;
+
+/// What one collector run reports, without the workspace's internal types.
+///
+/// Flat on purpose: the CLI prints it, and `GcReport`/`SweepPlan` are GC internals that must not leak
+/// into the CLI. `planned_objects` and `freed_objects` differ only in a dry run — that difference is
+/// the whole reason both fields exist.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GcSummary {
+    /// Whether anything was actually deleted.
+    pub dry_run: bool,
+    /// The policy value the run used.
+    pub repack_threshold: f64,
+    /// Objects the marked set held.
+    pub marked_objects: usize,
+    /// Objects that were deleted (`0` in a dry run).
+    pub freed_objects: usize,
+    /// Bytes of the deleted objects.
+    pub freed_object_bytes: u64,
+    /// Bytes reclaimed by repacking: dead frames that never had a row of their own.
+    pub reclaimed_dead_bytes: u64,
+    /// Packs deleted because nothing survived.
+    pub packs_deleted: usize,
+    /// Packs copy-repacked.
+    pub packs_repacked: usize,
+    /// Objects the sweep decided to free (present in a dry run too).
+    pub planned_objects: usize,
+}
+
 impl Repo {
     /// Creates the store (or opens it if it already exists) and makes sure it has a
     /// genesis commit on `main`.

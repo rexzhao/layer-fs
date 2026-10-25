@@ -38,7 +38,8 @@ fs-cli [--store <dir>] <command> [args]
   revert                          undo the head with a new commit
 
   verify [--deep]                 check objects and references
-  stats                           object and repository counts";
+  stats                           object and repository counts
+  gc [--dry-run]                  collect unreachable objects (offline: refuses while a writer holds the store)";
 
 fn main() -> ExitCode {
     match run() {
@@ -67,6 +68,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let head = repo.branch_head("main")?;
         println!("initialised {} (main = {})", path.display(), short(&head));
         return Ok(());
+    }
+
+    // `gc` runs **before** a `Repo` is opened: the collector takes the store exclusively, and a live
+    // `Repo` holds two connections to it, so opening first would make the collector refuse itself.
+    if command == "gc" {
+        return gc(&store, &arguments);
     }
 
     let repo = Repo::open(&store)?;
@@ -185,6 +192,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ------------------------------------------------------------------ commands
+
+/// `gc [--dry-run]`: the offline collector.
+///
+/// Refuses while any writer or workspace holds the store, which is ADR-008 §6.1's whole point; the
+/// error it prints is `StoreInUse` ("a maintainer is running, do not retry"), not `Busy`.
+fn gc(store: &std::path::Path, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let dry_run = arguments.iter().any(|argument| argument == "--dry-run");
+    let summary = fs_api::gc(store, dry_run)?;
+    println!(
+        "gc: {} (repack_threshold {})",
+        if summary.dry_run { "dry run" } else { "done" },
+        summary.repack_threshold
+    );
+    println!("  marked objects:      {}", summary.marked_objects);
+    println!("  freed objects:       {}", summary.freed_objects);
+    if summary.dry_run {
+        println!("  planned objects:     {}", summary.planned_objects);
+    }
+    println!("  freed bytes:         {}", summary.freed_object_bytes);
+    println!("  reclaimed dead bytes:{}", summary.reclaimed_dead_bytes);
+    println!(
+        "  packs: {} deleted, {} repacked",
+        summary.packs_deleted, summary.packs_repacked
+    );
+    Ok(())
+}
 
 fn branch(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if arguments.is_empty() {
