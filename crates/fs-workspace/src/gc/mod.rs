@@ -47,6 +47,14 @@ pub struct GcReport {
     pub reachable: Vec<ObjectId>,
     /// How many objects mark reached.
     pub reachable_count: usize,
+    /// How many objects the marked set held. Separate from `reachable_count` because G5 asks "was
+    /// anything marked?" and must not be answered by a byte count (P2b-6 §15).
+    pub marked_objects: usize,
+    /// Bytes of the objects that were deleted, summed from the index `length` (P2b-6 §15).
+    pub freed_object_bytes: u64,
+    /// Bytes reclaimed by repacking: dead frames that never had a row of their own. Kept apart from
+    /// `freed_object_bytes` because "reclaimed 10 KiB" and "deleted 3 objects" are different facts.
+    pub reclaimed_dead_bytes: u64,
     /// Packs rewritten because their survivor ratio fell below the threshold.
     pub packs_repacked: usize,
     /// Packs deleted because nothing in them survived.
