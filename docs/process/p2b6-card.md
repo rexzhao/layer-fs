@@ -487,3 +487,21 @@ impl SnapshotReader<'_> {
 8. `snapshot drop` 后：该根不可达的对象在**下一次** GC 被回收，其它根仍逐字节可读；
 9. `branch delete <b>` **保留 `branch_log`**（P7）：被删分支的历史提交仍为根 → 对象**存活**（这条同时钉住"`Repo::roots()`
    取全部 commit 行"的超集性质）。
+
+## 26. K9 的构造（需要 test-only seam）与 K8a/K8b 的分界（2026-10-24）
+
+### K9 需要 seam —— 裁决：加 test-only seam，不加产品 API
+
+K9 的形状是"pack 里有帧、索引里没有行"，只能由并发发布者丢行或批处理中止产生；`cas-store` 目前没有"追加帧但不写行"的入口。
+**裁决**：在 `cas-store::testing` 下、受 `gc-test-hooks` 门控，加一个 `stage_pack_with_dead_frame(...)`（或等价物），
+**不得**把它做成公开的产品 API，也**不得**用"删掉一个可达对象的行"来假装 K9——那会让 mark 先失败，测的就不是 K9。
+
+K9 的断言保持反向形式：`freed_objects == 0 && packs_repacked == 1`，且 `reclaimed_dead_bytes > 0`。
+
+### K8a 与 K8b 必须分开（worker 实测得出）
+
+- **K8a**：删掉**无人可达**对象的 pack 文件 → 实跑 `MissingPack`、`object_location` 全表逐行不变；dry-run 仍能回答并报出数量；
+- **K8b**：删掉**可达**数据的 pack 文件 → **mark 在遍历时中止**（这不是 K8a 的形状：K8a 第一版误用可达数据，mark 直接中止，
+  dry-run 也就无法回答）。
+
+两者是"缺失发生在被遍历到的路径上"与"不发生在"的区别，**必须各一条用例**，否则会互相掩盖。
