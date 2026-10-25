@@ -152,10 +152,14 @@ fn a_missing_pack_file_is_reported_and_its_rows_are_left_alone() {
         .expect("count");
 
     let marker = marker_with(&root.store(), &[]);
+    // One connection for the whole comparison. Opening and closing a *second* connection checkpoints
+    // the WAL and changes `store.sqlite-wal`'s length, which made this test flaky once (the assertion
+    // was right, the measurement was not).
+    let connection = index(&root.store());
     // After the marker exists: the comparison is about what *the plan* touches, not about the
     // fixture's own files.
     let before_bytes = fingerprint(&root.store());
-    let decided = plan(&index(&root.store()), &marker, &root.store(), 0.5).expect("plan");
+    let decided = plan(&connection, &marker, &root.store(), 0.5).expect("plan");
     assert_eq!(
         decided.missing_packs.len(),
         1,
@@ -166,7 +170,7 @@ fn a_missing_pack_file_is_reported_and_its_rows_are_left_alone() {
         fingerprint(&root.store()),
         "a plan is a pure read: deciding must not touch the store"
     );
-    let after = index(&root.store())
+    let after = connection
         .query_row("SELECT COUNT(*) FROM object_location", [], |row| {
             row.get::<_, i64>(0)
         })
