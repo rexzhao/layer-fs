@@ -73,12 +73,27 @@ pub fn apply(
             let frame = cas_store::repack::read_frame(&layout, &decision.pack_id, offset, length)?;
             frames.push(cas_store::RepackFrame { oid, role, frame });
         }
-        let result = cas_store::repack::repack(
+        // Points 3 and 4 live inside the repack, so the seam travels with it (P2b-6 §28): the observer
+        // aborts by returning a typed error, never by unwinding through the switch transaction.
+        let mut steps = |step: cas_store::RepackStep| -> cas_store::StoreResult<()> {
+            let point = match step {
+                cas_store::RepackStep::Staged => crate::gc::GcStep::RepackStaged,
+                cas_store::RepackStep::Switched => crate::gc::GcStep::RepackSwitched,
+            };
+            crate::gc::crash::reach(point).map_err(|error| {
+                cas_store::StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ))
+            })
+        };
+        let result = cas_store::repack::repack_observed(
             connection,
             &layout,
             &mut frames,
             std::slice::from_ref(&decision.pack_id),
             &mut cas_store::NoPackObservation,
+            &mut steps,
         )?;
         let _ = result;
         repacked += 1;

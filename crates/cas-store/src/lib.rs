@@ -213,7 +213,7 @@ pub use object::{
     PackFailureKind, PackVerificationFailure, VerificationFailure, VerificationReport,
 };
 pub use pack::{NoPackObservation, PackObserver, PackStep};
-pub use repack::{RepackFrame, RepackResult};
+pub use repack::{NoRepackObservation, RepackFrame, RepackObserver, RepackResult, RepackStep};
 
 use std::path::Path;
 

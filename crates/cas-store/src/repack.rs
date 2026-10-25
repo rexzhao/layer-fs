@@ -19,6 +19,52 @@ use crate::error::{StoreError, StoreResult};
 use crate::layout::Layout;
 use crate::pack::{self, PackObserver};
 
+/// The steps of a repack, in order (P2b-6 §28).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepackStep {
+    /// The replacement pack is durable in `packs/`; the index still points at the old pack.
+    Staged = 3,
+    /// The switch transaction has committed; the old pack's file is still there.
+    Switched = 4,
+}
+
+impl RepackStep {
+    /// The number a crash report prints (I6).
+    #[must_use]
+    pub fn number(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Receives each [`RepackStep`], and may **abort** the repack by returning an error.
+///
+/// Returning an error rather than panicking is the whole point (P2b-6 §28): an abort must not unwind
+/// through a transaction boundary, and a panic would disguise "the test stopped here" as a bug.
+pub trait RepackObserver {
+    /// Called immediately after `step` has completed.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the observer wants to report; the repack stops there.
+    fn step(&mut self, step: RepackStep) -> StoreResult<()>;
+}
+
+/// The production observer: does nothing and never aborts.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoRepackObservation;
+
+impl RepackObserver for NoRepackObservation {
+    fn step(&mut self, _step: RepackStep) -> StoreResult<()> {
+        Ok(())
+    }
+}
+
+impl<F: FnMut(RepackStep) -> StoreResult<()>> RepackObserver for F {
+    fn step(&mut self, step: RepackStep) -> StoreResult<()> {
+        self(step)
+    }
+}
+
 /// One frame destined for the replacement pack.
 #[derive(Debug, Clone)]
 pub struct RepackFrame {
@@ -61,6 +107,29 @@ pub fn repack(
     retired: &[String],
     observer: &mut dyn PackObserver,
 ) -> StoreResult<RepackResult> {
+    repack_observed(
+        connection,
+        layout,
+        frames,
+        retired,
+        observer,
+        &mut NoRepackObservation,
+    )
+}
+
+/// [`repack`], with a step observer that may abort (P2b-6 §28).
+///
+/// # Errors
+///
+/// As [`repack`], plus whatever the observer returns.
+pub fn repack_observed(
+    connection: &mut rusqlite::Connection,
+    layout: &Layout,
+    frames: &mut [RepackFrame],
+    retired: &[String],
+    observer: &mut dyn PackObserver,
+    steps: &mut dyn RepackObserver,
+) -> StoreResult<RepackResult> {
     let mut packed: Vec<pack::PackedFrame> = frames
         .iter()
         .map(|frame| pack::PackedFrame {
@@ -76,6 +145,9 @@ pub fn repack(
 
     // Durable before the index names it; the pin spans the "file exists, no row yet" window.
     let pin = pack::write(layout, &pack_id, &encoded.bytes, observer)?;
+    // Point 3: the file is durable, the switch transaction has not opened. An abort here leaves a pack no
+    // row names — the direction the next sweep reclaims.
+    steps.step(RepackStep::Staged)?;
 
     let transaction = connection.transaction()?;
     transaction.execute(
@@ -110,6 +182,9 @@ pub fn repack(
         transaction.execute("DELETE FROM pack WHERE pack_id = ?1", [old])?;
     }
     transaction.commit()?;
+    // Point 4: the switch committed, the old pack's file is still there but no row names it. Every object
+    // has exactly one location at this instant — the new pack.
+    steps.step(RepackStep::Switched)?;
     drop(pin);
 
     Ok(RepackResult {

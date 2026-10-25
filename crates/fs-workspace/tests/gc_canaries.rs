@@ -446,10 +446,7 @@ fn k8b_a_pack_missing_on_the_walk_aborts_and_deletes_nothing() {
     );
 }
 
-// ------------------------------------------------- crash points 1, 2, 5 (§27.A, I6)
-//
-// Points 3 and 4 live *inside* `cas-store::repack` (between the rename and the switch, and between the
-// switch and the unlink). They are not reachable from this crate yet; see the note in the report.
+// ------------------------------------------------- crash points (§27.A, §28, I6)
 
 /// The property every crash point promises: the store reopens, nothing that a root reaches is lost, and
 /// the only residue allowed is a file no row names.
@@ -505,5 +502,182 @@ fn crash_points_1_2_and_5_leave_a_recoverable_store() {
             !reader.references(root_oid).expect("references").is_empty(),
             "{label}: the committed tree must still be traversable"
         );
+    }
+}
+
+/// **Points 3 and 4** (§28): the abort happens *inside* the repack, so what each one promises differs.
+///
+/// - point 3 (staged, switch not run): the index is untouched, and the replacement pack is a file no row
+///   names — the next sweep reclaims it as an orphan;
+/// - point 4 (switched, old file not unlinked): every object has **exactly one** location, pointing at a
+///   file that exists; the old pack's file lingers without a row.
+#[test]
+#[cfg(feature = "gc-test-hooks")]
+fn crash_points_3_and_4_hold_their_own_invariants() {
+    use fs_workspace::gc::{crash, GcStep};
+
+    for (step, staged_expectation) in [
+        (GcStep::RepackStaged, true),
+        (GcStep::RepackSwitched, false),
+    ] {
+        let root = TempRoot::new(&format!("repack-crash-{}", step.number()));
+        let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
+        repo.init().expect("init");
+        drop(repo);
+
+        let store = Store::open(root.store(), OpenMode::ReadWrite).expect("open store");
+        let layout = cas_store::Layout::new(root.store());
+        let connection =
+            rusqlite::Connection::open(root.store().join("store.sqlite")).expect("index");
+        // A pack with one live frame and one rowless frame: the shape that gets repacked.
+        let live = cas_store::stage_pack_with_dead_frame(
+            &connection,
+            &layout,
+            &[(Role::Bytes, b"reachable".to_vec())],
+            &[(Role::Bytes, b"rowless".to_vec())],
+        )
+        .expect("stage the pack");
+        let survivor = live[0];
+        drop(connection);
+
+        // Make the survivor reachable through a snapshot root, so the pack is a repack candidate.
+        struct Sink<'a> {
+            store: &'a Store,
+        }
+        impl fs_snapshot::PageSink for Sink<'_> {
+            fn put(
+                &mut self,
+                role: Role,
+                value: &[u8],
+            ) -> fs_snapshot::SnapshotResult<cas_core::ObjectId> {
+                Ok(self.store.put(role, value).expect("put").oid)
+            }
+        }
+        let profile = fs_snapshot::Profile::V1;
+        let mut sink = Sink { store: &store };
+        let table = fs_snapshot::encode_inode_table(
+            &profile,
+            std::iter::once(fs_snapshot::InodeRecord {
+                serial: 0,
+                kind: fs_snapshot::Kind::File,
+                size: 32,
+                created_ns: 0,
+                modified_ns: 0,
+                content: fs_snapshot::Content::Blob(survivor),
+            }),
+            &mut sink,
+        )
+        .expect("table");
+        let snapshot_root = fs_snapshot::encode_root(
+            &profile,
+            &fs_snapshot::RootValue {
+                scope_id: [9u8; 32],
+                inode_table: table,
+            },
+            &mut sink,
+        )
+        .expect("root");
+        drop(store);
+        let connection =
+            rusqlite::Connection::open(root.store().join("store.sqlite")).expect("index");
+        connection
+            .execute(
+                "INSERT INTO snapshot (root_oid, workspace, created_ns) VALUES (?1, 'fixture', 1)",
+                [snapshot_root.to_string()],
+            )
+            .expect("snapshot row");
+
+        let rows_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM object_location", [], |row| row.get(0))
+            .expect("count");
+        drop(connection);
+
+        crash::arm(step);
+        let error = run(
+            root.store(),
+            GcOptions {
+                dry_run: false,
+                repack_threshold: 0.6,
+            },
+        )
+        .expect_err("the armed repack step must abort the run");
+        let reached = format!("{error:?}");
+        assert!(
+            reached.contains(&format!("gc step {}", step.number())),
+            "point {}: the error must name the reached step, got {reached}",
+            step.number()
+        );
+
+        // Reopen and check this point's invariant.
+        let connection =
+            rusqlite::Connection::open(root.store().join("store.sqlite")).expect("index");
+        let rows_after: i64 = connection
+            .query_row("SELECT COUNT(*) FROM object_location", [], |row| row.get(0))
+            .expect("count");
+        // Every object must have exactly one location whose file exists (both points 3 and 4).
+        let located: Vec<(String, String, i64)> = connection
+            .prepare("SELECT oid, location, kind FROM object_location")
+            .expect("prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        let dangling: Vec<String> = located
+            .into_iter()
+            .filter(|(_, location, kind)| {
+                *kind == cas_store::index::kind_pack()
+                    && !root
+                        .store()
+                        .join("packs")
+                        .join(format!("{location}.pack"))
+                        .exists()
+            })
+            .map(|(oid, _, _)| oid)
+            .collect();
+        assert!(
+            dangling.is_empty(),
+            "point {}: no row may point at a missing file: {dangling:?}",
+            step.number()
+        );
+
+        let live_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM object_location WHERE oid = ?1",
+                [survivor.to_string()],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            live_rows,
+            1,
+            "point {}: one location per object",
+            step.number()
+        );
+
+        if staged_expectation {
+            assert_eq!(
+                rows_before, rows_after,
+                "point 3: the switch transaction never ran, so no row moved"
+            );
+        }
+        drop(connection);
+
+        // Both points leave a store the next run can finish, and the survivor still reads.
+        let _recovered = run(
+            root.store(),
+            GcOptions {
+                dry_run: false,
+                repack_threshold: 0.6,
+            },
+        )
+        .expect("the store must be recoverable after a repack abort");
+        let store = Store::open(root.store(), OpenMode::ReadOnly).expect("open store");
+        assert!(store.get(survivor).is_ok(), "the survivor still reads");
     }
 }
