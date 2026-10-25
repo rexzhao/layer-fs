@@ -84,8 +84,9 @@ content_role=chunk;max_object_value=16777216;name_max=255;hash=blake3;domains=in
 
 ## 4. 时间语义
 
-1. 四个时间都是 **Unix epoch 纳秒 i64**；可表示 1677–2262 左右。前端把 FILETIME（1601 起 100ns，u64）转换：
-   - 超出 i64 纳秒范围 → `STATUS_INVALID_PARAMETER`（不截断、不静默回绕）；
+1. 四个时间都是 **Unix epoch 纳秒 i64**；可表示区间约为 **1677-09-21 – 2262-04-11**。前端把 FILETIME（1601 起 100ns，u64）转换：
+   - **1601 本身不可表示**（1601→1970 的偏移约 1.164e19 ns，超过 i64::MAX 9.223e18），转换必须用 **i128 中间值**，先算 `(tick * 100 - OFFSET_1601_TO_1970_NS)` 再检查落在 i64 范围；
+   - 落在 i64 范围外（含 FILETIME 0 / 1677 以前 / 2262 以后）→ `STATUS_INVALID_PARAMETER`，**不截断、不夹取、不静默回绕**；
    - 精度按 100ns 对齐（Windows 语义），小于 100ns 的余数向下取整并记录在测试中。
 2. **写内容**（write/truncate/overwrite）→ `modified_ns = changed_ns = now`。
 3. **元数据变更**（属性、时间设置、rename 之外的 inode 变更）→ `changed_ns = now`。
@@ -155,7 +156,7 @@ content_role=chunk;max_object_value=16777216;name_max=255;hash=blake3;domains=in
 5. 局部性：10 万 inode 改一条属性 → 新增页 ≤ 树深 + 2（现有测试扩展）；
 6. 旧 v2/v1 夹具拒绝矩阵（§8）；
 7. `verify --deep` 对 v3 干净根通过、对 §6 每类损坏指名失败；
-8. 前端转换：FILETIME 边界（1601、1970、2262 附近、超界）与 100ns 取整。
+8. 前端转换：**1601 不可表示 → 拒绝**；1970/2262 边界；i128 中间值防溢出；100ns 向下取整；越界不夹取。
 
 ---
 

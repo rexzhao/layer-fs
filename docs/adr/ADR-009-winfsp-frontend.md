@@ -63,7 +63,7 @@ adapter **禁止**：解析 CAS 对象、访问 `store.sqlite`/`overlay.sqlite`�
 | # | 语义 | 归属 | 难点 | 验收判据（L1/L2） |
 | --- | --- | --- | --- | --- |
 | 1 | Create dispositions（SUPERSEDE/OPEN/CREATE/OPEN_IF/OVERWRITE/OVERWRITE_IF） | 核心原子操作 + adapter 表 | 目录/文件 × 存在性；截断时机 | L1 表驱动 6×3 全格；L2 `CreateFile` 实测 |
-| 2 | Read/Write 偏移与越界 | 核心 | 越过 EOF 写扩展、读短读 | L1 与 P2 truncate 同族用例；L2 随机 IO |
+| 2 | Read/Write 偏移与越界 | 核心 | 越过 EOF 写扩展；`offset >= size` → `STATUS_END_OF_FILE`；部分越过 EOF → 短读成功（与 WinFsp MemFS 同） | L1 与 P2 truncate 同族用例；L2 随机 IO |
 | 3 | SetFileSize（截断/扩展） | 核心 | 缩容后扩展零化（已由 KI-9 钉住） | L1 缩→扩逐字节；L2 |
 | 4 | Get/Set file info（时间、属性、大小） | 核心元数据 + adapter 映射 | FILETIME 100ns/1601；只读属性 | L1 转换边界（0/极大/负）；L2 `GetFileInformationByHandle` |
 | 5 | 枚举（`FindFirst/Next`、marker、`.`/`..`） | adapter（缓存/游标） | 变更后游标语义、缓冲区不足 | L1 marker 续读、重命名中目录；L2 `dir /s` |
@@ -190,7 +190,7 @@ conflict ⇔ (H.desired & N.share) != 0 || (N.desired & H.share) != 0
 | `share` | desired×share 位规则；`conflict()` | 3×3×已有句柄集合穷举 |
 | `delete` | `DeleteState` 状态机 | open/set/cancel/cleanup 事件序列全表 |
 | `disposition` | §4.2 表 + 目录交叉 | 6×3 全格 |
-| `time` | FILETIME↔Unix ns（100ns、1601、无符号范围、负 ns） | 边界值往返；越界拒绝 |
+| `time` | FILETIME（u64，1601 起 100ns）↔ Unix ns i64；1601 不可表示、i128 中间值、100ns 取整 | 1601/1677 前拒绝；1970/2262 边界；越界不夹取 |
 | `error` | `ApiError`/`WorkspaceError`→NTSTATUS **穷举 match（禁止 `_`）** | 新增错误变体编译失败；表驱动每变体非零 |
 | `dirent` | 枚举模型、marker 编解码、`.`/`..` 过滤、缓冲不足 | marker 续读不重不漏；改名中目录 |
 | `attrs` | Windows 属性字 ↔ 核心属性（§10.1） | 位往返；只读强制 |
