@@ -246,6 +246,21 @@ G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后
 
 ---
 
+## 10.3 owner 决定（2026-10-24，经 grokbot 转达）
+
+| # | 事项 | 决定 | 对本 ADR 的影响 |
+| --- | --- | --- | --- |
+| A | WinFsp SDK 安装 | **owner 本人明天安装**；今天先做不依赖 SDK 的部分 | L1（`fs-windows`）与"用 mock 后端的 adapter"不受阻塞；`fs-winfsp`（真实 FFI + 挂载）等 SDK |
+| B | 绑定与 license | **自写最小 FFI**；**不评估 `winfsp_wrs`**；**不使用 GPL 的 `winfsp` crate** | 删除 §10.2 的 spike 选项；FFI 面自行维护（WinFsp FLOSS exception 覆盖链接），并需在 `docs/adr/` 记录"哪些 WinFsp API 被绑定、为什么" |
+| C | metadata profile | **选 (A)：升级 inode record v3**（ADR-005 修订，旧根拒绝） | G3 由"可选"转为**必须**；`set_times`/`set_attributes`/SD 进入 P3-2 核心补口；旧根拒绝要与 ADR-008 schema v3 同款：夹具用真实旧库 + 字节不变 |
+
+**因此 P3 的卡序调整为**：
+
+1. **P3-1（进行中）**：`fs-windows` L1 纯模型，不需要 SDK；
+2. **P3-2**：核心补口 —— G1 原子 disposition、G2 按 FileId 的读路径、G3 profile v3（时间/属性/SD）、G4 条件 rename；全部可用 L1/L2 之外的普通集成测试验证，不需 WinFsp；
+3. **P3-3**：adapter（`fs-winfsp`）+ **mock 后端**：把 handle 表、两段删除、dirent 游标、错误映射接到 fs-api 的 trait 上，用 mock 跑；**仍不需要 SDK**；
+4. **P3-4**：自写最小 FFI + 真实挂载（需 SDK，owner 明天装）。
+
 ## 11. 交付顺序与卡
 
 1. **P3-1（L1，无驱动）**：`fs-windows` 十个模块 + 穷举测试 + API 错误映射；CI 跨平台。产出可独立验收，不依赖 SDK。
