@@ -108,3 +108,37 @@ P2b-6 的实际行为：`snapshot_drop` 只删行，被 drop 的 workspace 若�
 `gc::run` 删掉 `open_any` 后不再有任何地方校验"根是不是树"。这不影响判据（G1/G3 比 oid 集合），但要留一条**独立**用例：
 把"根是 Bytes 对象"与"根是 chunk"两种裸根各跑一次 mark，断言 `references` 分别给出**空边集**与**真实边集**——
 这样"裸根不失败"是**有证据**的，而不是"删掉了检查所以不会报错"。
+
+## 9. 实现顺序（worker 草案，manager 采纳；每行 = 一个可提交单元 + 它自己的证据）
+
+1. **先红**：只加 `ov_sealed` 表与列（不改枚举）→ 提交"T1 / T2 / §27.D 三处红"的原始输出；**不许**先删 pending 项。
+2. 定 schema 细节（`ov_sealed(serial, oid, created_ns?)` 的键与唯一约束）→ 一次 migration，写进 ADR-006 §15。
+3. T1 加 `ov_sealed` 的**逐列**分类（`oid`→`RootSource(SealedContent)`；`serial`/`created_ns`→`NotARoot`）→ T1 绿。
+4. T2 删掉 `SealedContent` 的 pending 例外 → T2 绿；**不要**顺手改 G2。
+5. `root_rows_from` 改读 `ov_sealed`（若 (a)(b) 并存，保留 `sealed_content` 列的兼容读）→ 只读用例：两个 inode 封同一 chunk。
+6. label 改为 `sealed:{workspace}:{serial}:{oid}` → 用例断言两条事实都在 `roots_declared`（§29 的同族检查）。
+7. `gc::run` 删 `open_any`，根一律 `references(oid)` 起步 → §8.6 两条裸根用例（Bytes→空边、chunk→真实边）。
+8. 回归：`gc_run` / `gc_canaries` / `gc_shared_roots` / `gc_three_step` 全绿（不改判据）⇒ 证明"从任意对象起步"没有放宽任何 G。
+9. §27.D K 矩阵：删 pending 例外 + 补一条 `SealedContent` 金丝雀（seam 造态，与 K9 同一先例）。
+10. 金丝雀本体：仅被 `ov_sealed` 引用的 chunk → seal 存在时存活；删掉该 seal 行后**下一次** GC 回收。
+11. §8.4 回收时机写成断言：`snapshot drop` 后仍存活、`workspace discard` 后才可回收（两个时点各一条断言）。
+12. ~~决策落 ADR~~ → **已裁**（见 §10）：S1 已进 ADR-007 §6.1；`verify --deep` 不扩，ADR-008 §6.2 已写"不得静默宣称"。
+13. **反向证据改成可执行形式**：S1 之后"页行存 oid"不再可构造，因此改为——在 T1 分类里断言 **`ov_page` 的每一列都是 `NotARoot`+理由**，
+    并加一条注释说明 S1；将来若有人给 `ov_page` 加对象 id 列，T1 会当场红。
+14. 崩溃五点回归 + 全量 + clippy（Seal 动了 `run` 的根起点，必须重跑，不得沿用 P2b-6 的结论）。
+15. **最后**才删 ADR-008 §6.2 的"显式未完成项"并更新合并报告——顺序最后，否则将来红的时候归属又说不清。
+
+一句话：**1 先红、2–4 让 tripwire 转绿、5–7 改形状、8 证明没放宽判据、9–11 补覆盖、12–13 定性、14–15 收口。**
+
+## 10. 两处规格裁定（architect，2026-10-24，已落 ADR）
+
+- **S1（ADR-007 §6.1）**：overlay 对 CAS 对象的引用**只能**由 `ov_inode.sealed_content` 的根表达；`ov_page` 行只保存字节或对
+  `sealed_content` 的偏移，**不保存对象 id**。因此**不需要** overlay 侧的 GC 引用读取器。ADR-006 §15 末尾已加指向 S1 的说明。
+- **`verify --deep` 不扩**（ADR-008 §6.2 已写"不得静默宣称"）：sealed 内容由 Seal 卡的**闭包完整**构造不变量与 workspace 读取路径负责。
+  **本卡必须补一条构造层判据**：对每个 sealed 文件，`references(sealed_content 根)` 的闭包必须覆盖读该文件所需的全部对象
+  （chunk/extent 节点），且经 workspace 读路径逐字节等于 Seal 前。
+- **生命周期**：`sealed_content` **只**跟随其 `workspace` 行；`workspace_discard` 后成为不可达垃圾由下一次 GC 回收；
+  `snapshot drop` / `branch delete` **不影响** sealed 内容。
+- **profile**：chunk/extent 根没有 profile ⇒ 给 `SnapshotReader` 加不读根的构造 `for_objects(source, profile)`，profile 取自
+  `workspace_policy.snapshot_profile`（打开时已校验），**不要**为树根保留 `open_any` 特判（两套 profile 来源会漂）。
+- **空编码**：`sealed_content` 的 `empty` 编码 → **无根**，解析时不得造出空 oid（与 `pending_root` 空串同一条规则）。
