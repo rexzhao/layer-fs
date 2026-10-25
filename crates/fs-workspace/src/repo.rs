@@ -704,6 +704,81 @@ impl Repo {
         Ok(roots)
     }
 
+    /// Deletes `name` from the branch table, keeping its history.
+    ///
+    /// **`branch_log` rows are kept on purpose** (ADR-008 §6.2): they are audit, and the commits they
+    /// name are still GC roots, so the objects of a deleted branch's history stay alive. That is also
+    /// why this is not "delete the branch and its commits" — nothing here may make an object
+    /// unreachable as a side effect of tidying up names.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::NotFound`] when the branch does not exist, or [`WorkspaceError::Inconsistent`]
+    /// when a workspace is still on it.
+    pub fn branch_delete(&self, name: &str) -> WorkspaceResult<()> {
+        let connection = self.db.lock();
+        let open: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM workspace WHERE branch = ?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        if open > 0 {
+            return Err(WorkspaceError::Inconsistent {
+                detail: format!("branch {name} still has {open} workspace(s) on it"),
+            });
+        }
+        let removed = connection.execute("DELETE FROM branch WHERE name = ?1", [name])?;
+        if removed == 0 {
+            return Err(WorkspaceError::NotFound {
+                what: format!("branch {name}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Every named snapshot root, oldest first.
+    ///
+    /// A snapshot is a **GC root that does not move a branch**: the row is the only thing keeping its
+    /// tree alive, which is why dropping one is a meaningful operation and why the collector has to
+    /// enumerate these rows (ADR-008 §6.2).
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures.
+    pub fn snapshots(&self) -> WorkspaceResult<Vec<SnapshotRow>> {
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
+            "SELECT root_oid, workspace, created_ns FROM snapshot ORDER BY created_ns, root_oid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(SnapshotRow {
+                root: row.get(0)?,
+                workspace: row.get(1)?,
+                created_ns: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Drops the snapshot row for `root`, returning whether there was one.
+    ///
+    /// **Deletes the row, not the objects.** The tree stays in the store until the next collection
+    /// notices that nothing reaches it — which is the only order that cannot lose data if the process
+    /// dies in between.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures.
+    pub fn snapshot_drop(&self, root: &str) -> WorkspaceResult<bool> {
+        let connection = self.db.lock();
+        let removed = connection.execute("DELETE FROM snapshot WHERE root_oid = ?1", [root])?;
+        Ok(removed > 0)
+    }
+
     /// One policy value, or `None` when the store does not set it.
     ///
     /// Used by the collector for `gc_repack_threshold`: a policy value is data in the store, not a
@@ -1033,6 +1108,17 @@ fn commit_row(connection: &Connection, id: &str) -> WorkspaceResult<CommitInfo> 
         .ok_or_else(|| WorkspaceError::NotFound {
             what: format!("commit {id}"),
         })
+}
+
+/// One row of the `snapshot` table: a root nothing else has to move (ADR-008 §6.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRow {
+    /// The tree's root object id, as text (what the CLI prints and `snapshot drop` accepts).
+    pub root: String,
+    /// The workspace that recorded it.
+    pub workspace: String,
+    /// When it was recorded, in nanoseconds since the epoch.
+    pub created_ns: i64,
 }
 
 /// A repository opened for offline maintenance (ADR-008 §6.1, "maintenance single connection set").

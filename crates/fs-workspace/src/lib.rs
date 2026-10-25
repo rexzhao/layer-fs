@@ -52,7 +52,7 @@ pub use error::{WorkspaceError, WorkspaceResult};
 pub use ids::{commit_id, new_scope_id, new_workspace_id, parse_oid, random_bytes, SerialSegment};
 pub use main_db::MainDb;
 pub use publish::PublishOutcome;
-pub use repo::{BranchInfo, CommitInfo, MaintenanceRepo, Repo, RepoStats};
+pub use repo::{BranchInfo, CommitInfo, MaintenanceRepo, Repo, RepoStats, SnapshotRow};
 pub use schema::{
     DEFAULT_BRANCH, INIT_MESSAGE, MAIN_BUSY_TIMEOUT_MS, OVERLAY_PAGE_BYTES, SCHEMA_VERSION,
     SERIAL_LOW_WATER, SERIAL_SEGMENT, STATE_CREATING, STATE_READY,

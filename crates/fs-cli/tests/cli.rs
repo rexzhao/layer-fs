@@ -301,3 +301,100 @@ fn an_impossible_repack_threshold_is_reported_and_not_acted_on() {
     // Nothing was collected: the command failed before the sweep.
     root.ok(&["status"]);
 }
+
+/// `snapshot drop` removes the row; the tree's objects go on the **next** collection, and the other
+/// roots stay byte-identical (§25.C-8).
+#[test]
+fn dropping_a_snapshot_frees_only_what_nothing_else_reaches() {
+    let root = TempRoot::new("snapshot-drop");
+    root.init();
+    root.ok(&["checkout", "main"]);
+    std::fs::write(root.file("kept.txt"), b"the committed bytes").expect("write");
+    root.ok(&[
+        "put",
+        root.file("kept.txt").to_str().expect("utf8"),
+        "/kept.txt",
+    ]);
+    let commit = root.commit("one");
+
+    // A tree only a snapshot row reaches: write it, snapshot it, then wipe the workspace's pending
+    // view so nothing but the snapshot row names these bytes.
+    std::fs::write(
+        root.file("gone.txt"),
+        b"only this snapshot reaches these bytes",
+    )
+    .expect("write");
+    root.ok(&[
+        "put",
+        root.file("gone.txt").to_str().expect("utf8"),
+        "/gone.txt",
+    ]);
+    let snapshotted = root.ok(&["snapshot", "create"]);
+    let snapshot_root = snapshotted
+        .split_whitespace()
+        .last()
+        .expect("a root id")
+        .to_owned();
+    root.ok(&["restore", &commit, "--discard"]);
+
+    let listed = root.ok(&["snapshot", "list"]);
+    assert!(listed.contains(&snapshot_root), "{listed}");
+
+    // Collect once with the snapshot present: its tree is reachable, so nothing of it may be freed.
+    let first = root.ok(&["gc"]);
+    assert!(
+        first.contains("freed objects:       0"),
+        "the snapshot still holds its tree: {first}"
+    );
+
+    root.ok(&["snapshot", "drop", &snapshot_root]);
+    let second = root.ok(&["gc"]);
+    assert!(
+        !second.contains("freed objects:       0"),
+        "once the row is gone, its exclusive objects are collectable: {second}"
+    );
+
+    // The committed file survives, byte for byte.
+    let out = root.ok(&["cat", &format!("{commit}:/kept.txt")]);
+    assert_eq!(out.as_bytes(), b"the committed bytes");
+}
+
+/// `branch delete` keeps the history: the deleted branch's commits are still GC roots, so its objects
+/// survive a collection (§25.C-9).
+#[test]
+fn deleting_a_branch_keeps_its_objects_alive() {
+    let root = TempRoot::new("branch-delete");
+    root.init();
+    root.ok(&["checkout", "main"]);
+    root.ok(&["branch", "topic"]);
+    root.ok(&["checkout", "topic"]);
+    std::fs::write(
+        root.file("topic.txt"),
+        b"only the topic branch has these bytes",
+    )
+    .expect("write");
+    root.ok(&[
+        "put",
+        root.file("topic.txt").to_str().expect("utf8"),
+        "/topic.txt",
+    ]);
+    let topic_commit = root.commit("topic work");
+
+    // Back to main, then delete the branch: the commit row stays, so nothing becomes unreachable.
+    root.ok(&["checkout", "main"]);
+    // A workspace on `topic` would make the delete dangle, which is exactly what it must refuse.
+    root.ok(&["workspace", "discard", "topic"]);
+    root.ok(&["branch", "delete", "topic"]);
+    let branches = root.ok(&["branch"]);
+    assert!(!branches.contains("topic\t"), "topic is gone: {branches}");
+
+    let swept = root.ok(&["gc"]);
+    assert!(
+        swept.contains("freed objects:       0"),
+        "the deleted branch's commit is still a root, so its objects must survive: {swept}"
+    );
+
+    // And the history is still readable by commit id — that is what "still a root" means in practice.
+    let out = root.ok(&["cat", &format!("{topic_commit}:/topic.txt")]);
+    assert_eq!(out.as_bytes(), b"only the topic branch has these bytes");
+}

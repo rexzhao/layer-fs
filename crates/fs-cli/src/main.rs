@@ -19,7 +19,9 @@ fs-cli [--store <dir>] <command> [args]
 
   init <path>                     create a repository (Store + scope + main branch)
   branch [<name>] [--from <src>]  list branches, or create one
+  branch delete <name>            delete a branch (its history stays a GC root)
   checkout <branch>               make a workspace on a branch current
+  workspace discard <name>        drop a workspace's overlay and row (its branch is untouched)
 
   put   <local> <path>            write a host file's bytes
   get   <path> [local]            read a file out (or to stdout)
@@ -39,7 +41,9 @@ fs-cli [--store <dir>] <command> [args]
 
   verify [--deep]                 check objects and references
   stats                           object and repository counts
-  gc [--dry-run]                  collect unreachable objects (offline: refuses while a writer holds the store)";
+  gc [--dry-run]                  collect unreachable objects (offline: refuses while a writer holds the store)
+  snapshot [list | create | drop <root>]
+                                  named roots that keep a tree alive without moving a branch";
 
 fn main() -> ExitCode {
     match run() {
@@ -80,6 +84,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match command.as_str() {
         "branch" => branch(&repo, &arguments),
         "checkout" => checkout(&repo, &store, &arguments),
+        "snapshot" => snapshot(&repo, &store, &arguments),
+        "workspace" => workspace(&repo, &arguments),
         "put" => with_workspace(&repo, &store, |workspace| {
             let (local, path) = two(&arguments, "put <local> <path>")?;
             let mut bytes = Vec::new();
@@ -197,6 +203,66 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Refuses while any writer or workspace holds the store, which is ADR-008 §6.1's whole point; the
 /// error it prints is `StoreInUse` ("a maintainer is running, do not retry"), not `Busy`.
+/// `snapshot [list | drop <root>]`.
+///
+/// A snapshot is a root that keeps a tree alive without moving a branch; dropping one is how a user
+/// says "this tree may go", and the objects follow on the **next** collection rather than immediately.
+/// `workspace discard <name>`: remove a workspace row and its overlay.
+///
+/// Needed before `branch delete`, which refuses while a workspace is still on the branch: deleting the
+/// branch first would leave a workspace pointing at a name nobody has.
+fn workspace(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    match arguments.first().map(String::as_str) {
+        Some("discard") => {
+            let name = arguments
+                .get(1)
+                .ok_or("expected workspace discard <name>")?;
+            repo.workspace_discard(name)?;
+            println!("discarded workspace {name}");
+            Ok(())
+        }
+        other => Err(format!("unknown workspace action {other:?}").into()),
+    }
+}
+
+fn snapshot(
+    repo: &Repo,
+    store: &std::path::Path,
+    arguments: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    match arguments.first().map(String::as_str) {
+        None | Some("list") => {
+            let rows = repo.snapshots()?;
+            if rows.is_empty() {
+                println!("no snapshots");
+                return Ok(());
+            }
+            for row in rows {
+                println!("{}	{}", row.root, row.workspace);
+            }
+            Ok(())
+        }
+        Some("create") => {
+            let name = read_current(store)?;
+            let mut workspace = repo.workspace_open(&name)?;
+            let root = workspace.snapshot()?;
+            workspace.close()?;
+            println!("snapshot {root}");
+            Ok(())
+        }
+        Some("drop") => {
+            let root = arguments.get(1).ok_or("expected snapshot drop <root>")?;
+            if repo.snapshot_drop(root)? {
+                println!("dropped {root}: its objects stay until the next gc");
+            } else {
+                return Err(format!("no snapshot for {root}").into());
+            }
+            Ok(())
+        }
+        Some(other) => Err(format!("unknown snapshot action {other}").into()),
+    }
+}
+
 fn gc(store: &std::path::Path, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let dry_run = arguments.iter().any(|argument| argument == "--dry-run");
     let summary = fs_api::gc(store, dry_run)?;
@@ -232,6 +298,13 @@ fn branch(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::E
         .position(|a| a == "--from")
         .and_then(|index| arguments.get(index + 1))
         .map(String::as_str);
+    if name == "delete" {
+        let victim = arguments.get(1).ok_or("expected branch delete <name>")?;
+        repo.branch_delete(victim)?;
+        println!("deleted branch {victim} (its commits remain roots)");
+        return Ok(());
+    }
+
     let created = repo.branch_create(name, from)?;
     println!("{} -> {}", created.name, short(&created.head));
     Ok(())

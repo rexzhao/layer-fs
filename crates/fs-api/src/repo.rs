@@ -171,6 +171,36 @@ impl Repo {
         Ok(self.inner.branch_head(name)?)
     }
 
+    /// Deletes a branch, keeping its history (and therefore its objects) alive.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an unknown branch, `Inconsistent` while a workspace is still on it.
+    pub fn branch_delete(&self, name: &str) -> ApiResult<()> {
+        Ok(self.inner.branch_delete(name)?)
+    }
+
+    /// Every named snapshot root, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures.
+    pub fn snapshots(&self) -> ApiResult<Vec<fs_workspace::SnapshotRow>> {
+        Ok(self.inner.snapshots()?)
+    }
+
+    /// Drops a snapshot row, returning whether there was one.
+    ///
+    /// Deletes the **row**, not the objects: they become unreachable and the next collection reclaims
+    /// them. Doing it the other way round would lose data if the process died in between.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures.
+    pub fn snapshot_drop(&self, root: &str) -> ApiResult<bool> {
+        Ok(self.inner.snapshot_drop(root)?)
+    }
+
     /// A branch's history, newest first.
     ///
     /// # Errors
