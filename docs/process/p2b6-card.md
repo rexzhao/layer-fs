@@ -422,3 +422,31 @@ workspace 都让根枚举失败（`Inconsistent: object id ""`）。空串是"�
 
 口径收口：**凡"按变体分类"的 match，一律不留通配**；唯一允许的"兜底"是对**原始字节/node byte** 的诊断分支（它不是分类，
 而是"解码位置的错误报告"），且必须返回 typed 错误。
+
+## 23. 裁决：`fs-snapshot` 引入 `ObjectSource`（mark 在维护模式下读不到对象）
+
+**问题**：`SnapshotReader::open_any` 的签名是 `(&Store, ObjectId)`，而 `Store` 自带一条连接；维护模式已把 `store.sqlite`
+独占锁住，再开一条 `Store` 连接必然被拒——正是 §6.1/§19 要避免的"锁外另开连接"。
+
+**裁决：方案 1（`ObjectSource`），并且用 `&dyn` 而不是泛型参数。**
+
+```rust
+/// The only thing the reader needs from a store: fetch an object's raw value.
+pub trait ObjectSource {
+    fn get(&self, oid: ObjectId) -> SnapshotResult<Vec<u8>>;
+}
+
+impl SnapshotReader<'_> {
+    pub fn open_any(source: &dyn ObjectSource, root: ObjectId) -> SnapshotResult<Self>;
+}
+```
+
+- `&Store` 实现 `ObjectSource`，现有调用点 `open_any(&store, root)` **自动强制转换**，签名改动只落在 `fs-snapshot`；
+- 维护模式传"由维护连接支撑的实现"，于是 mark 与根枚举用**同一条**连接（"(c) 的延伸：一条连接服务一个库"）；
+- 用 `&dyn` 而非 `S: ObjectSource` 泛型：避免把泛型参数传播到 `fs-workspace`/`fs-api`/测试的所有调用点；每个对象一次动态派发
+  的代价可接受（P2b-6 的判据里没有 GC 吞吐指标）；
+- **否决** `Store::adopt(connection)`：要在 cas-store 内部暴露 `Database` 的构造，触及 `open.rs` 的私有不变量；
+- **否决** "GC 只用只读连接"：独占锁下读同样拿不到。
+
+**验收**：`ObjectSource` 的 `&Store` impl 与维护 impl 都要有一条"同一 root 两次读结果相同"的用例；`SnapshotReader`
+的既有用例全绿（证明强制转换没有改变调用语义）。
