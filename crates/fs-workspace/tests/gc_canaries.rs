@@ -681,3 +681,70 @@ fn crash_points_3_and_4_hold_their_own_invariants() {
         assert!(store.get(survivor).is_ok(), "the survivor still reads");
     }
 }
+
+// ------------------------------------------------- §27.D: every root source has a canary
+
+/// The K matrix is indexed by `RootSource`: a root kind with no canary is a source nobody proves the
+/// collector protects (P2b-6 §27.D).
+///
+/// The table is explicit rather than derived, because "which test covers which kind" is a human claim;
+/// what the test enforces is that the claim exists for **every** kind, and that no stale entry names a
+/// test this repository does not have.
+#[test]
+fn every_root_kind_is_covered_by_a_named_canary() {
+    use fs_workspace::gc::RootKind;
+
+    // (kind, the test that would fail if the collector stopped protecting it)
+    const COVERAGE: &[(RootKind, &str)] = &[
+        (
+            RootKind::Commit,
+            "gc_canaries::k1_no_reachable_object_is_taken_and_every_root_still_reads \
+             (+ gc_run::a_run_frees_the_orphan_and_keeps_the_committed_tree_readable)",
+        ),
+        (
+            RootKind::Snapshot,
+            "gc_shared_roots::a_shared_object_survives_dropping_one_root_and_is_freed_once_both_are_gone",
+        ),
+        (
+            RootKind::WorkspaceBase,
+            "gc_run::a_dry_run_decides_but_changes_nothing (the base root is the post-GC tree it reads)",
+        ),
+        (
+            RootKind::OverlayPending,
+            "gc_overlay_roots::maintenance_reads_the_overlay_pending_root_through_its_own_connection",
+        ),
+    ];
+
+    let kinds = [
+        RootKind::Commit,
+        RootKind::Snapshot,
+        RootKind::WorkspaceBase,
+        RootKind::OverlayPending,
+        RootKind::SealedContent,
+    ];
+
+    let missing: Vec<&RootKind> = kinds
+        .iter()
+        .filter(|kind| !COVERAGE.iter().any(|(covered, _)| covered == *kind))
+        .collect();
+    // `SealedContent` has no column yet (Seal has not landed), so it is the one documented gap — and it
+    // has to be listed here deliberately, which is what makes this tripwire live for the next kind.
+    assert_eq!(
+        missing,
+        vec![&RootKind::SealedContent],
+        "every root source needs a canary; the only acceptable gap is the documented pending one"
+    );
+
+    // No stale entries: each named test must exist in this repository (by its file, at least).
+    for (kind, canary) in COVERAGE {
+        let file = canary.split("::").next().expect("a file name");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(format!("{file}.rs"));
+        assert!(
+            path.is_file(),
+            "{kind:?} claims coverage by {canary}, but {} does not exist",
+            path.display()
+        );
+    }
+}

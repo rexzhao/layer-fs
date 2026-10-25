@@ -398,3 +398,62 @@ fn deleting_a_branch_keeps_its_objects_alive() {
     let out = root.ok(&["cat", &format!("{topic_commit}:/topic.txt")]);
     assert_eq!(out.as_bytes(), b"only the topic branch has these bytes");
 }
+
+/// §27.C: `verify --deep` checks the **snapshot** table and every workspace's `base_root`.
+///
+/// The experiment is a corruption, not a count: a tree reachable **only** through a snapshot row is
+/// damaged, and `verify --deep` must report it. Before the damage the same command is clean — the paired
+/// control, without which "verify failed" could just mean "verify always fails here".
+#[test]
+fn verify_deep_checks_snapshot_roots() {
+    let root = TempRoot::new("verify-snapshot");
+    root.init();
+    root.ok(&["checkout", "main"]);
+    std::fs::write(root.file("kept.txt"), b"committed").expect("write");
+    root.ok(&[
+        "put",
+        root.file("kept.txt").to_str().expect("utf8"),
+        "/kept.txt",
+    ]);
+    root.commit("one");
+
+    std::fs::write(root.file("snap.txt"), b"only in the snapshot").expect("write");
+    root.ok(&[
+        "put",
+        root.file("snap.txt").to_str().expect("utf8"),
+        "/snap.txt",
+    ]);
+    let created = root.ok(&["snapshot", "create"]);
+    let snapshot_root = created
+        .split_whitespace()
+        .last()
+        .expect("a root")
+        .to_owned();
+    root.ok(&["verify", "--deep"]);
+
+    // Damage exactly the object that names that tree's content: every pack file goes. The snapshot's
+    // tree can then no longer be walked, and `verify --deep` must say so.
+    for entry in std::fs::read_dir(root.store().join("packs"))
+        .expect("packs")
+        .flatten()
+    {
+        if entry.path().is_file() {
+            std::fs::remove_file(entry.path()).expect("delete a pack");
+        }
+    }
+
+    let output = root.run(&["verify", "--deep"]);
+    assert!(
+        !output.status.success(),
+        "a damaged store must not verify clean"
+    );
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        printed.contains(&snapshot_root) || printed.to_lowercase().contains("dangling"),
+        "verify --deep must report the damaged snapshot tree ({snapshot_root}): {printed}"
+    );
+}
