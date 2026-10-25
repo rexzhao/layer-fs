@@ -67,6 +67,24 @@ pub struct PinForTest {
     _pin: durability::Pin,
 }
 
+/// Reads one published object over a **caller-owned** connection (offline maintenance, ADR-008 §6.1).
+///
+/// The same code path [`Store::get`] uses, including the length, identity and role checks — a
+/// maintenance caller (the offline collector) must not reimplement "find the row, read the frame,
+/// verify it", because the copy that drifts is the one nobody exercises (P2b-6 §24).
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] when nothing is published under `oid`, [`StoreError::MissingPack`] when the
+/// pack file is gone, or [`StoreError::Corrupt`] when the bytes do not match the index.
+pub fn read_published(
+    connection: &rusqlite::Connection,
+    layout: &Layout,
+    oid: ObjectId,
+) -> StoreResult<Vec<u8>> {
+    object::get_with(connection, layout, oid)
+}
+
 /// Validates a store's schema over a caller-owned connection (offline maintenance, ADR-008 §6.1).
 ///
 /// The maintenance open owns **one** connection for the whole store, so it cannot go through

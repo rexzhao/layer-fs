@@ -44,10 +44,14 @@ pub(crate) struct Located {
     pub(crate) offset: u64,
 }
 
-pub(crate) fn locate(database: &Database, oid: ObjectId) -> StoreResult<Option<Located>> {
+/// The index lookup behind every object read, over a caller-owned connection (P2b-6 §24: one read
+/// path, two entry points — [`crate::Store::get`] and the offline collector's object source).
+pub(crate) fn locate_in(
+    connection: &rusqlite::Connection,
+    oid: ObjectId,
+) -> StoreResult<Option<Located>> {
     use rusqlite::OptionalExtension;
-    let row: Option<(i64, i64, i64, String, i64)> = database
-        .connection
+    let row: Option<(i64, i64, i64, String, i64)> = connection
         .query_row(
             "SELECT role, length, kind, location, offset FROM object_location WHERE oid = ?1",
             [oid.to_string()],
@@ -101,7 +105,20 @@ pub(crate) fn locate(database: &Database, oid: ObjectId) -> StoreResult<Option<L
 /// A pack object costs one seek and one frame read: the index knows `(offset, length)`, so
 /// neither the pack's tail nor its other frames are touched (ADR-008 §3).
 pub(crate) fn get(database: &Database, layout: &Layout, oid: ObjectId) -> StoreResult<Vec<u8>> {
-    let located = locate(database, oid)?.ok_or(StoreError::NotFound { oid })?;
+    get_with(&database.connection, layout, oid)
+}
+
+/// The one object read path, over a **caller-owned** connection (P2b-6 §24).
+///
+/// `Store::get` and the offline collector's object source both come through here: a second
+/// implementation of "find the row, read the frame, check the identity" is a second set of checks to
+/// keep in sync, and the one that drifts is always the one nobody exercises.
+pub(crate) fn get_with(
+    connection: &rusqlite::Connection,
+    layout: &Layout,
+    oid: ObjectId,
+) -> StoreResult<Vec<u8>> {
+    let located = locate_in(connection, oid)?.ok_or(StoreError::NotFound { oid })?;
     let bytes = if located.kind == schema::KIND_PACK {
         pack::read_frame(layout, &located.location, located.offset, located.length)?
     } else {

@@ -469,3 +469,111 @@ fn every_role_answers_its_own_way_and_never_panics() {
         "every role was asked"
     );
 }
+
+// ------------------------------------------------- the reader trusts the source, so test the source
+
+/// A source that answers from a table of prepared frames.
+///
+/// It exists to make the two failure shapes of §24 reachable: the reader does not verify identities
+/// itself (it trusts `ObjectSource` for that), so "a truncated frame" and "a frame of the wrong role"
+/// have to be produced by a source rather than by damaging a store.
+struct Fake {
+    answers: Vec<(ObjectId, Vec<u8>)>,
+}
+
+impl Fake {
+    fn from_store(store: &Store, oids: &[ObjectId]) -> Self {
+        let answers = oids
+            .iter()
+            .map(|oid| {
+                (
+                    *oid,
+                    store.get(*oid).expect("the fixture reads its own objects"),
+                )
+            })
+            .collect();
+        Self { answers }
+    }
+
+    fn replacing(mut self, oid: ObjectId, bytes: Vec<u8>) -> Self {
+        for (known, answer) in self.answers.iter_mut() {
+            if *known == oid {
+                *answer = bytes;
+                return self;
+            }
+        }
+        self.answers.push((oid, bytes));
+        self
+    }
+}
+
+impl fs_snapshot::ObjectSource for Fake {
+    fn get(&self, oid: ObjectId) -> SnapshotResult<Vec<u8>> {
+        self.answers
+            .iter()
+            .find(|(known, _)| *known == oid)
+            .map(|(_, bytes)| bytes.clone())
+            .ok_or_else(|| SnapshotError::Store(cas_store::StoreError::NotFound { oid }))
+    }
+}
+
+/// §24: `references` **trusts** the source, so a source that hands back a truncated frame must still
+/// produce an error — never an empty edge list.
+///
+/// The paired control is the same call against the same source with a sound frame, so an
+/// implementation that always failed would not pass.
+#[test]
+fn a_truncated_frame_from_the_source_is_an_error_not_an_empty_leaf() {
+    let root = TempRoot::new("fake-truncated");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+
+    let sound = Fake::from_store(&store, &[expected.root, expected.table]);
+    let reader = SnapshotReader::open_any(&sound, expected.root).expect("open reader");
+    assert!(
+        !reader
+            .references(expected.table)
+            .expect("the sound frame")
+            .is_empty(),
+        "control: the same call succeeds with a sound frame"
+    );
+
+    // A frame that starts like an inode leaf and then stops.
+    let truncated = sound.replacing(expected.table, vec![profile.fmt, 0u8, 1, 0, 0, 0]);
+    let reader = SnapshotReader::open_any(&truncated, expected.root).expect("open reader");
+    let error = reader
+        .references(expected.table)
+        .expect_err("a truncated frame must not read as an empty leaf");
+    assert!(
+        matches!(error, SnapshotError::Malformed { .. }),
+        "expected a typed Malformed, got {error:?}"
+    );
+}
+
+/// §24: the role comes from the envelope, so a root handed back as a byte object must be refused as
+/// `WrongRole` rather than decoded as if it were a root.
+#[test]
+fn a_frame_of_the_wrong_role_is_refused_by_the_reader() {
+    let root = TempRoot::new("fake-role");
+    let store = Store::open(root.path(), cas_store::OpenMode::Create).expect("open");
+    let profile = Profile::V1;
+    let expected = fixture(&store, &profile);
+
+    let wrong = Fake::from_store(&store, &[expected.root]).replacing(
+        expected.root,
+        cas_core::Object::new(cas_core::Role::Bytes, b"not a filesystem root")
+            .expect("framed")
+            .to_vec(),
+    );
+    let error = SnapshotReader::open_any(&wrong, expected.root)
+        .expect_err("a byte object is not a filesystem root");
+    assert!(
+        matches!(error, SnapshotError::WrongRole { .. }),
+        "expected a typed WrongRole, got {error:?}"
+    );
+
+    // Control: the same source, the same oid, the untouched frame opens.
+    let sound = Fake::from_store(&store, &[expected.root]);
+    SnapshotReader::open_any(&sound, expected.root).expect("the sound root opens");
+}
