@@ -25,8 +25,6 @@ use cas_core::{Object, Role};
 use cas_store::probe::{self, Event};
 use cas_store::{OpenMode, Store};
 
-const TAIL_BYTES: u64 = 48;
-
 /// The probe's log is process-global, so tests that reset it and then read it must not run
 /// beside each other: libtest runs the tests in a binary in parallel by default. One lock per
 /// test keeps "reset → do the batch → read events" an atomic observation.
@@ -346,7 +344,10 @@ fn a_pack_costs_one_sync_and_one_short_transaction() {
                 })
                 .expect("sum") as u64
         };
-        assert_eq!(rows, frame_bytes + TAIL_BYTES * expected_packs as u64);
+        assert_eq!(
+            rows,
+            frame_bytes + cas_store::PACK_TAIL_BYTES * expected_packs as u64
+        );
     }
 }
 

@@ -82,7 +82,11 @@ pub(crate) fn audit(stage: &str, layout: &Layout, pack_id: &str, bytes: u64) {
 pub(crate) const TAIL_MAGIC: [u8; 4] = *b"WPK1";
 
 /// Bytes of the fixed-size tail: magic, count, frames length, BLAKE3.
-pub(crate) const TAIL_BYTES: u64 = 4 + 4 + 8 + 32;
+/// The pack tail's size in bytes: `magic(4) + count(4) + frames_len(8) + BLAKE3(32)`.
+///
+/// Defined by ADR-008 §3. Exported because the reader-side criteria ("a single-object read must not touch the
+/// tail") need the number, and a test that writes `48` itself is a second definition that can drift.
+pub const PACK_TAIL_BYTES: u64 = 48;
 
 /// The observable steps of writing one pack, in the order they happen.
 ///
@@ -140,7 +144,7 @@ pub(crate) struct EncodedPack {
 /// Seals `frames` into a pack body: the frames verbatim, then the tail.
 pub(crate) fn encode(frames: &mut [PackedFrame]) -> EncodedPack {
     let mut bytes = Vec::with_capacity(
-        frames.iter().map(|frame| frame.frame.len()).sum::<usize>() + TAIL_BYTES as usize,
+        frames.iter().map(|frame| frame.frame.len()).sum::<usize>() + PACK_TAIL_BYTES as usize,
     );
     for frame in frames.iter_mut() {
         frame.offset = bytes.len() as u64;
@@ -359,16 +363,16 @@ pub(crate) fn verify(layout: &Layout, pack_id: &str) -> StoreResult<PackTail> {
         _ => StoreError::Io(error),
     })?;
     let length = bytes.len() as u64;
-    if length < TAIL_BYTES {
+    if length < PACK_TAIL_BYTES {
         return Err(corrupt_pack(pack_id, "file is shorter than a pack tail"));
     }
-    let at = (length - TAIL_BYTES) as usize;
+    let at = (length - PACK_TAIL_BYTES) as usize;
     if bytes[at..at + 4] != TAIL_MAGIC {
         return Err(corrupt_pack(pack_id, "tail magic is not WPK1"));
     }
     let count = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap_or([0; 4]));
     let frames_len = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap_or([0; 8]));
-    if frames_len + TAIL_BYTES != length {
+    if frames_len + PACK_TAIL_BYTES != length {
         return Err(corrupt_pack(
             pack_id,
             &format!("tail declares {frames_len} frame bytes but the file holds {length}"),

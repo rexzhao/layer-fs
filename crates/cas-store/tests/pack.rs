@@ -10,10 +10,9 @@ use std::path::{Path, PathBuf};
 use cas_core::{Object, Role};
 use cas_store::{OpenMode, Store};
 
-/// The pack tail: magic 4 + count 4 + frames_len 8 + BLAKE3 32 (ADR-008 §3).
-///
-/// Not 44: the `count` field is part of the format, and `verify` uses it.
-const TAIL_BYTES: usize = 48;
+// The pack tail (magic 4 + count 4 + frames_len 8 + BLAKE3 32, ADR-008 §3) comes from the crate's exported
+// constant; this file deliberately has no local one (card §5), and "not 44" is asserted once, in
+// `the_pack_tail_is_forty_eight_bytes`.
 
 struct TempRoot {
     path: PathBuf,
@@ -130,7 +129,9 @@ fn a_batch_lands_in_one_pack_and_each_object_reads_back_byte_for_byte() {
     // `bytes` is the file size: the frames plus this pack's one tail.
     assert_eq!(
         *bytes as usize,
-        frame_len(&first) + frame_len(&second) + TAIL_BYTES,
+        frame_len(&first)
+            + frame_len(&second)
+            + usize::try_from(cas_store::PACK_TAIL_BYTES).expect("fits"),
         "pack.bytes is the whole file"
     );
 
@@ -239,17 +240,19 @@ fn pack_max_bytes_splits_the_batch_where_the_arithmetic_says() {
             objects_written, objects as u64,
             "every object has a pack row"
         );
+        let tail = cas_store::PACK_TAIL_BYTES;
         let bytes: u64 = rows.iter().map(|(_, bytes, _)| bytes).sum();
         assert_eq!(
-            bytes as usize,
-            frame_bytes + TAIL_BYTES * expected_packs,
-            "each pack pays its own 48-byte tail (outside pack_max_bytes)"
+            bytes as u64,
+            u64::try_from(frame_bytes + usize::try_from(tail).expect("fits") * expected_packs)
+                .expect("fits"),
+            "each pack pays its own tail (outside pack_max_bytes)"
         );
         // The limit bounds the frames, not the file: every pack's body is at most `limit`.
         for (_, bytes, _) in &rows {
             assert!(
-                *bytes <= limit + TAIL_BYTES as u64,
-                "pack of {bytes} bytes exceeds {limit} + 48"
+                *bytes <= limit + tail,
+                "pack of {bytes} bytes exceeds {limit} + the tail"
             );
         }
 
@@ -404,7 +407,7 @@ fn verify_uses_the_tail_count_as_a_necessary_condition() {
 
     let path = root.store().join("packs").join(format!("{pack_id}.pack"));
     let mut bytes = std::fs::read(&path).expect("read");
-    let count_at = bytes.len() - TAIL_BYTES + 4;
+    let count_at = bytes.len() - usize::try_from(cas_store::PACK_TAIL_BYTES).expect("fits") + 4;
     bytes[count_at..count_at + 4].copy_from_slice(&3u32.to_le_bytes());
     std::fs::write(&path, &bytes).expect("widen count");
     assert!(
@@ -584,5 +587,25 @@ fn a_failed_pin_fails_the_publication_and_commits_no_rows() {
     assert!(
         store.verify().expect("verify").is_clean(),
         "an unreferenced pack is not a failure — it is not published"
+    );
+}
+
+/// The pack tail is **48 bytes**, defined once (card §5).
+///
+/// This is the crate's single tail-size assertion: every other use site names the exported constant, so a change
+/// to the format shows up here as one failing test instead of as a scatter of magic numbers that might each be
+/// "the other 48" (a frame length, an object header, …).
+#[test]
+// The subject *is* a constant: clippy's "assertion has a constant value" is exactly the point here, so the lint
+// is allowed locally rather than worked around (a helper variable would hide the number from the grep the card
+// uses for verification).
+#[allow(clippy::assertions_on_constants)]
+fn the_pack_tail_is_forty_eight_bytes() {
+    // One line, one assertion (criterion 3 greps the source and requires exactly one hit).
+    assert!(cas_store::PACK_TAIL_BYTES == 48, "cell constant: tail size");
+    assert_eq!(
+        4 + 4 + 8 + 32,
+        48,
+        "cell composition: magic + count + frames_len + BLAKE3 (ADR-008 §3)"
     );
 }

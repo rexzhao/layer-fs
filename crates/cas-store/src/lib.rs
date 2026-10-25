@@ -212,7 +212,7 @@ pub use batch::{Batch, BatchReport, PutOutcome};
 pub use object::{
     PackFailureKind, PackVerificationFailure, VerificationFailure, VerificationReport,
 };
-pub use pack::{NoPackObservation, PackObserver, PackStep};
+pub use pack::{NoPackObservation, PackObserver, PackStep, PACK_TAIL_BYTES};
 pub use repack::{NoRepackObservation, RepackFrame, RepackObserver, RepackResult, RepackStep};
 
 use std::path::Path;
