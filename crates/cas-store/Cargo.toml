@@ -10,6 +10,10 @@ license.workspace = true
 # Compiles the crash-point helpers used by this crate's own tests. Off by
 # default: a consumer of `cas-store` never gets the abort hooks (ADR-002 §13.1).
 crash-points = []
+# Test-only seam for the offline collector's K9 canary (P2b-6 §26): stage a pack that holds a frame
+# no index row names, which is the shape a concurrent publisher that lost its rows leaves behind. Off
+# by default — a production build has no way to create a rowless frame on purpose.
+gc-test-hooks = []
 # The publication probe (ADR-008 §5 acceptance): records what a batch did on disk and opens
 # rusqlite's `trace` so transaction boundaries come from SQLite, not from our own markers.
 # Off by default; a consumer never gets it.

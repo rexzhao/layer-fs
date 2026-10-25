@@ -254,3 +254,116 @@ fn g1c_a_dry_run_leaves_every_store_file_alone() {
     assert!(!root.store().join("packs").join("gc-mark.sqlite").exists());
     assert!(!root.store().join("tmp").join("gc-mark.sqlite").exists());
 }
+
+/// **K9** (§15, §26): a pack whose only garbage is a **rowless frame** must report
+/// `freed_objects == 0 && packs_repacked == 1`, with `reclaimed_dead_bytes > 0`.
+///
+/// The shape comes from the `gc-test-hooks` seam, not from deleting a reachable object's row: deleting
+/// a row of something a root reaches makes *marking* fail, which would test K8b instead of this.
+#[test]
+#[cfg(feature = "gc-test-hooks")]
+fn k9_dead_frames_without_dead_objects_report_zero_objects_and_one_repack() {
+    let root = TempRoot::new("k9");
+    let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
+    repo.init().expect("init");
+    drop(repo);
+
+    let store = Store::open(root.store(), OpenMode::ReadWrite).expect("open store");
+    let layout = cas_store::Layout::new(root.store());
+    let connection = rusqlite::Connection::open(root.store().join("store.sqlite")).expect("index");
+    let live = cas_store::stage_pack_with_dead_frame(
+        &connection,
+        &layout,
+        &[(Role::Bytes, b"reachable through a snapshot root".to_vec())],
+        &[(Role::Bytes, b"a frame no row names".to_vec())],
+    )
+    .expect("stage the K9 pack");
+    assert_eq!(live.len(), 1);
+    let survivor = live[0];
+
+    // Make the survivor reachable: one inode, one root, one snapshot row. A snapshot is a GC root that
+    // moves no branch, which is exactly what this fixture needs.
+    struct Sink<'a> {
+        store: &'a Store,
+    }
+    impl fs_snapshot::PageSink for Sink<'_> {
+        fn put(
+            &mut self,
+            role: Role,
+            value: &[u8],
+        ) -> fs_snapshot::SnapshotResult<cas_core::ObjectId> {
+            Ok(self.store.put(role, value).expect("put").oid)
+        }
+    }
+    let profile = fs_snapshot::Profile::V1;
+    let mut sink = Sink { store: &store };
+    let table = fs_snapshot::encode_inode_table(
+        &profile,
+        std::iter::once(fs_snapshot::InodeRecord {
+            serial: 0,
+            kind: fs_snapshot::Kind::File,
+            size: 32,
+            created_ns: 0,
+            modified_ns: 0,
+            content: fs_snapshot::Content::Blob(survivor),
+        }),
+        &mut sink,
+    )
+    .expect("encode inode table");
+    let snapshot_root = fs_snapshot::encode_root(
+        &profile,
+        &fs_snapshot::RootValue {
+            scope_id: [7u8; 32],
+            inode_table: table,
+        },
+        &mut sink,
+    )
+    .expect("encode root");
+    drop(store);
+    connection
+        .execute(
+            "INSERT INTO snapshot (root_oid, workspace, created_ns) VALUES (?1, 'fixture', 1)",
+            [snapshot_root.to_string()],
+        )
+        .expect("insert the snapshot row");
+    drop(connection);
+
+    let packs_before: i64 = {
+        let index = rusqlite::Connection::open(root.store().join("store.sqlite")).expect("index");
+        index
+            .query_row("SELECT COUNT(*) FROM pack", [], |row| row.get(0))
+            .expect("count")
+    };
+    let outcome = run(
+        root.store(),
+        GcOptions {
+            dry_run: false,
+            repack_threshold: 0.6,
+        },
+    )
+    .expect("collect");
+
+    assert_eq!(
+        outcome.report.freed.len(),
+        0,
+        "no object was unreachable — only a frame was dead: {:?}",
+        outcome.report.freed
+    );
+    assert_eq!(
+        outcome.report.packs_repacked, 1,
+        "the pack with a rowless frame is repacked"
+    );
+    assert_eq!(outcome.report.packs_deleted, 0);
+    assert!(
+        outcome.report.reclaimed_dead_bytes > 0,
+        "the rowless frame's bytes are what repacking reclaimed"
+    );
+    assert!(
+        outcome.report.packs_repacked <= usize::try_from(packs_before).expect("fits"),
+        "a repack cannot invent packs"
+    );
+
+    // The survivor still reads after the move, and the snapshot row still holds its tree.
+    let store = Store::open(root.store(), OpenMode::ReadWrite).expect("reopen");
+    assert!(store.get(survivor).is_ok(), "the survivor still reads");
+}

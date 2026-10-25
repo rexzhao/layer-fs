@@ -85,6 +85,101 @@ pub fn read_published(
     object::get_with(connection, layout, oid)
 }
 
+/// Stages a pack holding `live` frames **and** one frame no index row names (P2b-6 §26).
+///
+/// This is the K9 shape and nothing else: a pack whose tail counts two frames while the index knows
+/// one. It cannot be produced through the normal API — that is the point — so the collector's
+/// "dead frames are not dead objects" assertion needs a way to build it. Test-only, behind
+/// `gc-test-hooks`, so no production build can create garbage on purpose.
+///
+/// Returns the live objects' ids, in the order given.
+///
+/// # Errors
+///
+/// A staging/SQLite failure.
+#[cfg(feature = "gc-test-hooks")]
+pub fn stage_pack_with_dead_frame(
+    connection: &rusqlite::Connection,
+    layout: &Layout,
+    live: &[(cas_core::Role, Vec<u8>)],
+    dead: &[(cas_core::Role, Vec<u8>)],
+) -> StoreResult<Vec<ObjectId>> {
+    let mut frames: Vec<crate::pack::PackedFrame> = Vec::new();
+    let mut live_ids = Vec::new();
+    for (role, value) in live {
+        let object = cas_core::Object::new(*role, value).map_err(|error| {
+            StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            ))
+        })?;
+        live_ids.push(object.id().map_err(|error| {
+            StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            ))
+        })?);
+        frames.push(crate::pack::PackedFrame {
+            oid: *live_ids.last().expect("just pushed"),
+            role: *role,
+            frame: object.to_vec(),
+            offset: 0,
+        });
+    }
+    for (role, value) in dead {
+        let object = cas_core::Object::new(*role, value).map_err(|error| {
+            StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            ))
+        })?;
+        frames.push(crate::pack::PackedFrame {
+            oid: object.id().map_err(|error| {
+                StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ))
+            })?,
+            role: *role,
+            frame: object.to_vec(),
+            offset: 0,
+        });
+    }
+    let encoded = crate::pack::encode(&mut frames);
+    let pack_id = crate::pack::new_pack_id();
+    // The file is durable first, exactly as a publication does it.
+    let pin = crate::pack::write(layout, &pack_id, &encoded.bytes, &mut NoPackObservation)?;
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "INSERT INTO pack (pack_id, bytes, objects, created_ns) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            &pack_id,
+            i64::try_from(encoded.bytes.len()).unwrap_or(i64::MAX),
+            i64::try_from(frames.len()).unwrap_or(i64::MAX),
+            0_i64
+        ],
+    )?;
+    // ... and rows only for the live frames: the dead frame stays a frame.
+    for (index, frame) in frames.iter().enumerate().take(live.len()) {
+        let _ = index;
+        transaction.execute(
+            "INSERT INTO object_location (oid, role, length, kind, location, offset)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                frame.oid.to_string(),
+                i64::from(frame.role.tag()),
+                i64::try_from(frame.frame.len()).unwrap_or(i64::MAX),
+                crate::index::kind_pack(),
+                &pack_id,
+                i64::try_from(frame.offset).unwrap_or(i64::MAX),
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    drop(pin);
+    Ok(live_ids)
+}
+
 /// Validates a store's schema over a caller-owned connection (offline maintenance, ADR-008 §6.1).
 ///
 /// The maintenance open owns **one** connection for the whole store, so it cannot go through

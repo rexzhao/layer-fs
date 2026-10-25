@@ -25,3 +25,4 @@ blake3.workspace = true
 # P2b-6 §7). Same precedent as `cas-store`'s `crash-points`: the feature is off for every
 # consumer, and on for this crate's own tests, so the F counter-example actually runs.
 fs-workspace = { path = ".", features = ["gc-test-hooks"] }
+cas-store = { workspace = true, features = ["gc-test-hooks"] }
