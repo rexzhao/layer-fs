@@ -83,7 +83,7 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 
 ## 5. 顺带清理（`PACK_TAIL_BYTES`）
 
-- `cas-store` 导出 `pub const PACK_TAIL_BYTES: u64`（+ 需要的 `PACK_TAIL_MAGIC`），文档注明"由 ADR-008 §3 定义"；
+- `cas-store` 导出 `pub const PACK_TAIL_BYTES: u64`，文档注明"由 ADR-008 §3 定义"；**不要顺手导出 `PACK_TAIL_MAGIC`**——它当前无测试消费者，导出会变成第二个"无人引用的常量"（假绿风险）；
 - 删掉 `cas-store/tests/pack.rs` 与 `tests/sync_probe.rs` 的本地 `const TAIL_BYTES: usize = 48`；
 - 只留一处断言 `PACK_TAIL_BYTES == 48`。
 
@@ -120,7 +120,7 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 
 1. **`PACK_TAIL_BYTES` 现在是 `pub(crate)`**（`cas-store/src/pack.rs:85` 的 `TAIL_BYTES`）。G2 判据要断言“不触及 48 B 尾部”，
    测试需要它 ⇒ **P3-2 的第一件事**就是把 `cas-store` 的公开面收敛到这里：
-   - 导出 `pub const PACK_TAIL_BYTES: u64`（+ 需要的 `PACK_TAIL_MAGIC`），文档注明“由 ADR-008 §3 定义”；
+   - 导出 `pub const PACK_TAIL_BYTES: u64`，文档注明“由 ADR-008 §3 定义”；**不要顺手导出 `PACK_TAIL_MAGIC`**（当前无测试消费者 = 假绿风险）；
    - 断言 `PACK_TAIL_BYTES == 48` **只在** `cas-store` 一处；
    - 删掉 `tests/pack.rs` / `tests/sync_probe.rs` 的本地 `const TAIL_BYTES`；使用点必须引用常量（§5 的四条语义检查）。
 2. **G2 不是从零造类型**：`fs_snapshot::SnapshotReader::inode(serial)`、`root_serial()` 已有（`read.rs:151/160`），
