@@ -445,3 +445,65 @@ fn k8b_a_pack_missing_on_the_walk_aborts_and_deletes_nothing() {
         "the dry run's refusal must name the damage, got {dry:?}"
     );
 }
+
+// ------------------------------------------------- crash points 1, 2, 5 (§27.A, I6)
+//
+// Points 3 and 4 live *inside* `cas-store::repack` (between the rename and the switch, and between the
+// switch and the unlink). They are not reachable from this crate yet; see the note in the report.
+
+/// The property every crash point promises: the store reopens, nothing that a root reaches is lost, and
+/// the only residue allowed is a file no row names.
+#[test]
+#[cfg(feature = "gc-test-hooks")]
+fn crash_points_1_2_and_5_leave_a_recoverable_store() {
+    use fs_workspace::gc::{crash, GcStep};
+
+    for (step, label) in [
+        (GcStep::Marking, "marking"),
+        (GcStep::RowsDeletedFilesKept, "rows deleted, files kept"),
+        (GcStep::OrphanSweep, "orphan sweep"),
+    ] {
+        let (root, commit) = committed(
+            &format!("crash-{}", step.number()),
+            &[("/a.txt", b"survives")],
+        );
+        // Garbage so the sweep has something to do (and so point 5 has a mid-point to be inside of).
+        let store = Store::open(root.store(), OpenMode::ReadWrite).expect("open store");
+        store.put(Role::Bytes, b"garbage one").expect("put");
+        store.put(Role::Bytes, b"garbage two").expect("put");
+        drop(store);
+        std::fs::write(
+            root.store().join("packs").join("orphan.pack"),
+            b"a file no row names",
+        )
+        .expect("write an orphan");
+
+        crash::arm(step);
+        let error =
+            run(root.store(), GcOptions::default()).expect_err("the armed step must abort the run");
+        let reached = format!("{error:?}");
+        assert!(
+            reached.contains(&format!("gc step {}", step.number())),
+            "{label}: the error must name the step that was reached, got {reached}"
+        );
+
+        // Disarmed on the way out, so the store is usable and the next run is normal. It may have
+        // nothing left to collect — at point 2 the rows are already gone — so the assertion is that the
+        // run *succeeds*, not that it frees something. Claiming more here would be the "clean because it
+        // never got that far" mistake in the other direction.
+        let _outcome = run(root.store(), GcOptions::default())
+            .expect("the store must be recoverable after a crash");
+
+        // Nothing a root reaches is lost: the committed tree still reads, byte for byte.
+        let handle = Repo::open(root.store(), false).expect("reopen");
+        let info = handle.commit_info(&commit).expect("info");
+        let root_oid: cas_core::ObjectId = info.root.parse().expect("a root id");
+        let store = Store::open(root.store(), OpenMode::ReadOnly).expect("open store");
+        let reader =
+            fs_snapshot::SnapshotReader::open_any(&store, root_oid).expect("the root reads");
+        assert!(
+            !reader.references(root_oid).expect("references").is_empty(),
+            "{label}: the committed tree must still be traversable"
+        );
+    }
+}

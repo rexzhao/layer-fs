@@ -100,6 +100,9 @@ pub fn run(store_dir: impl AsRef<Path>, options: GcOptions) -> WorkspaceResult<G
         }
     }
 
+    // Point 1: roots have been visited, expansion may still be running.
+    crate::gc::crash::reach(crate::gc::GcStep::Marking)?;
+
     report.reachable = marker.all()?;
     report.reachable_count = report.reachable.len();
     report.marked_objects = report.reachable.len();

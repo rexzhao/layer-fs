@@ -114,6 +114,10 @@ pub fn apply(
     }
     transaction.commit()?;
 
+    // Point 2: the rows are gone, the files are not. This is the window where the *only* safe residue
+    // is a file nothing names.
+    crate::gc::crash::reach(crate::gc::GcStep::RowsDeletedFilesKept)?;
+
     // Files after the commit: a file without a row is garbage the next run reclaims, while a row
     // without a file is a `MissingPack` the next run has to report.
     for oid in &plan.dead_objects {
@@ -132,6 +136,9 @@ pub fn apply(
             })?;
         }
     }
+    // Point 5: half the orphans/temporaries are gone.
+    crate::gc::crash::reach(crate::gc::GcStep::OrphanSweep)?;
+
     for orphan in &plan.orphan_pack_files {
         if orphan.exists() {
             std::fs::remove_file(orphan).map_err(|error| WorkspaceError::NotFound {

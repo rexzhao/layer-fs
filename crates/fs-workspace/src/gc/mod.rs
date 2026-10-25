@@ -10,6 +10,7 @@
 //! database — a collector with two views of "what is live" cannot be tested for G2.
 
 pub mod apply;
+pub mod crash;
 pub mod criteria;
 pub mod mark;
 pub mod roots;
@@ -18,6 +19,7 @@ pub mod source;
 pub mod sweep;
 
 pub use apply::{apply, Applied};
+pub use crash::GcStep;
 pub use mark::{mark_roots, Marker};
 pub use roots::{MaintenanceRoots, RepoRoots, RootKind, RootRef, RootRow, RootSet, RootSource};
 pub use run::{run, GcOptions, GcOutcome};
