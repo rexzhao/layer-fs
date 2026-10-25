@@ -367,3 +367,81 @@ fn k9_dead_frames_without_dead_objects_report_zero_objects_and_one_repack() {
     let store = Store::open(root.store(), OpenMode::ReadWrite).expect("reopen");
     assert!(store.get(survivor).is_ok(), "the survivor still reads");
 }
+
+/// **K8b** (§12, §26): a pack that disappears **on the walked path** must abort the run, not be treated
+/// as a leaf.
+///
+/// This is the shape that "treat a decode failure as no children" would quietly destroy: the subtree
+/// below the missing page becomes unreachable, gets swept, and `verify` afterwards looks *cleaner*.
+/// So the assertion is not "the run failed" alone — it is that **not one index row moved** and no object
+/// file vanished.
+#[test]
+fn k8b_a_pack_missing_on_the_walk_aborts_and_deletes_nothing() {
+    let (root, _commit) = committed("k8b", &[("/a.txt", b"reachable bytes")]);
+
+    // Every pack goes: whatever the tree needs, it needs from here.
+    let packs: Vec<PathBuf> = std::fs::read_dir(root.store().join("packs"))
+        .expect("packs")
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.path())
+        .collect();
+    assert!(
+        !packs.is_empty(),
+        "the fixture must have published at least one pack"
+    );
+    for pack in &packs {
+        std::fs::remove_file(pack).expect("delete the pack behind the collector's back");
+    }
+
+    let rows = || -> Vec<(String, i64, String, i64)> {
+        index(&root.store())
+            .prepare("SELECT oid, kind, location, offset FROM object_location ORDER BY oid")
+            .expect("prepare")
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("collect")
+    };
+    let before = rows();
+    let before_files = fingerprint(&root.store());
+
+    let error = run(root.store(), GcOptions::default())
+        .expect_err("a pack missing on the walked path must abort the run");
+    let missing = matches!(
+        &error,
+        fs_workspace::WorkspaceError::Store(cas_store::StoreError::MissingPack { .. })
+            | fs_workspace::WorkspaceError::Snapshot(fs_snapshot::SnapshotError::Store(
+                cas_store::StoreError::MissingPack { .. }
+            ))
+    );
+    assert!(missing, "expected a typed MissingPack, got {error:?}");
+
+    assert_eq!(
+        before,
+        rows(),
+        "an aborted run must not remove a single index row"
+    );
+    assert_eq!(
+        before_files,
+        fingerprint(&root.store()),
+        "an aborted run must not lose a single file either"
+    );
+
+    // The dry run cannot answer here, and says so with the same typed error — it is not a mode that
+    // papers over damage.
+    let dry = run(
+        root.store(),
+        GcOptions {
+            dry_run: true,
+            ..GcOptions::default()
+        },
+    )
+    .expect_err("a dry run cannot answer when the walked path is unreadable");
+    assert!(
+        format!("{dry:?}").contains("MissingPack"),
+        "the dry run's refusal must name the damage, got {dry:?}"
+    );
+}
