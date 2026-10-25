@@ -12,7 +12,9 @@ degrade into "synthesise a v2 root by editing a header" — which tests self-ide
 - snapshot root: eed636c6225f5a685457f8eec2d9a642d5d60fbd9f8bde867902c7d69890192f
 - content length: 32768
 - content blake3: b88eeed285256715c3a0ae2c46d69407628efbab876974c9728c8a404c5bbe33
-- objects: 7 published objects in 2 packs (plus 2 commit rows and 1 snapshot row)
+- objects: **7 index rows** in 2 packs, of which **5 are reachable** from the recorded root below. The other two
+  are the genesis commit's own tree (`0c660a66…c9a427`, role `FilesystemRoot`) and its inode table — they belong to
+  the repository, not to this snapshot, which is why a walk from `root` finds five.
 - total fixture bytes: 189106
 
 ## How it was generated
