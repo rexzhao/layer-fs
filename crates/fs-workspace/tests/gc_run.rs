@@ -191,3 +191,68 @@ fn a_run_refuses_while_a_workspace_is_open() {
         "the store is still there"
     );
 }
+
+/// §25.5: **both** directions of the store's lock are released by a run.
+///
+/// `Repo::open` succeeding only proves the exclusive lock went away; a maintenance handle that
+/// lingered would still block the *next* maintenance open.
+#[test]
+fn a_run_releases_the_store_for_an_ordinary_open_and_for_another_run() {
+    let (root, _, _) = repo_with_one_orphan("release");
+    run(root.store(), GcOptions::default()).expect("first run");
+
+    Repo::open(root.store(), false).expect("an ordinary open works after a run");
+    let second_handle = fs_workspace::MaintenanceRepo::open(root.store())
+        .expect("a second maintenance open works after a run");
+    // Not a count assertion: the point is that the handle could be taken at all. Reading it keeps the
+    // value from being an unused `#[must_use]` result, which would be a warning rather than a check.
+    assert_eq!(second_handle.store_dir(), root.store());
+    drop(second_handle);
+
+    // And a second collection over the (now clean) store is a no-op rather than an error.
+    let second = run(root.store(), GcOptions::default()).expect("second run");
+    assert!(
+        second.report.freed.is_empty(),
+        "nothing is left to free: {:?}",
+        second.report.freed
+    );
+}
+
+/// §25.6: the report can be reconciled without trusting any single number.
+#[test]
+fn the_report_reconciles_with_a_hand_counted_store() {
+    let root = TempRoot::new("accounting");
+    let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
+    repo.init().expect("init");
+    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    put_file(&workspace, "/f", b"kept");
+    workspace.commit("one", false).expect("commit");
+    drop(workspace);
+    drop(repo);
+
+    let packs_before: i64 = {
+        let connection =
+            rusqlite::Connection::open(root.store().join("store.sqlite")).expect("index");
+        connection
+            .query_row("SELECT COUNT(*) FROM pack", [], |row| row.get(0))
+            .expect("count")
+    };
+
+    let outcome = run(root.store(), GcOptions::default()).expect("run");
+    assert_eq!(
+        outcome.report.marked_objects, outcome.report.reachable_count,
+        "the two names for the marked set must agree"
+    );
+    assert!(
+        outcome.report.packs_deleted + outcome.report.packs_repacked
+            <= usize::try_from(packs_before).expect("fits"),
+        "a pack can be deleted or repacked, never both: {} + {} > {}",
+        outcome.report.packs_deleted,
+        outcome.report.packs_repacked,
+        packs_before
+    );
+    assert_eq!(
+        outcome.report.reclaimed_dead_bytes, 0,
+        "this store has no dead frames, so nothing was reclaimed by repacking"
+    );
+}
