@@ -131,3 +131,58 @@ fn the_slot_indices_follow_the_sdk_order() {
         "cell reserved: {named} named entries, the rest reserved, {slots} slots in total"
     );
 }
+
+/// `FSP_FSCTL_VOLUME_PARAMS` is 504 bytes and this frontend writes only the leading scalars.
+#[test]
+fn volume_params_is_an_opaque_504_byte_block() {
+    use fs_winfsp::abi::VolumeParams;
+
+    assert_eq!(
+        size_of::<VolumeParams>(),
+        504,
+        "cell size: fsctl.h:267 asserts 504 — the same number the SDK does"
+    );
+    let mut params = VolumeParams::zeroed();
+    assert!(
+        params.as_bytes().iter().all(|byte| *byte == 0),
+        "cell default: every unset field is 0, which the SDK documents as the safe default"
+    );
+
+    params.set_version_size();
+    params.set_sector_size(4096);
+    params.set_sectors_per_allocation_unit(1);
+    params.set_max_component_length(255);
+    params.set_file_info_timeout(0);
+
+    let bytes = params.as_bytes();
+    assert_eq!(
+        u16::from_ne_bytes([bytes[0], bytes[1]]),
+        504,
+        "cell version: `Version` carries the struct size (fsctl.h:193)"
+    );
+    assert_eq!(
+        u16::from_ne_bytes([bytes[2], bytes[3]]),
+        4096,
+        "cell sector: fsctl.h:195"
+    );
+    assert_eq!(
+        u16::from_ne_bytes([bytes[4], bytes[5]]),
+        1,
+        "cell sectors per unit: 4096-byte allocation with 4096-byte sectors (fsctl.h:196)"
+    );
+    assert_eq!(
+        u16::from_ne_bytes([bytes[6], bytes[7]]),
+        255,
+        "cell name length: fsctl.h:197"
+    );
+    assert_eq!(
+        u32::from_ne_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]),
+        0,
+        "cell timeout: FileInfoTimeout at offset 32 (fsctl.h:204) — zero disables caching"
+    );
+    // The bitfield tail stays zero: no case sensitivity, no persistent ACLs, no reparse support claimed.
+    assert!(
+        bytes[36..].iter().all(|byte| *byte == 0),
+        "cell tail: the bitfields are left at their defaults rather than hand-encoded"
+    );
+}

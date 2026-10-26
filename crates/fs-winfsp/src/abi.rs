@@ -149,3 +149,80 @@ pub mod slot {
     /// How many named (non-reserved) entries the SDK declares; the rest are `Reserved[31]` plus padding to 64.
     pub const NAMED: usize = 33;
 }
+
+/// `FSP_FSCTL_VOLUME_PARAMS` — 504 bytes (`fsctl.h:265-267`, SDK assertion at `:267`), of which this frontend sets the
+/// leading scalars and leaves the rest zero.
+///
+/// Represented as an **opaque 504-byte buffer with typed accessors**, not as a mirrored struct: the tail is a run of
+/// `UINT32` bitfields (`fsctl.h:206` onward), and re-declaring bitfields by hand is the one place where "copied faithfully"
+/// and "compiles" are hardest to keep equal. Zero-filled plus the fields below is a valid set of parameters — the SDK
+/// documents every unset field as having a safe default of 0.
+///
+/// Offsets are asserted in the tests; each accessor cites the header line it writes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VolumeParams {
+    bytes: [u8; Self::SIZE],
+}
+
+impl VolumeParams {
+    /// `sizeof(FSP_FSCTL_VOLUME_PARAMS)` — `fsctl.h:267`.
+    pub const SIZE: usize = 504;
+
+    /// A zero-filled parameter block: every field at its documented default.
+    #[must_use]
+    pub fn zeroed() -> Self {
+        Self {
+            bytes: [0; Self::SIZE],
+        }
+    }
+
+    /// `UINT16 Version` — `fsctl.h:193`. The SDK accepts 0 (meaning "current") or `sizeof(...)`; this sets the explicit size
+    /// so a version mismatch is reported by the loader rather than guessed.
+    pub fn set_version_size(&mut self) {
+        self.write_u16(0, Self::SIZE as u16);
+    }
+
+    /// `UINT16 SectorSize` — `fsctl.h:195`.
+    pub fn set_sector_size(&mut self, value: u16) {
+        self.write_u16(2, value);
+    }
+
+    /// `UINT16 SectorsPerAllocationUnit` — `fsctl.h:196`.
+    pub fn set_sectors_per_allocation_unit(&mut self, value: u16) {
+        self.write_u16(4, value);
+    }
+
+    /// `UINT16 MaxComponentLength` — `fsctl.h:197`.
+    pub fn set_max_component_length(&mut self, value: u16) {
+        self.write_u16(6, value);
+    }
+
+    /// `UINT32 FileInfoTimeout` — `fsctl.h:204`. Zero disables caching, which is what a workspace wants: the overlay is the
+    /// only source of truth, and a cached `FileInfo` would hide a change made through another handle.
+    pub fn set_file_info_timeout(&mut self, millis: u32) {
+        self.write_u32(32, millis);
+    }
+
+    /// The raw bytes, for the FFI call.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; Self::SIZE] {
+        &self.bytes
+    }
+
+    fn write_u16(&mut self, at: usize, value: u16) {
+        self.bytes[at..at + 2].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn write_u32(&mut self, at: usize, value: u32) {
+        self.bytes[at..at + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+}
+
+impl std::fmt::Debug for VolumeParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VolumeParams")
+            .field("size", &Self::SIZE)
+            .finish_non_exhaustive()
+    }
+}
