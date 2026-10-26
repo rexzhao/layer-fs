@@ -19,6 +19,7 @@ pub mod handshake;
 pub mod loader;
 pub mod mock;
 pub mod mount;
+pub mod mounted;
 pub mod ops;
 
 pub use adapter::Adapter;

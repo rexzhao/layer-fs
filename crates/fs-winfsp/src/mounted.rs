@@ -1,0 +1,241 @@
+//! Mounting the file system read-only at a directory (P3-4 step ④).
+//!
+//! Kept apart from `mount.rs` on purpose: that module answers "does the library's lifecycle work" without a mount point, and
+//! this one answers "can Windows see us". Mixing them would put two different unknowns behind one crash.
+//!
+//! The four calls, in the order that matters: `create` → `SetMountPoint(dir)` → `start` → `SetMountPoint(NULL)` →
+//! `stop` → `delete`. **Unmounting before stopping** is not cosmetic: a mount point that outlives the process is the failure
+//! mode that needs a reboot to clear.
+
+use std::path::Path;
+
+use crate::loader::{resolve_library, LoadError};
+
+/// The device name this frontend creates (`fsctl.h:52`: `winfsp` + `.Disk`), shared with the lifecycle experiment.
+pub use crate::mount::DISK_DEVICE;
+
+/// What a read-only mount reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MountReport {
+    /// `FspFileSystemCreate`.
+    pub create: i32,
+    /// `FspFileSystemSetMountPoint` with the directory.
+    pub mount: i32,
+    /// `FspFileSystemStartDispatcher`.
+    pub start: i32,
+    /// `FspFileSystemSetMountPoint(NULL)` — the unmount.
+    pub unmount: i32,
+    /// Whether the directory was readable **while mounted**, as seen through the OS by the caller.
+    ///
+    /// Reported rather than asserted inside: a failure here is a result, not a bug in this function — the caller decides what
+    /// it means, and the message carries the OS error.
+    pub looked_like_a_mount: bool,
+}
+
+/// Mounts read-only at `mount_point`, observes it through the OS, unmounts, and tears everything down.
+///
+/// `probe` is called **while the mount is up**; its result is reported, never swallowed. Passing it in keeps the OS access out
+/// of this module, which is what lets the same code run with or without a mount point in tests.
+///
+/// # Errors
+///
+/// [`LoadError`] from the loader or a missing export.
+pub fn mount_read_only(
+    library: &Path,
+    mount_point: &Path,
+    probe: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<MountReport, LoadError> {
+    resolve_library(library)?;
+    platform::mount_read_only(library, mount_point, probe)
+}
+
+#[cfg(windows)]
+mod platform {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use crate::abi::{slot, FileSystemInterface, VolumeParams};
+    use crate::loader::LoadError;
+
+    type CreateFn = extern "system" fn(
+        *const u16,
+        *const VolumeParams,
+        *const FileSystemInterface,
+        *mut *mut c_void,
+    ) -> i32;
+    type SetMountPointFn = extern "system" fn(*mut c_void, *const u16) -> i32;
+    type StartFn = extern "system" fn(*mut c_void, u32) -> i32;
+    type StopFn = extern "system" fn(*mut c_void);
+    type DeleteFn = extern "system" fn(*mut c_void);
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *const c_void;
+        fn FreeLibrary(module: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    /// `GetVolumeInfo`: `(FSP_FILE_SYSTEM*, PVOID VolumeInfo, ULONG Length)` — `winfsp.h:206`.
+    unsafe extern "system" fn volume_info_trampoline(
+        _file_system: *mut c_void,
+        volume_info: *mut c_void,
+        volume_info_length: u32,
+    ) -> i32 {
+        // SAFETY: WinFsp passes a buffer of `volume_info_length` bytes, which is what the callee validates against its own
+        // structure size.
+        unsafe { crate::callbacks::get_volume_info(volume_info, volume_info_length) }
+    }
+
+    /// `GetFileInfo`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PVOID FileInfo)` — `winfsp.h:507`.
+    unsafe extern "system" fn file_info_trampoline(
+        _file_system: *mut c_void,
+        file_context: *mut c_void,
+        file_info: *mut c_void,
+    ) -> i32 {
+        // SAFETY: `file_context` is the `EntryContext` this frontend allocated, and `file_info` is WinFsp's output buffer.
+        unsafe { crate::callbacks::get_file_info(file_context, file_info) }
+    }
+
+    fn interface_with_callbacks() -> FileSystemInterface {
+        let mut interface = FileSystemInterface::empty();
+        // SAFETY: the slot type carries **no signature** (the SDK's slots differ in arity), so registering a callback is a
+        // hand-asserted shape match. Each index comes from `abi::slot`, which cites the header line it was read from.
+        unsafe {
+            let volume: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> i32 =
+                volume_info_trampoline;
+            let file: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 =
+                file_info_trampoline;
+            interface.slots[slot::GET_VOLUME_INFO] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(volume));
+            interface.slots[slot::GET_FILE_INFO] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(file));
+        }
+        interface
+    }
+
+    fn wide(path: &std::ffi::OsStr) -> Vec<u16> {
+        let mut units: Vec<u16> = path.encode_wide().collect();
+        units.push(0);
+        units
+    }
+
+    pub(super) fn mount_read_only(
+        library: &Path,
+        mount_point: &Path,
+        probe: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<super::MountReport, LoadError> {
+        let module_path = wide(library.as_os_str());
+        // SAFETY: `module_path` is NUL-terminated and outlives the call.
+        let module = unsafe { LoadLibraryW(module_path.as_ptr()) };
+        if module.is_null() {
+            let last_error = unsafe { GetLastError() };
+            return Err(LoadError::LoadFailed {
+                path: library.to_path_buf(),
+                last_error,
+            });
+        }
+
+        let resolve = |name: &str| -> Result<*const c_void, LoadError> {
+            let mut narrow: Vec<u8> = name.as_bytes().to_vec();
+            narrow.push(0);
+            // SAFETY: both pointers are valid for the call.
+            let address = unsafe { GetProcAddress(module, narrow.as_ptr()) };
+            if address.is_null() {
+                return Err(LoadError::MissingExport {
+                    name: name.to_owned(),
+                });
+            }
+            Ok(address)
+        };
+
+        // A missing export is reported before anything is created, so a version problem never looks like a mount problem.
+        let result = (|| -> Result<super::MountReport, LoadError> {
+            let create_address = resolve("FspFileSystemCreate")?;
+            let set_mount_address = resolve("FspFileSystemSetMountPoint")?;
+            let start_address = resolve("FspFileSystemStartDispatcher")?;
+            let stop_address = resolve("FspFileSystemStopDispatcher")?;
+            let delete_address = resolve("FspFileSystemDelete")?;
+
+            // SAFETY: each address came from this module's export table and the signatures are the SDK's.
+            let (create, set_mount_point, start, stop, delete) = unsafe {
+                (
+                    std::mem::transmute::<*const c_void, CreateFn>(create_address),
+                    std::mem::transmute::<*const c_void, SetMountPointFn>(set_mount_address),
+                    std::mem::transmute::<*const c_void, StartFn>(start_address),
+                    std::mem::transmute::<*const c_void, StopFn>(stop_address),
+                    std::mem::transmute::<*const c_void, DeleteFn>(delete_address),
+                )
+            };
+
+            let mut params = VolumeParams::zeroed();
+            params.set_version_size();
+            params.set_sector_size(4096);
+            params.set_sectors_per_allocation_unit(1);
+            params.set_max_component_length(255);
+            // No caching: the workspace is the only source of truth, and a cached FileInfo would hide another handle's write.
+            params.set_file_info_timeout(0);
+            let interface = interface_with_callbacks();
+
+            let device = wide(std::ffi::OsStr::new(super::DISK_DEVICE));
+            let mut file_system: *mut c_void = std::ptr::null_mut();
+            let create_status = create(device.as_ptr(), &params, &interface, &mut file_system);
+            if create_status != 0 || file_system.is_null() {
+                return Ok(super::MountReport {
+                    create: create_status,
+                    mount: 0,
+                    start: 0,
+                    unmount: 0,
+                    looked_like_a_mount: false,
+                });
+            }
+
+            let mount_path = wide(mount_point.as_os_str());
+            let mount_status = set_mount_point(file_system, mount_path.as_ptr());
+            let start_status = start(file_system, 0);
+
+            // Observe **while mounted**: this is the only window in which the OS can see the file system.
+            let looked_like_a_mount = mount_status == 0 && probe(mount_point).is_ok();
+
+            // Unmount first, then stop, then delete.
+            let unmount_status = set_mount_point(file_system, std::ptr::null());
+            stop(file_system);
+            delete(file_system);
+
+            Ok(super::MountReport {
+                create: create_status,
+                mount: mount_status,
+                start: start_status,
+                unmount: unmount_status,
+                looked_like_a_mount,
+            })
+        })();
+
+        // SAFETY: paired with the successful load, on every path.
+        unsafe { FreeLibrary(module) };
+        result
+    }
+}
+
+#[cfg(not(windows))]
+mod platform {
+    use std::path::Path;
+
+    use crate::loader::LoadError;
+
+    pub(super) fn mount_read_only(
+        library: &Path,
+        _mount_point: &Path,
+        _probe: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<super::MountReport, LoadError> {
+        Err(LoadError::LoadFailed {
+            path: library.to_path_buf(),
+            last_error: 0,
+        })
+    }
+}
