@@ -49,6 +49,13 @@ impl TreeRead for OverlayWrite<'_> {
 }
 
 impl TreeWrite for OverlayWrite<'_> {
+    fn set_attributes(&mut self, id: FileId, attributes: u32) -> NamespaceResult<()> {
+        // The G3 implementation, run against **this** transaction: the attribute change commits with the disposition's
+        // decision, so a reader can never see a superseded file that kept its old attributes.
+        crate::content::set_attributes_impl(&self.transaction, self.base, id, attributes)
+            .map_err(crate::view::into_namespace)
+    }
+
     fn truncate(&mut self, id: FileId, new_size: u64) -> NamespaceResult<()> {
         // Same implementation the content API uses, run against **this** transaction: the size change and the
         // zeroing of the exposed range commit together with the disposition's decision.

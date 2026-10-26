@@ -139,6 +139,17 @@ pub trait TreeWrite: TreeRead {
     /// Backend failures, or the type error when `id` is a directory.
     fn truncate(&mut self, id: FileId, new_size: u64) -> NamespaceResult<()>;
 
+    /// Replaces the **stored** attribute bits of `id` (v3; G1 revision).
+    ///
+    /// Needed by the rules layer because `SUPERSEDE` means "replace the attributes" (`ReplaceFileAttributes = TRUE` in
+    /// ADR-009 §4.2) while `OVERWRITE` keeps them — a difference the rules can only express if the tree can be told to
+    /// drop the bits, and it must happen **inside the same transaction** as the truncation.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the backend reports (typically `InvalidRecord` for a bit outside the storable domain).
+    fn set_attributes(&mut self, id: FileId, attributes: u32) -> NamespaceResult<()>;
+
     /// Removes an inode's reachability **without destroying the row** (ADR-009, P3-2 G2).
     ///
     /// One deletion semantics for both `unlink` and `remove_at`: the row stays with `live = 0`, so an id that is still

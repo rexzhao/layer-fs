@@ -225,6 +225,13 @@ impl<S: TreeStore> Rules<S> {
                     // Truncated **inside** this transaction: the entry keeps its FileId, and no reader can observe the
                     // old bytes after the disposition was granted.
                     tree.truncate(id, 0)?;
+                    // `ReplaceFileAttributes` — the **only** remaining difference between the dispositions sharing this
+                    // arm (ADR-009 §4.2): SUPERSEDE replaces the stored attributes, OVERWRITE/OVERWRITE_IF keep them.
+                    // Found by P3-3b's ④: the mock implemented this, the core did not, so the real backend silently kept
+                    // the old bits and only a **reopen**-based assertion could see it.
+                    if disposition == fs_semantics::disposition::Disposition::Supersede {
+                        tree.set_attributes(id, 0)?;
+                    }
                     (id, Kind::File)
                 }
             };
