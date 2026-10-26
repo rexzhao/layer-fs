@@ -58,6 +58,9 @@
 
 ## B-8 SUPERSEDE 后旧句柄的读（跨 GC 的联合用例）
 
+> **若 owner 采纳 SUPERSEDE 方案 (a)（ADR-009 §4.2 2026-10-26 修订）：本条作废**——SUPERSEDE 保留同一 FileId，旧句柄读到覆盖后内容，不存在"跨 GC 的旧 inode"。替代用例并入 P3-4 L2：`open(h) → CREATE_ALWAYS 同路径 → read(h)` 读到空/新内容、`FileIndex` 不变。"有句柄目标的保留语义"若出现，只来自 rename-replace 且 U1 不成立，届时按本条原用例形状另立。
+
+
 - **来源**：QA 在 P3-2 预审中发现 ADR-009 内部矛盾（`:117` 删旧 inode ↔ `:239` "核心不存在该状态"）；裁决后
   ADR-009 §4.2 定为「旧 inode 记录保留（只增）」，可读性由「GC 期无句柄」保证（ADR-008 §6.1）。
 - **为什么没做**：这条联合用例需要 **adapter 句柄表**（P3-3）+ **GC 可被调用**，G1/G2 里两样都没有。
@@ -82,6 +85,7 @@
 
 - **来源**：ADR-009 §4.2「SUPERSEDE 造出的保留状态」裁决为 **B（只增保留）**；泄漏的是**行/页**，不是内容副本
   （base 内容由历史根引用；overlay 页是替换前已有的那一行，不是复制）。
+  **若采纳 SUPERSEDE 方案 (a)**：SUPERSEDE 不再产生保留行；不可达行只来自 `remove_at`/rename-replace 的 tombstone（及 U1 不成立时的保留），触发条件随之改写。
 - **触发条件**：挂载期反复“SUPERSEDE 命中仍有打开句柄”导致 overlay 不可达行累积（66–90 B/条），直到 `workspace_discard`。
 - **方案 C（推荐）**：**离线 GC 在 overlay 排他锁下**扫描并删除不可达 inode 行——比方案 A（adapter 在最后一个旧句柄
   关闭时 release：需保留标记 + release API + 崩溃后清扫三点）少两个机制，且顺手解决 overlay 的一般性垃圾。

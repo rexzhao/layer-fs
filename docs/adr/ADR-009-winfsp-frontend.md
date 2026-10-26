@@ -125,16 +125,27 @@ adapter **禁止**：解析 CAS 对象、访问 `store.sqlite`/`overlay.sqlite`�
 
 | disposition \ 目标 | 不存在 | 文件（同路径） | 目录（请求文件/目录） |
 | --- | --- | --- | --- |
-| SUPERSEDE | 创建（新 FileId） | **解除旧名字绑定并创建新 inode（新 FileId）**；旧 inode 的**记录保留、不在替换时删除**（`DELETE` 旧 inode 会当场破坏旧句柄的读），旧 FileId 仍可解析；旧句柄先过 share 检查（不满足 → `STATUS_SHARING_VIOLATION`）；属性按 Create 参数重置（以 L2 的 NTFS 对照确认） | `STATUS_FILE_IS_A_DIRECTORY` |
+| SUPERSEDE | 创建（新 FileId） | **在同一 FileId 上截断为 0，属性按 Create 参数整体替换**（`ReplaceFileAttributes=TRUE`）；旧句柄与本次打开是同一个 FSD 文件节点，**读到覆盖后的内容**；share 检查由 FSD 在 Open 前完成 | `STATUS_FILE_IS_A_DIRECTORY` |
 | OPEN | `OBJECT_NAME_NOT_FOUND` | 打开（保留 FileId） | 打开 |
 | CREATE | 创建 | `OBJECT_NAME_COLLISION` | `OBJECT_NAME_COLLISION` |
 | OPEN_IF | 创建 | 打开（保留 FileId） | 打开 |
 | OVERWRITE | `OBJECT_NAME_NOT_FOUND` | 截断为 0（**保留 FileId**） | `STATUS_FILE_IS_A_DIRECTORY` |
 | OVERWRITE_IF | 创建 | 截断为 0（**保留 FileId**） | `STATUS_FILE_IS_A_DIRECTORY` |
 
-SUPERSEDE 与 OVERWRITE/OVERWRITE_IF 的区别是**FileId**：前者按 NT 语义替换（解除旧名字并建新 inode；**旧 inode 记录保留**，见 §4.2），后者打开并截断同一文件。QA 预审指出"18 格表缺 FileId 列"——两种 disposition 在外部（`GetFileInformationByHandle::FileIndex`）必须可区分，L2 用 NTFS 对照确认：`CREATE_ALWAYS` 命中既有文件时 FileIndex 变化、`TRUNCATE_EXISTING` 不变。若实测 NTFS 与"新 FileId"不符，以实测为准并在 ADR 记修订。
+SUPERSEDE 与 OVERWRITE/OVERWRITE_IF 的**唯一区别是属性**：前者整体替换（`ReplaceFileAttributes=TRUE`），后者与现有属性合并（OR）。**FileId 相同**——这是传输层决定的，不是选择：
 
-**SUPERSEDE 造出的"名字已解除、旧 FileId 仍被句柄引用"状态**由 overlay 持有：旧 inode 记录**保留（只增）**，旧句柄可继续按 FileId 读；`DELETE` 旧 inode 会当场破坏旧句柄的读，禁止。保留**不产生内容副本**：base 来源的内容本来就被历史根引用，overlay 来源的页是替换前已有的那一行，不是复制。代价是**不可达的 inode 行（及 overlay 页）在挂载期只增**，直到 `workspace_discard` 或未来回收（backlog **B-10**，推荐方案 C：离线 GC 在 overlay 排他锁下扫描并删除不可达行）。P3 **不实现**该回收；当前 GC 不扫描 overlay 行，因此它不参与本状态，也不需要活句柄输入（ADR-008 §6.1）。
+**传输层如何触发（流程 207）**：WinFsp 2.1 用户态分发（`src/dll/fsop.c`，tag `v2.1`）把 `FILE_SUPERSEDE` 与 `FILE_OVERWRITE_IF` 交给同一函数 `FspFileSystemOpCreate_FileOverwriteIf`（fsop.c:929-931）：目标存在 ⇒ 调 `Open`（fsop.c:696-708）返回 `FILE_SUPERSEDED`/`FILE_OVERWRITTEN`，随后 FSD 以 `Overwrite` 请求把**同一个 FileContext** 与 `Supersede` 位（作为 `ReplaceFileAttributes`）交给 `Overwrite` 回调（fsop.c:946-972；`winfsp.h:326-347`；`fsctl.h:376-378`）；`Create` 回调只在目标不存在时调用（fsop.c:710-745）。用户态 FS 因此**拿不到"替换为新 inode"的时机**；本表每一格的触发路径：
+
+| 目标 | SUPERSEDE | OPEN | CREATE | OPEN_IF | OVERWRITE | OVERWRITE_IF |
+| --- | --- | --- | --- | --- | --- | --- |
+| 不存在 | `Create` | —（FSD 返回 not found） | `Create` | `Create` | — | `Create` |
+| 存在 | `Open` + `Overwrite(replace=1)` | `Open` | `Create`（返回 collision） | `Open` | `Open` + `Overwrite(replace=0)` | `Open` + `Overwrite(replace=0)` |
+
+L2 用 NTFS 对照 `CREATE_ALWAYS` 命中既有文件时 `FileIndex` 是否变化（P3-4 卡 U2/U10）：若 NTFS 不变，一致；若 NTFS 变化，记为**有意差异**（传输层不能表达新 inode），不改本表。
+
+（2026-10-26 前本表 SUPERSEDE 行写"解除旧名字绑定并创建新 inode、旧 inode 保留"——该语义经 WinFsp 无法触发，已按上文修订，见修订记录。）
+
+**SUPERSEDE 不产生"名字已解除、旧句柄仍开"的状态**：它不解除绑定、不新建 inode，`create_or_open` 的 `replaced` 对所有 disposition 恒为 `None`（字段保留，"只加不减"）。overlay 中仍会只增的不可达 inode 行只来自 `remove_at` 与 rename-replace 的 tombstone（§5.4），回收见 backlog **B-10**。
 
 目录请求（`FILE_DIRECTORY_FILE`）与上表交叉：对"文件"目标一律 `STATUS_NOT_A_DIRECTORY`；对"目录"目标的覆盖类 disposition 一律 `STATUS_FILE_IS_A_DIRECTORY`。**整表由 L1 穷举，不得缺格**。
 
@@ -194,24 +205,25 @@ remove_at(parent: FileId, name: &[u8], expected_id: FileId) -> Result<()>
 **实现校验**：`(parent, name)` 只是提示不是身份——必须校验 `entry.child == expected_id`，不符 ⇒ `InvalidRecord`（过期身份；名字不存在才是 `NotFound`，两者区分见下文"「过期身份」与「条目不存在」是两个错误"）（失效模式是"删不掉"而不是"误删"，见 P3-2 卡 §3.9 的路径复用招法）。
 
 **正常删除** = `remove_at`（内部解除绑定 + 删除内容 + 把 inode 行置为 **tombstone `live=0`**；by-id 的 `read/stat/read_dir` 一律 `NotFound`；行保留"只增"，由 **B-10** 回收）。**不得**保留"live 且 size>0 但内容已删"的行——那会让读返回零或错数据。
-**SUPERSEDE** = 解除旧名字 + 创建新 inode，**不**对旧 inode 调 `remove_at`（旧 inode 保留，§4.2）；核心返回 `replaced: Option<FileId>`，adapter 把旧 FileId 的所有句柄标记为 **unbound**。
+**SUPERSEDE** = 同一 FileId 上截断 + 替换属性（§4.2），**不涉及**绑定与删除；句柄无需更新。
 
 **rename-replace**（`replace=true` 且目标存在）：**未验证（L2，P3-4 实测）**——上游文档的 Rename 契约写"目标名已有打开句柄时 FSD 不下发 Rename"，但这是代码/文档依据，尚无行为实测。
 
 - **若实测成立**：目标在本 adapter 下无句柄，核心可立即 retire 目标并返回 `replaced: Option<FileId>`；
-- **若实测不成立**（FSD 会下发）：**必须改用 SUPERSEDE 的保留语义**——目标 inode 保持 **live**、旧句柄可读，`replaced` 仍返回供 adapter 标记 unbound；**`unbound` 只防误删，不能代替保留**；
+- **若实测不成立**（FSD 会下发）：**必须改用保留语义**——目标 inode 保持 **live**、旧句柄可读（解除名字但不 retire），`replaced` 仍返回供 adapter 标记 unbound；**`unbound` 只防误删，不能代替保留**。这是 SUPERSEDE 修订后**唯一**可能产生"live 但不可达"行的路径；
 - 两种情况下 adapter 都做防御性 unbound（真存在句柄说明契约被破坏，记录而非静默）。
 
 目标就是源自身（同 FileId）时 `replaced = None`，**不得 retire 自己**：误 retire 会让名字仍在、inode 变 tombstone，所有句柄/读立即 `NotFound`——数据全丢。
 
-**两类"行保留"的可见性相反**（两者都只增，最终由 **B-10** 回收）：
+**"行保留"的可见性**（都只增，最终由 **B-10** 回收）：
 
 | 路径 | inode 行状态 | 旧句柄 | by-id 读 |
 | --- | --- | --- | --- |
-| **SUPERSEDE** | **live**（保留） | 仍然有效，读到旧内容 | 可读（句柄存在期间） |
 | **`remove_at`** | **tombstone `live=0`** | 无（已在最后 cleanup 调用） | `NotFound` |
+| **rename-replace，U1 成立**（目标无句柄） | **tombstone `live=0`** | 无 | `NotFound` |
+| **rename-replace，U1 不成立**（目标有句柄） | **live**（保留） | 仍然有效，读到旧内容 | 可读（句柄存在期间） |
 
-这个区别是承重的：SUPERSEDE 若把旧行置 tombstone，旧句柄立刻读不到（B-8 破）；`remove_at` 若保留 live 行而删内容，`read_at_id` 会返回零/错数据（静默数据损坏）。
+这个区别是承重的：有句柄的目标若被置 tombstone，旧句柄立刻读不到；`remove_at` 若保留 live 行而删内容，`read_at_id` 会返回零/错数据（静默数据损坏）。SUPERSEDE 不在此表中（同一 FileId，无保留状态）。
 
 **为什么排他性使其成立**：W2 保证一个 workspace 同时只有一个打开者（含只读），SDK/CLI 在挂载期间打不开；名字绑定只可能由本 adapter 改变，它能在自己的句柄表里同步。**若将来放宽 W2（多挂载、并发只读或外部写者），B 立刻失效**：必须改实现为 A（`child` 反向索引 + base 侧父指针/全量索引）或维护 per-open 名字注册表——**签名仍是 `remove_at`，实现忽略 `name`**，这就是"先取 B 形状"的价值。
 
@@ -275,7 +287,7 @@ remove_at(parent: FileId, name: &[u8], expected_id: FileId) -> Result<()>
 
 | # | 缺口 | 内容 | 归属 |
 | --- | --- | --- | --- |
-| G1 | 原子 open/create | `OpenDisposition`（§4.2）+ 目录/文件 + 一个 overlay 事务；返回 `{file_id, kind, action, stat, created, binding, replaced}`（**只加不减**：18 格表继续用 `file_id/kind/action`；`replaced` 是 supersede 的旧 FileId） | fs-overlay/fs-api |
+| G1 | 原子 open/create | `OpenDisposition`（§4.2）+ 目录/文件 + 一个 overlay 事务；返回 `{file_id, kind, action, stat, created, binding, replaced}`（**只加不减**：18 格表继续用 `file_id/kind/action`；`replaced` 对 create_or_open **恒为 `None`**——SUPERSEDE 保留 FileId，§4.2） | fs-overlay/fs-api |
 | G2 | 按 FileId 的操作 | `stat_id` / `read_at_id`（range；见下方读放大判据）/ `write_at_id` / `truncate_id` / `read_dir_id` / `open_id`（返回 FileId 的 open）；删除侧为 `remove_at(parent,name,expected_id)`（§5.4） | fs-overlay/fs-api |
 | G3 | 元数据写 | `set_times`（creation/write，若 §10.1 扩展则 access/change）、`set_attributes`；`stat` 暴露 FileId | fs-namespace（profile v3，若批准） |
 | G4 | 条件 rename | `rename(..., replace: bool)` 原子；返回 `{binding, replaced: Option<FileId>}`；替换/不替换语义同 ADR-003 R3–R7 | fs-namespace/fs-api |
@@ -293,7 +305,7 @@ G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后
 
 用**计数 source** 做阳性对照（故意读整个 pack 必须红）。rename 之后同一 FileId 的读必须继续满足该判据（name 绑定变了，inode 未变）。
 
-**SUPERSEDE 可以造出"已解除名字、旧句柄仍开"的状态**（§4.2），所以不能说"核心不存在该状态"：旧 inode 记录**保留（只增）**、旧 FileId 可读，直到 `workspace_discard` 或未来 **B-10** 回收；`DELETE` 旧 inode 会破坏旧句柄的读。这**不是 G2 的要求**——G2 只要求 rename 后按 FileId 读；SUPERSEDE 的保留由 overlay/句柄层负责，当前 GC 不扫描这些不可达行。**delete-pending 期间的读**只是普通 FileId 读，由 **adapter 的句柄表**保证（两段删除把真正的 `remove` 推迟到最后一个 `Cleanup`）。
+**"已解除名字、旧句柄仍开"的状态只可能来自 rename-replace 且 U1 不成立**（§5.4）；SUPERSEDE 修订后不再产生它。这**不是 G2 的要求**——G2 只要求 rename 后按 FileId 读；保留由 overlay/句柄层负责，当前 GC 不扫描这些不可达行。**delete-pending 期间的读**只是普通 FileId 读，由 **adapter 的句柄表**保证（两段删除把真正的 `remove` 推迟到最后一个 `Cleanup`）。
 
 **「过期身份」与「条目不存在」是两个错误，不是一个**（2026-10-26，P3-3a 三处待补收口时定稿）：
 
@@ -308,7 +320,7 @@ G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后
 判据：`fs-winfsp/tests/mock_identity.rs` 的 `remove_at_classifies_three_ways`（三态）与
 `contract.rs` 的 `scenario_removal_cases`（同一套词汇跨 mock/真后端），两处都用**变体**断言而不是等值比较。
 
-**GC 不需要活句柄输入**：离线 GC 的承重件是 **overlay 的 `locking_mode=EXCLUSIVE`**（ADR-006 §5.1；每次打开都执行），不是 `store.sqlite` 的锁。任何挂载中的 adapter 必持有某个 workspace 的 overlay 排他锁，GC 试图独占打开该 overlay 会得到 `WorkspaceInUse`；因此 GC 期间不可能存在句柄，SUPERSEDE 的保留记录无需成为 GC 根。`store.sqlite` 在 WAL 下允许读者与维护者共存，**不能**作为该论证的依据。
+**GC 不需要活句柄输入**：离线 GC 的承重件是 **overlay 的 `locking_mode=EXCLUSIVE`**（ADR-006 §5.1；每次打开都执行），不是 `store.sqlite` 的锁。任何挂载中的 adapter 必持有某个 workspace 的 overlay 排他锁，GC 试图独占打开该 overlay 会得到 `WorkspaceInUse`；因此 GC 期间不可能存在句柄，保留记录（若有）无需成为 GC 根。`store.sqlite` 在 WAL 下允许读者与维护者共存，**不能**作为该论证的依据。
 
 ---
 
@@ -384,3 +396,7 @@ G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后
 ## 14. 与 ADR-001 D8 的一致性声明
 
 本 ADR 不改变核心语义：核心仍逐字节区分大小写、不做规范化。Windows 的大小写不敏感、路径别名、8.3 全部在 `fs-windows`/`fs-winfsp` 层处理；折叠歧义按 §4.1 拒绝而非猜测。ADR-004 §3.2 的四条句柄问题（rename 后身份、unlink 后句柄、生命周期、锁/share 交互）在此逐条落地：W3/W4/W5/W7/W6。
+
+## 修订记录
+
+- 2026-10-26（**草案，待 owner 裁决 (a)**）：SUPERSEDE 由"解除旧名字 + 新 inode + 旧 inode 保留"改为"同一 FileId 截断 + 属性整体替换"。依据：WinFsp 2.1 用户态分发源码（`fsop.c:929-972`）——SUPERSEDE 以 `Open` + `Overwrite(ReplaceFileAttributes=Supersede)` 作用于同一 FileContext，原语义经传输层无法触发（流程 207）。同步：§4.2 表与触发路径表、§5.4 SUPERSEDE 行与可见性表、G1 `replaced` 不变量、GC 段落。判据影响：改变（P3-2 G1 18 格 FileId 列 SUPERSEDE 行、P3-3a 判据 2 与 M4、B-8、相关测试，见 `docs/reports/supersede-a-impact.md`）。
