@@ -58,6 +58,12 @@ pub enum CloseEffect {
 #[derive(Debug, Default)]
 pub struct HandleTable {
     handles: std::collections::BTreeMap<HandleId, Handle>,
+    /// `FileId -> (parent, name)`: where each open entry currently lives.
+    ///
+    /// Keyed by **FileId**, not by handle: `remove_at` guards with an id, so the binding's lifetime has to follow the id.
+    /// Per-handle copies would disagree with each other after a rename, and the disagreement would surface as "the entry
+    /// cannot be deleted" (the guard refuses a stale name) rather than as an obvious error.
+    bindings: std::collections::BTreeMap<u64, (u64, Vec<u8>)>,
     next: u64,
     /// `FileId`s that have been marked delete-pending. Kept per **id**, not per name: the entry may be renamed
     /// between `set_delete(true)` and the last close, and the deletion must follow the object.
@@ -80,6 +86,27 @@ pub fn close_removes(remaining: usize, pending: bool) -> bool {
 }
 
 impl HandleTable {
+    /// Records where `file_id` currently lives (from `OpenOutcome.binding`).
+    pub fn remember_binding(&mut self, file_id: u64, parent: u64, name: Vec<u8>) {
+        self.bindings.insert(file_id, (parent, name));
+    }
+
+    /// Where `file_id` currently lives, if a handle ever recorded it.
+    ///
+    /// `None` is **not** "guess from the last path": an unrecorded id must fail loudly, because a guessed name would name
+    /// some other object and the guard would then refuse the removal — a silent non-deletion.
+    #[must_use]
+    pub fn binding_of(&self, file_id: u64) -> Option<(u64, Vec<u8>)> {
+        self.bindings.get(&file_id).cloned()
+    }
+
+    /// Updates the binding of `file_id` after a rename moved it to `(parent, name)`.
+    pub fn rebind(&mut self, file_id: u64, parent: u64, name: Vec<u8>) {
+        if let Some(binding) = self.bindings.get_mut(&file_id) {
+            *binding = (parent, name);
+        }
+    }
+
     /// An empty table.
     #[must_use]
     pub fn new() -> Self {
