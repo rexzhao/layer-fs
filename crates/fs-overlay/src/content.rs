@@ -398,7 +398,10 @@ fn touch_inode(
     let now = now_ns();
     if inode_row(connection, id.serial())?.is_some() {
         connection.execute(
-            "UPDATE ov_inode SET size = ?1, base_limit = ?2, modified_ns = ?3 WHERE serial = ?4",
+            // A content write moves **both** the modification time and the metadata-change time: NTFS reports the latter
+            // as `ChangeTime`, and a writer that only bumped `modified_ns` would make "metadata changed" look false after
+            // a content change — the two are not synonyms, but a content write is a change to both.
+            "UPDATE ov_inode SET size = ?1, base_limit = ?2, modified_ns = ?3, changed_ns = ?3 WHERE serial = ?4",
             (size as i64, base_limit as i64, now, id.serial() as i64),
         )?;
         return Ok(());

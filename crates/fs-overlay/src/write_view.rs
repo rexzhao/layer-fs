@@ -282,8 +282,8 @@ fn ensure_dir_row(connection: &Connection, base: &BaseLayer, serial: FileId) -> 
     };
     connection.execute(
         "INSERT INTO ov_inode
-         (serial, origin, live, kind, size, created_ns, modified_ns, base_limit, entries)
-         VALUES (?1, ?2, ?3, 1, 0, ?4, ?4, 0, ?5)",
+         (serial, origin, live, kind, size, created_ns, modified_ns, changed_ns, base_limit, entries)
+         VALUES (?1, ?2, ?3, 1, 0, ?4, ?4, ?4, 0, ?5)",
         (
             serial.serial() as i64,
             schema::ORIGIN_LOCAL,
@@ -360,3 +360,4 @@ pub(crate) fn now_ns() -> i64 {
         .map(|elapsed| elapsed.as_nanos() as i64)
         .unwrap_or(0)
 }
+
