@@ -72,6 +72,29 @@ impl std::fmt::Debug for SnapshotReader<'_> {
     }
 }
 
+/// The `fmt` byte expected on a page of this **role** under this profile.
+///
+/// Inode table pages carry `inode_fmt` (ADR-005-v3 §2.1: only the inode record changed in v3); every other page — root,
+/// directory, extent — carries `fmt`, which is still 1.
+///
+/// One function on purpose. The v3 switch exposed that the rule was applied by hand in twenty places, and the one place it
+/// was missed (`references_of`'s inode branch) made the whole GC mark phase refuse a v3 store. A rule that lives in twenty
+/// call sites is a rule that will be forgotten in the twenty-first.
+#[must_use]
+pub(crate) fn page_format(profile: &Profile, role: Role) -> u8 {
+    match role {
+        Role::InodeTable => profile.inode_fmt,
+        // Enumerated rather than `_ =>`: a new role must be given an answer here, and the compiler is the one asking.
+        Role::FilesystemRoot
+        | Role::DirectoryLeaf
+        | Role::DirectoryBranch
+        | Role::ExtentLeaf
+        | Role::ExtentBranch
+        | Role::Chunk
+        | Role::Bytes => profile.fmt,
+    }
+}
+
 impl<'a> SnapshotReader<'a> {
     /// Opens a snapshot by its root object id, accepting either known profile.
     ///
@@ -122,7 +145,7 @@ impl<'a> SnapshotReader<'a> {
     ) -> SnapshotResult<Self> {
         let value = fetch(source, root, Role::FilesystemRoot, "filesystem root")?;
         let mut reader = Reader::new(&value);
-        reader.format(profile.fmt)?;
+        reader.format(page_format(&profile, Role::FilesystemRoot))?;
         let found = reader.take(32)?;
         let expected = profile.id();
         if found != expected {
@@ -169,7 +192,7 @@ impl<'a> SnapshotReader<'a> {
             let mut reader = Reader::new(&page);
             // Inode pages carry `inode_fmt`, not `fmt` (ADR-005-v3 draft §2.1). Mirroring the writer's single predicate
             // is what makes "v3 page read by a v2 build" a version error (`UnsupportedFormat`) instead of a corrupt file.
-            reader.format(self.profile.inode_fmt)?;
+            reader.format(page_format(&self.profile, Role::InodeTable))?;
             // The fourth and last caller: `lookup`, `read_dir` and `extents_in_range`
             // already bound the page, and this one was missed (P2a-1-QA-2).
             check_page_size(&page, &self.profile)?;
@@ -304,7 +327,7 @@ impl<'a> SnapshotReader<'a> {
                 let value = value.to_vec();
                 debug_assert_eq!(role, Role::FilesystemRoot, "filesystem root");
                 let mut reader = Reader::new(&value);
-                reader.format(self.profile.fmt)?;
+                reader.format(page_format(&self.profile, Role::FilesystemRoot))?;
                 let _profile = reader.take(32)?;
                 let _scope = reader.take(32)?;
                 let _root_serial = reader.u64()?;
@@ -318,7 +341,7 @@ impl<'a> SnapshotReader<'a> {
                 let mut reader = Reader::new(&value);
                 // Inode pages carry `inode_fmt` (ADR-005-v3 §2.1). This is the **mark** path: getting it wrong here means
                 // GC refuses to walk a v3 store at all (`UnsupportedFormat`), which is how the switch surfaced it.
-                reader.format(self.profile.inode_fmt)?;
+                reader.format(page_format(&self.profile, Role::InodeTable))?;
                 check_page_size(&value, &self.profile)?;
                 let mut out = Vec::new();
                 match reader.u8()? {
@@ -365,7 +388,7 @@ impl<'a> SnapshotReader<'a> {
                 let value = value.to_vec();
                 debug_assert_eq!(role, Role::DirectoryLeaf, "directory leaf");
                 let mut reader = Reader::new(&value);
-                reader.format(self.profile.fmt)?;
+                reader.format(page_format(&self.profile, Role::DirectoryLeaf))?;
                 check_page_size(&value, &self.profile)?;
                 let count = reader.u32()?;
                 for _ in 0..count {
@@ -379,7 +402,7 @@ impl<'a> SnapshotReader<'a> {
                 let value = value.to_vec();
                 debug_assert_eq!(role, Role::DirectoryBranch, "directory branch");
                 let mut reader = Reader::new(&value);
-                reader.format(self.profile.fmt)?;
+                reader.format(page_format(&self.profile, Role::DirectoryBranch))?;
                 check_page_size(&value, &self.profile)?;
                 let height = reader.u8()?;
                 if height == 0 {
@@ -402,7 +425,7 @@ impl<'a> SnapshotReader<'a> {
                 let value = value.to_vec();
                 debug_assert_eq!(role, Role::ExtentLeaf, "extent leaf");
                 let mut reader = Reader::new(&value);
-                reader.format(self.profile.fmt)?;
+                reader.format(page_format(&self.profile, Role::ExtentLeaf))?;
                 check_page_size(&value, &self.profile)?;
                 let count = reader.u32()?;
                 let mut out = Vec::new();
@@ -419,7 +442,7 @@ impl<'a> SnapshotReader<'a> {
                 let value = value.to_vec();
                 debug_assert_eq!(role, Role::ExtentBranch, "extent branch");
                 let mut reader = Reader::new(&value);
-                reader.format(self.profile.fmt)?;
+                reader.format(page_format(&self.profile, Role::ExtentBranch))?;
                 check_page_size(&value, &self.profile)?;
                 let height = reader.u8()?;
                 if height == 0 {
@@ -473,7 +496,7 @@ impl<'a> SnapshotReader<'a> {
             let role = role_of(self.source, pointer)?;
             let page = fetch(self.source, pointer, role, "directory")?;
             let mut reader = Reader::new(&page);
-            reader.format(self.profile.fmt)?;
+            reader.format(page_format(&self.profile, role))?;
             check_page_size(&page, &self.profile)?;
             match role {
                 Role::DirectoryLeaf => {
@@ -590,7 +613,7 @@ impl<'a> SnapshotReader<'a> {
         let role = role_of(self.source, page)?;
         let value = fetch(self.source, page, role, "directory")?;
         let mut reader = Reader::new(&value);
-        reader.format(self.profile.fmt)?;
+        reader.format(page_format(&self.profile, role))?;
         check_page_size(&value, &self.profile)?;
         match role {
             Role::DirectoryLeaf => {
@@ -672,7 +695,7 @@ impl<'a> SnapshotReader<'a> {
         let role = role_of(self.source, page)?;
         let value = fetch(self.source, page, role, "extent tree")?;
         let mut reader = Reader::new(&value);
-        reader.format(self.profile.fmt)?;
+        reader.format(page_format(&self.profile, role))?;
         check_page_size(&value, &self.profile)?;
         match role {
             Role::ExtentLeaf => {
