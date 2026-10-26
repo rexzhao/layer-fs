@@ -226,3 +226,34 @@ impl std::fmt::Debug for VolumeParams {
             .finish_non_exhaustive()
     }
 }
+
+/// The header of one `FSP_FSCTL_DIR_INFO` record (`fsctl.h:299-311`; SDK assertion `104 == sizeof(...)` at `:311`).
+///
+/// The record is variable-length: `Size` counts the whole record **including** the name, the name starts right after this
+/// header, and the next record begins at `align8(Size)`. Written and read through helpers below rather than as a mirrored
+/// struct, because the flexible array member cannot be expressed in Rust without unsafe gymnastics that would hide the
+/// arithmetic this file is trying to make explicit.
+pub mod dir_info {
+    /// Offset of `Size` (`fsctl.h:301`).
+    pub const SIZE_AT: usize = 0;
+    /// Offset of the embedded `FSP_FSCTL_FILE_INFO` (`fsctl.h:302`) — 8-aligned, hence the 6 bytes of padding after `Size`.
+    pub const FILE_INFO_AT: usize = 8;
+    /// Offset of the `NextOffset`/`Padding[24]` union (`fsctl.h:303-308`).
+    pub const NEXT_AT: usize = 80;
+    /// Offset where the file name begins (`fsctl.h:309`).
+    pub const NAME_AT: usize = 104;
+    /// The fixed part of every record (`104 == sizeof`, `fsctl.h:311`).
+    pub const HEADER: usize = 104;
+
+    /// Rounds a record size up to the 8-byte alignment WinFsp requires between records.
+    #[must_use]
+    pub const fn aligned(size: usize) -> usize {
+        (size + 7) & !7
+    }
+
+    /// The size in bytes of a record holding `name` (UTF-16 units, no terminator counted).
+    #[must_use]
+    pub const fn record_size(name_units: usize) -> usize {
+        HEADER + name_units * 2
+    }
+}

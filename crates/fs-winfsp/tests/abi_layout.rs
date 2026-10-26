@@ -186,3 +186,49 @@ fn volume_params_is_an_opaque_504_byte_block() {
         "cell tail: the bitfields are left at their defaults rather than hand-encoded"
     );
 }
+
+/// The `FSP_FSCTL_DIR_INFO` record: fixed header, 8-alignment, and the name at the end.
+///
+/// A wrong header size or a missing alignment does not fail loudly — the OS reads the name out of the middle of the next
+/// record, which shows up as "garbage file names in Explorer" rather than as an error.
+#[test]
+fn a_dir_info_record_has_the_sdk_layout() {
+    use fs_winfsp::abi::dir_info;
+
+    assert_eq!(dir_info::SIZE_AT, 0, "cell size field: fsctl.h:301");
+    assert_eq!(
+        dir_info::FILE_INFO_AT,
+        8,
+        "cell file info: fsctl.h:302, 8-aligned after the u16 Size"
+    );
+    assert_eq!(
+        dir_info::NEXT_AT,
+        80,
+        "cell next offset: fsctl.h:303-308 (24-byte union)"
+    );
+    assert_eq!(dir_info::NAME_AT, 104, "cell name: fsctl.h:309");
+    assert_eq!(
+        dir_info::HEADER,
+        size_of::<fs_winfsp::abi::FileInfo>() + 32,
+        "cell header: 8 + sizeof(FileInfo=72) + 24 = 104, which is the SDK's own assertion (fsctl.h:311)"
+    );
+
+    // Names of odd length must still leave the next record 8-aligned.
+    for units in [1usize, 2, 3, 5, 31] {
+        let size = dir_info::record_size(units);
+        assert_eq!(
+            size,
+            dir_info::HEADER + units * 2,
+            "cell size {units}: header plus the name, no terminator counted"
+        );
+        assert_eq!(
+            dir_info::aligned(size) % 8,
+            0,
+            "cell align {units}: the next record starts at a multiple of 8"
+        );
+        assert!(
+            dir_info::aligned(size) >= size,
+            "cell align {units}: rounding up never shrinks a record"
+        );
+    }
+}
