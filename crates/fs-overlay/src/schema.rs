@@ -8,7 +8,13 @@
 ///
 /// Changing any DDL statement below means bumping this: an overlay written by another
 /// build is refused rather than misinterpreted.
-pub const SCHEMA_VERSION: i64 = 1;
+/// The overlay schema version.
+///
+/// **2** added the four v3 metadata columns to `ov_inode` (`accessed_ns`, `changed_ns`, `attributes`, `security`). They are
+/// `NOT NULL DEFAULT`: an overlay written by version 1 is still readable, and reading it reports 0 / empty, which is the
+/// same "absent, not zero" convention the snapshot record uses. The column is where the value *can* live; whether it does
+/// is decided by the writer, not by the schema.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The DDL, statement by statement.
 ///
@@ -29,7 +35,11 @@ pub const DDL: &[&str] = &[
          created_ns INTEGER NOT NULL,
          modified_ns INTEGER NOT NULL,
          base_limit INTEGER NOT NULL,
-         entries INTEGER NOT NULL
+         entries INTEGER NOT NULL,
+         accessed_ns INTEGER NOT NULL DEFAULT 0,
+         changed_ns INTEGER NOT NULL DEFAULT 0,
+         attributes INTEGER NOT NULL DEFAULT 0,
+         security BLOB NOT NULL DEFAULT x''
      ) STRICT",
     "CREATE TABLE ov_entry (
          parent INTEGER NOT NULL,

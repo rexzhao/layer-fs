@@ -695,8 +695,32 @@ const CLASSIFIED: &[Classification] = &[
     (
         "overlay",
         "ov_inode",
+        "accessed_ns",
+        "NotARoot(a timestamp, not an object reference; v3 column)",
+    ),
+    (
+        "overlay",
+        "ov_inode",
+        "attributes",
+        "NotARoot(attribute bits, not an object reference; v3 column)",
+    ),
+    (
+        "overlay",
+        "ov_inode",
+        "changed_ns",
+        "NotARoot(a timestamp, not an object reference; v3 column)",
+    ),
+    (
+        "overlay",
+        "ov_inode",
         "origin",
         "NotARoot(overlay bookkeeping)",
+    ),
+    (
+        "overlay",
+        "ov_inode",
+        "security",
+        "NotARoot(security descriptor bytes stored inline, not an object reference; v3 column)",
     ),
     (
         "overlay",
