@@ -293,3 +293,54 @@ fn set_delete_requires_delete_access() {
         "cell state: the entry is still openable"
     );
 }
+
+/// **B3(iii)** — the adapter's deletion happens **once**: after the last handle closes, `calls()` shows exactly one
+/// `RemoveAt` for that entry.
+///
+/// "the entry is gone" cannot distinguish one removal from two (the second is an idempotent no-op, which is exactly why
+/// the core made it idempotent). The count is the only evidence.
+#[test]
+fn the_last_close_removes_exactly_once() {
+    let backend = MockBackend::new();
+    let id = file(&backend, b"/f", b"body");
+    let mut table = HandleTable::new();
+    let first = table
+        .open(id, mask(&[Term::Read, Term::Delete]), Mask::ALL_BITS, false)
+        .expect("handle one");
+    let second = table
+        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false)
+        .expect("handle two");
+    table.set_delete(first).expect("mark pending");
+
+    backend.clear_calls();
+    assert_eq!(
+        table.close(first),
+        Ok(CloseEffect::Nothing),
+        "cell setup: one handle remains"
+    );
+    assert_eq!(
+        backend.calls(),
+        vec![],
+        "cell no-removal: closing a non-last handle must not reach the backend at all"
+    );
+
+    assert_eq!(
+        table.close(second),
+        Ok(CloseEffect::Remove(id)),
+        "cell last close"
+    );
+    // The adapter performs the removal the table asked for, then reports it done.
+    backend.remove_at(ROOT, b"f", id).expect("adapter removes");
+    table.removed(id);
+
+    let removals: Vec<_> = backend
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, fs_winfsp::Call::RemoveAt(..)))
+        .collect();
+    assert_eq!(
+        removals,
+        vec![fs_winfsp::Call::RemoveAt(ROOT, b"f".to_vec(), id)],
+        "cell count: exactly one removal, and it names the id the caller believed in"
+    );
+}

@@ -169,3 +169,47 @@ fn the_cursor_does_not_synthesise_dot_entries() {
         "cell dots: absent — the adapter synthesises them"
     );
 }
+
+/// **N2 variant** — the adapter must **not** filter `.`/`..` out of a backend's output.
+///
+/// The rule the card sets is "the backend never sends them; the adapter synthesises them". This test is the **negative**
+/// of that rule: if a backend *did* send a `.`, the adapter would pass it through and the caller would see two of them.
+/// Asserting the pass-through looks like asserting a bug — and it is exactly the point: it proves the "backend sends no
+/// dots" half is load-bearing, because nothing downstream hides a violation.
+///
+/// Without this, "each entry appears exactly once" would be satisfied by an adapter that silently de-duplicated instead
+/// of by a backend that behaved.
+#[test]
+fn a_dot_from_the_backend_would_reach_the_caller_twice() {
+    use fs_winfsp::{DirEntry, DirentCursor, Kind};
+
+    let mut cursor = DirentCursor::new();
+    // A backend misbehaving in the way the rule forbids: it returns its own `.`.
+    let entries = vec![
+        DirEntry {
+            name: b".".to_vec(),
+            kind: Kind::Directory,
+        },
+        DirEntry {
+            name: b"real".to_vec(),
+            kind: Kind::File,
+        },
+    ];
+    cursor.fill(entries, |name| name.to_ascii_lowercase());
+    let listed: Vec<Vec<u8>> = cursor
+        .page(None, 32)
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    assert_eq!(
+        listed,
+        vec![b".".to_vec(), b"real".to_vec()],
+        "cell pass-through: the adapter does not filter — so a backend that sent `.` would surface it, and the caller \
+         (which synthesises its own `.`) would show it twice. This is why the rule says the backend must not send it"
+    );
+    assert_eq!(
+        listed.len(),
+        2,
+        "cell count: two entries survive — no de-duplication is hiding a misbehaving backend"
+    );
+}
