@@ -16,7 +16,9 @@ pub struct InodeView {
     pub kind: Kind,
     /// Logical size in bytes; zero for directories.
     ///
-    /// The rules never change it, but they do report it, so it belongs in the view.
+    /// The rules **do** change it: [`crate::TreeWrite::truncate`] backs `create_or_open`'s `FILE_OVERWRITE_IF` arm,
+    /// which must truncate inside the transaction that decided the disposition. The view therefore has to carry the
+    /// size, and a stale value here would make the truncation invisible to every caller that stats the entry.
     pub size: u64,
     /// Creation time, Unix epoch nanoseconds.
     pub created_ns: i64,
