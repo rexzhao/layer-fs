@@ -35,6 +35,9 @@ create_or_open(disposition, path, kind_hint) -> OpenOutcome { file_id, kind, siz
 // `size`/`times` 必须是**取回时从核心读到的值**，不是打开时缓存的值，也不是 adapter 自己维护的副本。
 // 否则 §3.2 的“新句柄 size == 0”在“缓存旧值”的实现下会**假绿**（读到的是替换前的缓存）。
 
+**mock 的 `remove_at` 必须实现 `expected_id` 校验**（不符 ⇒ `NotFound`）：P3-3a 只有 mock 一个后端，
+若 mock 把 `expected_id` 当“提示”不校验，那么 §3.9 的路径复用红法（删错对象）**在 mock 上不会红** —— 判据就成摆设。
+
 **为什么 `size` 不许缓存、而 dirent 允许（§3.6 首读快照）**：缓存的合法性取决于**语义要求的可见性**。
 `size`/`times` 要求“读到即当前”（NT 的 `GetFileInformation` 拿的就是当前状态）；而 dirent 的快照语义
 **本身就是接口承诺**（枚举期间不重排、不新增），缓存是它的实现方式，不是偏离。
