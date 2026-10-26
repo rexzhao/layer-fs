@@ -32,6 +32,8 @@
 
 ```
 create_or_open(disposition, path, kind_hint) -> OpenOutcome { file_id, kind, size, times, attributes }
+// `size`/`times` 必须是**取回时从核心读到的值**，不是打开时缓存的值，也不是 adapter 自己维护的副本。
+// 否则 §3.2 的“新句柄 size == 0”在“缓存旧值”的实现下会**假绿**（读到的是替换前的缓存）。
 read(file_id, offset, len) -> bytes
 write(file_id, offset, bytes) -> written
 set_size(file_id, len)
