@@ -1,11 +1,13 @@
-# SUPERSEDE 方案 (a) 的影响清单（草案，待 owner 裁决）
+# SUPERSEDE 方案 (a) 的影响清单（owner 已裁决 (a)，2026-10-26）
 
 - 作者：architect，2026-10-26；基于 `origin/main` `c92a0da`
 - 裁决对象：ADR-009 §4.2 SUPERSEDE 由"解除旧名字 + 新 inode（新 FileId）+ 旧 inode 保留、旧句柄读旧内容"改为
   **(a) 同一 FileId 上截断为 0 + 属性整体替换（`ReplaceFileAttributes=TRUE`），旧句柄读到覆盖后内容**。
 - 依据：WinFsp 2.1 `src/dll/fsop.c`（tag `v2.1`）:929-972——`FILE_SUPERSEDE` 与 `FILE_OVERWRITE_IF` 同走
   `FspFileSystemOpCreate_FileOverwriteIf`，目标存在时 `Open` + `Overwrite(同一 FileContext, ReplaceFileAttributes=Supersede)`；
-  `Create` 只在目标不存在时调用。原语义经传输层无法触发（流程 207）。**独立复核中（QA）**。
+  `Create` 只在目标不存在时调用。原语义经传输层无法触发（流程 207）。QA 已复核，并补两点：(b) 的内核 FileNode 缓存死因；`ReplaceFileAttributes` 判别信号。
+- 归属：属性替换/合并规则落在 **G1 修订卡**（manager 裁，一张卡改完全部）；排在 G3 收尾之后（同一函数，不并行）。
+- 总原则（owner）：与普通文件系统真实行为一致，适用于以前和以后的开发内容。
 - ADR 修订草案：同分支 `docs/adr/ADR-009-winfsp-frontend.md`（§4.2、§5.4、G1 行、GC 段、修订记录）、
   `docs/adr/ADR-008-pack-gc.md`（§6.1、§8）、`docs/process/backlog.md`（B-8 作废说明、B-10 来源）。
 
@@ -25,7 +27,7 @@
 | `crates/fs-winfsp/src/ops.rs:77,94-95` | 文档写"SUPERSEDE 后新句柄 size 0"、"replaced 仍可被自己的句柄读" | 改写：SUPERSEDE 后**所有**句柄（含旧句柄）`size==0`；`replaced` 对 create_or_open 恒 None |
 | `crates/fs-winfsp/src/mock.rs:318-370` `ReplaceExisting` 分支 | 新 id + 保留旧 inode | 同一 id 截断 + 属性替换 |
 | `crates/fs-winfsp/src/lib.rs:5` 模块注释 | 列 "SUPERSEDE" 为句柄语义难点 | 改为"SUPERSEDE（同 FileId 覆盖）" |
-| （G3 关联）属性写入 | G3 正在引入 `attributes` | SUPERSEDE=替换、OVERWRITE=合并 的属性规则应落在 G3 或 G1 修订卡里，**二者择一**写清归属 |
+| 属性写入（G1 修订卡） | G3 引入 `attributes` 字段 | **G1 修订卡**实现：`ReplaceFileAttributes=TRUE` 整体替换、`FALSE` 合并；判别只凭该布尔（ADR-009 §4.2 (a) 判据 1、4） |
 
 ## 2. 测试（期望翻转）
 

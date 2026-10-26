@@ -143,6 +143,18 @@ SUPERSEDE 与 OVERWRITE/OVERWRITE_IF 的**唯一区别是属性**：前者整体
 
 L2 用 NTFS 对照 `CREATE_ALWAYS` 命中既有文件时 `FileIndex` 是否变化（P3-4 卡 U2/U10）：若 NTFS 不变，一致；若 NTFS 变化，记为**有意差异**（传输层不能表达新 inode），不改本表。
 
+**(a) 的可断言判据（L1/L2 均适用）**：
+1. **判别信号**：目标存在时，SUPERSEDE **必定**到达 `Overwrite(ReplaceFileAttributes=TRUE)`，OVERWRITE/OVERWRITE_IF **必定**到达 `Overwrite(ReplaceFileAttributes=FALSE)`；adapter 只凭该布尔区分两者（不凭 disposition 推测）。L2 记录 `Overwrite` 回调的参数序列，断言与 disposition 一一对应；
+2. **身份**：`Overwrite` 前后同一 FileContext 上报的 FileId（`IndexNumber`）相同；
+3. **内容**：所有已打开句柄（含覆盖前打开的）在覆盖后读到 `size == 0`；
+4. **属性**：`ReplaceFileAttributes=TRUE` ⇒ 属性 = 请求属性（整体替换）；`FALSE` ⇒ 属性 = 原属性 ∪ 请求属性（合并）。
+
+**为什么不选 (b)（"Overwrite 内部换成新 inode，旧句柄保留旧身份"）**——两条独立死因：
+1. 传输层只给 `Overwrite` 一个 FileContext，拿不到"新建 inode"的时机（上文）；
+2. **内核缓存与自身目标矛盾**：`Overwrite` 返回的 `FileInfo` 由 FSD 写进该文件节点的共享缓存（`fsop.c:981`：`Response->Rsp.Overwrite.FileInfo`；默认模式下同名打开共享同一 FileNode，`winfsp.h:172-177`）。若 adapter 在这里返回新 inode 的 `IndexNumber`，**旧句柄随后从缓存读到的 FileId 也会变成新的**——(b) 想保住的"旧句柄 = 旧身份"在内核层就被覆盖，自相矛盾。
+
+**总原则（owner，2026-10-26）**：只要保证用起来与普通文件系统（NTFS）的真实行为一致即可，适用于以前和以后的开发内容。本节结论以 L2 NTFS 对照为最终依据；对照与本表不符时，**以实测为准修订本表**，不以 ADR 文本约束实测。
+
 （2026-10-26 前本表 SUPERSEDE 行写"解除旧名字绑定并创建新 inode、旧 inode 保留"——该语义经 WinFsp 无法触发，已按上文修订，见修订记录。）
 
 **SUPERSEDE 不产生"名字已解除、旧句柄仍开"的状态**：它不解除绑定、不新建 inode，`create_or_open` 的 `replaced` 对所有 disposition 恒为 `None`（字段保留，"只加不减"）。overlay 中仍会只增的不可达 inode 行只来自 `remove_at` 与 rename-replace 的 tombstone（§5.4），回收见 backlog **B-10**。
@@ -399,4 +411,4 @@ G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后
 
 ## 修订记录
 
-- 2026-10-26（**草案，待 owner 裁决 (a)**）：SUPERSEDE 由"解除旧名字 + 新 inode + 旧 inode 保留"改为"同一 FileId 截断 + 属性整体替换"。依据：WinFsp 2.1 用户态分发源码（`fsop.c:929-972`）——SUPERSEDE 以 `Open` + `Overwrite(ReplaceFileAttributes=Supersede)` 作用于同一 FileContext，原语义经传输层无法触发（流程 207）。同步：§4.2 表与触发路径表、§5.4 SUPERSEDE 行与可见性表、G1 `replaced` 不变量、GC 段落。判据影响：改变（P3-2 G1 18 格 FileId 列 SUPERSEDE 行、P3-3a 判据 2 与 M4、B-8、相关测试，见 `docs/reports/supersede-a-impact.md`）。
+- 2026-10-26（**owner 已裁决 (a)**，并定总原则"与真实文件系统行为一致"）：SUPERSEDE 由"解除旧名字 + 新 inode + 旧 inode 保留"改为"同一 FileId 截断 + 属性整体替换"。依据：WinFsp 2.1 用户态分发源码（`fsop.c:929-972`）——SUPERSEDE 以 `Open` + `Overwrite(ReplaceFileAttributes=Supersede)` 作用于同一 FileContext，原语义经传输层无法触发（流程 207）。同步：§4.2 表与触发路径表、§5.4 SUPERSEDE 行与可见性表、G1 `replaced` 不变量、GC 段落。判据影响：改变（P3-2 G1 18 格 FileId 列 SUPERSEDE 行、P3-3a 判据 2 与 M4、B-8、相关测试，见 `docs/reports/supersede-a-impact.md`）。补 QA 复核两点：(b) 的内核 FileNode 缓存死因；`ReplaceFileAttributes` 判别信号写成 (a) 的可断言判据。
