@@ -14,7 +14,7 @@
 | --- | --- |
 | W1 | **适配层只依赖 `fs-api`**：`fs-winfsp` 不得 import `fs-overlay`/`fs-workspace`/`fs-namespace` 内部，不得直接碰 store/overlay；所有语义经 `Repo`/`Workspace`/`ReadView`。 |
 | W2 | 适配层拆成两个 crate：**`fs-windows`（无 WinFsp 依赖，纯模型，跨平台可测）** + **`fs-winfsp`（FFI/回调/挂载，cfg(windows)）**。L1 判据全部落在前者。 |
-| W3 | **句柄表在 adapter**：handle 存 `(workspace, FileId, desired access, share, delete-on-close, flags)`；**不存路径**。路径只在 Open/Create 时使用。 |
+| W3 | **句柄表在 adapter**：handle 存 `(workspace, FileId, desired access, share, delete-on-close, flags, binding)`；**不存绝对路径**；`binding = (parent FileId, name)` 是删除的定位键（**提示，不是身份**，必须校验 `entry.child == expected_id`），须随本进程的 rename 同步。**该放松依赖 W2（workspace 排他打开，判据见 backlog B-14）；一旦允许并发打开者即刻失效。** |
 | W4 | **FileId = inode serial，跨 rename 稳定、跨重启对同一 commit 稳定**；WinFsp `IndexNumber` 直接用它。核心不得在 scope 内复用 serial。 |
 | W5 | **原子处置**：核心新增"按 disposition 的 open/create"与"带 replace 标志的 rename"，全部在**一个 overlay 事务**内判定；adapter 不做 stat-then-op 的 TOCTOU。 |
 | W6 | **共享模式：完整位规则**（desired×share 三比特），在 adapter 的句柄表上判定；不做"最小子集"。 |
@@ -61,7 +61,7 @@
 | `ReadDirectory` | 目录缓存 + marker 续读 + 过滤 `.`/`..` | `read_dir`（排序保证） |
 | `Rename` | `ReplaceIfExists` + 大小写规则 | `rename_with`（§9-G4） |
 | `CanDelete` / `SetDelete` | 非空目录/只读检查；置/清 pending | `stat_id`（判空通过 `read_dir`） |
-| `Cleanup` | 最后一个句柄时执行删除；刷缓存 | `flush` + `remove_id`（§9-G2） |
+| `Cleanup` | 最后一个句柄时执行删除；刷缓存 | `flush` + `remove_at(parent,name,expected_id)`（§9-G2） |
 | `Flush` | 文件/卷 flush | `flush` |
 | `Close` | 释放句柄；撤销锁（WinFsp 内核） | 无 |
 
@@ -79,7 +79,7 @@ adapter **禁止**：解析 CAS 对象、访问 `store.sqlite`/`overlay.sqlite`�
 | 4 | Get/Set file info（时间、属性、大小） | 核心元数据 + adapter 映射 | FILETIME 100ns/1601；只读属性 | L1 转换边界（0/极大/负）；L2 `GetFileInformationByHandle` |
 | 5 | 枚举（`FindFirst/Next`、marker、`.`/`..`） | adapter（缓存/游标） | 变更后游标语义、缓冲区不足 | L1 marker 续读、重命名中目录；L2 `dir /s` |
 | 6 | Rename + ReplaceIfExists | 核心原子 + adapter 映射 | 条件替换、case-only、跨目录 | L1 规则表（R3–R7 + case）；L2 `MoveFileEx` |
-| 7 | Delete / 两段删除 / cancel | adapter 状态机 + 核心 `remove_id` | 最后 cleanup 语义、new-open 拒绝 | L1 状态机全事件序列；L2 双进程 |
+| 7 | Delete / 两段删除 / cancel | adapter 状态机 + 核心 `remove_at(parent,name,expected_id)` | 最后 cleanup 语义、new-open 拒绝；定位键见 §5.4 | L1 状态机全事件序列；L2 双进程 |
 | 8 | Share mode | adapter 句柄表 | 位规则 × 现有句柄；与 delete 交互 | L1 3 desired × 3 share 全组合；L2 双进程 |
 | 9 | Delete-pending 可见性 | adapter | 新 open → `STATUS_DELETE_PENDING`；枚举显示与否 | L1 状态断言；L2 |
 | 10 | 句柄跨 rename / unlink | 核心 by-id + adapter FileId | rename 后旧 handle 有效 | L1 open→rename→read/write；L2 |
@@ -144,7 +144,7 @@ SUPERSEDE 与 OVERWRITE/OVERWRITE_IF 的区别是**FileId**：前者按 NT 语�
 
 ### 5.1 句柄（W3/W4）
 
-- `Handle { id: u64, file: FileId, desired: DesiredAccess, share: ShareMode, delete_on_close: bool, ... }`；路径不存。
+- `Handle { id: u64, file: FileId, desired: DesiredAccess, share: ShareMode, delete_on_close: bool, binding: Option<Binding>, ... }`；**不存绝对路径**；`Binding { parent: FileId, name: Vec<u8> }` 只是删除/替换的定位键（不是身份），见 §5.4。
 - 所有读写/截断/查询走 **FileId**（§9-G2），因此 rename 后旧句柄继续有效；unlink 由 W7 推迟到最后句柄。
 - `IndexNumber` = `FileId.serial()`。核心不得在 scope 内复用 serial（已有 `serial_next` 单调预留；在 §9-G2 的 `open` 返回值里显式带出）。
 - FileId **不跨 commit 变化**：同一 commit 的同一 inode 在重启后 serial 相同；`restore`/`rebase` 会改变 workspace 的根，挂载期间不允许（CLI 拒绝）。
@@ -167,9 +167,36 @@ conflict ⇔ (H.desired & N.share) != 0 || (N.desired & H.share) != 0
 - `SetDelete(TRUE)`：需要 `DELETE` 访问与 `FILE_SHARE_DELETE` 兼容；置 `DeletePending`；**不调用核心 remove**。
 - 新 `Open/Create` 命中 pending → `STATUS_DELETE_PENDING`（无论 share）。
 - `SetDelete(FALSE)`：允许清 pending（同一 FileId，持 DELETE 访问即可；文档写明）。
-- `Cleanup`：若本 handle 是最后一个且带 `FspCleanupDelete` → `remove_id`（目录空检查在内核保证之外，adapter 再检查一次）；否则只释放句柄。
+- `Cleanup`：若本 handle 是最后一个且带 `FspCleanupDelete` → `remove_at(binding.parent, binding.name, expected = file)`（目录空检查在内核保证之外，adapter 再检查一次）；已 unbound（SUPERSEDE 的旧句柄）则跳过；否则只释放句柄。
 - `Close`：释放句柄资源；不得在 Close 里做删除（Cleanup 已决定）。
 - 目录删除：`CanDelete` 判空；枚举/删除竞争由 adapter 的句柄互斥 + 核心原子操作收口。
+
+### 5.4 删除的定位键：`remove_at(parent, name, expected_id)`（B 形状，不封死 A）
+
+核心签名取 **B 形状**，但**不封死 A**（manager 2026-10-26 裁决，P3-2 G2 `5e4fa6c`）：
+
+```
+remove_at(parent: FileId, name: &[u8], expected_id: FileId) -> Result<()>
+```
+
+- **B 不封死 A**：将来若有反向索引，实现可以**忽略 `name`**，直接用 `expected_id` 定位；
+- **A 形状封死 B**：只有 `file_id` 时核心拿不到 `(parent, name)`，B 永远不可能；
+- 所以先取 B 形状，把"反查 vs 定位键"的取舍下推到实现内部；复审若改 A，**trait 签名不动**。
+
+**A 侧是"代价高"，不是"不可实现"**（这是需要写清的区别）：
+
+- overlay 的 `ov_entry` 可以加 `child` 索引，反查廉价；
+- **base 快照目录页的绑定没有反向索引**：要么全树扫描目录页（读放大顶掉 §9 G2 的判据），要么在 workspace 打开时构建一次 serial→(parent,name) 映射（O(#条目) 时间/空间），或给格式加父指针/反向索引（profile 变更）；
+- P2 不变量"每个 inode 恰有一个目录项"（ADR-005 S7）保证暴力反查**能找到唯一绑定**，所以 A 在原理上可实现，只是代价不可接受。B 是当前唯一不引入新索引/全树扫描的选择。
+
+**adapter 侧（B）**：`Open/Create` 时从核心取得 `binding = (parent FileId, name)`（`OpenOutcome` 带回），存进句柄（不存绝对路径）；`rename` 返回新 binding，adapter 用它更新**该 FileId 的所有句柄**。祖先目录 rename **不改变后代的 `parent`**（parent 是 FileId，不是路径），后代无需更新。
+
+**实现校验**：`(parent, name)` 只是提示不是身份——必须校验 `entry.child == expected_id`，不符 ⇒ `NotFound`（失效模式是"删不掉"而不是"误删"，见 P3-2 卡 §3.9 的路径复用招法）。
+
+**正常删除** = `remove_at`（内部解除绑定 + 删除内容 + 把 inode 行置为 **tombstone `live=0`**；by-id 的 `read/stat/read_dir` 一律 `NotFound`；行保留"只增"，由 **B-10** 回收）。**不得**保留"live 且 size>0 但内容已删"的行——那会让读返回零或错数据。
+**SUPERSEDE** = 解除旧名字 + 创建新 inode，**不**对旧 inode 调 `remove_at`（旧 inode 保留，§4.2）；核心返回 `replaced: Option<FileId>`，adapter 把旧 FileId 的所有句柄标记为 **unbound**。
+
+**为什么排他性使其成立**：W2 保证一个 workspace 同时只有一个打开者（含只读），SDK/CLI 在挂载期间打不开；名字绑定只可能由本 adapter 改变，它能在自己的句柄表里同步。**若将来放宽 W2（多挂载、并发只读或外部写者），B 立刻失效**：必须改实现为 A（`child` 反向索引 + base 侧父指针/全量索引）或维护 per-open 名字注册表——**签名仍是 `remove_at`，实现忽略 `name`**，这就是"先取 B 形状"的价值。
 
 ---
 
@@ -231,10 +258,10 @@ conflict ⇔ (H.desired & N.share) != 0 || (N.desired & H.share) != 0
 
 | # | 缺口 | 内容 | 归属 |
 | --- | --- | --- | --- |
-| G1 | 原子 open/create | `OpenDisposition`（§4.2）+ 目录/文件 + 一个 overlay 事务；返回 `{stat, created}` | fs-overlay/fs-api |
-| G2 | 按 FileId 的操作 | `stat_id` / `read_at_id`（range；见下方读放大判据）/ `write_at_id` / `truncate_id` / `remove_id` / `open_id`（返回 FileId 的 open） | fs-overlay/fs-api |
+| G1 | 原子 open/create | `OpenDisposition`（§4.2）+ 目录/文件 + 一个 overlay 事务；返回 `{stat, created, binding, replaced}`（supersede 的旧 FileId） | fs-overlay/fs-api |
+| G2 | 按 FileId 的操作 | `stat_id` / `read_at_id`（range；见下方读放大判据）/ `write_at_id` / `truncate_id` / `read_dir_id` / `open_id`（返回 FileId 的 open）；删除侧为 `remove_at(parent,name,expected_id)`（§5.4） | fs-overlay/fs-api |
 | G3 | 元数据写 | `set_times`（creation/write，若 §10.1 扩展则 access/change）、`set_attributes`；`stat` 暴露 FileId | fs-namespace（profile v3，若批准） |
-| G4 | 条件 rename | `rename(..., replace: bool)` 原子；替换/不替换语义同 ADR-003 R3–R7 | fs-namespace/fs-api |
+| G4 | 条件 rename | `rename(..., replace: bool)` 原子；返回 `{binding, replaced: Option<FileId>}`；替换/不替换语义同 ADR-003 R3–R7 | fs-namespace/fs-api |
 | G5 | 枚举游标 | 可选 `read_dir_after(path, after)`；否则 adapter 缓存整目录（保持"一次枚举期间一致"） | fs-overlay（可选） |
 | G6 | 通知挂钩 | 无需核心；adapter 从自己的调用点发 | — |
 
