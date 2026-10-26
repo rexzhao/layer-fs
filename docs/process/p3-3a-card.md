@@ -53,12 +53,21 @@ flush()                                     // workspace 级
 ## 3. 判据（每条都要能红；红法写在测试里）
 
 1. **句柄跨 rename 有效**：`open` → `rename(from, to)` → 用**旧句柄** `read` 仍返回原内容；`get_info` 的 `file_id` 不变。
-2. **句柄跨 SUPERSEDE 有效**（接 P3-2 的裁决 (a)）：`open` → `open(SUPERSEDE)` 同路径 → 旧句柄 `read` 仍读到**旧内容**（旧 inode 记录只增，B-8）；新句柄 `size == 0` 且读到空内容；两者 `file_id` 不同。
+2. **句柄跨 SUPERSEDE 有效**（接 P3-2 的裁决 (a)）：`open` → `open(SUPERSEDE)` 同路径 → 旧句柄 `read` 仍读到**旧内容**且**旧句柄 `get_info.size` 不变**（旧 inode 记录只增，B-8）；新句柄 **`size == 0`** 且读到空内容；两者 `file_id` 不同。
+   **两边 `size` 都要断言**（N3）：只断言"旧的可读"或只断言"新的是空"都会漏掉一半——`SUPERSEDE` 若被实现成"截断同一 inode"，旧句柄会读到空且 `size` 变 0。
+   **档位：`未验证（依赖 G2）`**（旧 FileId 可读需 G2 的按 FileId 读路径；本卡只在 mock 上判）。
 3. **两段删除**（W7）：`set_delete(true)` 后 (i) 新 `open` 得到 `DELETE_PENDING`；(ii) 旧句柄 `read`/`write` 仍可用；(iii) `close` 最后一个句柄时才真正 `remove`，且**只有一次**。
 4. **`DELETE_ON_CLOSE`**：`open(delete_on_close=true)` → `close` ⇒ 条目消失；若期间被 rename，删除**跟随 FileId** 而不是原路径（这条是本卡最容易写错的一条）。
 5. **share 位判定**：3 desired × 3 share 全组合（9 格）表驱动；`FILE_SHARE_DELETE` 与 `set_delete`/`SUPERSEDE` 的交互单列。
 6. **dirent 游标（首读快照语义）**：每个目录句柄首读时缓存排序后的完整列表，后续按 `marker` 切；期间 rename/删除**不改变已取快照**，新条目不出现；大小写不同的两个条目都返回（不按折叠去重）；`.`/`..` 各恰好一次且在最前。
 7. **契约测试（mock-only）+ 真实后端延后**：§3 的 1–6 本卡在 `mock` 上全部跑通并给出覆盖表；真实 `fs-api` 后端在 **P3-3b** 重跑同一批（至少 1、2、6；1/2 依赖 P3-2 G1/G2 的按 FileId 读）。本卡**不实现真实后端**；覆盖表里 mock-only 的条目必须逐条标注，不得把"mock 绿"写成"收口"。
+
+   **7a（C1-f）每个场景函数恰好一处实例化（mock）**：出现第二处实例化而**不是** P3-3b 的真后端 ⇒ **红**。
+   这条防的是"假装跑了两个后端"——mock-only 改版后最可能出现的写法（口径反转后，**"多"永远是旧口径的残留**，而它在代码里与"有一个真后端"长得一样）。
+   场景函数必须是泛型的：`fn scenario<B: WorkspaceOps>(backend: &B)`；机械核对：`grep -c 'fn scenario' …` 与 `grep -c 'scenario::<' …` 对得上。
+
+   **7b 档位词**：本卡凡"依赖 G1/G2 才可判"的判据（判据 2 的旧 FileId 可读、判据 1 的按 FileId 读），档位一律写
+   **`未验证（依赖 G2）`**——与 P3-3a 清单 J0 同档。**不得写"部分通过"**（三态里没有第四态）。
 8. **错误映射不重复实现**：`fs-winfsp/src/error.rs` 只能**调用** `fs_windows` 的映射（`pub use`/函数调用）；不得出现 `match err` 分支或第二份状态码表。形状查：`grep -n 'match .*err' crates/fs-winfsp/src` 为空；`STATUS_` 只出现在调用点与测试断言，不出现在映射分支。
 
 ## 4. 明确不做（本卡范围外）
