@@ -28,6 +28,22 @@ pub struct Rules<S: TreeStore> {
     store: S,
 }
 
+/// What a successful conditional [`Rules::rename_with`] did (P3-2 G4).
+///
+/// `binding` is the pair `remove_at` takes — destination **parent id** plus the destination **raw name bytes** — so a
+/// caller that keeps a handle can act on the moved entry without re-resolving a path (the same race G1 removed on the
+/// create side). `replaced` is `Some` only when this call retired a *different* inode; it is never the source itself,
+/// because a rename that retired its own inode would delete what it just moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameOutcome {
+    /// Where the moved entry now lives: `(parent id, destination name bytes)`.
+    pub binding: (FileId, Vec<u8>),
+    /// The inode that lost the destination name, already tombstoned. `None` when nothing was replaced.
+    pub replaced: Option<FileId>,
+    /// The inode that was moved — the source `FileId`, unchanged by the move.
+    pub file_id: FileId,
+}
+
 /// What [`Rules::create_or_open`] produced (P3-2 G1).
 ///
 /// `kind` is the node's kind, not a variant of the outcome: the same shape answers "which entry" and "is it a
@@ -339,14 +355,40 @@ impl<S: TreeStore> Rules<S> {
         })
     }
 
-    /// Moves `from` to `to` (ADR-003 §3.3 R1–R12).
+    /// Moves `from` to `to`, replacing an existing destination (ADR-003 §3.3 R1–R12).
+    ///
+    /// Thin wrapper over [`Self::rename_with`] with `replace = true`, which is what every existing caller wants; the
+    /// outcome's `binding`/`replaced` are dropped because those callers bind by path again anyway.
     ///
     /// # Errors
     ///
-    /// `IsRoot` when either side is `/`, `NotFound` for a missing source or parent,
-    /// `AlreadyExists` when the types disagree, `DirectoryNotEmpty` when replacing a
-    /// non-empty directory, and `IntoOwnSubtree` for the R9 case.
+    /// As [`Self::rename_with`].
     pub fn rename(&self, from: &Path, to: &Path) -> NamespaceResult<()> {
+        self.rename_with(from, to, true).map(|_outcome| ())
+    }
+
+    /// Moves `from` to `to`, optionally replacing an existing destination (G4).
+    ///
+    /// `replace = false` turns "the destination name is taken" into [`NamespaceError::NameCollision`] and guarantees
+    /// **no change at all**; `replace = true` applies R3/R4/R5/R6 as before. The existence test, the type rules and the
+    /// move itself all run inside **one** `write` closure, so a `replace = false` caller never races a concurrent
+    /// create (this is the adapter's `ReplaceIfExists = false` without a stat-then-rename window).
+    ///
+    /// The returned [`RenameOutcome`] is what lets a handle stay valid across the move: `binding` is the destination
+    /// **parent id plus the raw destination name bytes**, i.e. exactly the pair `remove_at` takes, and `replaced` names
+    /// the inode that lost the destination name (already tombstoned when it is returned).
+    ///
+    /// # Errors
+    ///
+    /// `IsRoot` when either side is `/`; `NotFound` for a missing source or parent; `NameCollision` when
+    /// `replace = false` and the destination name is taken; `AlreadyExists` when the types disagree (R4/R5);
+    /// `DirectoryNotEmpty` when replacing a non-empty directory (R6); `IntoOwnSubtree` for the R9 case.
+    pub fn rename_with(
+        &self,
+        from: &Path,
+        to: &Path,
+        replace: bool,
+    ) -> NamespaceResult<RenameOutcome> {
         if from.is_root() || to.is_root() {
             return Err(NamespaceError::IsRoot);
         }
@@ -355,8 +397,16 @@ impl<S: TreeStore> Rules<S> {
         // `NotFound` rather than pretending to succeed. `/A` to `/a` differs
         // byte-wise and is therefore a real rename.
         if from.segments() == to.segments() {
-            self.resolve(from)?;
-            return Ok(());
+            return self.store.read(|tree| {
+                let id = resolve_in(tree, from)?;
+                let parent = resolve_parent_in(tree, from)?;
+                let name = from.name().expect("a non-root path has a name");
+                Ok(RenameOutcome {
+                    binding: (parent, name.as_bytes().to_vec()),
+                    replaced: None,
+                    file_id: id,
+                })
+            });
         }
         self.store.write(OpLabel::Rename, |tree| {
             let (source_parent, source_name, source) = resolve_existing(tree, from)?;
@@ -381,9 +431,25 @@ impl<S: TreeStore> Rules<S> {
                 });
             }
 
+            let binding = (target_parent, target_name.as_bytes().to_vec());
+            let mut replaced = None;
             match tree.lookup(target_parent, target_name.as_bytes())? {
                 None => {}
+                // The destination name already names the source inode itself (a backend that folded two spellings, or
+                // `/A` -> `/a` with both bindings present). Nothing is replaced and nothing is retired: retiring "self"
+                // here would tombstone the very inode the move is about to bind.
+                //
+                // This arm is defensive: with raw-byte bindings the public API cannot currently produce two names for
+                // one inode, so a single-name test cannot observe it. Removing it does red criterion 9 (the race),
+                // which is how the guard is known to be load-bearing rather than dead.
+                Some(existing) if existing == source => {}
                 Some(existing) => {
+                    // Checked **before** the type rules so a `replace = false` caller gets one predictable refusal
+                    // (`NameCollision`) instead of an R4/R5/R6 error: the caller asked "only if free", and the answer
+                    // does not depend on what occupies the name.
+                    if !replace {
+                        return Err(NamespaceError::NameCollision { path: to.display() });
+                    }
                     let existing_kind = tree
                         .inode(existing)?
                         .ok_or_else(|| NamespaceError::NotFound { path: to.display() })?
@@ -408,12 +474,17 @@ impl<S: TreeStore> Rules<S> {
                     // inode, and with it everything the inode owned.
                     tree.unbind(target_parent, target_name.as_bytes())?;
                     tree.tombstone(existing)?;
+                    replaced = Some(existing);
                 }
             }
 
             tree.unbind(source_parent, source_name.as_bytes())?;
             tree.bind(target_parent, target_name.as_bytes(), source)?;
-            Ok(())
+            Ok(RenameOutcome {
+                binding,
+                replaced,
+                file_id: source,
+            })
         })
     }
 

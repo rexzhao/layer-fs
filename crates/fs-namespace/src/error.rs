@@ -54,6 +54,14 @@ pub enum NamespaceError {
         /// The occupied path.
         path: String,
     },
+    /// A conditional `rename` (`replace = false`) found the destination name taken.
+    ///
+    /// Distinct from [`Self::AlreadyExists`]: that one reports the *type* rules (R4/R5), this one reports the caller's
+    /// own `replace = false` condition. The adapter maps it to `NameCollision`.
+    NameCollision {
+        /// The occupied destination path.
+        path: String,
+    },
     /// A path component that must be a directory is a file.
     NotADirectory {
         /// The file that was used as a directory.
@@ -139,6 +147,9 @@ impl fmt::Display for NamespaceError {
             NamespaceError::InvalidPath(error) => write!(f, "invalid path: {error}"),
             NamespaceError::NotFound { path } => write!(f, "no such path: {path}"),
             NamespaceError::AlreadyExists { path } => write!(f, "already exists: {path}"),
+            NamespaceError::NameCollision { path } => {
+                write!(f, "name collision (replace = false): {path}")
+            }
             NamespaceError::NotADirectory { path } => write!(f, "not a directory: {path}"),
             NamespaceError::IsADirectory { path } => write!(f, "is a directory: {path}"),
             NamespaceError::DirectoryNotEmpty { path } => {
@@ -179,6 +190,7 @@ impl std::error::Error for NamespaceError {
             | NamespaceError::IsADirectory { .. }
             | NamespaceError::DirectoryNotEmpty { .. }
             | NamespaceError::IntoOwnSubtree { .. }
+            | NamespaceError::NameCollision { .. }
             | NamespaceError::IsRoot
             | NamespaceError::InvalidPath(_)
             | NamespaceError::NamespaceNotFound { .. }

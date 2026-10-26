@@ -60,5 +60,5 @@ pub use rules::{resolve_in, resolve_parent_in};
 /// `Rules` is what makes P2a-3 worth anything: a backend implements [`TreeStore`] and
 /// gets every path rule — R1–R12, the violation forms, the ordering of checks — without
 /// copying or re-deriving any of it.
-pub use rules::{CreateOutcome, Rules};
+pub use rules::{CreateOutcome, RenameOutcome, Rules};
 pub use tree_store::{OpLabel, TreeRead, TreeStore, TreeWrite};
