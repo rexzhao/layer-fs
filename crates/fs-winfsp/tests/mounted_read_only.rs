@@ -99,11 +99,12 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
     .expect("the mount path is available");
 
     eprintln!(
-        "create={} mount={} start={} unmount={} looked_like_a_mount={} probe={:?}",
+        "create={} mount={} start={} unmount={} released_after_delete={} looked_like_a_mount={} probe={:?}",
         report.create,
         report.mount,
         report.start,
         report.unmount,
+        report.released_after_delete,
         report.looked_like_a_mount,
         probe_result
     );

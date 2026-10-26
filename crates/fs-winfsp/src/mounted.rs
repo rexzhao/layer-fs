@@ -25,6 +25,11 @@ pub struct MountReport {
     pub start: i32,
     /// `FspFileSystemSetMountPoint(NULL)` — the unmount.
     pub unmount: i32,
+    /// Whether the drive letter / directory was **gone after `delete`**.
+    ///
+    /// A status code says what one call thought; this says what the OS now believes. For a drive letter it is read back with
+    /// `GetLogicalDrives`, which is the hard evidence that nothing was left mounted.
+    pub released_after_delete: bool,
     /// Whether the directory was readable **while mounted**, as seen through the OS by the caller.
     ///
     /// Reported rather than asserted inside: a failure here is a result, not a bug in this function — the caller decides what
@@ -75,6 +80,26 @@ mod platform {
         fn GetProcAddress(module: *mut c_void, name: *const u8) -> *const c_void;
         fn FreeLibrary(module: *mut c_void) -> i32;
         fn GetLastError() -> u32;
+        fn GetLogicalDrives() -> u32;
+    }
+
+    /// Whether `path` still looks like a live drive letter (`Y:`), as the OS reports it.
+    fn drive_letter_present(path: &Path) -> bool {
+        let text = path.to_string_lossy();
+        let bytes = text.as_bytes();
+        if bytes.len() != 2 || bytes[1] != b':' {
+            return false;
+        }
+        let Some(letter) = text.chars().next() else {
+            return false;
+        };
+        if !letter.is_ascii_alphabetic() {
+            return false;
+        }
+        // SAFETY: `GetLogicalDrives` has no arguments and no preconditions.
+        let mask = unsafe { GetLogicalDrives() };
+        let index = u32::from(letter.to_ascii_uppercase() as u8 - b'A');
+        mask & (1 << index) != 0
     }
 
     /// `GetVolumeInfo`: `(FSP_FILE_SYSTEM*, PVOID VolumeInfo, ULONG Length)` — `winfsp.h:206`.
@@ -191,6 +216,7 @@ mod platform {
                     mount: 0,
                     start: 0,
                     unmount: 0,
+                    released_after_delete: true,
                     looked_like_a_mount: false,
                 });
             }
@@ -206,12 +232,24 @@ mod platform {
             let unmount_status = set_mount_point(file_system, std::ptr::null());
             stop(file_system);
             delete(file_system);
+            // The hard evidence, read back from the OS: is the mount point gone? A status code alone does not say.
+            let was_drive = {
+                let text = mount_point.to_string_lossy();
+                text.len() == 2 && text.ends_with(':')
+            };
+            let released_after_delete = if was_drive {
+                !drive_letter_present(mount_point)
+            } else {
+                // A directory mount point is not a drive; "absent" would be the wrong question there.
+                true
+            };
 
             Ok(super::MountReport {
                 create: create_status,
                 mount: mount_status,
                 start: start_status,
                 unmount: unmount_status,
+                released_after_delete,
                 looked_like_a_mount,
             })
         })();
