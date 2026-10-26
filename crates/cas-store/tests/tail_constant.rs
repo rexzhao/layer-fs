@@ -167,10 +167,38 @@ fn is_tail_arithmetic(line: &str) -> bool {
         .any(|pattern| line.contains(pattern))
 }
 
+/// Criterion 6: a binding **named after the tail** that is not the constant.
+///
+/// The first version of rule 5 only looked for the literal `48`, which misses the composed form
+/// (`let tail = 4 + 4 + 8 + 32;`) — the same second definition, spelled arithmetically. The rule is therefore
+/// about the *name*: if a `let`/`const` is called `tail…`, its value must be `PACK_TAIL_BYTES`, whatever else the
+/// arithmetic says.
+fn is_tail_binding(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let rest = if let Some(rest) = trimmed.strip_prefix("let ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("const ") {
+        rest
+    } else {
+        return false;
+    };
+    let Some((lhs, value)) = rest.split_once('=') else {
+        return false;
+    };
+    let name = lhs
+        .split(':')
+        .next()
+        .unwrap_or(lhs)
+        .trim()
+        .to_ascii_lowercase();
+    name.contains("tail") && !value.contains("PACK_TAIL_BYTES")
+}
+
 #[test]
 fn no_test_binds_or_arithmetics_the_tail_literal() {
     let mut bindings = Vec::new();
     let mut arithmetics = Vec::new();
+    let mut tail_bindings = Vec::new();
     // **Tests only.** In production code `at + 48` appears as the digest's end offset (`at + 16 .. at + 48`), which
     // is the tail's layout rather than a second definition of its size; the card's rule is about tests, where a
     // literal silently bypasses the constant. Named here so the narrower scope is a decision, not an accident.
@@ -188,7 +216,10 @@ fn no_test_binds_or_arithmetics_the_tail_literal() {
                 bindings.push(where_.clone());
             }
             if is_tail_arithmetic(line) {
-                arithmetics.push(where_);
+                arithmetics.push(where_.clone());
+            }
+            if is_tail_binding(line) {
+                tail_bindings.push(where_);
             }
         }
     }
@@ -199,6 +230,10 @@ fn no_test_binds_or_arithmetics_the_tail_literal() {
     assert!(
         arithmetics.is_empty(),
         "cell arithmetic: tail maths on the literal 48 bypasses the single source: {arithmetics:?}"
+    );
+    assert!(
+        tail_bindings.is_empty(),
+        "cell tail-binding: anything named `tail*` must be bound to the constant, not to `48` or `4 + 4 + 8 + 32`:          {tail_bindings:?}"
     );
 }
 
