@@ -102,3 +102,93 @@ mod platform {
         })
     }
 }
+
+/// The exports the mount path needs, in the order they are used.
+///
+/// Kept as **names** rather than as resolved pointers at module scope: resolution needs a loaded module, and a `static` that
+/// is only valid while a DLL is loaded is exactly the kind of hidden state a mount must not have.
+pub const REQUIRED_EXPORTS: [&str; 5] = [
+    "FspFileSystemCreate",
+    "FspFileSystemSetMountPoint",
+    "FspFileSystemStartDispatcher",
+    "FspFileSystemStopDispatcher",
+    "FspFileSystemDelete",
+];
+
+/// Checks that every required export exists, and reports the **first missing one by name**.
+///
+/// A mount that fails with "unsupported" because one symbol is absent is indistinguishable from a mount that fails because
+/// a callback is wrong; naming the missing export is what separates a version problem from a logic problem.
+///
+/// # Errors
+///
+/// [`LoadError::NotFound`] / [`LoadError::LoadFailed`] from the loader, or [`LoadError::MissingExport`] naming the first
+/// absent symbol.
+pub fn check_exports(library: &Path) -> Result<usize, LoadError> {
+    resolve_library(library)?;
+    exports::check_exports(library)
+}
+
+#[cfg(windows)]
+mod exports {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use crate::loader::LoadError;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *const c_void;
+        fn FreeLibrary(module: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    pub(super) fn check_exports(library: &Path) -> Result<usize, LoadError> {
+        let mut wide: Vec<u16> = library.as_os_str().encode_wide().collect();
+        wide.push(0);
+        // SAFETY: `wide` is NUL-terminated and outlives the call.
+        let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+        if module.is_null() {
+            let last_error = unsafe { GetLastError() };
+            return Err(LoadError::LoadFailed {
+                path: library.to_path_buf(),
+                last_error,
+            });
+        }
+
+        let mut found = 0usize;
+        for name in super::REQUIRED_EXPORTS {
+            let mut narrow: Vec<u8> = name.as_bytes().to_vec();
+            narrow.push(0);
+            // SAFETY: both pointers are valid for the call; the result is only compared against null.
+            let address = unsafe { GetProcAddress(module, narrow.as_ptr()) };
+            if address.is_null() {
+                // SAFETY: `module` came from a successful `LoadLibraryW` and is not used after this.
+                unsafe { FreeLibrary(module) };
+                return Err(LoadError::MissingExport {
+                    name: name.to_owned(),
+                });
+            }
+            found += 1;
+        }
+        // SAFETY: paired with the successful load above.
+        unsafe { FreeLibrary(module) };
+        Ok(found)
+    }
+}
+
+#[cfg(not(windows))]
+mod exports {
+    use std::path::Path;
+
+    use crate::loader::LoadError;
+
+    pub(super) fn check_exports(library: &Path) -> Result<usize, LoadError> {
+        Err(LoadError::LoadFailed {
+            path: library.to_path_buf(),
+            last_error: 0,
+        })
+    }
+}

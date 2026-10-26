@@ -105,9 +105,21 @@ fn the_slot_indices_follow_the_sdk_order() {
 
     // The three pairs whose relative order is easy to get wrong and expensive to get wrong.
     for (left, right, why) in [
-        (slot::OPEN, slot::OVERWRITE, "Open comes before Overwrite (winfsp.h:322 vs :345)"),
-        (slot::CLEANUP, slot::CLOSE, "Cleanup comes before Close (winfsp.h:410 vs :420)"),
-        (slot::READ, slot::GET_FILE_INFO, "Read comes before GetFileInfo (winfsp.h:441 vs :507)"),
+        (
+            slot::OPEN,
+            slot::OVERWRITE,
+            "Open comes before Overwrite (winfsp.h:322 vs :345)",
+        ),
+        (
+            slot::CLEANUP,
+            slot::CLOSE,
+            "Cleanup comes before Close (winfsp.h:410 vs :420)",
+        ),
+        (
+            slot::READ,
+            slot::GET_FILE_INFO,
+            "Read comes before GetFileInfo (winfsp.h:441 vs :507)",
+        ),
     ] {
         assert!(left < right, "cell order: {why}");
     }

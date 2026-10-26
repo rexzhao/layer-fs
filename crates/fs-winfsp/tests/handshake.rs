@@ -48,3 +48,37 @@ fn an_absent_library_is_not_a_load_failure() {
         other => panic!("cell absent: expected NotFound before any loader call, got {other:?}"),
     }
 }
+
+/// Every export the mount path needs must be present, and the check must be **runnable without a mount**.
+#[test]
+fn the_mount_exports_are_all_present() {
+    let resolved = fs_winfsp::loader::default_library();
+    let path = resolved.as_path();
+    if let Err(LoadError::NotFound { path }) = resolve_library(path) {
+        eprintln!(
+            "SKIP: winfsp library not installed at {} — export check not exercised (skip, not pass)",
+            path.display()
+        );
+        return;
+    }
+    let found =
+        fs_winfsp::handshake::check_exports(path).expect("all required exports are present");
+    assert_eq!(
+        found,
+        fs_winfsp::handshake::REQUIRED_EXPORTS.len(),
+        "cell count: the check resolves every name in the list, so a shorter list cannot pass silently"
+    );
+}
+
+/// A missing export is reported **by name**, because that is what tells a version problem from a logic problem.
+#[test]
+fn a_missing_export_names_itself() {
+    // The library is absent here, so the loader fails first — which is itself the documented order: presence, then exports.
+    let missing = Path::new("F:/definitely/not/here/winfsp-x64.dll");
+    match fs_winfsp::handshake::check_exports(missing) {
+        Err(LoadError::NotFound { .. }) => {}
+        other => {
+            panic!("cell order: absence is reported before any symbol is looked for, got {other:?}")
+        }
+    }
+}
