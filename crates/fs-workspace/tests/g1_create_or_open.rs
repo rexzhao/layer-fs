@@ -48,13 +48,23 @@ fn p(text: &str) -> Path {
 }
 
 /// The cells that can be seeded without a second inode: absent, file, directory.
-fn seed(rules: &Rules<fs_workspace::WorkspaceStore>, exists: Exists) {
+fn seed(
+    workspace: &fs_workspace::Workspace,
+    rules: &Rules<fs_workspace::WorkspaceStore>,
+    exists: Exists,
+) {
     match exists {
         Exists::Absent => {}
         Exists::File => {
-            rules
+            let seeded = rules
                 .create_or_open(&p("/target"), Disposition::Create)
                 .expect("seed file");
+            // **Non-empty** on purpose: a zero-length seed cannot tell "truncated" from "never written".
+            let _ = seeded;
+            workspace
+                .write_at("/target", 0, b"seeded bytes")
+                .expect("seed content");
+            workspace.truncate("/target", 12).expect("seed size");
         }
         Exists::Directory => rules.mkdir(&p("/target")).expect("seed dir"),
     }
@@ -68,7 +78,7 @@ fn every_cell_has_an_action_a_kind_and_a_file_id() {
             cells += 1;
             let fixture = fixture(&format!("{}-{}", disposition as u8, cells));
             let rules = Rules::new(fixture.workspace.store());
-            seed(&rules, exists);
+            seed(&fixture.workspace, &rules, exists);
             let before: Option<FileId> = rules.resolve(&p("/target")).ok();
 
             match (decide(disposition, exists), rules.create_or_open(&p("/target"), disposition)) {
@@ -104,6 +114,20 @@ fn every_cell_has_an_action_a_kind_and_a_file_id() {
                         rules.resolve(&p("/target")).expect("the name resolves"),
                         "cell disposition={disposition:?} exists={exists:?}: the outcome must name the entry the name carries"
                     );
+                    // The truncating dispositions must leave an **empty** file, and must keep the same entry
+                    // (that pair is the whole observable difference from SUPERSEDE).
+                    if action == Action::TruncateExisting {
+                        assert_eq!(
+                            Some(file_id),
+                            before,
+                            "cell disposition={disposition:?} exists={exists:?}: overwriting reuses the entry"
+                        );
+                        assert_eq!(
+                            fixture.workspace.content_size("/target").expect("size"),
+                            0,
+                            "cell disposition={disposition:?} exists={exists:?}: the file must be truncated to zero"
+                        );
+                    }
                     if action == Action::ReplaceExisting {
                         assert_ne!(
                             Some(file_id),

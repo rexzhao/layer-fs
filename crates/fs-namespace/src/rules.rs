@@ -188,6 +188,9 @@ impl<S: TreeStore> Rules<S> {
                 // one observable difference from SUPERSEDE, and it is why this arm must not create an inode.
                 Action::TruncateExisting => {
                     let id = existing.expect("OVERWRITE requires an existing entry");
+                    // Truncated **inside** this transaction: the entry keeps its FileId, and no reader can observe the
+                    // old bytes after the disposition was granted.
+                    tree.truncate(id, 0)?;
                     (id, Kind::File)
                 }
                 Action::ReplaceExisting => {

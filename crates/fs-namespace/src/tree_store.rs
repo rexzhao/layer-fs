@@ -127,6 +127,18 @@ pub trait TreeWrite: TreeRead {
     /// Backend failures.
     fn create_inode(&mut self, kind: crate::Kind) -> NamespaceResult<FileId>;
 
+    /// Sets the file's logical size, zeroing any range the call exposes (P3-2 G1).
+    ///
+    /// In the tree contract rather than only in the content API because `create_or_open`'s
+    /// `FILE_OVERWRITE_IF` arm has to truncate **inside** the same transaction that decided the disposition: doing it
+    /// afterwards would leave a window in which the entry exists, the old bytes are still readable, and a concurrent
+    /// opener sees a file that should already be empty.
+    ///
+    /// # Errors
+    ///
+    /// Backend failures, or the type error when `id` is a directory.
+    fn truncate(&mut self, id: FileId, new_size: u64) -> NamespaceResult<()>;
+
     /// Removes an inode **and everything that hangs off it**.
     ///
     /// The cascade is the backend's duty, not the caller's: P1's A1 defect was

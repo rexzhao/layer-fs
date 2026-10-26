@@ -49,6 +49,13 @@ impl TreeRead for OverlayWrite<'_> {
 }
 
 impl TreeWrite for OverlayWrite<'_> {
+    fn truncate(&mut self, id: FileId, new_size: u64) -> NamespaceResult<()> {
+        // Same implementation the content API uses, run against **this** transaction: the size change and the
+        // zeroing of the exposed range commit together with the disposition's decision.
+        crate::content::truncate_impl(&self.transaction, self.base, id, new_size)
+            .map_err(crate::view::into_namespace)
+    }
+
     fn bind(&mut self, parent: FileId, name: &[u8], child: FileId) -> NamespaceResult<()> {
         bind_impl(&self.transaction, self.base, parent, name, child)
             .map_err(crate::view::into_namespace)
