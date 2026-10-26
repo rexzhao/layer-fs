@@ -301,3 +301,29 @@ fn security_round_trips_and_stays_out_of_the_inode_view() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **The v2 shape must not move**: writing a descriptor changes an overlay row, **not** the snapshot root.
+///
+/// This is the encode-side half QA asked for. `set_security` writes a column; if it also republished anything, the base
+/// root id would change and the workspace would silently fork history. The assertion is on the **root id**, not on "no
+/// error", because a fork would be a successful call.
+///
+/// When `CURRENT` becomes v3 this stays true by construction — the descriptor lives in the overlay row, never in the
+/// committed tree — so this test does not flip with the baseline probe; `baseline_reverse` is the one that flips.
+#[test]
+fn setting_a_descriptor_does_not_change_the_root() {
+    let (dir, overlay) = overlay("root-stable");
+    overlay.set_attributes(id(), 0x20).expect("materialise");
+
+    let root_before = overlay.base_root();
+    overlay
+        .set_security(id(), Some(&[0x01, 0x02, 0x03, 0x04]))
+        .expect("set security");
+    overlay.set_security(id(), None).expect("clear security");
+    assert_eq!(
+        overlay.base_root(),
+        root_before,
+        "cell root: the descriptor is overlay state; the committed root must not move"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
