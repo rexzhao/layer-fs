@@ -60,43 +60,49 @@ pub struct VolumeInfo {
     pub volume_label: [u16; 32],
 }
 
-/// `FSP_FILE_SYSTEM_INTERFACE` — only the entries this frontend implements, in the SDK's order.
+/// `FSP_FILE_SYSTEM_INTERFACE` — the SDK's operation table, which is **64 pointers** (`winfsp.h:193-1093`, with the SDK's
+/// own assertion `sizeof(...) == 64 * sizeof(NTSTATUS (*)())` right after the struct).
 ///
-/// The SDK struct is a table of function pointers (`winfsp.h:1517`-ish, `FSP_FILE_SYSTEM_INTERFACE`); it is **longer**
-/// than this, and the entries we do not implement are `None`. The order matters — the table is positional — so this struct
-/// is a subset in SDK order, with each field citing the SDK entry it corresponds to.
+/// This type is deliberately **a fixed 64-slot array and not a struct with ten named fields**: the first version of this
+/// file declared only the ten operations we intend to implement, which reads like a table but is the wrong layout — passing
+/// it would put our `Create` into whichever slot happens to line up. The table is positional, so its **size** is part of the
+/// ABI and is asserted; the individual slot indices will be filled in when the callbacks are wired, one header line at a
+/// time.
 ///
-/// All pointers are `Option<unsafe extern "C" fn ...>`: `None` is how WinFsp is told "this operation is not supported",
-/// which is a supported answer for most entries and a required one for the optional volume operations.
-///
-/// Nothing here is wired yet (P3-4 step 1); the point of declaring it now is that the **shape** is reviewable before the
-/// callbacks exist, and the test below pins the order.
+/// Every slot is `Option`: `None` is how WinFsp is told "this operation is not supported".
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct FileSystemInterface {
-    /// `GetVolumeInfo` — no side effects, so it is the first callback to wire.
-    pub get_volume_info: Option<unsafe extern "C" fn() -> i32>,
-    /// `GetSecurityByName`.
-    pub get_security_by_name: Option<unsafe extern "C" fn() -> i32>,
-    /// `Create` — create **or** open, per the disposition in its parameters.
-    pub create: Option<unsafe extern "C" fn() -> i32>,
-    /// `Open`.
-    pub open: Option<unsafe extern "C" fn() -> i32>,
-    /// `Overwrite` — the truncation the adapter maps to `TruncateExisting`.
-    pub overwrite: Option<unsafe extern "C" fn() -> i32>,
-    /// `Cleanup` — the first phase of two-phase deletion.
-    pub cleanup: Option<unsafe extern "C" fn() -> i32>,
-    /// `Close` — where the adapter performs the single `remove_at` when the last handle goes.
-    pub close: Option<unsafe extern "C" fn() -> i32>,
-    /// `Read`.
-    pub read: Option<unsafe extern "C" fn() -> i32>,
-    /// `Write`.
-    pub write: Option<unsafe extern "C" fn() -> i32>,
-    /// `GetFileInfo` — also side-effect free.
-    pub get_file_info: Option<unsafe extern "C" fn() -> i32>,
+    /// The 64 function-pointer slots, in SDK order.
+    pub slots: [Option<unsafe extern "C" fn() -> i32>; Self::SLOTS],
 }
 
 impl FileSystemInterface {
-    /// The number of entries this build fills in, used by the order test.
-    pub const IMPLEMENTED: usize = 10;
+    /// The number of slots the SDK's table has (`FSP_FSCTL_STATIC_ASSERT(... == 64 * sizeof(...))`).
+    pub const SLOTS: usize = 64;
+
+    /// An all-unsupported table: the "nothing wired yet" state, which is also what a partially implemented mount must
+    /// never be mistaken for.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            slots: [None; Self::SLOTS],
+        }
+    }
+}
+
+impl Default for FileSystemInterface {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl std::fmt::Debug for FileSystemInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let filled = self.slots.iter().filter(|slot| slot.is_some()).count();
+        f.debug_struct("FileSystemInterface")
+            .field("slots", &Self::SLOTS)
+            .field("filled", &filled)
+            .finish()
+    }
 }

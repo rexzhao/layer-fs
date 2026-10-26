@@ -45,30 +45,22 @@ fn volume_info_matches_the_sdk_layout() {
     // 18 + 64 = 82; the struct rounds to 88 because `u64` members make the alignment 8.
 }
 
-/// The callback table's **shape** is reviewable before any callback exists: the order is positional in WinFsp, so an
-/// accidental reordering is an ABI bug that no behaviour test would catch.
+/// The callback table is a **64-slot** array, not a ten-field struct: the first version of this file got that wrong, and the
+/// SDK's own assertion (`sizeof == 64 * sizeof(pointer)`) is what caught it.
 #[test]
-fn the_interface_table_has_the_documented_shape() {
+fn the_interface_table_is_sixty_four_slots() {
     use fs_winfsp::abi::FileSystemInterface;
-    use std::mem::size_of;
 
-    // One optional function pointer per entry: `Option<fn>` is pointer-sized on this target.
     assert_eq!(
         size_of::<FileSystemInterface>(),
-        FileSystemInterface::IMPLEMENTED * size_of::<usize>(),
-        "cell size: the table is exactly `IMPLEMENTED` pointers, no padding"
+        FileSystemInterface::SLOTS * size_of::<Option<unsafe extern "C" fn() -> i32>>(),
+        "cell size: 64 pointers, no padding — the SDK asserts exactly this"
     );
-    assert_eq!(
-        FileSystemInterface::IMPLEMENTED,
-        10,
-        "cell count: ten entries are planned; changing this number is changing the ABI surface"
-    );
+    assert_eq!(FileSystemInterface::SLOTS, 64, "cell count: winfsp.h:1091");
 
-    // An all-`None` table must be constructible: that is the "nothing wired yet" state, and it is what the mount sees
-    // today rather than a half-filled table.
-    let empty = FileSystemInterface::default();
+    let empty = FileSystemInterface::empty();
     assert!(
-        empty.get_volume_info.is_none(),
-        "cell default: unsupported operations are `None`, not dangling pointers"
+        empty.slots.iter().all(Option::is_none),
+        "cell empty: an unwired mount must have every slot `None`, not a half-filled table that looks implemented"
     );
 }
