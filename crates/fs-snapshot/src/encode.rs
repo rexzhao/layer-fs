@@ -83,6 +83,42 @@ pub fn encode_directory(
 
 /// Encodes an inode table. The table is never empty: serial 0 is the root directory.
 ///
+/// The bytes of one inode record under `profile`.
+///
+/// `profile.inode_fmt` selects the layout: 1 is the v2 record (five fields), 2 is the v3 record (nine fields + security).
+/// Both are reached from the same `InodeRecord`, which is what keeps "which format is this page" a single decision.
+fn inode_record_bytes(profile: &Profile, record: &InodeRecord) -> SnapshotResult<Vec<u8>> {
+    if profile.inode_fmt == 1 {
+        let mut leaf = Writer::new();
+        leaf.u64(record.serial);
+        leaf.u8(record.kind.tag());
+        leaf.u64(record.size);
+        leaf.i64(record.created_ns);
+        leaf.i64(record.modified_ns);
+        // v2 has nowhere to put the v3 fields; dropping them here is the definition of "v2 cannot store this", not a
+        // lossy conversion somebody could "fix" by adding a byte.
+        leaf.u8(record.content.tag());
+        if let Some(oid) = content_object(record.clone()) {
+            leaf.oid(oid);
+        }
+        return Ok(leaf.finish());
+    }
+    let mut encoded = crate::inode_v3::encode(&crate::inode_v3::InodeRecordV3 {
+        serial: record.serial,
+        kind: record.kind,
+        size: record.size,
+        created_ns: record.created_ns,
+        modified_ns: record.modified_ns,
+        accessed_ns: record.accessed_ns,
+        changed_ns: record.changed_ns,
+        attributes: record.attributes,
+        security: record.security.clone(),
+        content: record.content,
+    })?;
+    encoded.shrink_to_fit();
+    Ok(encoded)
+}
+
 /// # Errors
 ///
 /// As [`encode_directory`], plus `Malformed` for an illegal kind/content pair.
@@ -104,21 +140,16 @@ pub fn encode_inode_table(
         // stores nothing before it: `page_key` stays empty and `leaf` carries the
         // whole record. Writing the key twice would make the decoder read the kind
         // byte out of the serial's second half.
-        let mut leaf = Writer::new();
-        leaf.u64(record.serial);
-        leaf.u8(record.kind.tag());
-        leaf.u64(record.size);
-        leaf.i64(record.created_ns);
-        leaf.i64(record.modified_ns);
-        leaf.u8(record.content.tag());
-        if let Some(oid) = content_object(record) {
-            leaf.oid(oid);
-        }
+        // The record's wire layout is chosen by the **profile**, and the choice is made here rather than in the pager:
+        // the pager writes a page's `fmt` byte and copies `entry.leaf` verbatim, so if these two disagreed the page
+        // would advertise one format while carrying another — the half-v3 shape that round-trips in-process and is
+        // unreadable everywhere else.
+        let leaf = inode_record_bytes(profile, &record)?;
 
         collected.push(Entry {
             key: key_bytes.clone(),
             page_key: Vec::new(),
-            leaf: leaf.finish(),
+            leaf,
             // In an inode branch the first key is `first_serial`, a bare u64.
             branch_key: key_bytes,
         });

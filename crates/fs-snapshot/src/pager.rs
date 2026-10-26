@@ -189,6 +189,18 @@ fn branch_overhead(shape: &Shape) -> usize {
     1 + usize::from(shape.inode_node_byte) + 1 + 4
 }
 
+/// A page's `fmt` byte: inode pages carry `inode_fmt`, every other page carries `fmt` (ADR-005-v3 draft §2.1).
+///
+/// One function so the writer cannot say "inode page" in one place and "generic page" in another; the reader mirrors it
+/// with the same predicate (`shape.inode_node_byte` ⇔ inode table page).
+fn page_fmt(profile: &Profile, shape: &Shape) -> u8 {
+    if shape.inode_node_byte {
+        profile.inode_fmt
+    } else {
+        profile.fmt
+    }
+}
+
 fn publish_leaf(
     profile: &Profile,
     shape: &Shape,
@@ -196,7 +208,7 @@ fn publish_leaf(
     sink: &mut dyn PageSink,
 ) -> SnapshotResult<Child> {
     let mut value = Vec::new();
-    value.push(profile.fmt);
+    value.push(page_fmt(profile, shape));
     if shape.inode_node_byte {
         value.push(0); // node = leaf
     }
@@ -224,7 +236,7 @@ fn publish_branch(
     sink: &mut dyn PageSink,
 ) -> SnapshotResult<Child> {
     let mut value = Vec::new();
-    value.push(profile.fmt);
+    value.push(page_fmt(profile, shape));
     if shape.inode_node_byte {
         value.push(1); // node = branch
     }

@@ -20,6 +20,15 @@ impl<'a> Reader<'a> {
         self.bytes.len() - self.offset
     }
 
+    /// The unread bytes, without consuming them.
+    ///
+    /// Needed by decoders whose length is only known **after** parsing (the v3 inode record: `security_len` decides how
+    /// long the record is). They parse a peek, then `take` exactly what they consumed — `take(remaining())` would look
+    /// equivalent for a single-record page and would silently swallow every following record.
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        &self.bytes[self.offset..]
+    }
+
     pub(crate) fn at_end(&self) -> bool {
         self.offset == self.bytes.len()
     }

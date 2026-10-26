@@ -163,7 +163,9 @@ impl<'a> SnapshotReader<'a> {
         loop {
             let page = fetch(self.source, pointer, Role::InodeTable, "inode table")?;
             let mut reader = Reader::new(&page);
-            reader.format(self.profile.fmt)?;
+            // Inode pages carry `inode_fmt`, not `fmt` (ADR-005-v3 draft §2.1). Mirroring the writer's single predicate
+            // is what makes "v3 page read by a v2 build" a version error (`UnsupportedFormat`) instead of a corrupt file.
+            reader.format(self.profile.inode_fmt)?;
             // The fourth and last caller: `lookup`, `read_dir` and `extents_in_range`
             // already bound the page, and this one was missed (P2a-1-QA-2).
             check_page_size(&page, &self.profile)?;
@@ -790,6 +792,27 @@ fn fetch(
 }
 
 fn decode_inode(reader: &mut Reader<'_>, profile: Profile) -> SnapshotResult<InodeRecord> {
+    // The record layout follows the page's format, and the page's format follows the profile. v3 records are decoded by
+    // the v3 codec, which validates its own invariants (derived attribute bits, `security_len`); the v2 path below
+    // cannot express those fields at all, so a v3 page reaching it is a version mismatch, not a corrupt record.
+    if profile.inode_fmt == 2 {
+        // `inode_v3::decode` works on a slice and reports how many bytes it consumed. Peek, then `take` exactly that
+        // many: consuming the whole remaining page would decode the first record and lose the rest of the page.
+        let (record, used) = crate::inode_v3::decode(reader.rest())?;
+        reader.take(used)?;
+        return Ok(InodeRecord {
+            serial: record.serial,
+            kind: record.kind,
+            size: record.size,
+            created_ns: record.created_ns,
+            modified_ns: record.modified_ns,
+            accessed_ns: record.accessed_ns,
+            changed_ns: record.changed_ns,
+            attributes: record.attributes,
+            security: record.security,
+            content: record.content,
+        });
+    }
     let serial = reader.u64()?;
     let kind_tag = reader.u8()?;
     let kind = Kind::from_tag(kind_tag)
