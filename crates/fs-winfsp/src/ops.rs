@@ -146,6 +146,14 @@ pub enum OpsError {
     OutOfRange,
     /// A malformed path (empty component, embedded separator, reserved name).
     InvalidParameter,
+    /// The backend refused because a **stored record** is not something it can interpret (a guard mismatch on the
+    /// underlying row, a corrupt entry).
+    ///
+    /// Distinct from [`Self::NotFound`] on purpose, and the distinction is the whole point of this variant: the core
+    /// reports `NamespaceError::InvalidRecord` where this used to fold into `NotFound`, and those two map to **different**
+    /// NTSTATUS values (`Internal` vs `OBJECT_NAME_NOT_FOUND`). Folding "the name now belongs to another entry" into
+    /// "the name is gone" tells the caller the wrong thing about its own handle.
+    InvalidRecord(String),
     /// Anything the core reported that has no dedicated variant here.
     Other(String),
 }

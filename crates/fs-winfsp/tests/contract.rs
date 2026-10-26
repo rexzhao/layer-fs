@@ -68,10 +68,12 @@ pub fn scenario_supersede_keeps_old_object<B: WorkspaceOps>(backend: &B) {
 pub fn scenario_removal_cases<B: WorkspaceOps>(backend: &B) {
     let file = create(backend, b"/a");
     let stranger = create(backend, b"/b");
-    assert_eq!(
-        backend.remove_at(ROOT, b"a", stranger),
-        Err(OpsError::NotFound),
-        "cell 1: another inode's name is refused"
+    assert!(
+        matches!(
+            backend.remove_at(ROOT, b"a", stranger),
+            Err(OpsError::InvalidRecord(_))
+        ),
+        "cell 1: another inode's name is refused — the guard reports a stale identity, not a missing entry"
     );
     assert_eq!(
         backend.remove_at(ROOT, b"a", file),

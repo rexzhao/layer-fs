@@ -41,6 +41,9 @@ pub const fn to_failure(error: &OpsError) -> Failure {
         OpsError::SharingViolation => Failure::SharingViolation,
         OpsError::DeletePending => Failure::DeletePending,
         OpsError::AccessDenied => Failure::AccessDenied,
+        // The core's `InvalidRecord` maps to `Internal` (see `fs_namespace::failure_for`); the adapter's variant carries
+        // the same meaning, so it lands on the same status instead of pretending the entry is missing.
+        OpsError::InvalidRecord(_) => Failure::Internal,
         OpsError::Other(_) => Failure::Internal,
     }
 }
@@ -71,6 +74,7 @@ mod tests {
             OpsError::SharingViolation,
             OpsError::DeletePending,
             OpsError::AccessDenied,
+            OpsError::InvalidRecord("guard mismatch".to_owned()),
             OpsError::Other("x".to_owned()),
         ];
         for error in all {

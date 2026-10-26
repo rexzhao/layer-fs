@@ -165,10 +165,14 @@ fn remove_at_classifies_three_ways() {
     let file = create(&backend, b"/f");
     let stranger = create(&backend, b"/g");
 
-    assert_eq!(
-        backend.remove_at(ROOT, b"f", stranger),
-        Err(OpsError::NotFound),
-        "cell 1: the name belongs to another inode"
+    // A **stale identity**, not a missing name: the core reports `InvalidRecord` here for the same reason, and the two
+    // map to different NTSTATUS values.
+    assert!(
+        matches!(
+            backend.remove_at(ROOT, b"f", stranger),
+            Err(OpsError::InvalidRecord(_))
+        ),
+        "cell 1: the name belongs to another inode — a stale handle, not a missing entry"
     );
     assert!(
         backend.is_live(file),

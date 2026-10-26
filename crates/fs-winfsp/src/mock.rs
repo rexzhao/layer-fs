@@ -597,7 +597,13 @@ impl WorkspaceOps for MockBackend {
         //   3. the name is free and `expected_id` is still **live** -> `NotFound`: the entry moved away and the caller's
         //      identity no longer names anything.
         match inner.children.get(&(parent, name.to_vec())).copied() {
-            Some(bound) if bound != expected_id => Err(OpsError::NotFound),
+            // The name now belongs to a **different** entry. That is not "not found" — the caller's handle is stale, and
+            // the core says `InvalidRecord` here for the same reason. Folding it into `NotFound` would report a missing
+            // file where the truth is "your identity no longer names this name".
+            Some(bound) if bound != expected_id => Err(OpsError::InvalidRecord(format!(
+                "remove_at guard: {parent}/{} is bound to {bound}, caller expected {expected_id}",
+                String::from_utf8_lossy(name)
+            ))),
             Some(bound) => {
                 inner.children.remove(&(parent, name.to_vec()));
                 inner.retire(bound);
