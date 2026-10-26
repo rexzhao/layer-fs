@@ -1,6 +1,7 @@
 # P3-4 任务卡（草案）：自写最小 WinFsp FFI + 真实挂载 + L2/L3 实测
 
-- 状态：**草案（architect 起草，2026-10-26）——未派发**。§9 的三项裁定完成前不得派发。
+- 状态：**草案（architect 起草，2026-10-26）——可派发**（§9.1 已由 owner 裁决 (a)；§9.2/§9.3 为本卡开工首项，按建议执行、以 L2 结果定稿）。
+- **总纲（owner，2026-10-26）**：**只要保证用起来与普通文件系统（NTFS）的真实行为一致即可**，适用于以前和以后的开发内容。本卡每一处 NTFS 对照以它为准：对照结果与 ADR/卡的文本不符时，**以实测为准修订文本**，不以文本约束实测；"有意差异"只允许传输层确实无法表达的情形，并须写明证据 ref。
 - 上游：ADR-009（W1–W14、§5、§6、§8、§12）；`docs/process/p3-winfsp-ffi-surface.md`（FFI 面）；P3-3a（adapter 骨架 + mock）；P3-3b（真实 `fs-api` 后端重跑契约测试）；P3-2（G1–G4）。
 - 环境：WinFsp 2.1 运行时已装、驱动已加载；SDK 在 `F:/work/winfsp-sdk/DYNAMIC/{inc,lib}`；冒烟已过（`LoadLibraryW` + `FspVersion` → status 0）。
 - 下游建议拆分（见 §10）：**P3-4a**（本卡：FFI + 挂载 + L2 语义）／**P3-4b**（spec §2 P3 第 5、6 条：真实 workload 与 NTFS 性能对照）。
@@ -27,7 +28,7 @@ P3-3a/3b 把"所有能用普通 Rust 测的语义"做完了；本卡只做**转�
 | # | 前置（出处） | 现有依据等级 | P3-4 的验证方式 | 不成立时的后果 |
 | --- | --- | --- | --- | --- |
 | U1 | **rename-replace 目标有打开句柄时 FSD 不下发 Rename**（ADR-009 §5.4；P3-2 卡 G4 前提） | 头文件文档（`winfsp.h:612-617`："A file cannot be renamed if a file with the same name exists and has open handles"）；**无行为实测** | L2：打开目标 `T` 不关 → `MoveFileEx(S, T, REPLACE_EXISTING)`；断言 Win32 失败且 adapter 的 `Rename` 回调**未被调用**（回调计数 0） | 改用 SUPERSEDE/保留语义（ADR-009 §5.4 的"若实测不成立"分支），G4 判据 5 重写 |
-| U2 | **SUPERSEDE = 新 FileId + 旧 inode 保留**（ADR-009 §4.2；B-8；P3-3a 判据 2；P3-2 G1 的 SUPERSEDE 行） | **被接口证据挑战（见 §9.1）**：WinFsp 2.1 源码（`fsop.c:929-972`）把 `FILE_SUPERSEDE` 处理为 `Open` + `Overwrite(同一 FileContext, ReplaceFileAttributes=Supersede)`，不调 `Create` | 先裁定（§9.1），再 L2：`CreateFile(CREATE_ALWAYS)` 命中既有文件时 NTFS 与本 FS 的 `FileIndex` 是否变化、旧句柄读到什么 | 见 §9.1 |
+| U2 | **SUPERSEDE 同 FileId 覆盖**（owner 裁决 (a)；ADR-009 §4.2 修订） | 已裁决；WinFsp 2.1 源码 `fsop.c:929-981` | L2：`CREATE_ALWAYS` 命中既有文件 ⇒ `Overwrite(ReplaceFileAttributes=TRUE)`、`TRUNCATE_EXISTING`/`OPEN_ALWAYS+truncate` ⇒ `FALSE`；FileIndex 前后不变；旧句柄读到 size 0；与 NTFS 对照 FileIndex | 以 NTFS 实测为准修订 ADR（总纲） |
 | U3 | **share mode 与 delete-pending 由 adapter 句柄表判定**（ADR-009 W6/W7） | WinFsp-Design 文档称 FSD 已处理"file sharing、open 与 delete/rename 的冲突"；**无行为实测** | L2：双进程 9 格 share 组合 + delete-pending 新 open；同时记录 adapter 回调是否被调用 | 见 §9.2（单一来源） |
 | U4 | **目录 rename 时子孙有打开句柄** | 头文件文档（`winfsp.h:615-616`：FSD 拒绝）；**无行为实测** | L2：打开 `/d/f` 不关 → rename `/d` → 断言 Win32 失败且回调未被调用 | 若会下发：adapter 必须保证子孙句柄的 binding 不失效（parent 是 FileId，ADR-009 §5.4 已覆盖）并补 L2 判据 |
 | U5 | **默认 SD（`GetSecurityByName` 返回 `size=0`）被 OS 接受**（FFI 面 §2） | 无 | L2：`GetFileSecurity`/`icacls`/资源管理器属性页可读；创建/打开不因 SD 失败 | 绑定 `FspCreateSecurityDescriptor`/`FspDeleteSecurityDescriptor` 构造默认 SD（FFI 面已预留） |
@@ -48,7 +49,7 @@ P3-3a/3b 把"所有能用普通 Rust 测的语义"做完了；本卡只做**转�
 ## 2. FFI 最小面（以 `p3-winfsp-ffi-surface.md` 为准，本卡只列"必须绑定"）
 
 - **主机 API（P0）**：`FspFileSystemCreate`/`Delete`/`SetMountPoint`/`StartDispatcher`/`StopDispatcher`/`AcquireDirectoryBuffer`/`AddDirInfo`/`ReleaseDirectoryBuffer`；**P1**：`RemoveMountPoint`、`StopServiceIfNecessary`、`FspVersion`、`NotifyBegin/End/Notify` + `AddNotifyInfo`（通知可在 P3-4b 才启用，但绑定在本卡完成）。
-- **回调（P0）**：`GetVolumeInfo`、`GetSecurityByName`、`Open`、`Create`、`Overwrite`（**新增为 P0**，见 §9.1：SUPERSEDE/OVERWRITE 只经它下发）、`Read`、`Write`、`GetFileInfo`、`ReadDirectory`、`Cleanup`、`Close`；**P1**：`SetFileSize`、`SetBasicInfo`、`Rename`、`CanDelete`、`SetDelete`（或只 `CanDelete`，见 §9.2）、`Flush`、`GetSecurity`、`SetSecurity`（返回 `STATUS_NOT_SUPPORTED`）。
+- **回调（P0）**：`GetVolumeInfo`、`GetSecurityByName`、`Open`、`Create`、`Overwrite`（**P0**：SUPERSEDE/OVERWRITE 只经它下发；只凭 `ReplaceFileAttributes` 区分二者，ADR-009 §4.2 (a) 判据 1）、`Read`、`Write`、`GetFileInfo`、`ReadDirectory`、`Cleanup`、`Close`；**P1**：`SetFileSize`、`SetBasicInfo`、`Rename`、`CanDelete`、`SetDelete`（或只 `CanDelete`，见 §9.2）、`Flush`、`GetSecurity`、`SetSecurity`（返回 `STATUS_NOT_SUPPORTED`）。
 - **不绑定**：异步完成、服务化、POSIX/路径辅助、EA/stream/reparse、`FspFileSystemOp*`、内核模式 API（FFI 面 §7）。
 - **卷参数**：ADR-009 §8 的 flag 集合 + **FileContext 模式**（§9.3 裁定）。位域只经 bindgen 生成的访问器设置。
 - **绑定生成**：bindgen 产物入库，CI 重新生成并 `git diff --exit-code`；缺 SDK 时 `build.rs` 编译失败并打印安装指引（L3）。
@@ -107,15 +108,15 @@ P3-3a/3b 把"所有能用普通 Rust 测的语义"做完了；本卡只做**转�
 
 ## 6. 交付与验收
 
-- 分支 `p3-4a/ffi-mount`，基于 `origin/main`；提交说明首行写判据影响行（含 U<n> 的消项结论）；
+- 分支 `p3-4a/ffi-mount`，基于 `origin/main`（**须在 G1 修订卡合入之后**：本卡依赖 (a) 的 `Overwrite` 语义）；提交说明首行写判据影响行（含 U<n> 的消项结论）；
 - 每次提交附：L1 测试结果、L2/L3 用例的**执行记录**（不是"已写"）、§1 表的当前状态；
 - QA 独立复跑 L2（至少 3 次）与 L3 M1–M9；变异：把 `Overwrite` 回调实现成"新建 FileId"/"保留旧内容"（按 §9.1 裁定的反面）⇒ 对应 L2 第 1 条必须红。
 
 ---
 
-## 9. 开工前必须裁定的三件事（本卡阻塞项）
+## 9. 开工前裁定（9.1 已关闭；9.2/9.3 为开工首项）
 
-### 9.1 SUPERSEDE 的身份语义与 WinFsp 接口冲突（**阻塞，影响已合入的 ADR 与 P3-2/P3-3a 判据**）
+### 9.1 SUPERSEDE 的身份语义与 WinFsp 接口冲突（**已关闭：owner 2026-10-26 裁决 (a)**，修订见 ADR-009 §4.2 与 `docs/reports/supersede-a-impact.md`；以下保留为裁决依据）
 
 **事实（接口证据，不是推测）**：
 - WinFsp 2.1 用户态分发（`src/dll/fsop.c`，tag `v2.1`）：`FILE_SUPERSEDE` 与 `FILE_OVERWRITE_IF` **同走** `FspFileSystemOpCreate_FileOverwriteIf`（fsop.c:929-931）——目标存在则先调 **`Open`**（fsop.c:696-708），返回 `FILE_SUPERSEDED`/`FILE_OVERWRITTEN`；随后 FSD 发 `Overwrite` 请求，`FspFileSystemOpOverwrite` 把**同一个 FileContext** 与 `Supersede` 位作为 `ReplaceFileAttributes` 传给 `Overwrite` 回调（fsop.c:946-972；回调签名 `winfsp.h:326-347`；请求位 `fsctl.h:376-378`）；
