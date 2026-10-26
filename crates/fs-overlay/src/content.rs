@@ -131,6 +131,51 @@ impl OverlayStore {
             .map_err(|error| into_namespace(OverlayError::Sqlite(error)))
     }
 
+    /// Sets the **stored** attribute bits and moves `changed_ns`.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidRecord` for a derived/unknown bit, `NotFound` for an absent inode.
+    pub fn set_attributes(&self, id: FileId, attributes: u32) -> NamespaceResult<()> {
+        let _guard = ScopeGuard::enter().map_err(into_namespace)?;
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction()
+            .map_err(|error| into_namespace(OverlayError::Sqlite(error)))?;
+        set_attributes_impl(&transaction, &self.base, id, attributes).map_err(into_namespace)?;
+        transaction
+            .commit()
+            .map_err(|error| into_namespace(OverlayError::Sqlite(error)))
+    }
+
+    /// The stored attribute bits for `id` (0 when the overlay has no row).
+    ///
+    /// # Errors
+    ///
+    /// SQL failures.
+    pub fn attributes(&self, id: FileId) -> NamespaceResult<u32> {
+        let _guard = ScopeGuard::enter().map_err(into_namespace)?;
+        let connection = self.lock();
+        attributes_impl(&connection, id).map_err(into_namespace)
+    }
+
+    /// How many inode rows the overlay holds, for tests that must prove a refusal created none.
+    ///
+    /// # Errors
+    ///
+    /// SQL failures.
+    #[cfg(feature = "gc-test-hooks")]
+    pub fn inode_row_count(&self) -> NamespaceResult<u64> {
+        let _guard = ScopeGuard::enter().map_err(into_namespace)?;
+        let connection = self.lock();
+        connection
+            .query_row("SELECT COUNT(*) FROM ov_inode", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| u64::try_from(count).unwrap_or(0))
+            .map_err(|error| into_namespace(OverlayError::Sqlite(error)))
+    }
+
     /// Reports how a file's bytes are currently represented.
     ///
     /// # Errors
@@ -475,3 +520,68 @@ fn resolve_file(
     }
 }
 
+/// Sets the **stored** attribute bits and moves `changed_ns`.
+///
+/// Validation happens **here** — the layer closest to the disk — with the same `fs_semantics::attributes::validate` the
+/// core and the frontend call, so a derived bit cannot be stored by a caller that bypasses the rules layer.
+///
+/// # Errors
+///
+/// [`OverlayError::InvalidRecord`] for a derived/unknown bit, `NotFound` when the inode does not exist, SQL failures.
+pub(crate) fn set_attributes_impl(
+    connection: &Connection,
+    base: &crate::base::BaseLayer,
+    id: FileId,
+    attributes: u32,
+) -> OverlayResult<()> {
+    fs_semantics::attributes::validate(attributes).map_err(|failure| {
+        OverlayError::InvalidRecord {
+            field: "ov_inode.attributes",
+            detail: format!("attributes {attributes:#x} rejected: {failure:?}"),
+        }
+    })?;
+    let now = now_ns();
+    if inode_row(connection, id.serial())?.is_none() {
+        let Some(record) = base.inode(id.serial())? else {
+            return Err(OverlayError::Namespace(NamespaceError::NotFound {
+                path: format!("{}", id.serial()),
+            }));
+        };
+        // A base inode acquires an override row the first time it is touched. Everything except the field being set keeps
+        // the base's value — including `base_limit`, which is the whole size because no content was written — so "what the
+        // workspace sees" changes in exactly one place.
+        connection.execute(
+            "INSERT INTO ov_inode
+             (serial, origin, live, kind, size, created_ns, modified_ns, base_limit, entries, changed_ns, attributes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 0)",
+            (
+                id.serial() as i64,
+                schema::ORIGIN_BASE,
+                schema::LIVE,
+                kind_tag(record.kind),
+                record.size as i64,
+                record.created_ns,
+                record.modified_ns,
+                record.size as i64,
+                now,
+            ),
+        )?;
+    }
+    connection.execute(
+        "UPDATE ov_inode SET attributes = ?1, changed_ns = ?2 WHERE serial = ?3",
+        (i64::from(attributes), now, id.serial() as i64),
+    )?;
+    Ok(())
+}
+
+/// The stored attribute bits for `id`: 0 when the overlay holds no row (a base inode nobody has touched).
+///
+/// # Errors
+///
+/// SQL failures.
+pub(crate) fn attributes_impl(connection: &Connection, id: FileId) -> OverlayResult<u32> {
+    match inode_row(connection, id.serial())? {
+        Some(row) => Ok(u32::try_from(row.attributes).unwrap_or(0)),
+        None => Ok(0),
+    }
+}

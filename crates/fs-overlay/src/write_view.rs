@@ -360,4 +360,3 @@ pub(crate) fn now_ns() -> i64 {
         .map(|elapsed| elapsed.as_nanos() as i64)
         .unwrap_or(0)
 }
-
