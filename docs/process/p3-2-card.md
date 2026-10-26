@@ -71,6 +71,16 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 
 **纪律**：**不得为了迁就现有夹具而放宽断言**——先落夹具、再落判据；缺口按四步表写进这张卡，不写在邮件里。
 
+**worker 交 `a743147` 时的原文（已按四步表落档）**
+
+> 状态：**未实现**（不是“已覆盖”）。阻塞点在第 2 步（夹具），不是在第 4 步（判据）；判据本身已明确，无需再裁定。
+>
+> - **判据 1（读放大）缺在第 2 步：夹具形态。** 需要“同一时刻只持有一个 `Workspace` 句柄”的夹具（第二个句柄会 `Busy`），且内容必须**已提交**（未提交字节在 overlay 页，`pack_read_bytes` 会因错误原因保持 0）。现有 `g2_read_side` 夹具同时持有 `Workspace` 与 `Repo`，两条都不满足；**不放宽断言去迁就夹具**，故未交付。
+> - **判据 4（跨重启）缺在第 2 步：同一原因**（重开 `Repo` 前必须释放前一个句柄，现有夹具在测试体内无法释放）。
+> - 证据位置：`crates/fs-workspace/tests/g2_read_side.rs` 末尾的 `read amplification / restart: fixture restructure pending` 注释块。
+> - 计划：先落删除侧（`remove_at` tombstone），再用“一次只开一个句柄”的夹具补这两条，同批合入。
+
+
 **归属说明**：`delete-pending` 期间"用 FileId 继续读"属 **adapter/模型层**（P3-1 的 `delete` 模块已建模），**不在 G2**；
 存储层不持久 delete-pending（与 Windows 语义一致：重启后 pending 消失）。这条写进卡以免 G2/G3 互相越界。
 
