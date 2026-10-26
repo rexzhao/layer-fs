@@ -189,3 +189,61 @@ fn a_derived_bit_is_refused_and_creates_no_row() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Time semantics with a **pinned clock** (no wall clock, no sleeps): a content write moves `modified_ns` *and*
+/// `changed_ns`, while setting only `accessed` must not touch `modified_ns`.
+#[test]
+fn set_times_moves_only_what_was_asked_for() {
+    use fs_overlay::clock;
+
+    let (dir, overlay) = overlay("times");
+    clock::set(Some(10_000));
+    overlay
+        .set_attributes(id(), 0x20)
+        .expect("materialise with a known clock");
+    let first = overlay
+        .read(|tree: &fs_overlay::OverlayRead<'_>| TreeRead::inode(tree, id()))
+        .expect("read")
+        .expect("inode");
+    assert_eq!(
+        first.changed_ns, 10_000,
+        "cell materialise: changed_ns is the pinned clock"
+    );
+
+    clock::set(Some(20_000));
+    overlay
+        .set_times(id(), Some(1_111), None, None, None)
+        .expect("set accessed only");
+    let second = overlay
+        .read(|tree: &fs_overlay::OverlayRead<'_>| TreeRead::inode(tree, id()))
+        .expect("read")
+        .expect("inode");
+    assert_eq!(
+        second.accessed_ns, 1_111,
+        "cell accessed: the explicit value"
+    );
+    assert_eq!(
+        second.modified_ns, first.modified_ns,
+        "cell modified: untouched — `None` means leave it alone, not 'set it to now'"
+    );
+    assert_eq!(
+        second.changed_ns, 20_000,
+        "cell changed: a metadata write still moves the change time"
+    );
+
+    // An explicit `changed` wins over the implicit bump (SetFileTime can backdate).
+    clock::set(Some(30_000));
+    overlay
+        .set_times(id(), None, None, Some(5), None)
+        .expect("set changed explicitly");
+    let third = overlay
+        .read(|tree: &fs_overlay::OverlayRead<'_>| TreeRead::inode(tree, id()))
+        .expect("read")
+        .expect("inode");
+    assert_eq!(
+        third.changed_ns, 5,
+        "cell explicit: a caller-supplied change time beats the clock"
+    );
+    clock::set(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -354,7 +354,36 @@ fn base_kind(record: &InodeRecord) -> Kind {
     }
 }
 
+/// The clock seam: a test may pin the time, production always reads the wall clock.
+///
+/// A thread-local `Option` rather than a field on `OverlayOptions`: the seam must cost nothing in production (an unused
+/// `Option` read), and it must not appear in a structure that is serialised or compared — a `clock` field there would leak
+/// into every equality assertion about options.
+#[cfg(feature = "gc-test-hooks")]
+pub mod clock {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PINNED: Cell<Option<i64>> = const { Cell::new(None) };
+    }
+
+    /// Pins the clock to `ns` for this thread; `None` returns to the wall clock.
+    pub fn set(ns: Option<i64>) {
+        PINNED.with(|cell| cell.set(ns));
+    }
+
+    /// The pinned value, if any.
+    #[must_use]
+    pub fn get() -> Option<i64> {
+        PINNED.with(Cell::get)
+    }
+}
+
 pub(crate) fn now_ns() -> i64 {
+    #[cfg(feature = "gc-test-hooks")]
+    if let Some(pinned) = clock::get() {
+        return pinned;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos() as i64)

@@ -57,4 +57,6 @@ pub use content::ContentState;
 pub use error::{OverlayError, OverlayResult};
 pub use store::{OverlayOptions, OverlayStore};
 pub use view::OverlayRead;
+#[cfg(feature = "gc-test-hooks")]
+pub use write_view::clock;
 pub use write_view::OverlayWrite;

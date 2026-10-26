@@ -235,6 +235,42 @@ pub const MAX_NAME_BYTES: usize = 255;
 /// Largest accepted path depth, in segments (ADR-003 §3.1 P8).
 pub const MAX_DEPTH: usize = 64;
 
+/// The frontend failure this error denotes.
+///
+/// The mapping lives here — not in each adapter — because there is one NTSTATUS table (`fs_windows::error::to_status`) and
+/// it takes a [`fs_semantics::disposition::Failure`]. An adapter that wrote its own translation would be a second table,
+/// and the two would disagree exactly where it matters (a guard mismatch reported as "not found" versus "internal").
+///
+/// **Exhaustive on purpose, no fallback arm**: a new variant must be given a frontend meaning.
+#[must_use]
+pub fn failure_for(error: &NamespaceError) -> fs_semantics::disposition::Failure {
+    use fs_semantics::disposition::Failure;
+    match error {
+        NamespaceError::InvalidPath(_) | NamespaceError::InvalidParameter { .. } => {
+            Failure::InvalidParameter
+        }
+        NamespaceError::NotFound { .. } => Failure::LeafMissing,
+        NamespaceError::AlreadyExists { .. } | NamespaceError::NameCollision { .. } => {
+            Failure::NameCollision
+        }
+        NamespaceError::NotADirectory { .. } => Failure::NotADirectory,
+        NamespaceError::IsADirectory { .. } => Failure::IsADirectory,
+        NamespaceError::DirectoryNotEmpty { .. } => Failure::DirectoryNotEmpty,
+        NamespaceError::IntoOwnSubtree { .. } => Failure::InvalidParameter,
+        NamespaceError::IsRoot => Failure::AccessDenied,
+        NamespaceError::ReadOnly => Failure::AccessDenied,
+        NamespaceError::NamespaceNotFound { .. } => Failure::ParentMissing,
+        // `InvalidRecord` is "the data on disk is not something this build can interpret" — an internal fault, not a
+        // caller mistake. Mapping it to `LeafMissing` (as the mock does for its guard case) would make a corrupt store
+        // look like a missing file; that difference is recorded for P3-3b.
+        NamespaceError::InvalidRecord { .. } | NamespaceError::SchemaMismatch { .. } => {
+            Failure::Internal
+        }
+        NamespaceError::NestedTransaction => Failure::Internal,
+        NamespaceError::Store(_) => Failure::Internal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

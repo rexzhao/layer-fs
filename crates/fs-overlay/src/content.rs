@@ -159,6 +159,39 @@ impl OverlayStore {
         attributes_impl(&connection, id).map_err(into_namespace)
     }
 
+    /// Sets whichever of the four timestamps are given (`None` leaves that one alone).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an absent inode, SQL failures.
+    pub fn set_times(
+        &self,
+        id: FileId,
+        accessed: Option<i64>,
+        written: Option<i64>,
+        changed: Option<i64>,
+        created: Option<i64>,
+    ) -> NamespaceResult<()> {
+        let _guard = ScopeGuard::enter().map_err(into_namespace)?;
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction()
+            .map_err(|error| into_namespace(OverlayError::Sqlite(error)))?;
+        set_times_impl(
+            &transaction,
+            &self.base,
+            id,
+            accessed,
+            written,
+            changed,
+            created,
+        )
+        .map_err(into_namespace)?;
+        transaction
+            .commit()
+            .map_err(|error| into_namespace(OverlayError::Sqlite(error)))
+    }
+
     /// How many inode rows the overlay holds, for tests that must prove a refusal created none.
     ///
     /// # Errors
@@ -584,4 +617,56 @@ pub(crate) fn attributes_impl(connection: &Connection, id: FileId) -> OverlayRes
         Some(row) => Ok(u32::try_from(row.attributes).unwrap_or(0)),
         None => Ok(0),
     }
+}
+/// Sets the requested timestamps; `None` leaves a field alone, and `changed_ns` moves unless it was set explicitly.
+///
+/// An explicit `changed` wins over the implicit "metadata changed" bump: the caller that says what the time is knows more
+/// than the clock does (`SetFileTime` can backdate).
+///
+/// # Errors
+///
+/// [`OverlayError::Namespace`] with `NotFound` for an absent inode, SQL failures.
+pub(crate) fn set_times_impl(
+    connection: &Connection,
+    base: &crate::base::BaseLayer,
+    id: FileId,
+    accessed: Option<i64>,
+    written: Option<i64>,
+    changed: Option<i64>,
+    created: Option<i64>,
+) -> OverlayResult<()> {
+    let now = now_ns();
+    if inode_row(connection, id.serial())?.is_none() {
+        let Some(record) = base.inode(id.serial())? else {
+            return Err(OverlayError::Namespace(NamespaceError::NotFound {
+                path: format!("{}", id.serial()),
+            }));
+        };
+        connection.execute(
+            "INSERT INTO ov_inode
+             (serial, origin, live, kind, size, created_ns, modified_ns, base_limit, entries, changed_ns, attributes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 0)",
+            (
+                id.serial() as i64,
+                schema::ORIGIN_BASE,
+                schema::LIVE,
+                kind_tag(record.kind),
+                record.size as i64,
+                record.created_ns,
+                record.modified_ns,
+                record.size as i64,
+                now,
+            ),
+        )?;
+    }
+    connection.execute(
+        "UPDATE ov_inode SET
+             accessed_ns = COALESCE(?1, accessed_ns),
+             modified_ns = COALESCE(?2, modified_ns),
+             changed_ns  = COALESCE(?3, ?4),
+             created_ns  = COALESCE(?5, created_ns)
+         WHERE serial = ?6",
+        (accessed, written, changed, now, created, id.serial() as i64),
+    )?;
+    Ok(())
 }
