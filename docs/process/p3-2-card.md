@@ -140,11 +140,26 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 **基线要求**：**改动前**、同机、同参数（10 万 inode）测，报告带 commit SHA 与机器；记录
 `record_old`、`record_new`、`pages_old`、`height_old`、`time_old`、`avg_entries_per_page`、`max_page_bytes` 命中次数。
 
-**判据（数值由 QA 从基线填入；未填前本段视为未定稿，不得派发执行）**：
-1. `pages_new ≤ pages_old × (1 + __%)`（默认建议 5%，QA 按基线定）；
+**判据（2026-10-26 定稿；数值来自 QA 在 `41694d0` 的同机实测基线）**：
+1. `pages_new ≤ pages_old × 1.05`（基线 1472 ⇒ 红界 **1546**）。**依据**：容量 244→179（−26.6%），但**只有 2.3% 的页受容量约束**（34/1448），期望 ≈ **+0.9%**；+5% 留 5 倍余量，仍能抓“按字节打包”的真回归（+26%）；
 2. **任一 v3 页的字节数 > `max_page_bytes` ⇒ 红**（这是记录膨胀唯一会改变页数的机制；报告触发页数/最满页）；
-3. `height_new ≤ height_old + __`（记录膨胀可能多一层；QA 按基线定 0 或 1）；
-4. `time_new ≤ time_old × __`（写放大/耗时容忍；QA 定）。
+3. `height_new ≤ height_old + 0`（基线 2 ⇒ 红界 **>2**）。**依据**：24 个 branch 对扇出约 402，远未饱和；
+4. `time_new ≤ time_old × 1.2`（基线 **187 ms** 中位（163/164/187/193/195）⇒ 红界 **224 ms**）。**必须同 build 同机**：debug/release 差 5–10 倍；worker 若用 release 测，不得套用此数。
+
+**基线实测（`41694d0`，Windows 10 本地 SSD，debug，99,999 条带 oid 记录）**
+
+| 项 | 值 |
+| --- | --- |
+| `record_old` | **66 B**（带 oid）／ **34 B**（Empty） |
+| `pages_old` | **1472**（leaves 1448 + branches 24） |
+| `height_old` | **2** |
+| `time_old` | **187 ms** 中位（163/164/187/193/195） |
+| 最大页实测 | **16110**（距 `max_page_bytes` 16384 仅 274 B） |
+| `max_entries_per_leaf` | **244** |
+| `avg_entries_per_page` | **69.06**（v3 预期 ≈ **68.5**） |
+| **护栏命中** | **34 / 1448 = 2.3%** ← **“原 24/4096 模型作废”的直接证据** |
+
+**两条执行纪律**：① 基线绑定 `41694d0`；G3 之前若 main 有改动触及**编码器或 profile** ⇒ 必须重测（G2 只改读路径，可复用）；② 判据 4 必须同 build 同机。
 
 超出任一阈值 ⇒ 红，并作为**代价问题**上报给 owner（manager 转）。
 
