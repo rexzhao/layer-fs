@@ -196,6 +196,8 @@ remove_at(parent: FileId, name: &[u8], expected_id: FileId) -> Result<()>
 **正常删除** = `remove_at`（内部解除绑定 + 删除内容 + 把 inode 行置为 **tombstone `live=0`**；by-id 的 `read/stat/read_dir` 一律 `NotFound`；行保留"只增"，由 **B-10** 回收）。**不得**保留"live 且 size>0 但内容已删"的行——那会让读返回零或错数据。
 **SUPERSEDE** = 解除旧名字 + 创建新 inode，**不**对旧 inode 调 `remove_at`（旧 inode 保留，§4.2）；核心返回 `replaced: Option<FileId>`，adapter 把旧 FileId 的所有句柄标记为 **unbound**。
 
+**rename-replace**（`replace=true` 且目标存在）：WinFsp FSD 保证"目标名已有打开句柄时不下发 Rename"（`FspFileSystem` 的 Rename 契约），因此目标在本 adapter 下没有句柄，核心**可以立即 retire 目标**并返回 `replaced: Option<FileId>`；adapter 仍按防御性把该 id 的句柄标记 unbound（若真存在，说明 FSD 契约被破坏，记录而不是静默）。目标就是源自身（同 FileId）时 `replaced = None`，不得 retire 自己。
+
 **两类"行保留"的可见性相反**（两者都只增，最终由 **B-10** 回收）：
 
 | 路径 | inode 行状态 | 旧句柄 | by-id 读 |

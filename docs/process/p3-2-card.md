@@ -96,12 +96,20 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 - `replace=true`：目标存在则替换（R3）；跨类型（R4/R5）与非空目录（R6）规则不变；
 - `replace=false`：目标存在即 `NameCollision`，**且不得有任何改动**。
 
+**前提（写进卡）**：WinFsp FSD 保证"目标名已有打开句柄时不下发 Rename"，因此 `replace=true` 的目标在本 adapter 下**没有句柄**，核心可以立即 retire 它；核心不建模句柄，G4 只按这个前提测。
+
 **判据**
 
 1. true：替换成功，目标内容为源内容、源消失；
 2. false 冲突：返回 `NameCollision` **且指纹不变**——`store/` 的 `(路径, 长度, 哈希)` 清单 + `object_location` 行数 +
    目标父目录 `read_dir` 三者前后相同（"返回冲突"与"没改动"是两件事）；
-3. 并发 `replace=false`：`Barrier` + 20–50 轮，每轮"一成一败"。
+3. 并发 `replace=false`：`Barrier` + 20–50 轮，每轮"一成一败"；
+4. **返回的 `binding` 正确**：`rename(from,to,r)` 成功时 `binding.parent == FileId(parent(to))`、`binding.name == to 的最后一段原始字节`（保留大小写）；用该 `binding` + 源 FileId 调 `remove_at` 必须删到 `to`。反例（任一即红）：返回 `from` 的旧 binding、返回 parent 的路径字符串、返回折叠后的名字。
+5. **`replaced` 语义**：`replace=false` 目标不存在 / `rename(x,x)` / 大小写-only 且目标不存在 ⇒ `None`；`replace=true` 且目标存在且是**不同 FileId** ⇒ `Some(old)`，且返回后 `stat_id(old)`/`read_id(old)` 都是 `NotFound`（tombstone），目标名此时解析到源 FileId；`replace=true` 且目标就是源自身（同 FileId）⇒ `None`，**不得**把自己 retire。
+6. **目录 rename-replace**：`replace=true` 目标是空目录 ⇒ `replaced=Some(old_dir)`，其子树内各 FileId 不变；目标非空 ⇒ `NotEmpty`、无 `binding/replaced` 返回、§4.1 指纹不变。
+7. **大小写-only rename**：`/A → /a` 且 `/a` 不存在 ⇒ `binding.name == b"a"`、`replaced=None`、FileId 不变；`/a` 存在且是另一个 FileId ⇒ `replace=false` 返回 `NameCollision`；`replace=true` 按 R3 替换（这是**核心语义**；adapter 对"折叠名冲突"另有拒绝策略，见 ADR-009 §4.1，G4 不替 adapter 表态）。
+8. **失败不产生 outcome**：跨类型（R4/R5）、非空目录（R6）、移入自身子树（R9）、`replace=false` 冲突，一律返回 typed 错误，**不返回** `binding/replaced`，且判据 2 的三项指纹/计数不变。
+9. **竞争与 outcome 配对**（扩展判据 3）：20–50 轮中，成功一方的 `binding`/`replaced` 必须与最终目录视图一致；失败一方无 outcome 且无改动；不得出现"返回成功但 binding 指向失败者的名字"。
 
 ## 5. 顺带清理（`PACK_TAIL_BYTES`）
 
