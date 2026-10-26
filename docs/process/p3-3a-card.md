@@ -183,7 +183,7 @@ mock 的作用是**让 adapter 的语义可测**，不是复刻 `fs-api`。它�
 | M3 | **create_or_open 全 18 格**：六种 disposition × 不存在/文件/目录；返回 `file_id/kind/action/binding/replaced/size/times/attributes` | 18 格表与 SUPERSEDE 判据 | 少一格 ⇒ 表驱动红；缓存旧 size/times ⇒ §3.2 假绿 |
 | M4 | **SUPERSEDE**：新 FileId；旧 inode 记录保持 **live 且内容可读**（B 方案）；`replaced=Some(old)` | 判据 2（B-8） | 只标 unbound/不可见而不保留内容 ⇒ 旧句柄读到空/错 ⇒ 判据 2 红 |
 | M5 | **rename**：原子；返回 `binding/replaced`；`replace=false` 冲突零改动；目录/非空/跨类型规则同 ADR-003；case-only 更新名字字节 | 判据 1/4/7/9 | 返回旧 binding ⇒ 判据 4 红；replace 目标未 retire/保留错 ⇒ 判据 5 红 |
-| M6 | **remove_at**：校验 `entry.child == expected_id`；解除绑定 + 把 inode 置 **tombstone**；第二次调用 `NotFound`；计数器 | 判据 3/4/§3.9、B3(iii) 恰好一次 | 不校验 expected ⇒ §3.9 第二条红法失效（误删）；不计数 ⇒ "删两次"假绿 |
+| M6 | **remove_at**：校验 `entry.child == expected_id`；解除绑定 + 把 inode 置 **tombstone**；**第二次调用返回幂等 `Ok(())`**（不是 `NotFound`，见下方三分类）；计数器 | 判据 3/4/§3.9、B3(iii) 恰好一次 | 不校验 expected ⇒ §3.9 第二条红法失效（误删）；不计数 ⇒ "删两次"假绿 |
 | M7 | **read/write/set_size**：字节数组语义；EOF 短读、`offset>=size` 的错误由模型层定；零扩展；洞读零；`size` 当前值 | 判据 1/2/3/4 | 缓存 size ⇒ §3.2 假绿；扩展不零化 ⇒ 与 KI-9 同族 |
 | M8 | **read_dir**：不含 `.`/`..`；顺序确定；返回当前绑定集合 | 判据 6、N2 | mock 也返回 `.` ⇒ N2 红；返回无序 ⇒ 判据 6 不可复现 |
 | M9 | **元数据**：`times`/`attributes` 可读写、即时生效；逻辑时钟（无墙钟/随机） | 判据 2/8 与确定性 | 用真实时间 ⇒ flaky；缓存元数据 ⇒ 假绿 |
@@ -192,6 +192,19 @@ mock 的作用是**让 adapter 的语义可测**，不是复刻 `fs-api`。它�
 | M12 | **计数/事件**：`remove_at`/`flush` 调用次数、关键顺序（rename→remove、open→share→create） | "恰好一次"、ordering 判据 | 无计数 ⇒ B3(iii) 假绿；无顺序 ⇒ 竞争判据假绿 |
 | M13 | **隔离**：不 import `fs-winfsp` 内部；每测例新实例；`#[cfg(test)]`/dev-dep | 防止 mock 与 adapter 共享错误 | 共享状态 ⇒ 用例互相污染 |
 | M14 | **测试钩子**：可关闭 `expected_id` 校验（cfg(test)），用于证明 §3.9 红法**真的会红** | 判据敏感性自证 | 关不掉 ⇒ 无法证明 red 不是别的原因 |
+
+**M6 的三分类（对齐 ADR-009 与核心实现，2026-10-26 定；原卡“第二次 `NotFound`”作废）**
+
+| 情形 | 返回 | 理由 |
+| --- | --- | --- |
+| 名字属于**别的条目** | `InvalidRecord { field: "remove_at(expected_id)" }` | 绑定过期（内部不变量被违反），adapter 应记录并跳过 |
+| 名字已消失、`expected_id` **已是墓碑** | **幂等 `Ok(())`** | **崩溃后的重复清理不该变成错误**——这是两段删除的正常路径 |
+| 名字已消失、`expected_id` 仍活着 | `NotFound` | 真正的“找不到” |
+
+⇒ mock 必须与核心**同一套**三分类；否则 adapter 在 mock 上通过的判据，在真后端上会以不同错误类型失败（正是本轮 `remove_id` 残留那类“卡与卡各说一套”）。
+
+**本卡 mock 的范围（2026-10-26 定）**：**M1–M10、M12、M13、M14 必做**（判据 1–6 与 §3.9 直接依赖）；
+**M11（故障注入）本卡不做**，记 **B-16**——当前六条判据都不依赖注入式失败，先做会把成本花在未被判据使用的面上。
 
 **明确不提供（非目标）**：持久化/崩溃恢复、pack/CAS、snapshot/profile、并发、cached I/O、WinFsp 句柄/share/delete-pending（这些是 adapter 的职责）、真实 `fs-api` 的完整语义。mock 与真实核心的差异必须在报告里列出；**不能**用 mock 绿代替 P3-3b 的真实后端。
 
