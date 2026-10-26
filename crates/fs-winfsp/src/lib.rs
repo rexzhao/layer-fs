@@ -12,6 +12,7 @@ pub mod adapter;
 pub mod boundary;
 pub mod dirent;
 pub mod error;
+pub mod file_info;
 pub mod handles;
 pub mod mock;
 pub mod ops;
