@@ -295,6 +295,19 @@ G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后
 
 **SUPERSEDE 可以造出"已解除名字、旧句柄仍开"的状态**（§4.2），所以不能说"核心不存在该状态"：旧 inode 记录**保留（只增）**、旧 FileId 可读，直到 `workspace_discard` 或未来 **B-10** 回收；`DELETE` 旧 inode 会破坏旧句柄的读。这**不是 G2 的要求**——G2 只要求 rename 后按 FileId 读；SUPERSEDE 的保留由 overlay/句柄层负责，当前 GC 不扫描这些不可达行。**delete-pending 期间的读**只是普通 FileId 读，由 **adapter 的句柄表**保证（两段删除把真正的 `remove` 推迟到最后一个 `Cleanup`）。
 
+**「过期身份」与「条目不存在」是两个错误，不是一个**（2026-10-26，P3-3a 三处待补收口时定稿）：
+
+核心 `remove_at` 的守卫不匹配返回 `NamespaceError::InvalidRecord`，而不是 `NotFound`；两者分别映射到
+`STATUS_INTERNAL_ERROR` 与 `STATUS_OBJECT_NAME_NOT_FOUND`。折叠会把 adapter 推向**相反的动作**：
+
+| 语义 | 含义 | adapter 应做 |
+| --- | --- | --- |
+| `InvalidRecord`（过期身份） | 名字现在属于别的对象，你的 `FileId` 不再指向它 | **放弃这个句柄**（unbind 自己），不产生删除事件 |
+| `NotFound`（不存在） | 名字/对象已经没了 | 当作**删除事件**：关闭句柄、必要时通知上层 |
+
+判据：`fs-winfsp/tests/mock_identity.rs` 的 `remove_at_classifies_three_ways`（三态）与
+`contract.rs` 的 `scenario_removal_cases`（同一套词汇跨 mock/真后端），两处都用**变体**断言而不是等值比较。
+
 **GC 不需要活句柄输入**：离线 GC 的承重件是 **overlay 的 `locking_mode=EXCLUSIVE`**（ADR-006 §5.1；每次打开都执行），不是 `store.sqlite` 的锁。任何挂载中的 adapter 必持有某个 workspace 的 overlay 排他锁，GC 试图独占打开该 overlay 会得到 `WorkspaceInUse`；因此 GC 期间不可能存在句柄，SUPERSEDE 的保留记录无需成为 GC 根。`store.sqlite` 在 WAL 下允许读者与维护者共存，**不能**作为该论证的依据。
 
 ---
