@@ -34,6 +34,15 @@
 create_or_open(disposition, path, kind_hint) -> OpenOutcome { file_id, kind, size, times, attributes }
 // `size`/`times` 必须是**取回时从核心读到的值**，不是打开时缓存的值，也不是 adapter 自己维护的副本。
 // 否则 §3.2 的“新句柄 size == 0”在“缓存旧值”的实现下会**假绿**（读到的是替换前的缓存）。
+
+**为什么 `size` 不许缓存、而 dirent 允许（§3.6 首读快照）**：缓存的合法性取决于**语义要求的可见性**。
+`size`/`times` 要求“读到即当前”（NT 的 `GetFileInformation` 拿的就是当前状态）；而 dirent 的快照语义
+**本身就是接口承诺**（枚举期间不重排、不新增），缓存是它的实现方式，不是偏离。
+
+**由此得一条判据写法**：**任何断言，若其期望值可以被“缓存的旧值”满足，就必须再造一个“缓存会露馅”的输入。**
+- 对 `size`：先 `SUPERSEDE`，再**通过另一个句柄**读 `size`（缓存句柄会给出旧值 ⇒ 红）；
+- 对 dirent：先枚举一页 → 期间新增条目 → 用同一句柄继续枚举，**新条目不得出现**——这是**期望**，不是缺陷。
+  验收报告须写明“此处不出现是快照语义，不是缓存 bug”（否则两个方向都会被误判）。
 read(file_id, offset, len) -> bytes
 write(file_id, offset, bytes) -> written
 set_size(file_id, len)
