@@ -7,9 +7,11 @@
 
 #![deny(missing_docs)]
 
+pub mod handles;
 pub mod mock;
 pub mod ops;
 
+pub use handles::{close_removes, CloseEffect, Handle, HandleId, HandleTable};
 pub use mock::{Call, MockBackend, ROOT};
 pub use ops::{
     Attributes, DirEntry, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, RenameOutcome, Times,

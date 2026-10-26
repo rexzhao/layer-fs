@@ -136,6 +136,12 @@ pub enum OpsError {
     IsADirectory,
     /// The namespace is read-only.
     ReadOnly,
+    /// An existing handle's share bits forbid the requested access (or the reverse).
+    SharingViolation,
+    /// The entry is delete-pending: a new open is refused while it is.
+    DeletePending,
+    /// The handle lacks the access the operation needs.
+    AccessDenied,
     /// The request is outside the file.
     OutOfRange,
     /// A malformed path (empty component, embedded separator, reserved name).
