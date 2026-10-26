@@ -32,7 +32,7 @@ pub struct Rules<S: TreeStore> {
 ///
 /// `kind` is the node's kind, not a variant of the outcome: the same shape answers "which entry" and "is it a
 /// directory", which is exactly the third column the eighteen-cell table has to assert.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateOutcome {
     /// The entry that now carries the name.
     pub file_id: FileId,
@@ -40,6 +40,16 @@ pub struct CreateOutcome {
     pub kind: Kind,
     /// What the call had to do to satisfy the disposition.
     pub action: fs_semantics::disposition::Action,
+    /// Where the name now lives: `(parent, name)`.
+    ///
+    /// Returned because the caller may have created the entry through a *different* path than the one it will use
+    /// next (an adapter that resolved a parent handle once), and re-deriving it means a second lookup that can race.
+    pub binding: (FileId, Vec<u8>),
+    /// The entry that lost the name, for `SUPERSEDE`.
+    ///
+    /// `None` for every other disposition. The old row is **not** destroyed (it may still be open elsewhere); this is
+    /// the caller's handle on it, which is what makes "unbind the name, keep the entry" observable rather than implied.
+    pub replaced: Option<FileId>,
 }
 
 /// The disposition table's failures, translated to this layer's vocabulary.
@@ -152,6 +162,8 @@ impl<S: TreeStore> Rules<S> {
                     file_id: FileId::ROOT,
                     kind: Kind::Directory,
                     action,
+                    binding: (FileId::ROOT, Vec::new()),
+                    replaced: None,
                 }),
                 Outcome::Failed(failure) => Err(into_namespace_failure(failure, path)),
             };
@@ -172,6 +184,7 @@ impl<S: TreeStore> Rules<S> {
                 Outcome::Failed(failure) => return Err(into_namespace_failure(failure, path)),
             };
             use fs_semantics::disposition::Action;
+            let mut replaced: Option<FileId> = None;
             let (file_id, kind) = match action {
                 // `Open`: nothing to do, including the directory case (no file handle is created).
                 Action::Open => {
@@ -194,7 +207,8 @@ impl<S: TreeStore> Rules<S> {
                     (id, Kind::File)
                 }
                 Action::ReplaceExisting => {
-                    let _old = existing.expect("SUPERSEDE requires an existing entry");
+                    let old = existing.expect("SUPERSEDE requires an existing entry");
+                    replaced = Some(old);
                     // Unbind the name only: the old inode row (and its content) stays for anyone holding it, which
                     // is what lets a frontend keep serving a handle opened before the replace.
                     tree.unbind(parent, name.as_bytes())?;
@@ -207,6 +221,8 @@ impl<S: TreeStore> Rules<S> {
                 file_id,
                 kind,
                 action,
+                binding: (parent, name.as_bytes().to_vec()),
+                replaced,
             })
         })
     }

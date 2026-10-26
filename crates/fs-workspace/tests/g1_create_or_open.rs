@@ -95,7 +95,7 @@ fn every_cell_has_an_action_a_kind_and_a_file_id() {
                 (Outcome::Opened(action), Err(error)) => panic!(
                     "cell disposition={disposition:?} exists={exists:?}: expected {action:?}, got {error:?}"
                 ),
-                (Outcome::Opened(action), Ok(CreateOutcome { file_id, kind, action: got })) => {
+                (Outcome::Opened(action), Ok(CreateOutcome { file_id, kind, action: got, .. })) => {
                     assert_eq!(
                         got, action,
                         "cell disposition={disposition:?} exists={exists:?}: action"
@@ -432,5 +432,56 @@ fn the_two_step_version_is_constructible_but_produces_no_double_winner() {
         rounds_with_two_winners, 0,
         "cell control: the constructible two-step shape must not produce two winners (QA 0/20); \
          a non-zero count means `bind` no longer re-checks inside the insert transaction"
+    );
+}
+
+/// `CreateOutcome` must tell the caller **where** the name now lives and **what it replaced** (ADR-009, P3-2 G2).
+///
+/// Both fields exist to remove a second lookup from the adapter's path: re-deriving `(parent, name)` after the call is a
+/// race, and "which old entry lost the name" cannot be recovered at all once the binding is gone.
+#[test]
+fn the_outcome_reports_the_binding_and_the_replaced_entry() {
+    let fixture = fixture("outcome-fields");
+    let rules = Rules::new(fixture.workspace.store());
+
+    let created = rules
+        .create_or_open(&p("/f"), Disposition::Create)
+        .expect("create");
+    assert_eq!(
+        created.binding,
+        (FileId::ROOT, b"f".to_vec()),
+        "cell binding: the name the call created"
+    );
+    assert_eq!(
+        created.replaced, None,
+        "cell replaced: Create replaces nothing"
+    );
+
+    let superseded = rules
+        .create_or_open(&p("/f"), Disposition::Supersede)
+        .expect("supersede");
+    assert_eq!(
+        superseded.replaced,
+        Some(created.file_id),
+        "cell replaced: Supercede names the entry that lost the name"
+    );
+    assert_eq!(
+        superseded.binding.0,
+        FileId::ROOT,
+        "cell binding parent after supersede"
+    );
+
+    // Every other disposition leaves `replaced` empty — a build that filled it with "whatever was there" would make
+    // OVERWRITE_IF look like SUPERSEDE from outside.
+    let overwritten = rules
+        .create_or_open(&p("/f"), Disposition::OverwriteIf)
+        .expect("overwrite_if");
+    assert_eq!(
+        overwritten.replaced, None,
+        "cell replaced: OverwriteIf reuses the entry, so nothing was replaced"
+    );
+    assert_eq!(
+        overwritten.file_id, superseded.file_id,
+        "cell overwrite_if: the entry is the same one"
     );
 }
