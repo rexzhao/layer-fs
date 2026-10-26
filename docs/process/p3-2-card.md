@@ -96,7 +96,7 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 - `replace=true`：目标存在则替换（R3）；跨类型（R4/R5）与非空目录（R6）规则不变；
 - `replace=false`：目标存在即 `NameCollision`，**且不得有任何改动**。
 
-**前提（写进卡）**：WinFsp FSD 保证"目标名已有打开句柄时不下发 Rename"，因此 `replace=true` 的目标在本 adapter 下**没有句柄**，核心可以立即 retire 它；核心不建模句柄，G4 只按这个前提测。
+**前提（未验证，P3-4 L2 实测）**：上游 Rename 契约写"目标名已有打开句柄时 FSD 不下发 Rename"，但**尚无行为实测**。若实测成立：`replace=true` 的目标无句柄，核心可立即 retire；若实测不成立：核心必须改用 SUPERSEDE 的**保留**语义（目标 live、旧句柄可读），`replaced` 仍返回供 adapter unbound——**unbound 只防误删，不能代替保留**。核心不建模句柄，G4 按当前前提测，并在报告里标明该前提未验证。
 
 **判据**
 

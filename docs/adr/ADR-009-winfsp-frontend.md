@@ -196,7 +196,13 @@ remove_at(parent: FileId, name: &[u8], expected_id: FileId) -> Result<()>
 **正常删除** = `remove_at`（内部解除绑定 + 删除内容 + 把 inode 行置为 **tombstone `live=0`**；by-id 的 `read/stat/read_dir` 一律 `NotFound`；行保留"只增"，由 **B-10** 回收）。**不得**保留"live 且 size>0 但内容已删"的行——那会让读返回零或错数据。
 **SUPERSEDE** = 解除旧名字 + 创建新 inode，**不**对旧 inode 调 `remove_at`（旧 inode 保留，§4.2）；核心返回 `replaced: Option<FileId>`，adapter 把旧 FileId 的所有句柄标记为 **unbound**。
 
-**rename-replace**（`replace=true` 且目标存在）：WinFsp FSD 保证"目标名已有打开句柄时不下发 Rename"（`FspFileSystem` 的 Rename 契约），因此目标在本 adapter 下没有句柄，核心**可以立即 retire 目标**并返回 `replaced: Option<FileId>`；adapter 仍按防御性把该 id 的句柄标记 unbound（若真存在，说明 FSD 契约被破坏，记录而不是静默）。目标就是源自身（同 FileId）时 `replaced = None`，不得 retire 自己。
+**rename-replace**（`replace=true` 且目标存在）：**未验证（L2，P3-4 实测）**——上游文档的 Rename 契约写"目标名已有打开句柄时 FSD 不下发 Rename"，但这是代码/文档依据，尚无行为实测。
+
+- **若实测成立**：目标在本 adapter 下无句柄，核心可立即 retire 目标并返回 `replaced: Option<FileId>`；
+- **若实测不成立**（FSD 会下发）：**必须改用 SUPERSEDE 的保留语义**——目标 inode 保持 **live**、旧句柄可读，`replaced` 仍返回供 adapter 标记 unbound；**`unbound` 只防误删，不能代替保留**；
+- 两种情况下 adapter 都做防御性 unbound（真存在句柄说明契约被破坏，记录而非静默）。
+
+目标就是源自身（同 FileId）时 `replaced = None`，**不得 retire 自己**：误 retire 会让名字仍在、inode 变 tombstone，所有句柄/读立即 `NotFound`——数据全丢。
 
 **两类"行保留"的可见性相反**（两者都只增，最终由 **B-10** 回收）：
 
