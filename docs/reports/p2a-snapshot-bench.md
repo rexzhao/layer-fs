@@ -2,7 +2,7 @@
 
 - 日期：2026-10-23
 - 卡：P2a-1（fs-snapshot crate）
-- 用途：ADR-005 §9「数值是初值，P2a-1 卡用基准确认」——为 profile 参数提供实测依据
+- 用途：ADR-005 §5（Snapshot profile）「数值是初值，P2a-1 卡用基准确认」——为 profile 参数提供实测依据
 - 命令：`cargo run -p fs-snapshot --release --example scale`
 
 ## 0. 规则
