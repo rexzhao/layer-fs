@@ -159,7 +159,7 @@ grep -A20 'struct Handle' crates/fs-winfsp/src/handles.rs | grep -cE '(parent|n
 红法：mock 也返回 `.` ⇒ 枚举里出现两次 ⇒ 必须红。
 
 **B3(iii) 的写法**：`remove` 两次不报错是**正确行为**，所以"只有一次"必须靠**计数**断言
-（mock 记 `remove(file_id)` 调用次数 == 1）；否则"删两次"和"删一次"都绿。
+（mock 记 `remove_at` 调用次数 == 1）；否则"删两次"和"删一次"都绿。
 
 **N4 删除必须跟随 FileId（结构变异）**：把"最后一个句柄的删除"实现成按**路径**删除（测试：`open` → `rename` → `close`）⇒ 判据 4 必须红；改回按 FileId ⇒ 绿。`DELETE_ON_CLOSE` 与 `set_delete` 两条路径都必须用 FileId（不是打开时的原路径）：路径在 rename 后已失效，W3 的删除键只能是 FileId。
 
@@ -168,6 +168,31 @@ grep -A20 'struct Handle' crates/fs-winfsp/src/handles.rs | grep -cE '(parent|n
 | 缺面 | 谁需要 | 本卡怎么绕 | 建议 |
 | --- | --- | --- | --- |
 | `create_or_open(disposition)` | adapter 的 Create/Open | mock 实现 | P3-2 G1 按 `CreateOutcome { file_id, kind, action }` 形状实现 |
-| `read/write/set_size/get_info/remove` **按 FileId** | 句柄跨 rename / 两段删除 | mock 实现 | P3-2 G2（`read_at_id` 等） |
+| `read/write/set_size/get_info` **按 FileId**；`remove_at(parent,name,expected)` | 句柄跨 rename / 两段删除 | mock 实现 | P3-2 G2（`read_at_id` 等；删除侧 `remove_at`） |
 | `read_dir(dir_id)` | 目录句柄跨 rename 的枚举 | mock 实现 | P3-2 G2 建议补；当前 `fs-api` 只有 `read_dir(path)` |
 | `set_times` / `set_attributes` | `SetBasicInfo` | mock 实现 | P3-2 G3（profile v3） |
+
+## 10. mock 必须提供的最小能力（不是"第二个核心"）
+
+mock 的作用是**让 adapter 的语义可测**，不是复刻 `fs-api`。它必须忠实到"adapter 依赖的每一条语义"，但不需要实现持久化、快照、pack、缓存或并发。缺一条的最小能力，都会让某条判据变成空转。
+
+| # | 能力 | 为什么需要 | 缺失/做错的红法 |
+| --- | --- | --- | --- |
+| M1 | **身份**：`FileId` 创建时分配、rename 不变、删除不复用；根目录 id 固定 | 判据 1/4/9 全依赖"身份≠名字" | rename 换 id ⇒ 判据 1 红；复用 id ⇒ §3.9 红法失效 |
+| M2 | **绑定**：每个目录维护原始字节 `name → child`；大小写敏感，允许 `A`/`a` 并存；parent 用 FileId | 判据 1/4/6/§3.9；dirent 不去重 | 折叠名字 ⇒ §3.6 红；按路径存 ⇒ N1 红 |
+| M3 | **create_or_open 全 18 格**：六种 disposition × 不存在/文件/目录；返回 `file_id/kind/action/binding/replaced/size/times/attributes` | 18 格表与 SUPERSEDE 判据 | 少一格 ⇒ 表驱动红；缓存旧 size/times ⇒ §3.2 假绿 |
+| M4 | **SUPERSEDE**：新 FileId；旧 inode 记录保持 **live 且内容可读**（B 方案）；`replaced=Some(old)` | 判据 2（B-8） | 只标 unbound/不可见而不保留内容 ⇒ 旧句柄读到空/错 ⇒ 判据 2 红 |
+| M5 | **rename**：原子；返回 `binding/replaced`；`replace=false` 冲突零改动；目录/非空/跨类型规则同 ADR-003；case-only 更新名字字节 | 判据 1/4/7/9 | 返回旧 binding ⇒ 判据 4 红；replace 目标未 retire/保留错 ⇒ 判据 5 红 |
+| M6 | **remove_at**：校验 `entry.child == expected_id`；解除绑定 + 把 inode 置 **tombstone**；第二次调用 `NotFound`；计数器 | 判据 3/4/§3.9、B3(iii) 恰好一次 | 不校验 expected ⇒ §3.9 第二条红法失效（误删）；不计数 ⇒ "删两次"假绿 |
+| M7 | **read/write/set_size**：字节数组语义；EOF 短读、`offset>=size` 的错误由模型层定；零扩展；洞读零；`size` 当前值 | 判据 1/2/3/4 | 缓存 size ⇒ §3.2 假绿；扩展不零化 ⇒ 与 KI-9 同族 |
+| M8 | **read_dir**：不含 `.`/`..`；顺序确定；返回当前绑定集合 | 判据 6、N2 | mock 也返回 `.` ⇒ N2 红；返回无序 ⇒ 判据 6 不可复现 |
+| M9 | **元数据**：`times`/`attributes` 可读写、即时生效；逻辑时钟（无墙钟/随机） | 判据 2/8 与确定性 | 用真实时间 ⇒ flaky；缓存元数据 ⇒ 假绿 |
+| M10 | **错误面**：adapter 映射的**每个** `ApiError` 变体都能被 mock 触发 | 判据 8（映射不重复） | 缺一个变体 ⇒ 该映射分支未测 |
+| M11 | **故障注入**：`fail_next(op, error)`；可让任一方法按需失败 | 验证 adapter 不吞错、不误删 | 不能注入 ⇒ "错误传播"只能靠读代码 |
+| M12 | **计数/事件**：`remove_at`/`flush` 调用次数、关键顺序（rename→remove、open→share→create） | "恰好一次"、ordering 判据 | 无计数 ⇒ B3(iii) 假绿；无顺序 ⇒ 竞争判据假绿 |
+| M13 | **隔离**：不 import `fs-winfsp` 内部；每测例新实例；`#[cfg(test)]`/dev-dep | 防止 mock 与 adapter 共享错误 | 共享状态 ⇒ 用例互相污染 |
+| M14 | **测试钩子**：可关闭 `expected_id` 校验（cfg(test)），用于证明 §3.9 红法**真的会红** | 判据敏感性自证 | 关不掉 ⇒ 无法证明 red 不是别的原因 |
+
+**明确不提供（非目标）**：持久化/崩溃恢复、pack/CAS、snapshot/profile、并发、cached I/O、WinFsp 句柄/share/delete-pending（这些是 adapter 的职责）、真实 `fs-api` 的完整语义。mock 与真实核心的差异必须在报告里列出；**不能**用 mock 绿代替 P3-3b 的真实后端。
+
+**一条纪律**：mock 的"保留"必须真的保留内容（M4），"删除"必须真的不可读（M6）。`unbound` 只是名字层的标记，**标记不可见 ≠ 保留内容**——这是 SUPERSEDE/rename-replace 两次评审里都出现过的同一个混淆。
