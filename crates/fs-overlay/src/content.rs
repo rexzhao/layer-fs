@@ -192,6 +192,34 @@ impl OverlayStore {
             .map_err(|error| into_namespace(OverlayError::Sqlite(error)))
     }
 
+    /// Sets (or clears, with `None`) the stored security descriptor.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidRecord` when the descriptor exceeds 65536 bytes, `NotFound` for an absent inode.
+    pub fn set_security(&self, id: FileId, security: Option<&[u8]>) -> NamespaceResult<()> {
+        let _guard = ScopeGuard::enter().map_err(into_namespace)?;
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction()
+            .map_err(|error| into_namespace(OverlayError::Sqlite(error)))?;
+        set_security_impl(&transaction, &self.base, id, security).map_err(into_namespace)?;
+        transaction
+            .commit()
+            .map_err(|error| into_namespace(OverlayError::Sqlite(error)))
+    }
+
+    /// The stored descriptor, if any (v1 overlays have none).
+    ///
+    /// # Errors
+    ///
+    /// SQL failures.
+    pub fn security(&self, id: FileId) -> NamespaceResult<Option<Vec<u8>>> {
+        let _guard = ScopeGuard::enter().map_err(into_namespace)?;
+        let connection = self.lock();
+        security_impl(&connection, id).map_err(into_namespace)
+    }
+
     /// How many inode rows the overlay holds, for tests that must prove a refusal created none.
     ///
     /// # Errors
@@ -669,4 +697,69 @@ pub(crate) fn set_times_impl(
         (accessed, written, changed, now, created, id.serial() as i64),
     )?;
     Ok(())
+}
+/// Stores (or clears) the descriptor and moves `changed_ns`.
+///
+/// The length limit is enforced **here**, at the disk-facing layer, for the same reason the attribute bits are: a caller
+/// that bypasses the rules layer must not be able to write a 1 MiB descriptor into an inode row.
+///
+/// # Errors
+///
+/// [`OverlayError::InvalidRecord`] over 65536 bytes, `NotFound` for an absent inode, SQL failures.
+pub(crate) fn set_security_impl(
+    connection: &Connection,
+    base: &crate::base::BaseLayer,
+    id: FileId,
+    security: Option<&[u8]>,
+) -> OverlayResult<()> {
+    let bytes = security.unwrap_or(&[]);
+    // The limit is the record codec's (`fs_snapshot::MAX_SECURITY_LEN`); this layer only enforces it before the bytes reach
+    // SQL, so a caller that bypasses the rules layer still cannot write an oversized row.
+    if bytes.len() > usize::try_from(fs_snapshot::MAX_SECURITY_LEN).expect("fits") {
+        return Err(OverlayError::InvalidRecord {
+            field: "ov_inode.security",
+            detail: format!("descriptor is {} bytes, limit 65536", bytes.len()),
+        });
+    }
+    let now = now_ns();
+    if inode_row(connection, id.serial())?.is_none() {
+        let Some(record) = base.inode(id.serial())? else {
+            return Err(OverlayError::Namespace(NamespaceError::NotFound {
+                path: format!("{}", id.serial()),
+            }));
+        };
+        connection.execute(
+            "INSERT INTO ov_inode
+             (serial, origin, live, kind, size, created_ns, modified_ns, base_limit, entries, changed_ns, attributes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 0)",
+            (
+                id.serial() as i64,
+                schema::ORIGIN_BASE,
+                schema::LIVE,
+                kind_tag(record.kind),
+                record.size as i64,
+                record.created_ns,
+                record.modified_ns,
+                record.size as i64,
+                now,
+            ),
+        )?;
+    }
+    connection.execute(
+        "UPDATE ov_inode SET security = ?1, changed_ns = ?2 WHERE serial = ?3",
+        (bytes.to_vec(), now, id.serial() as i64),
+    )?;
+    Ok(())
+}
+
+/// The stored descriptor, if any.
+///
+/// # Errors
+///
+/// SQL failures.
+pub(crate) fn security_impl(connection: &Connection, id: FileId) -> OverlayResult<Option<Vec<u8>>> {
+    match inode_row(connection, id.serial())? {
+        Some(row) if !row.security.is_empty() => Ok(Some(row.security)),
+        _ => Ok(None),
+    }
 }

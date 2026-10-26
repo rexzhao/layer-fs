@@ -247,3 +247,57 @@ fn set_times_moves_only_what_was_asked_for() {
     clock::set(None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The security descriptor: stored verbatim, sized-limited, and **separate** from what `stat` reports.
+///
+/// The two-way shape the card asks for: the descriptor round-trips at full length (so the *record* would grow by exactly
+/// that many bytes — asserted at the record layer in `inode_v3_page.rs`), while `InodeView` carries no descriptor at all,
+/// which is what keeps ordinary `stat` from paying for it.
+#[test]
+fn security_round_trips_and_stays_out_of_the_inode_view() {
+    let (dir, overlay) = overlay("security");
+    assert_eq!(
+        overlay.security(id()).expect("read"),
+        None,
+        "cell initial: no explicit descriptor"
+    );
+    overlay.set_attributes(id(), 0x20).expect("materialise");
+
+    let descriptor: Vec<u8> = (0..4096u32).map(|index| (index % 251) as u8).collect();
+    overlay.set_security(id(), Some(&descriptor)).expect("set");
+    assert_eq!(
+        overlay.security(id()).expect("read"),
+        Some(descriptor.clone()),
+        "cell round trip: the bytes come back verbatim, not normalised"
+    );
+
+    // The view is the structural half: `InodeView` has no field for the descriptor, so `stat` cannot report it even by
+    // accident. This asserts the value that *is* shared (attributes) still reads, i.e. the row is healthy.
+    let view = overlay
+        .read(|tree: &fs_overlay::OverlayRead<'_>| TreeRead::inode(tree, id()))
+        .expect("read")
+        .expect("inode");
+    assert_eq!(
+        view.attributes, 0x20,
+        "cell view: the row is healthy after the descriptor write"
+    );
+
+    // Clearing returns to "inherit the default", which is `None` — not an empty descriptor.
+    overlay.set_security(id(), None).expect("clear");
+    assert_eq!(
+        overlay.security(id()).expect("read"),
+        None,
+        "cell cleared: absent again"
+    );
+
+    // The limit is enforced where the bytes reach SQL.
+    let oversized = vec![0u8; 65_537];
+    let error = overlay
+        .set_security(id(), Some(&oversized))
+        .expect_err("cell oversized: refused");
+    assert!(
+        format!("{error:?}").contains("InvalidRecord"),
+        "cell oversized: a value-domain error: {error:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

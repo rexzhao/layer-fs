@@ -33,7 +33,7 @@ impl<'a> OverlayRead<'a> {
 }
 
 /// One overlay inode row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InodeRow {
     pub(crate) origin: i64,
     pub(crate) live: i64,
@@ -47,6 +47,8 @@ pub(crate) struct InodeRow {
     pub(crate) accessed_ns: i64,
     pub(crate) changed_ns: i64,
     pub(crate) attributes: i64,
+    /// The stored descriptor; **not** surfaced through `InodeView` on purpose — `stat` must never pay for it.
+    pub(crate) security: Vec<u8>,
 }
 
 /// Reads the overlay row for `serial`, if any.
@@ -54,7 +56,7 @@ pub(crate) fn inode_row(connection: &Connection, serial: u64) -> OverlayResult<O
     let row = connection
         .query_row(
             "SELECT origin, live, kind, size, created_ns, modified_ns, base_limit, entries,
-                    accessed_ns, changed_ns, attributes
+                    accessed_ns, changed_ns, attributes, security
              FROM ov_inode WHERE serial = ?1",
             [serial as i64],
             |row| {
@@ -70,6 +72,7 @@ pub(crate) fn inode_row(connection: &Connection, serial: u64) -> OverlayResult<O
                     accessed_ns: row.get(8)?,
                     changed_ns: row.get(9)?,
                     attributes: row.get(10)?,
+                    security: row.get(11)?,
                 })
             },
         )
