@@ -159,6 +159,9 @@ dependencies = [
 [[package]]
 name = "fs-windows"
 version = "0.1.0"
+dependencies = [
+ "fs-namespace",
+]
 
 [[package]]
 name = "fs-workspace"

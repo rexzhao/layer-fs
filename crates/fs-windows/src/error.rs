@@ -102,46 +102,11 @@ impl NtStatus {
     }
 }
 
-/// A failure of the model, before it is an NTSTATUS.
+/// The failure vocabulary, defined once in the core (P3-2 §12) and re-exported here.
 ///
-/// Deliberately **finer** than [`NtStatus`]: "the parent is missing" and "the leaf is missing" are one
-/// NTSTATUS apart and are the difference between Windows' two not-found codes, so the model carries the
-/// distinction and the mapping decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Failure {
-    /// A path or name violates Windows rules.
-    InvalidName,
-    /// A folded name collides with an existing entry.
-    NameCollision,
-    /// The final component does not exist.
-    LeafMissing,
-    /// A directory along the path does not exist.
-    ParentMissing,
-    /// A path component that must be a directory is a file.
-    NotADirectory,
-    /// The target is a directory; the operation needs a file.
-    IsADirectory,
-    /// The entry is delete-pending.
-    DeletePending,
-    /// An existing handle's share mode forbids this access.
-    SharingViolation,
-    /// The caller may not do this (read-only attributes, security descriptors).
-    AccessDenied,
-    /// The directory is not empty.
-    DirectoryNotEmpty,
-    /// An argument is out of range.
-    InvalidParameter,
-    /// The read is at or past EOF.
-    EndOfFile,
-    /// The write would exceed the maximum size.
-    FileTooLarge,
-    /// No space.
-    NoSpace,
-    /// Valid but unimplemented in this model (P3-1 §2.4).
-    Unsupported,
-    /// Anything else.
-    Internal,
-}
+/// The table that produces these values lives in `fs_namespace::disposition`, because the core performs the
+/// action; this crate's job is only to say what Windows should see for each of them.
+pub use fs_namespace::disposition::Failure;
 
 /// The mapping. **Exhaustive on purpose**: every `Failure` names its own `NtStatus`, and there is no
 /// fallback arm, so a new variant is a compile error until somebody decides what Windows should see
@@ -169,25 +134,8 @@ pub const fn to_status(failure: Failure) -> NtStatus {
     }
 }
 
-/// Every [`Failure`] variant, for completeness checks in tests.
-pub const ALL_FAILURES: [Failure; 16] = [
-    Failure::InvalidName,
-    Failure::NameCollision,
-    Failure::LeafMissing,
-    Failure::ParentMissing,
-    Failure::NotADirectory,
-    Failure::IsADirectory,
-    Failure::DeletePending,
-    Failure::SharingViolation,
-    Failure::AccessDenied,
-    Failure::DirectoryNotEmpty,
-    Failure::InvalidParameter,
-    Failure::EndOfFile,
-    Failure::FileTooLarge,
-    Failure::NoSpace,
-    Failure::Unsupported,
-    Failure::Internal,
-];
+/// Every [`Failure`] variant, for completeness checks in tests (re-exported from the core's table).
+pub use fs_namespace::disposition::ALL_FAILURES;
 
 /// Every [`NtStatus`] value this build can return.
 pub const ALL_STATUSES: [NtStatus; 17] = [

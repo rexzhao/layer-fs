@@ -3,6 +3,11 @@
 No FFI, no WinFsp, no `cfg(windows)`-only dependency: the whole crate is a **model** of the Windows semantics the
 P3 frontend must reproduce, so `cargo test -p fs-windows` runs on any platform and in CI without an SDK.
 
+It **does** depend on `fs-namespace`, for one thing only: the disposition table and the failure vocabulary it
+produces are shared with the core (P3-2 §12). The core is what performs the action, the frontend is what classifies
+the request, and both must use the same eighteen cells — so the table lives there and is re-exported here
+(`fs-windows::disposition`), not copied.
+
 Every module's knowledge is a **table with a missing-cell-is-red mechanism**, and each table's cardinality is
 asserted against a **literal** (not against another enum's length, which would move with it):
 

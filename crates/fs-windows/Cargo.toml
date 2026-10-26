@@ -9,3 +9,6 @@ license.workspace = true
 # No dependencies on purpose: this crate is a pure model. No FFI, no `cfg(windows)`-only crate, no
 # WinFsp — so `cargo test -p fs-windows` runs on every platform and in CI without an SDK (P3-1 §1).
 [dependencies]
+# The disposition table (and the failure vocabulary it produces) is owned by the core: the frontend classifies a
+# request, the core performs it, and both must use the same eighteen cells (P3-2 §12).
+fs-namespace.workspace = true
