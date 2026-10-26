@@ -139,7 +139,11 @@ pub trait TreeWrite: TreeRead {
     /// Backend failures, or the type error when `id` is a directory.
     fn truncate(&mut self, id: FileId, new_size: u64) -> NamespaceResult<()>;
 
-    /// Removes an inode **and everything that hangs off it**.
+    /// Removes an inode's reachability **without destroying the row** (ADR-009, P3-2 G2).
+    ///
+    /// One deletion semantics for both `unlink` and `remove_at`: the row stays with `live = 0`, so an id that is still
+    /// held somewhere cannot silently address something else later, and a base inode cannot fall through and
+    /// resurrect. Physically reclaiming the row is the collector's business, not the tree's.
     ///
     /// The cascade is the backend's duty, not the caller's: P1's A1 defect was
     /// exactly a caller forgetting half of it. After this returns, nothing owned by
@@ -148,7 +152,7 @@ pub trait TreeWrite: TreeRead {
     /// # Errors
     ///
     /// Backend failures.
-    fn drop_inode(&mut self, id: FileId) -> NamespaceResult<()>;
+    fn tombstone(&mut self, id: FileId) -> NamespaceResult<()>;
 }
 
 /// A tree backend with transactional read and write scopes.

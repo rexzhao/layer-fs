@@ -12,3 +12,12 @@ cas-store.workspace = true
 fs-namespace.workspace = true
 fs-snapshot.workspace = true
 rusqlite.workspace = true
+
+[features]
+# Test-only seams for the tree contract (P3-2 G2): the `live` marker of a tombstoned row is invisible through
+# `TreeRead` by design, so "the row is still there" needs a seam that production never gets.
+gc-test-hooks = []
+
+[dev-dependencies]
+# Self-reference so this crate's own tests compile with the seam (same precedent as `cas-store`'s `crash-points`).
+fs-overlay = { path = ".", features = ["gc-test-hooks"] }

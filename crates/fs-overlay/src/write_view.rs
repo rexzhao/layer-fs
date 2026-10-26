@@ -69,8 +69,8 @@ impl TreeWrite for OverlayWrite<'_> {
         create_inode_impl(&self.transaction, kind).map_err(crate::view::into_namespace)
     }
 
-    fn drop_inode(&mut self, id: FileId) -> NamespaceResult<()> {
-        drop_inode_impl(&self.transaction, self.base, id).map_err(crate::view::into_namespace)
+    fn tombstone(&mut self, id: FileId) -> NamespaceResult<()> {
+        tombstone_impl(&self.transaction, self.base, id).map_err(crate::view::into_namespace)
     }
 }
 
@@ -192,16 +192,20 @@ pub(crate) fn unbind_impl(
     }
 }
 
-pub(crate) fn drop_inode_impl(
+pub(crate) fn tombstone_impl(
     connection: &Connection,
     base: &BaseLayer,
     id: FileId,
 ) -> OverlayResult<()> {
     match inode_row(connection, id.serial())? {
         Some(row) if row.origin == schema::ORIGIN_LOCAL => {
+            // A **local** inode is tombstoned, not deleted (ADR-009, single deletion semantics): a held id must keep
+            // meaning "this entry, deleted", and a missing row would let a later allocation reuse the serial's slot
+            // semantics silently.
             connection.execute(
-                "DELETE FROM ov_inode WHERE serial = ?1",
-                [id.serial() as i64],
+                "UPDATE ov_inode SET live = ?1, size = 0, base_limit = 0, entries = 0
+                 WHERE serial = ?2",
+                (schema::TOMBSTONE, id.serial() as i64),
             )?;
         }
         Some(_) => {

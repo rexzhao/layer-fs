@@ -96,6 +96,7 @@ fn empty_base(dir: &std::path::Path) -> (Store, ObjectId) {
 }
 
 struct Fixture {
+    /// Kept for the fixture lifetime (the overlay file lives under it).
     _root: TempRoot,
     rules: Rules<OverlayStore>,
 }
@@ -136,8 +137,8 @@ fn p(text: &str) -> Path {
 /// **K1** — after `unlink`, the deleted inode's metadata and content are unreachable.
 ///
 /// The overlay-specific sharpness: a deleted base inode must not fall through to the
-/// base on the next read. The tombstone is what stops that, so this test fails if
-/// `drop_inode` merely deletes the override row.
+/// base on the next read. The tombstone is what stops that — and since ADR-009 there is only **one** deletion
+/// semantics, so this is not a special case for base inodes: every removal tombstones.
 #[test]
 fn k1_unlink_leaves_nothing_reachable() {
     let fixture = Fixture::new("k1");
@@ -160,15 +161,55 @@ fn k1_unlink_leaves_nothing_reachable() {
     assert_eq!(again.len(), entries.len());
 }
 
-/// **K1** for a file created and removed in the same workspace: the row is dropped
-/// outright rather than tombstoned.
+/// **K1** for a file created and removed in the same workspace: the row is **tombstoned**, not dropped.
+///
+/// This used to assert the opposite (`DELETE FROM ov_inode` for a local inode). ADR-009 removed that second semantics:
+/// one deletion means one behaviour, and a held id keeps meaning "this entry, deleted" instead of pointing at nothing.
 #[test]
-fn k1_unlink_of_a_local_file_removes_its_row() {
+fn k1_unlink_of_a_local_file_tombstones_its_row() {
     let fixture = Fixture::new("k1-local");
     fixture.store().create_file(&p("/f")).expect("create");
     fixture.store().write_at(&p("/f"), 0, b"x").expect("write");
+    let id = fixture.rules.resolve(&p("/f")).expect("id");
     fixture.rules.unlink(&p("/f")).expect("unlink");
-    assert!(fixture.rules.stat(&p("/f")).is_err());
+    assert!(fixture.rules.stat(&p("/f")).is_err(), "the name is gone");
+
+    // **Paired criterion: the row is still there AND it is invisible.**
+    //
+    // "Invisible" alone is also satisfied by deleting the row; "present" alone is satisfied by a row that still reads.
+    // Only the pair means "tombstone". The row is checked in the database because that is the only place a tombstone is
+    // visible at all — this crate owns that schema, so the white-box read belongs here and nowhere else.
+    // Read through the crate's **own** connection: a second `rusqlite::Connection` is refused while the overlay holds
+    // its lock ("database is locked"), and `TreeRead` hides dead rows by design — so "the row is still there" is only
+    // observable through a test-only seam.
+    let live = fixture
+        .rules
+        .backend()
+        .live_marker(id.serial())
+        .expect("read the marker")
+        .expect("cell paired: the row must still exist — a physical delete would also make the id unreadable, which is                  why the pair is needed");
+    assert_eq!(
+        live,
+        fs_overlay::schema::TOMBSTONE,
+        "cell paired: the surviving row must be marked dead"
+    );
+
+    // What the caller can observe, and what the old "delete the row" behaviour got wrong:
+    // 1. the id still means "this entry, deleted": reading it is NotFound, not somebody else's bytes;
+    // 2. the serial is not recycled into a new entry (a reused slot would make the held id point at a live file).
+    assert!(
+        fixture.rules.backend().read_at_id(id, 0, 8).is_err(),
+        "cell tombstone: a deleted id must not read"
+    );
+    fixture
+        .store()
+        .create_file(&p("/f2"))
+        .expect("create again");
+    let fresh = fixture.rules.resolve(&p("/f2")).expect("new id");
+    assert_ne!(
+        fresh, id,
+        "cell tombstone: a new entry must not be handed the removed id"
+    );
 }
 
 // ---------------------------------------------------------------------- K2

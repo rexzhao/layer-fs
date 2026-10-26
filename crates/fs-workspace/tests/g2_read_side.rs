@@ -203,3 +203,74 @@ fn reading_a_directory_by_file_id_is_refused() {
 // (uncommitted bytes are overlay pages, so the pack counter would stay at zero for the wrong reason). Rather than
 // loosen the assertions to fit the current fixture, they are left out of this commit and land next with a fixture that
 // opens exactly the handles each test needs.
+
+// ------------------------------------------------------------- path reuse (identity vs name)
+
+/// **Path reuse**: the same name, a different entry.
+///
+/// This is the sharpest discriminator between "identify by FileId" and "identify by path": after the name is deleted and
+/// reused, a path-based reader sees the *new* bytes and an id-based reader must not. Both sides are asserted, because
+/// either alone is vacuous — if the reuse never happened, the id side proves nothing; if the id side is unknown, the
+/// path side just describes a rename.
+#[test]
+fn a_reused_path_is_a_different_entry_and_the_old_id_does_not_see_it() {
+    let fixture = fixture("reuse");
+    let rules = Rules::new(fixture.workspace.store());
+
+    // First occupant.
+    let first = rules
+        .create_or_open(&p("/slot"), fs_semantics::disposition::Disposition::Create)
+        .expect("create the first entry");
+    fixture
+        .workspace
+        .write_at("/slot", 0, b"FIRST")
+        .expect("write");
+    assert_eq!(
+        fixture
+            .workspace
+            .read_at_id(first.file_id, 0, 5)
+            .expect("read first"),
+        b"FIRST",
+        "cell first occupant: readable by id before the reuse"
+    );
+
+    // Remove the name, then hand it to a new entry.
+    rules.unlink(&p("/slot")).expect("unlink the first entry");
+    let second = rules
+        .create_or_open(&p("/slot"), fs_semantics::disposition::Disposition::Create)
+        .expect("create the second entry");
+    fixture
+        .workspace
+        .write_at("/slot", 0, b"SECOND")
+        .expect("write");
+
+    // Self-proof: the reuse really happened — two different entries, and the path now shows the new bytes.
+    assert_ne!(
+        first.file_id, second.file_id,
+        "cell self-proof: a reused name must be a different entry, otherwise this test proves nothing"
+    );
+    assert_eq!(
+        fixture
+            .workspace
+            .read_at("/slot", 0, 6)
+            .expect("read by path"),
+        b"SECOND",
+        "cell path side: the name now belongs to the second entry"
+    );
+
+    // The id side: the first entry is gone and must not be readable as the second one's bytes.
+    if let Ok(bytes) = fixture.workspace.read_at_id(first.file_id, 0, 5) {
+        panic!(
+            "cell id side: the removed entry must not serve bytes any more, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    assert_eq!(
+        fixture
+            .workspace
+            .read_at_id(second.file_id, 0, 6)
+            .expect("read second"),
+        b"SECOND",
+        "cell id side control: the *current* entry is readable by its own id"
+    );
+}

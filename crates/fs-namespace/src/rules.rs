@@ -258,7 +258,7 @@ impl<S: TreeStore> Rules<S> {
                 });
             }
             tree.unbind(parent, name.as_bytes())?;
-            tree.drop_inode(id)?;
+            tree.tombstone(id)?;
             Ok(())
         })
     }
@@ -288,7 +288,7 @@ impl<S: TreeStore> Rules<S> {
                 }
             }
             tree.unbind(parent, name.as_bytes())?;
-            tree.drop_inode(id)?;
+            tree.tombstone(id)?;
             Ok(())
         })
     }
@@ -361,7 +361,7 @@ impl<S: TreeStore> Rules<S> {
                     // R3 and R7 both replace: remove the destination's name and its
                     // inode, and with it everything the inode owned.
                     tree.unbind(target_parent, target_name.as_bytes())?;
-                    tree.drop_inode(existing)?;
+                    tree.tombstone(existing)?;
                 }
             }
 

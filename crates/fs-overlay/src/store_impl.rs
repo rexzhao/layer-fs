@@ -2,6 +2,8 @@
 
 use fs_namespace::{NamespaceResult, OpLabel, TreeStore};
 
+use rusqlite::OptionalExtension;
+
 use crate::error::{OverlayError, OverlayResult};
 use crate::store::{OverlayStore, ScopeGuard};
 use crate::view::{into_namespace, OverlayRead};
@@ -57,6 +59,26 @@ impl TreeStore for OverlayStore {
 }
 
 impl OverlayStore {
+    /// The `live` marker of one inode row, **including tombstones** (P3-2 G2).
+    ///
+    /// Test-only on purpose: `TreeRead` deliberately hides dead rows, so "the row is still there" is not observable from
+    /// the public API at all. This opens the crate's own connection instead of a second one — a second connection is
+    /// refused while the overlay holds its lock ("database is locked"), which is what a raw `rusqlite::Connection` in a
+    /// test would hit.
+    #[cfg(feature = "gc-test-hooks")]
+    pub fn live_marker(&self, serial: u64) -> OverlayResult<Option<i64>> {
+        let _guard = ScopeGuard::enter()?;
+        let connection = self.lock();
+        let live: Option<i64> = connection
+            .query_row(
+                "SELECT live FROM ov_inode WHERE serial = ?1",
+                [serial as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(live)
+    }
+
     /// Makes every change that has returned so far durable (ADR-006 §8).
     ///
     /// The overlay commits each change with `synchronous = NORMAL`, which is what keeps
