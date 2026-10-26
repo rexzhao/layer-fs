@@ -59,3 +59,44 @@ pub struct VolumeInfo {
     /// `fsctl.h:275` — 32 UTF-16 units, NUL-padded.
     pub volume_label: [u16; 32],
 }
+
+/// `FSP_FILE_SYSTEM_INTERFACE` — only the entries this frontend implements, in the SDK's order.
+///
+/// The SDK struct is a table of function pointers (`winfsp.h:1517`-ish, `FSP_FILE_SYSTEM_INTERFACE`); it is **longer**
+/// than this, and the entries we do not implement are `None`. The order matters — the table is positional — so this struct
+/// is a subset in SDK order, with each field citing the SDK entry it corresponds to.
+///
+/// All pointers are `Option<unsafe extern "C" fn ...>`: `None` is how WinFsp is told "this operation is not supported",
+/// which is a supported answer for most entries and a required one for the optional volume operations.
+///
+/// Nothing here is wired yet (P3-4 step 1); the point of declaring it now is that the **shape** is reviewable before the
+/// callbacks exist, and the test below pins the order.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FileSystemInterface {
+    /// `GetVolumeInfo` — no side effects, so it is the first callback to wire.
+    pub get_volume_info: Option<unsafe extern "C" fn() -> i32>,
+    /// `GetSecurityByName`.
+    pub get_security_by_name: Option<unsafe extern "C" fn() -> i32>,
+    /// `Create` — create **or** open, per the disposition in its parameters.
+    pub create: Option<unsafe extern "C" fn() -> i32>,
+    /// `Open`.
+    pub open: Option<unsafe extern "C" fn() -> i32>,
+    /// `Overwrite` — the truncation the adapter maps to `TruncateExisting`.
+    pub overwrite: Option<unsafe extern "C" fn() -> i32>,
+    /// `Cleanup` — the first phase of two-phase deletion.
+    pub cleanup: Option<unsafe extern "C" fn() -> i32>,
+    /// `Close` — where the adapter performs the single `remove_at` when the last handle goes.
+    pub close: Option<unsafe extern "C" fn() -> i32>,
+    /// `Read`.
+    pub read: Option<unsafe extern "C" fn() -> i32>,
+    /// `Write`.
+    pub write: Option<unsafe extern "C" fn() -> i32>,
+    /// `GetFileInfo` — also side-effect free.
+    pub get_file_info: Option<unsafe extern "C" fn() -> i32>,
+}
+
+impl FileSystemInterface {
+    /// The number of entries this build fills in, used by the order test.
+    pub const IMPLEMENTED: usize = 10;
+}

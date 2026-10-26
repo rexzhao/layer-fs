@@ -44,3 +44,31 @@ fn volume_info_matches_the_sdk_layout() {
     );
     // 18 + 64 = 82; the struct rounds to 88 because `u64` members make the alignment 8.
 }
+
+/// The callback table's **shape** is reviewable before any callback exists: the order is positional in WinFsp, so an
+/// accidental reordering is an ABI bug that no behaviour test would catch.
+#[test]
+fn the_interface_table_has_the_documented_shape() {
+    use fs_winfsp::abi::FileSystemInterface;
+    use std::mem::size_of;
+
+    // One optional function pointer per entry: `Option<fn>` is pointer-sized on this target.
+    assert_eq!(
+        size_of::<FileSystemInterface>(),
+        FileSystemInterface::IMPLEMENTED * size_of::<usize>(),
+        "cell size: the table is exactly `IMPLEMENTED` pointers, no padding"
+    );
+    assert_eq!(
+        FileSystemInterface::IMPLEMENTED,
+        10,
+        "cell count: ten entries are planned; changing this number is changing the ABI surface"
+    );
+
+    // An all-`None` table must be constructible: that is the "nothing wired yet" state, and it is what the mount sees
+    // today rather than a half-filled table.
+    let empty = FileSystemInterface::default();
+    assert!(
+        empty.get_volume_info.is_none(),
+        "cell default: unsupported operations are `None`, not dangling pointers"
+    );
+}
