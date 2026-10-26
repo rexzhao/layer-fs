@@ -132,7 +132,7 @@ adapter **禁止**：解析 CAS 对象、访问 `store.sqlite`/`overlay.sqlite`�
 | OVERWRITE | `OBJECT_NAME_NOT_FOUND` | 截断为 0（**保留 FileId**） | `STATUS_FILE_IS_A_DIRECTORY` |
 | OVERWRITE_IF | 创建 | 截断为 0（**保留 FileId**） | `STATUS_FILE_IS_A_DIRECTORY` |
 
-SUPERSEDE 与 OVERWRITE/OVERWRITE_IF 的区别是**FileId**：前者按 NT 语义替换（旧文件删除后重建），后者打开并截断同一文件。QA 预审指出"18 格表缺 FileId 列"——两种 disposition 在外部（`GetFileInformationByHandle::FileIndex`）必须可区分，L2 用 NTFS 对照确认：`CREATE_ALWAYS` 命中既有文件时 FileIndex 变化、`TRUNCATE_EXISTING` 不变。若实测 NTFS 与"新 FileId"不符，以实测为准并在 ADR 记修订。
+SUPERSEDE 与 OVERWRITE/OVERWRITE_IF 的区别是**FileId**：前者按 NT 语义替换（解除旧名字并建新 inode；**旧 inode 记录保留**，见 §4.2），后者打开并截断同一文件。QA 预审指出"18 格表缺 FileId 列"——两种 disposition 在外部（`GetFileInformationByHandle::FileIndex`）必须可区分，L2 用 NTFS 对照确认：`CREATE_ALWAYS` 命中既有文件时 FileIndex 变化、`TRUNCATE_EXISTING` 不变。若实测 NTFS 与"新 FileId"不符，以实测为准并在 ADR 记修订。
 
 **SUPERSEDE 造出的"名字已解除、旧 FileId 仍被句柄引用"状态**由 overlay 持有：旧 inode 记录**保留（只增）**，旧句柄可继续按 FileId 读；`DELETE` 旧 inode 会当场破坏旧句柄的读，禁止。保留**不产生内容副本**：base 来源的内容本来就被历史根引用，overlay 来源的页是替换前已有的那一行，不是复制。代价是**不可达的 inode 行（及 overlay 页）在挂载期只增**，直到 `workspace_discard` 或未来回收（backlog **B-10**，推荐方案 C：离线 GC 在 overlay 排他锁下扫描并删除不可达行）。P3 **不实现**该回收；当前 GC 不扫描 overlay 行，因此它不参与本状态，也不需要活句柄输入（ADR-008 §6.1）。
 
