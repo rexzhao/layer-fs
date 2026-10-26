@@ -48,12 +48,6 @@ pub use error::{InvalidPath, NamespaceError, NamespaceResult, MAX_DEPTH, MAX_NAM
 pub use inode_view::InodeView;
 pub use model::{Entry, FileId, Kind, Stat};
 pub use path::Path;
-/// The path rules, for a backend to run unchanged (ADR-006 W6).
-///
-/// `Rules` is what makes P2a-3 worth anything: a backend implements [`TreeStore`] and
-/// gets every path rule — R1–R12, the violation forms, the ordering of checks — without
-/// copying or re-deriving any of it.
-pub use rules::Rules;
 /// The path walks, for a backend that must resolve inside its own transaction.
 ///
 /// A backend whose content operations live outside [`TreeStore`] (the overlay's pages)
@@ -61,4 +55,10 @@ pub use rules::Rules;
 /// check-then-use window. Re-exported so it can do that without duplicating the walk or
 /// opening a nested read scope.
 pub use rules::{resolve_in, resolve_parent_in};
+/// The path rules, for a backend to run unchanged (ADR-006 W6).
+///
+/// `Rules` is what makes P2a-3 worth anything: a backend implements [`TreeStore`] and
+/// gets every path rule — R1–R12, the violation forms, the ordering of checks — without
+/// copying or re-deriving any of it.
+pub use rules::{CreateOutcome, Rules};
 pub use tree_store::{OpLabel, TreeRead, TreeStore, TreeWrite};

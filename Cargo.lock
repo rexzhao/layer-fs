@@ -135,6 +135,8 @@ version = "0.1.0"
 dependencies = [
  "cas-core",
  "cas-store",
+ "fs-overlay",
+ "fs-semantics",
 ]
 
 [[package]]
@@ -177,6 +179,7 @@ dependencies = [
  "cas-store",
  "fs-namespace",
  "fs-overlay",
+ "fs-semantics",
  "fs-snapshot",
  "fs-workspace",
  "rusqlite",

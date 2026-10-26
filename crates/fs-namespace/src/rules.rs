@@ -28,6 +28,51 @@ pub struct Rules<S: TreeStore> {
     store: S,
 }
 
+/// What [`Rules::create_or_open`] produced (P3-2 G1).
+///
+/// `kind` is the node's kind, not a variant of the outcome: the same shape answers "which entry" and "is it a
+/// directory", which is exactly the third column the eighteen-cell table has to assert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateOutcome {
+    /// The entry that now carries the name.
+    pub file_id: FileId,
+    /// Whether that entry is a file or a directory.
+    pub kind: Kind,
+    /// What the call had to do to satisfy the disposition.
+    pub action: fs_semantics::disposition::Action,
+}
+
+/// The disposition table's failures, translated to this layer's vocabulary.
+///
+/// Deliberately lossy in one place: the frontend keeps `Failure::AccessDenied` vs `InvalidParameter` apart for
+/// NTSTATUS, while the tree only needs "this was refused". Anything the tree cannot name becomes `ReadOnly`, which
+/// is the closest thing it has to "not offered here".
+fn into_namespace_failure(
+    failure: fs_semantics::disposition::Failure,
+    path: &Path,
+) -> NamespaceError {
+    use fs_semantics::disposition::Failure;
+    match failure {
+        Failure::NameCollision => NamespaceError::AlreadyExists {
+            path: path.display(),
+        },
+        Failure::LeafMissing | Failure::ParentMissing => NamespaceError::NotFound {
+            path: path.display(),
+        },
+        Failure::NotADirectory => NamespaceError::NotADirectory {
+            path: path.display(),
+        },
+        Failure::IsADirectory => NamespaceError::IsADirectory {
+            path: path.display(),
+        },
+        Failure::DirectoryNotEmpty => NamespaceError::DirectoryNotEmpty {
+            path: path.display(),
+        },
+        // Everything else is "this layer does not offer it", which is what `ReadOnly` means here.
+        _ => NamespaceError::ReadOnly,
+    }
+}
+
 impl<S: TreeStore> Rules<S> {
     /// Wraps a backend.
     pub fn new(store: S) -> Self {
@@ -76,6 +121,90 @@ impl<S: TreeStore> Rules<S> {
                     other => other,
                 })?;
             Ok(())
+        })
+    }
+
+    /// Creates or opens `path` according to an NT disposition, **atomically** (P3-2 G1).
+    ///
+    /// The existence test and the action run inside one `write` closure, which is one SQLite transaction: a second
+    /// creator cannot slip between "it does not exist" and "create it". That is the whole point — an adapter that
+    /// resolved first and created second would be a TOCTOU with a race that users see as a lost file.
+    ///
+    /// `SUPERSEDE` on an existing entry **unbinds the old name and drops nothing else**: the old inode row stays,
+    /// because a handle elsewhere may still be reading it (the frontend's L2 proves that separation; this layer only
+    /// has to avoid destroying the row).
+    ///
+    /// # Errors
+    ///
+    /// The [`Decide`] failure translated to the closest namespace error: `AlreadyExists` (collision), `NotFound`
+    /// (missing leaf), `NotADirectory` / `IsADirectory`, and `ReadOnly` for the derived-attribute refusals.
+    pub fn create_or_open(
+        &self,
+        path: &Path,
+        disposition: fs_semantics::disposition::Disposition,
+    ) -> NamespaceResult<CreateOutcome> {
+        use fs_semantics::disposition::{decide, Exists, Outcome};
+
+        if path.is_root() {
+            // The root always exists and is a directory; only the file-opening dispositions care.
+            return match decide(disposition, Exists::Directory) {
+                Outcome::Opened(action) => Ok(CreateOutcome {
+                    file_id: FileId::ROOT,
+                    kind: Kind::Directory,
+                    action,
+                }),
+                Outcome::Failed(failure) => Err(into_namespace_failure(failure, path)),
+            };
+        }
+        let (parent, name) = self.resolve_parent(path)?;
+        self.store.write(OpLabel::Create, |tree| {
+            let existing = tree.lookup(parent, name.as_bytes())?;
+            let exists = match existing {
+                None => Exists::Absent,
+                Some(id) => match tree.inode(id)? {
+                    Some(view) if view.kind == Kind::Directory => Exists::Directory,
+                    Some(_) => Exists::File,
+                    None => Exists::Absent,
+                },
+            };
+            let action = match decide(disposition, exists) {
+                Outcome::Opened(action) => action,
+                Outcome::Failed(failure) => return Err(into_namespace_failure(failure, path)),
+            };
+            use fs_semantics::disposition::Action;
+            let (file_id, kind) = match action {
+                // `Open`: nothing to do, including the directory case (no file handle is created).
+                Action::Open => {
+                    let id = existing.expect("OPEN requires an existing entry");
+                    let kind = tree.inode(id)?.map_or(Kind::File, |view| view.kind);
+                    (id, kind)
+                }
+                Action::CreateNew => {
+                    let id = tree.create_inode(Kind::File)?;
+                    tree.bind(parent, name.as_bytes(), id)?;
+                    (id, Kind::File)
+                }
+                // OVERWRITE_IF / OVERWRITE: the entry is **reused**, so the FileId does not change — that is the
+                // one observable difference from SUPERSEDE, and it is why this arm must not create an inode.
+                Action::TruncateExisting => {
+                    let id = existing.expect("OVERWRITE requires an existing entry");
+                    (id, Kind::File)
+                }
+                Action::ReplaceExisting => {
+                    let _old = existing.expect("SUPERSEDE requires an existing entry");
+                    // Unbind the name only: the old inode row (and its content) stays for anyone holding it, which
+                    // is what lets a frontend keep serving a handle opened before the replace.
+                    tree.unbind(parent, name.as_bytes())?;
+                    let fresh = tree.create_inode(Kind::File)?;
+                    tree.bind(parent, name.as_bytes(), fresh)?;
+                    (fresh, Kind::File)
+                }
+            };
+            Ok(CreateOutcome {
+                file_id,
+                kind,
+                action,
+            })
         })
     }
 

@@ -8,4 +8,10 @@ license.workspace = true
 
 [dependencies]
 cas-core.workspace = true
+# The disposition table is shared with the frontend (P3-2 §12); it lives in a zero-dependency crate.
+fs-semantics.workspace = true
 cas-store.workspace = true
+
+[dev-dependencies]
+cas-store.workspace = true
+fs-overlay.workspace = true
