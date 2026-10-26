@@ -264,3 +264,32 @@ fn admitting_everything_disagrees_with_the_real_rule_on_the_grid() {
         "cell control: \"admit everything\" admits strictly more cells ({generous_admitted}) than the real rule          ({real_admitted}), so the grid can tell the two apart"
     );
 }
+
+/// A handle without `DELETE` access cannot mark the entry delete-pending; the refusal must not change the state.
+///
+/// (This test was accidentally dropped when the criterion-5 control was rewritten — the rewrite sliced the file from a
+/// marker to the end. It is back, and the count going **down** from 7 to 6 is what caught it.)
+#[test]
+fn set_delete_requires_delete_access() {
+    let backend = MockBackend::new();
+    let id = file(&backend, b"/f", b"x");
+    let mut table = HandleTable::new();
+    let handle = table
+        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false)
+        .expect("open read-only");
+    assert_eq!(
+        table.set_delete(handle),
+        Err(OpsError::AccessDenied),
+        "cell refusal: a read-only handle may not delete"
+    );
+    assert!(
+        !table.is_pending(id),
+        "cell state: the refusal changed nothing"
+    );
+    assert!(
+        table
+            .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false)
+            .is_ok(),
+        "cell state: the entry is still openable"
+    );
+}

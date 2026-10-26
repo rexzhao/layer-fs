@@ -66,6 +66,11 @@ pub struct HandleTable {
 
 /// The whole of criterion 3's third case, as one expression.
 ///
+/// **Criterion aid only.** This is not the adapter's policy entry point: the adapter decides when to call
+/// `remove_at`, and it must not route that decision through this function to "reuse the tested rule" — a single call
+/// site is what makes the "exactly once" criterion observable in `calls()`. It is `pub` so the criterion can run the
+/// real rule and two wrong policies side by side in one process; production code has exactly one caller, [`HandleTable::close`].
+///
 /// Extracted so the criterion can be **falsified in-process**: the test runs the same table of `(remaining, pending)`
 /// through this function and through two wrong policies, and requires the wrong ones to disagree. A version of this
 /// criterion that could only be checked by editing the source and re-running is a criterion that will not be re-checked.
