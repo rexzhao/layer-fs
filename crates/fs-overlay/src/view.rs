@@ -43,13 +43,18 @@ pub(crate) struct InodeRow {
     pub(crate) modified_ns: i64,
     pub(crate) base_limit: i64,
     pub(crate) entries: i64,
+    /// v3 columns; 0 / empty means "this store has no explicit value", not "the value is zero".
+    pub(crate) accessed_ns: i64,
+    pub(crate) changed_ns: i64,
+    pub(crate) attributes: i64,
 }
 
 /// Reads the overlay row for `serial`, if any.
 pub(crate) fn inode_row(connection: &Connection, serial: u64) -> OverlayResult<Option<InodeRow>> {
     let row = connection
         .query_row(
-            "SELECT origin, live, kind, size, created_ns, modified_ns, base_limit, entries
+            "SELECT origin, live, kind, size, created_ns, modified_ns, base_limit, entries,
+                    accessed_ns, changed_ns, attributes
              FROM ov_inode WHERE serial = ?1",
             [serial as i64],
             |row| {
@@ -62,6 +67,9 @@ pub(crate) fn inode_row(connection: &Connection, serial: u64) -> OverlayResult<O
                     modified_ns: row.get(5)?,
                     base_limit: row.get(6)?,
                     entries: row.get(7)?,
+                    accessed_ns: row.get(8)?,
+                    changed_ns: row.get(9)?,
+                    attributes: row.get(10)?,
                 })
             },
         )
@@ -187,11 +195,11 @@ pub(crate) fn inode_impl(
             size: row.size as u64,
             created_ns: row.created_ns,
             modified_ns: row.modified_ns,
-            // The overlay schema is v2's: it has no columns for these, so they are **absences**, and `stat` reporting 0
-            // here is the truth about this store rather than a placeholder to be "filled in" later.
-            accessed_ns: 0,
-            changed_ns: 0,
-            attributes: 0,
+            // Schema v2 has the columns; an overlay written by v1 reads back 0, which means "absent" rather than
+            // "zero" — the same convention the snapshot record uses.
+            accessed_ns: row.accessed_ns,
+            changed_ns: row.changed_ns,
+            attributes: u32::try_from(row.attributes).unwrap_or(0),
         }));
     }
     Ok(base.inode(id.serial())?.map(|record| InodeView {

@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# The value-domain rule for attributes lives here (zero-dependency, shared with the frontend). This crate is the layer
+# closest to the disk, so it must refuse a derived bit itself rather than trusting a caller: that is the fourth call site
+# of one function, not a fourth copy of one rule.
+fs-semantics.workspace = true
 cas-core.workspace = true
 cas-store.workspace = true
 fs-namespace.workspace = true
