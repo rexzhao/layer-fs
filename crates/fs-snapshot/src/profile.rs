@@ -152,7 +152,7 @@ impl Profile {
     };
 
     /// The profile this build writes.
-    pub const CURRENT: Profile = Profile::V2;
+    pub const CURRENT: Profile = Profile::V3;
 
     /// Whether this profile is the one this build writes.
     #[must_use]

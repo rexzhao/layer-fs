@@ -91,8 +91,15 @@ fn under_v2_a_descriptor_does_not_change_the_encoded_root() {
 /// ignores my input".
 #[test]
 fn under_v3_the_same_input_changes_the_root() {
-    let without = root_under(Profile::V3, &[]);
-    let with = root_under(Profile::V3, &[0xA5u8; 4096]);
+    // `CURRENT` rather than a hard-coded `V3`: after the switch this is the claim that matters — the format this build
+    // **writes** must put the descriptor in the tree, and it must keep doing so for whatever `CURRENT` becomes.
+    assert_eq!(
+        Profile::CURRENT.inode_fmt,
+        2,
+        "cell precondition: CURRENT carries descriptors"
+    );
+    let without = root_under(Profile::CURRENT, &[]);
+    let with = root_under(Profile::CURRENT, &[0xA5u8; 4096]);
     assert_ne!(
         without, with,
         "cell control: under v3 the descriptor is part of the record, so the root must move — otherwise the v2 assertion \

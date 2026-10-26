@@ -316,7 +316,9 @@ impl<'a> SnapshotReader<'a> {
                 let value = value.to_vec();
                 debug_assert_eq!(role, Role::InodeTable, "inode table");
                 let mut reader = Reader::new(&value);
-                reader.format(self.profile.fmt)?;
+                // Inode pages carry `inode_fmt` (ADR-005-v3 §2.1). This is the **mark** path: getting it wrong here means
+                // GC refuses to walk a v3 store at all (`UnsupportedFormat`), which is how the switch surfaced it.
+                reader.format(self.profile.inode_fmt)?;
                 check_page_size(&value, &self.profile)?;
                 let mut out = Vec::new();
                 match reader.u8()? {

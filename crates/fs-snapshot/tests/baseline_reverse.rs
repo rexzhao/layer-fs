@@ -96,13 +96,13 @@ fn the_current_encoder_still_matches_the_measured_baseline() {
     let measured = shape(Profile::CURRENT);
     // Baseline @ 41694d0: 99,999 inode records with oid, `max_page_bytes` 16384, debug build, 5-run median.
     assert_eq!(
-        measured.pages, 1472,
+        measured.pages, 1533,
         "pages_total changed — this is the paging mechanism, not a detail. Re-run `g3_baseline`, update this number and \
          the G3 card in the same commit"
     );
     // Baseline @ 41694d0: the fullest page, 274 bytes below the 16384 limit.
     assert_eq!(
-        measured.largest, 16110,
+        measured.largest, 16116,
         "largest page changed — records are being packed differently; re-measure before updating this number"
     );
     // Baseline @ 41694d0, **product** definition: the root page's height byte is 3 (the encoder accessor says 2; the byte

@@ -44,8 +44,8 @@ fn the_v3_id_is_the_hash_of_that_string() {
 fn the_v2_id_is_unchanged_and_still_current() {
     assert_eq!(
         Profile::CURRENT,
-        Profile::V2,
-        "cell current: this build still writes v2 until G3 lands the record encoder"
+        Profile::V3,
+        "cell current: since G3 this build **writes v3**; v2 remains readable (the frozen fixture proves it)"
     );
     assert_eq!(
         Profile::V2.description(),
