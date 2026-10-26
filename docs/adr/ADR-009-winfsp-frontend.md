@@ -345,6 +345,7 @@ G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后
 - **选项 B**：adapter 侧旁路 DB（按 FileId）；**不推荐**：commit/restore/rebuild 后丢失、与其他 workspace 不一致、GC/verify 看不见。
 - **选项 C**：全部拒绝写（只读时间/属性/SD）；P3 兼容性差（安装器/编辑器会失败）。
 - 若选 A：`attributes` 只强制 `READONLY`；`HIDDEN/SYSTEM/ARCHIVE` 存储但只报告；SD 仅存取不强制（与 W10 一致）；`access/change` 由 adapter 在读写/元数据变更时更新或按策略保留（写明）。
+- **有意行为，不是 bug（owner 2026-10-26 裁：升级语义 (a) 拒绝）**：v2 workspace / v2 根在 v3 构建下**打开即被拒**（类型化错误，名称以 ADR-005 §8 判据与实现为准），**不迁移、不降级读、不自动升级**。理由：未上线、无真实部署，**不承诺跨 profile 兼容**（ADR-005 §10 第 4 条"旧库零迁移"）。**不得"修"成兼容读或静默迁移**——那会引入一条无判据保护的第二解码路径；若将来有真实部署，须另立迁移 ADR（带自己的判据），而不是放宽这里的拒绝。
 
 ### 10.2 WinFsp 绑定与 license
 
@@ -412,3 +413,4 @@ G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后
 ## 修订记录
 
 - 2026-10-26（**owner 已裁决 (a)**，并定总原则"与真实文件系统行为一致"）：SUPERSEDE 由"解除旧名字 + 新 inode + 旧 inode 保留"改为"同一 FileId 截断 + 属性整体替换"。依据：WinFsp 2.1 用户态分发源码（`fsop.c:929-972`）——SUPERSEDE 以 `Open` + `Overwrite(ReplaceFileAttributes=Supersede)` 作用于同一 FileContext，原语义经传输层无法触发（流程 207）。同步：§4.2 表与触发路径表、§5.4 SUPERSEDE 行与可见性表、G1 `replaced` 不变量、GC 段落。判据影响：改变（P3-2 G1 18 格 FileId 列 SUPERSEDE 行、P3-3a 判据 2 与 M4、B-8、相关测试，见 `docs/reports/supersede-a-impact.md`）。补 QA 复核两点：(b) 的内核 FileNode 缓存死因；`ReplaceFileAttributes` 判别信号写成 (a) 的可断言判据。
+- 2026-10-26：§10.1 补"v2 在 v3 构建下拒绝是有意行为"（owner 裁升级语义 (a) 拒绝），防误修为兼容读。判据影响：无（澄清）。
