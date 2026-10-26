@@ -87,6 +87,23 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 - 删掉 `cas-store/tests/pack.rs` 与 `tests/sync_probe.rs` 的本地 `const TAIL_BYTES: usize = 48`；
 - 只留一处断言 `PACK_TAIL_BYTES == 48`。
 
+### 5.1 落地版判据（2026-10-26，与 `crates/cas-store/tests/tail_constant.rs` 一一对应）
+
+五条检查已从“清单里的 grep”变成**每次 `cargo test` 都跑的检查**（判据不是清单：清单会被改文案绕过）。
+
+| # | 判据 | 说明 |
+| --- | --- | --- |
+| R1 | 字面量绑定 = 0 | `let/const … = 48` 之类 |
+| M2 | 收窄名字版 = 0 | 名字以 `tail`/`_bytes`/`_len`/`_size` 结尾且值含数字（`0x30`、`4+4+8+32` 都算） |
+| M1 | 名字白名单 | 名字含 `tail` 且值含数字 ⇒ 必须叫 `{tail, tail_bytes, tail_len, tail_size}` 之一（抓 `tail_bytes2 = 0x30`） |
+| F1–F5 | 白名单 | 就地 + 带理由 + **条目数 == 命中数（双向）** + **上限即信号**（第 2 条出现时该消灭知识而不是登记） |
+| — | 三级分辨率 | 裸名字 `pub const TABLE` 7 处 / 类型化形状 3 处 / 语意判据 1 处——**每个数都带自己的命令** |
+
+三级分辨率那句原话（QA）：**每提高一级，被误计为“定义”的“提及”就少一类。**
+
+另外两条落地约束：`// tail-allow:` 行内豁免（当前**只许 1 条**：`src/pack.rs` 的 `at + 16..at + 48` 是摘要结束位置，
+不是第二份尾长）；`let tail = 4 + 4 + 8 + 32` 这类“算出 48”由 M1 抓。
+
 **验收用语义检查，不用 `grep 48`**（`48` 可能是别的数，会假红/假绿）：
 
 1. `grep -n 'pub use.*PACK_TAIL_BYTES' crates/cas-store/src/lib.rs` = **1 行**；
@@ -182,7 +199,19 @@ capacity(rec) = ceil((16073 − 5) / rec)
 1. **v3 每页容量实测值**（应为 **179 / 278**）——不符即说明字段布局没按 ADR-005 §2.2；
 2. **`mask_bits` + 分析形状**（有内容/无内容各多少条）——否则页数无法解读。
 
-## 12. G1 的表放哪：`fs-namespace`（manager 裁决，2026-10-24）
+## 12. G1 的表放哪：**`fs-semantics`**（manager 裁决改判，2026-10-26；原方案 `fs-namespace` 作废）
+
+> **改判理由（QA 用一条 `cargo tree` 抓到的）**：`fs-namespace → cas-store → rusqlite(bundled) → cc/pkg-config/vcpkg`
+> 共 23 个 crate。若把表搬进 `fs-namespace`，`cargo test -p fs-windows` 就需要 **C 工具链**，且 `fs-windows` README 的
+> “no FFI / no SDK / any platform” 三条声明**全部失守**（`libsqlite3-sys` 就是对 C 的 FFI）。
+>
+> 现方案：新建**零依赖** crate **`fs-semantics`**，只装决策词表；依赖方向 `fs-windows → fs-semantics`、
+> `fs-namespace → fs-semantics`、`fs-api` 再导出。实测 `cargo tree -p fs-windows --depth 1` 从 **0 → 1**（只多这一条），
+> 无 C 工具链。落地见 `8f71814`。
+>
+> 边界（同批裁决）：**类型跟表走**（`Disposition`/`Exists`/`Action`/`Outcome` 全进 `fs-semantics`，否则表引用它们会形成
+> `fs-semantics → fs-windows` 反向依赖）；**`FileId` 不进**（存储概念，`CreateOutcome { file_id, kind, action }` 留在
+> 定义 FileId 的那层）。
 
 - **表与 `decide` 上移到 `fs-namespace`**（`fs-api` 再导出）；`fs-windows` 改为 `pub use`，**不得保留副本**；
 - 依赖方向：`fs-windows → fs-namespace`（adapter 依赖核心，方向正确）；**P3-1 README 里 "no deps" 的表述同卡改成
