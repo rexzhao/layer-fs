@@ -10,6 +10,7 @@
 pub mod abi;
 pub mod adapter;
 pub mod boundary;
+pub mod callbacks;
 pub mod dirent;
 pub mod error;
 pub mod file_info;
