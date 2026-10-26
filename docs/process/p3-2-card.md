@@ -41,7 +41,17 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
   > **两个签名不对称**：B 形状（`parent, name, expected_id`）**不封死** A —— 有了反向索引后，实现可以**忽略** `name`、
   > 直接用 `expected_id` 定位；反之 A 形状（只有 `id`）**封死** B，因为核心拿不到 `(parent, name)`。
   > ⇒ **先取 B 形状把取舍下推到实现内部**；ADR 复核后若改 A，**trait 签名不动**，只改实现。
-  > 实现暂定 B：定位键 `(parent, name)` 只是**提示不是身份**，必须校验 `entry.child == expected_id`，不符 ⇒ `NotFound`（绝不误删）。
+  > 实现暂定 B：定位键 `(parent, name)` 只是**提示不是身份**，必须校验 `entry.child == expected_id`。
+
+**守卫失败的三种结果（2026-10-26 定，《implementation 先行》）：**
+
+| 情形 | 返回 | 理由 |
+| --- | --- | --- |
+| 名字现在属于**别的条目** | `InvalidRecord { field: "remove_at(expected_id)" }` | 这是**绑定过期**（内部不变量被违反），不是“找不到”；adapter 应记录并跳过 |
+| 名字已消失，且 `expected_id` **已是墓碑** | `Ok(())` | **幂等**：崩溃后的重复清理不该变成错误 |
+| 名字已消失，`expected_id` 仍活着 | `NotFound` | 真正的“找不到” |
+
+（原卡写“不符 ⇒ `NotFound`”，已被上面细分取代；worker 在 `efc618b` 先实现，我按“实现给出了更好的区分”采纳并回写卡与 ADR。）
 
   **A 的可行性未评估（记一行，别留白）**：已知其代价至少 **O(#目录)**——`base` 树里的绑定不在 `ov_entry` 索引里，
   反查要么全树扫描、要么对每个目录问一遍。若 P3-3b 之前评估为“可实现”，则按 A 实现，**接口不变**（这正是取 B 形状的理由）。
