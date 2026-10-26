@@ -23,7 +23,17 @@ fn the_numbers_are_stable_and_not_measured() {
     // Writing a large file must not change what the volume reports: if it did, this layer would be reading
     // the host's free space, which is exactly the mistake the module documents.
     let before = info();
-    let scratch = std::env::temp_dir().join("fs-windows-volume-probe.bin");
+    // The name carries the pid. **Hygiene, not a fix**: QA ran 48 concurrent processes against the fixed name and did
+    // not reproduce a collision, so this does not repair an observed failure — it just removes a shared path from the
+    // test's surface, because the next such collision would be a puzzle nobody wants to debug.
+    let scratch = std::env::temp_dir().join(format!(
+        "fs-windows-volume-probe-{}-{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    ));
     std::fs::write(&scratch, vec![0u8; 1 << 20]).expect("write a scratch file");
     let after = info();
     let _ = std::fs::remove_file(&scratch);

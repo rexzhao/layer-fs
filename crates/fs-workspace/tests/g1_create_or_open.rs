@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use fs_namespace::{CreateOutcome, FileId, Kind, Path, Rules};
+use fs_namespace::{CreateOutcome, FileId, Kind, NamespaceError, Path, Rules};
 use fs_semantics::disposition::{decide, Action, Disposition, Exists, Outcome};
 use fs_workspace::Repo;
 
@@ -240,100 +240,6 @@ fn create_or_open_resolves_inside_the_single_write_closure() {
 ///
 /// What this proves, stated precisely: under contention exactly one `Create` wins and the loser sees `AlreadyExists`.
 ///
-/// What a two-step (`resolve` then `create`) version would do is **not** "two successes" here: QA measured **0/20**
-/// rounds with two successes, and the code says why — the store's mutex is held for the whole write closure, and
-/// `bind` re-checks uniqueness inside that same transaction, so the loser is refused even in the two-step shape.
-///
-/// That makes the race **unconstructible at this layer**, which is why atomicity is asserted *structurally*
-/// (criterion 1): a behavioural test cannot distinguish "atomic" from "accidentally serialised" when the lock already
-/// serialises everything. Earlier versions of this comment claimed two successes; that claim was wrong in both
-/// directions and is kept only as this note, so nobody re-derives it.
-#[test]
-fn a_two_step_version_cannot_produce_two_successes_at_this_layer() {
-    use std::sync::Barrier;
-
-    // The control, measured rather than asserted from theory: 20 rounds of "resolve, then create", two threads each.
-    let mut both = 0usize;
-    for round in 0..20 {
-        let fixture = fixture(&format!("twostep-{round}"));
-        let barrier = Arc::new(Barrier::new(2));
-        let mut handles: Vec<std::thread::JoinHandle<bool>> = Vec::new();
-        for _ in 0..2 {
-            let store = fixture.workspace.store();
-            let barrier = Arc::clone(&barrier);
-            handles.push(std::thread::spawn(move || {
-                let rules = Rules::new(store);
-                barrier.wait();
-                // The two steps: ask first (its own transaction), then act (another).
-                let seen = rules.resolve(&p("/twostep")).is_ok();
-                let _ = seen;
-                rules
-                    .create_or_open(&p("/twostep"), Disposition::Create)
-                    .is_ok()
-            }));
-        }
-        let mut successes = 0usize;
-        for handle in handles {
-            if handle.join().expect("thread") {
-                successes += 1;
-            }
-        }
-        if successes == 2 {
-            both += 1;
-        }
-    }
-    assert_eq!(
-        both, 0,
-        "cell control: the two-step shape must not produce two successes at this layer (QA measured 0/20);          if this ever reports more, the mutex no longer covers the whole closure"
-    );
-}
-
-/// Criterion 2 (behavioural) — under contention exactly one entry is created and the loser sees the typed refusal.
-#[test]
-fn concurrent_creators_produce_exactly_one_entry() {
-    use std::sync::Barrier;
-
-    for round in 0..20usize {
-        let fixture = fixture(&format!("barrier-{round}"));
-        let barrier = Arc::new(Barrier::new(2));
-        let mut handles: Vec<
-            std::thread::JoinHandle<Result<FileId, fs_namespace::NamespaceError>>,
-        > = Vec::new();
-        for _ in 0..2 {
-            let store = fixture.workspace.store();
-            let barrier = Arc::clone(&barrier);
-            handles.push(std::thread::spawn(move || {
-                let rules = Rules::new(store);
-                barrier.wait();
-                rules
-                    .create_or_open(&p("/race"), Disposition::Create)
-                    .map(|outcome| outcome.file_id)
-            }));
-        }
-        let mut created = 0usize;
-        let mut refusals = Vec::new();
-        for handle in handles {
-            match handle.join().expect("thread") {
-                Ok(_) => created += 1,
-                Err(error) => refusals.push(error),
-            }
-        }
-        assert_eq!(
-            (created, refusals.len()),
-            (1, 1),
-            "cell barrier round={round}: exactly one creator may win, refusals were {refusals:?}"
-        );
-        assert!(
-            matches!(
-                refusals[0],
-                fs_namespace::NamespaceError::AlreadyExists { .. }
-            ),
-            "cell barrier round={round}: the loser must see AlreadyExists, got {:?}",
-            refusals[0]
-        );
-    }
-}
-
 /// Criterion 3 — **a refusal changes nothing**, asserted on the two things a caller can see.
 #[test]
 fn a_refused_disposition_leaves_the_entry_and_its_bytes_alone() {
@@ -362,5 +268,169 @@ fn a_refused_disposition_leaves_the_entry_and_its_bytes_alone() {
         fixture.workspace.read_at("/target", 0, 64).expect("bytes"),
         before_bytes,
         "cell refusal: the bytes are untouched"
+    );
+}
+
+/// How long the holder stays inside the write closure.
+const HOLD: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How long the prober must have been blocked before we believe the closure is serialising.
+///
+/// Half of [`HOLD`], as a **separate** constant: the probe's falsifiability depends on being able to shrink the actual
+/// hold without shrinking the expectation. Written as a literal (not `HOLD / 2`) so the two can be changed
+/// independently and the difference is visible in review.
+const MIN_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Lock probe: the write closure really holds the store's mutex for its whole body.
+///
+/// Threshold is **half** the holder's hold time: a prober that returns faster than that did not wait for the lock, so
+/// the closure would not be serialising anything. Returning a busy error counts as having waited (it is contention,
+/// not a fast path), which is why the assertion is about elapsed time rather than about success.
+#[test]
+fn the_write_closure_holds_the_lock_for_its_whole_body() {
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let fixture = fixture("lock-probe");
+    // Two constants on purpose: the wait threshold and the hold are separate decisions, and a single constant would
+    // make the probe unfalsifiable — shrinking the hold would also shrink what it waits for.
+    let hold = HOLD;
+    let minimum_wait = MIN_WAIT;
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let store = fixture.workspace.store();
+    let holder = std::thread::spawn(move || {
+        use fs_namespace::{OpLabel, TreeStore};
+        store
+            .write(OpLabel::Create, |_tree| {
+                ready_tx.send(()).expect("signal");
+                std::thread::sleep(hold);
+                Ok(())
+            })
+            .expect("holder");
+    });
+    ready_rx.recv().expect("the holder is inside the closure");
+
+    let started = Instant::now();
+    let rules = Rules::new(fixture.workspace.store());
+    let outcome = rules.create_or_open(&p("/probe"), Disposition::Create);
+    let elapsed = started.elapsed();
+    holder.join().expect("holder thread");
+
+    assert!(
+        elapsed >= minimum_wait,
+        "cell lock probe: the prober returned after {elapsed:?}, less than the {minimum_wait:?} it must wait while          the closure holds the store for {hold:?} — the closure is not serialising (outcome was {outcome:?})"
+    );
+}
+
+// ---------------------------------------- concurrency: one winner, and a control that stays measured
+
+/// Criterion 2 (behavioural): under contention exactly one entry is created and the loser sees the typed refusal.
+#[test]
+fn concurrent_creators_produce_exactly_one_entry() {
+    use std::sync::Barrier;
+
+    for round in 0..20usize {
+        let fixture = fixture(&format!("barrier-{round}"));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles: Vec<std::thread::JoinHandle<Result<FileId, NamespaceError>>> = Vec::new();
+        for _ in 0..2 {
+            let store = fixture.workspace.store();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let rules = Rules::new(store);
+                barrier.wait();
+                rules
+                    .create_or_open(&p("/race"), Disposition::Create)
+                    .map(|outcome| outcome.file_id)
+            }));
+        }
+        let mut created = 0usize;
+        let mut refusals = Vec::new();
+        for handle in handles {
+            match handle.join().expect("thread") {
+                Ok(_) => created += 1,
+                Err(error) => refusals.push(error),
+            }
+        }
+        assert_eq!(
+            (created, refusals.len()),
+            (1, 1),
+            "cell barrier round={round}: exactly one creator may win, refusals were {refusals:?}"
+        );
+        assert!(
+            matches!(refusals[0], NamespaceError::AlreadyExists { .. }),
+            "cell barrier round={round}: the loser must see AlreadyExists, got {:?}",
+            refusals[0]
+        );
+    }
+}
+
+/// A **genuine** two-step version: the decision in one transaction, the insert in another.
+///
+/// The earlier "control" still called `create_or_open`, so it was the atomic path with extra steps. This one really
+/// separates them — `Rules::resolve` decides, `store.write(create_inode + bind)` acts — and the measurement shows
+/// what happens: **nothing**. Both callers can hold a stale "the name is free" decision, yet `bind` re-checks
+/// uniqueness inside the inserting transaction and refuses the second.
+fn two_step_create(
+    rules: &Rules<fs_workspace::WorkspaceStore>,
+    store: &fs_workspace::WorkspaceStore,
+    path: &Path,
+    name: &'static str,
+) -> Result<FileId, NamespaceError> {
+    use fs_namespace::{OpLabel, TreeStore, TreeWrite};
+    if rules.resolve(path).is_ok() {
+        return Err(NamespaceError::AlreadyExists {
+            path: path.display(),
+        });
+    }
+    store.write(OpLabel::Create, |tree| {
+        let id = tree.create_inode(Kind::File)?;
+        tree.bind(FileId::ROOT, name.as_bytes(), id)?;
+        Ok(id)
+    })
+}
+
+/// The control, measured: the genuine two-step shape is **constructible**, and yet it produces **zero** rounds with
+/// two winners (QA measured 0/20). The reason is `bind`'s uniqueness check inside the inserting transaction, so a
+/// stale decision cannot create a duplicate.
+///
+/// This is why atomicity is asserted **structurally** (criterion 1) rather than behaviourally: with the mutex
+/// covering each closure and `bind` re-checking, no arrangement of two threads produces the lost update that the
+/// atomic call exists to prevent. If this test ever reports two winners, `bind` has stopped checking and the
+/// structural criterion is no longer the whole story.
+#[test]
+fn the_two_step_version_is_constructible_but_produces_no_double_winner() {
+    use std::sync::Barrier;
+
+    let mut rounds_with_two_winners = 0usize;
+    for round in 0..20usize {
+        let fixture = fixture(&format!("genuine-{round}"));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles: Vec<std::thread::JoinHandle<bool>> = Vec::new();
+        for _ in 0..2 {
+            let store = fixture.workspace.store();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let rules = Rules::new(store.clone());
+                barrier.wait();
+                two_step_create(&rules, &store, &p("/lost-update"), "lost-update").is_ok()
+            }));
+        }
+        let mut winners = 0usize;
+        for handle in handles {
+            if handle.join().expect("thread") {
+                winners += 1;
+            }
+        }
+        match winners {
+            2 => rounds_with_two_winners += 1,
+            0 | 1 => {}
+            other => panic!("cell round={round}: unexpected winner count {other}"),
+        }
+    }
+    assert_eq!(
+        rounds_with_two_winners, 0,
+        "cell control: the constructible two-step shape must not produce two winners (QA 0/20); \
+         a non-zero count means `bind` no longer re-checks inside the insert transaction"
     );
 }
