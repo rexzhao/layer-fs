@@ -59,6 +59,42 @@ impl OverlayStore {
         read_at_impl(&connection, &self.base, id, offset, len).map_err(into_namespace)
     }
 
+    /// Reads by **FileId** instead of path (P3-2 G2).
+    ///
+    /// The path version resolves the path and calls the same implementation, so this is not a second read path — it is
+    /// the same one without the resolution step. That matters for a caller holding a handle: after a rename its path is
+    /// stale, its FileId is not.
+    ///
+    /// # Errors
+    ///
+    /// `IsADirectory` for a directory, `NotFound` for an id that is not live, or a store failure.
+    pub fn read_at_id(
+        &self,
+        id: fs_namespace::FileId,
+        offset: u64,
+        len: usize,
+    ) -> NamespaceResult<Vec<u8>> {
+        let _guard = ScopeGuard::enter().map_err(into_namespace)?;
+        let connection = self.lock();
+        // The path version got this check for free: `resolve_file` refuses a directory. Going straight to the id
+        // skips that, so the check has to be here — otherwise "read a directory" returns its pages as if they were
+        // file bytes, which is worse than an error because it looks like data.
+        match crate::view::inode_impl(&connection, &self.base, id).map_err(into_namespace)? {
+            Some(view) if view.kind == fs_namespace::Kind::File => {}
+            Some(_) => {
+                return Err(fs_namespace::NamespaceError::IsADirectory {
+                    path: String::new(),
+                })
+            }
+            None => {
+                return Err(fs_namespace::NamespaceError::NotFound {
+                    path: String::new(),
+                })
+            }
+        }
+        read_at_impl(&connection, &self.base, id, offset, len).map_err(into_namespace)
+    }
+
     /// Writes `bytes` at `offset`, extending the file when the write runs past its end.
     ///
     /// # Errors

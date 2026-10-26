@@ -111,6 +111,57 @@ impl Workspace {
         self.base_root
     }
 
+    /// Reads a file by **FileId** (P3-2 G2): the entry the caller holds, not the name it had.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Overlay`] with `IsADirectory`/`NotFound` as the overlay reports them.
+    pub fn read_at_id(
+        &self,
+        file_id: fs_namespace::FileId,
+        offset: u64,
+        len: usize,
+    ) -> WorkspaceResult<Vec<u8>> {
+        Ok(self.overlay.read_at_id(file_id, offset, len)?)
+    }
+
+    /// Lists a directory by **FileId**, resumable after `after` (P3-2 G2).
+    ///
+    /// A directory handle must survive a rename, so enumeration cannot go through a path. The order is the tree's:
+    /// the same call twice returns the same sequence, which is what the card's "stable order" criterion asks for.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Namespace`] with `NotFound`/`NotADirectory` when the id is not a live directory.
+    pub fn read_dir_id(
+        &self,
+        dir_id: fs_namespace::FileId,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> WorkspaceResult<Vec<(Vec<u8>, fs_namespace::FileId)>> {
+        use fs_namespace::TreeStore;
+        let store = self.store();
+        Ok(store.read(|tree| {
+            use fs_namespace::{Kind, TreeRead};
+            // Liveness first: `read_dir` on a dead id would otherwise return an empty list, which is
+            // indistinguishable from "an empty directory" and hides a stale handle instead of reporting it.
+            match tree.inode(dir_id)? {
+                Some(view) if view.kind == Kind::Directory => {}
+                Some(_) => {
+                    return Err(fs_namespace::NamespaceError::NotADirectory {
+                        path: String::new(),
+                    })
+                }
+                None => {
+                    return Err(fs_namespace::NamespaceError::NotFound {
+                        path: String::new(),
+                    })
+                }
+            }
+            tree.read_dir(dir_id, after, limit)
+        })?)
+    }
+
     /// The overlay file's path.
     #[must_use]
     pub fn overlay_path(&self) -> &std::path::Path {
