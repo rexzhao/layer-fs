@@ -106,3 +106,46 @@ impl std::fmt::Debug for FileSystemInterface {
             .finish()
     }
 }
+
+/// Slot indices of the operations this frontend implements, in the SDK's table order.
+///
+/// Extracted mechanically from `winfsp.h:193-1093` (33 named entries followed by `Reserved`), and every index below cites
+/// the header line of its declaration. Written as constants rather than as struct fields because the table is an **array of
+/// 64 slots**: a field would reintroduce the "reads like a table, is not one" mistake that `a7bec80` fixed.
+pub mod slot {
+    /// `GetVolumeInfo` — `winfsp.h:206`.
+    pub const GET_VOLUME_INFO: usize = 0;
+    /// `SetVolumeLabel` — `winfsp.h:221` (not implemented: labels are read-only here).
+    pub const SET_VOLUME_LABEL: usize = 1;
+    /// `GetSecurityByName` — `winfsp.h:252`.
+    pub const GET_SECURITY_BY_NAME: usize = 2;
+    /// `Create` — `winfsp.h:291`.
+    pub const CREATE: usize = 3;
+    /// `Open` — `winfsp.h:322`.
+    pub const OPEN: usize = 4;
+    /// `Overwrite` — `winfsp.h:345`.
+    pub const OVERWRITE: usize = 5;
+    /// `Cleanup` — `winfsp.h:410`.
+    pub const CLEANUP: usize = 6;
+    /// `Close` — `winfsp.h:420`.
+    pub const CLOSE: usize = 7;
+    /// `Read` — `winfsp.h:441`.
+    pub const READ: usize = 8;
+    /// `Write` — `winfsp.h:471`.
+    pub const WRITE: usize = 9;
+    /// `Flush` — `winfsp.h:491`.
+    pub const FLUSH: usize = 10;
+    /// `GetFileInfo` — `winfsp.h:507`.
+    pub const GET_FILE_INFO: usize = 11;
+    /// `SetBasicInfo` — `winfsp.h:538`.
+    pub const SET_BASIC_INFO: usize = 12;
+    /// `SetFileSize` — `winfsp.h:576`.
+    pub const SET_FILE_SIZE: usize = 13;
+    /// `CanDelete` — `winfsp.h:607`.
+    pub const CAN_DELETE: usize = 14;
+    /// `Rename` — `winfsp.h:632`.
+    pub const RENAME: usize = 15;
+
+    /// How many named (non-reserved) entries the SDK declares; the rest are `Reserved[31]` plus padding to 64.
+    pub const NAMED: usize = 33;
+}
