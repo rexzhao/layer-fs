@@ -606,7 +606,6 @@ fn the_pack_tail_is_forty_eight_bytes() {
     // The composition check that used to sit here (`4 + 4 + 8 + 32 == 48`) was **tautological**: both sides were
     // literals, so it could never fail and proved nothing about the format. The composition is asserted where it
     // can actually break — `verify` reads a real tail and compares `frames_len + the tail size` against the file
-    // length, and the pack tests above exercise that on every published pack. (Saying the constant's name here
-    // would add a hit to the count card §5 pins at 11, so the prose avoids it.)
+    // length, and the pack tests above exercise that on every published pack.
     assert!(cas_store::PACK_TAIL_BYTES == 48, "cell constant: tail size");
 }
