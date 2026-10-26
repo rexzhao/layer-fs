@@ -8,15 +8,6 @@ use std::path::Path;
 use fs_winfsp::handshake::read_version;
 use fs_winfsp::loader::{resolve_library, LoadError};
 
-/// **Ignored on purpose**: this test *crashes the whole test binary* on this machine (`0xC0000005`) when the DLL is
-/// present, and a crashing test cannot be "skipped with a reason" — it takes the other tests in the file with it.
-///
-/// The crash is a **finding**, not a flake. Manager's manual harness, using the same two calls, reported
-/// `FspVersion → 2.0.1` on this machine, while this harness crashes against the same file (and against the SDK's
-/// `SxS/DYNAMIC/bin` copy too). So something differs between the two harnesses — entry point, calling convention, or a load
-/// step (WinFsp's runtime may require `FspLoad` before its exports are callable). Finding that difference is the next step;
-/// pretending the check passed would hide it, and leaving it un-ignored would redden every CI run with a process abort.
-#[ignore = "crashes the test process with 0xC0000005 on this machine; under investigation against manager's manual             harness which reported version 2.0.1 — run with --ignored to reproduce"]
 #[test]
 fn the_library_loads_and_reports_its_version() {
     let resolved = fs_winfsp::loader::default_library();
@@ -28,11 +19,23 @@ fn the_library_loads_and_reports_its_version() {
         );
         return;
     }
+    // Two assertions, because each alone can be satisfied by a wrong call: a version read from the wrong slot is positive
+    // garbage, and an NTSTATUS-only check would pass for a zero version. `read_version` fails on a non-zero status, so
+    // reaching this line already means `STATUS_SUCCESS`; the version still has to look like a WinFsp version.
     let version = read_version(path).expect("the library loads and exports FspVersion");
-    eprintln!("winfsp version = {version:#010x}");
+    eprintln!(
+        "winfsp version = {version:#010x} ({}.{})",
+        version >> 16,
+        version & 0xffff
+    );
     assert!(
         version > 0,
         "cell version: a loaded WinFsp reports a non-zero version; zero means the symbol resolved to the wrong place"
+    );
+    assert_eq!(
+        version >> 16,
+        2,
+        "cell major: WinFsp 2.x is what this frontend targets — a different major means the layout assertions were made          against the wrong header"
     );
 }
 

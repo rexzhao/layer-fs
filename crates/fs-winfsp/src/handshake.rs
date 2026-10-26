@@ -64,13 +64,25 @@ mod platform {
             });
         }
 
-        // SAFETY: `FspVersion` is documented as `ULONG FspVersion(VOID)`; the address came from that module's export table.
-        let version: u32 = unsafe {
-            let function: extern "system" fn() -> u32 = std::mem::transmute(address);
-            function()
-        };
+        // `FSP_API NTSTATUS FspVersion(PUINT32 PVersion)` (`winfsp.h:2180`): it **writes the version through a pointer** and
+        // returns an NTSTATUS. Declaring it `fn() -> u32` (the first version of this file) made it write to whatever was in
+        // the first argument slot and crashed with `0xC0000005` — the crash was the signature, not the environment.
+        let function: extern "system" fn(*mut u32) -> i32 =
+            // SAFETY: the address came from this module's export table and the signature is the SDK's.
+            unsafe { std::mem::transmute(address) };
+        let mut version = 0u32;
+        // The transmuted pointer is already an `extern "system" fn`, so this call is safe Rust: the unsafety was the
+        // transmute above, and wrapping the call in `unsafe` again would hide that (clippy was right).
+        let status = function(&mut version);
         // SAFETY: as above — paired with the successful load.
         unsafe { FreeLibrary(module) };
+        if status != 0 {
+            return Err(LoadError::LoadFailed {
+                path: library.to_path_buf(),
+                // The NTSTATUS is the OS's answer; the loader error code is not involved, and saying so keeps the two apart.
+                last_error: u32::try_from(status).unwrap_or(0),
+            });
+        }
         Ok(version)
     }
 }
