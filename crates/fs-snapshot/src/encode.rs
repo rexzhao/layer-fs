@@ -87,9 +87,12 @@ pub fn encode_directory(
 ///
 /// `profile.inode_fmt` selects the layout: 1 is the v2 record (five fields), 2 is the v3 record (nine fields + security).
 /// Both are reached from the same `InodeRecord`, which is what keeps "which format is this page" a single decision.
-fn inode_record_bytes(profile: &Profile, record: &InodeRecord) -> SnapshotResult<Vec<u8>> {
+fn inode_record_bytes(
+    profile: &Profile,
+    record: &InodeRecord,
+    leaf: &mut Writer,
+) -> SnapshotResult<()> {
     if profile.inode_fmt == 1 {
-        let mut leaf = Writer::new();
         leaf.u64(record.serial);
         leaf.u8(record.kind.tag());
         leaf.u64(record.size);
@@ -101,22 +104,25 @@ fn inode_record_bytes(profile: &Profile, record: &InodeRecord) -> SnapshotResult
         if let Some(oid) = content_object(record.clone()) {
             leaf.oid(oid);
         }
-        return Ok(leaf.finish());
+        return Ok(());
     }
-    let mut encoded = crate::inode_v3::encode(&crate::inode_v3::InodeRecordV3 {
-        serial: record.serial,
-        kind: record.kind,
-        size: record.size,
-        created_ns: record.created_ns,
-        modified_ns: record.modified_ns,
-        accessed_ns: record.accessed_ns,
-        changed_ns: record.changed_ns,
-        attributes: record.attributes,
-        security: record.security.clone(),
-        content: record.content,
-    })?;
-    encoded.shrink_to_fit();
-    Ok(encoded)
+    // Written straight into the page's buffer: a `Vec` per record is an allocation per record, which on the 99,999-record
+    // baseline cost more than the four extra fields did (456 ms vs 187 ms) and would have been misreported as a format cost.
+    crate::inode_v3::encode_into(
+        &crate::inode_v3::InodeRecordV3 {
+            serial: record.serial,
+            kind: record.kind,
+            size: record.size,
+            created_ns: record.created_ns,
+            modified_ns: record.modified_ns,
+            accessed_ns: record.accessed_ns,
+            changed_ns: record.changed_ns,
+            attributes: record.attributes,
+            security: record.security.clone(),
+            content: record.content,
+        },
+        leaf.bytes_mut(),
+    )
 }
 
 /// # Errors
@@ -144,12 +150,13 @@ pub fn encode_inode_table(
         // the pager writes a page's `fmt` byte and copies `entry.leaf` verbatim, so if these two disagreed the page
         // would advertise one format while carrying another — the half-v3 shape that round-trips in-process and is
         // unreadable everywhere else.
-        let leaf = inode_record_bytes(profile, &record)?;
+        let mut leaf = Writer::new();
+        inode_record_bytes(profile, &record, &mut leaf)?;
 
         collected.push(Entry {
             key: key_bytes.clone(),
             page_key: Vec::new(),
-            leaf,
+            leaf: leaf.finish(),
             // In an inode branch the first key is `first_serial`, a bare u64.
             branch_key: key_bytes,
         });

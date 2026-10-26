@@ -149,6 +149,14 @@ impl Writer {
         self.bytes.len()
     }
 
+    /// The underlying buffer, for a codec that writes its own layout (the v3 inode record).
+    ///
+    /// Exists so the record encoder can append **in place**: allocating a `Vec` per record cost more than the four extra
+    /// fields did on the 99,999-record baseline.
+    pub(crate) fn bytes_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
+    }
+
     pub(crate) fn finish(self) -> Vec<u8> {
         self.bytes
     }

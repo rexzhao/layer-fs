@@ -131,7 +131,7 @@ fn measure(profile: Profile) -> Measured {
 #[test]
 #[ignore = "measurement, not a criterion: run with --ignored --nocapture to print the baseline table"]
 fn print_the_baseline_table() {
-    let profile = Profile::V2;
+    let profile = Profile::CURRENT;
     let mut times = Vec::new();
     let mut last = None;
     for _ in 0..5 {
