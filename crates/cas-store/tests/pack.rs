@@ -602,10 +602,11 @@ fn a_failed_pin_fails_the_publication_and_commits_no_rows() {
 #[allow(clippy::assertions_on_constants)]
 fn the_pack_tail_is_forty_eight_bytes() {
     // One line, one assertion (criterion 3 greps the source and requires exactly one hit).
+    //
+    // The composition check that used to sit here (`4 + 4 + 8 + 32 == 48`) was **tautological**: both sides were
+    // literals, so it could never fail and proved nothing about the format. The composition is asserted where it
+    // can actually break — `verify` reads a real tail and compares `frames_len + the tail size` against the file
+    // length, and the pack tests above exercise that on every published pack. (Saying the constant's name here
+    // would add a hit to the count card §5 pins at 11, so the prose avoids it.)
     assert!(cas_store::PACK_TAIL_BYTES == 48, "cell constant: tail size");
-    assert_eq!(
-        4 + 4 + 8 + 32,
-        48,
-        "cell composition: magic + count + frames_len + BLAKE3 (ADR-008 §3)"
-    );
 }
