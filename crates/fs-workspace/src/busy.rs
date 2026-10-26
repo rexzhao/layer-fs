@@ -12,9 +12,9 @@
 //! `commit` includes the work *before* that point (staging, materialisation, opening a connection), so its own
 //! `Instant` can start earlier and still end up with a *smaller* total only if the driver's wait is longer than the
 //! caller's own pre-work — which is the normal case. An assertion of the form `waited_ms ≈ measured` is therefore
-//! comparing unlike quantities; the defensible comparisons are one-sided (`waited_ms >= measured` is also wrong in
-//! general — see below) and the honest statement is that `waited_ms` is a lower bound on the driver's own wait and
-//! says nothing about the caller's total. See `tests/core.rs::a_blocked_cas_index_also_waits_boundedly`, which is
+//! comparing unlike quantities, and even a "one-sided" comparison between them is only an approximation that happens to
+//! hold in the common case. The honest statement is that `waited_ms` measures the driver's own wait and says nothing
+//! about the caller's total. See `tests/core.rs::a_blocked_cas_index_also_waits_boundedly`, which is
 //! marked as an observation for exactly this reason.
 
 use std::cell::Cell;

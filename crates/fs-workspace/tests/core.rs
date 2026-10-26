@@ -488,7 +488,7 @@ fn a_held_main_database_lock_ends_in_a_typed_busy() {
             // driver's clock starts at the main-database lock, the test's starts earlier, so the two are not
             // comparable quantities (see `busy.rs` on clock origins).
             // **Only the policy bound is asserted.** The two empirical assertions that used to sit here
-            // (`waited_ms >= measured` and `<= policy + 1000`) compared quantities with different clock origins — the
+            // (a cross-clock comparison, and an empirical upper bound) compared quantities with different clock origins — the
             // driver starts its clock where it begins waiting on the database, the test starts its own before
             // `commit` — so they measured the machine, not the code (that is the flake QA reproduced). What remains is
             // the one claim this layer makes: the wait was configured to be at least the policy, and the caller is told
@@ -637,7 +637,7 @@ fn a_rejected_rule_leaves_the_view_unchanged() {
 /// 1. **Different clock origins.** `busy::start` runs where this crate begins waiting on the main database; the test's
 ///    own `Instant` starts before `commit` and therefore includes staging and connection work. `waited_ms` can
 ///    legitimately be *larger or smaller* than the test's `measured`, so `waited_ms ≈ measured` compares unlike
-///    quantities and `waited_ms >= measured` is only an approximation that happens to hold here.
+///    quantities, and a one-sided comparison across them is only an approximation that happens to hold here.
 /// 2. **The policy is not configurable.** `workspace_policy.main_busy_timeout_ms` is pinned by the schema to the
 ///    compiled default, so "reported the constant" and "reported the measurement" are the same number.
 ///
@@ -671,7 +671,7 @@ fn a_blocked_cas_index_also_waits_boundedly() {
             // driver's clock starts at the main-database lock, the test's starts earlier, so the two are not
             // comparable quantities (see `busy.rs` on clock origins).
             // **Only the policy bound is asserted.** The two empirical assertions that used to sit here
-            // (`waited_ms >= measured` and `<= policy + 1000`) compared quantities with different clock origins — the
+            // (a cross-clock comparison, and an empirical upper bound) compared quantities with different clock origins — the
             // driver starts its clock where it begins waiting on the database, the test starts its own before
             // `commit` — so they measured the machine, not the code (that is the flake QA reproduced). What remains is
             // the one claim this layer makes: the wait was configured to be at least the policy, and the caller is told
