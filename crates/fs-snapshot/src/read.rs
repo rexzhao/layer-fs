@@ -92,7 +92,11 @@ impl<'a> SnapshotReader<'a> {
         // scope (32), root_serial (8), inode table (32). The profile id is the first 32
         // bytes after the format byte.
         let recorded = probe.take(32)?;
-        let profile = [Profile::CURRENT, Profile::V1]
+        // Every profile this build can **read**, not just the one it writes: `open_any` exists for history, and history is
+        // written by older builds. `[CURRENT, V1]` was correct only while `CURRENT` happened to be the newest readable
+        // format; with v3 added, leaving it this way silently makes every v2 snapshot unopenable (the committed v2
+        // fixture included).
+        let profile = [Profile::V3, Profile::V2, Profile::V1]
             .into_iter()
             .find(|candidate| candidate.id() == recorded)
             .ok_or_else(|| SnapshotError::UnsupportedProfile {
