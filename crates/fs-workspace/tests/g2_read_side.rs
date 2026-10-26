@@ -148,15 +148,26 @@ fn listing_a_removed_directory_is_a_typed_error() {
     let dir_id = rules.resolve(&p("/gone")).expect("dir id");
     rules.rmdir(&p("/gone")).expect("rmdir");
 
+    // **Variant matching, not string matching**: `format!("{error:?}").contains(..)` would pass for any token that
+    // happened to appear in the message, which is how a criterion becomes unfalsifiable. The two outcomes the card
+    // distinguishes (removed → NotFound, not-a-directory → NotADirectory) are asserted by variant, and the second has
+    // its own control below.
     match fixture.workspace.read_dir_id(dir_id, None, 16) {
-        Ok(entries) => panic!("cell after remove: expected a typed error, got {entries:?}"),
-        Err(error) => {
-            let text = format!("{error:?}");
-            assert!(
-                text.contains("NotFound") || text.contains("NotADirectory"),
-                "cell after remove: expected NotFound/NotADirectory, got {text}"
-            );
-        }
+        Err(fs_workspace::WorkspaceError::Namespace(fs_namespace::NamespaceError::NotFound {
+            ..
+        })) => {}
+        other => panic!("cell after remove: expected NotFound, got {other:?}"),
+    }
+
+    // Control: a **file's** id must give the other variant, so the assertion above cannot be satisfied by any error.
+    let file = rules
+        .create_or_open(&p("/file"), fs_semantics::disposition::Disposition::Create)
+        .expect("create");
+    match fixture.workspace.read_dir_id(file.file_id, None, 16) {
+        Err(fs_workspace::WorkspaceError::Namespace(
+            fs_namespace::NamespaceError::NotADirectory { .. },
+        )) => {}
+        other => panic!("cell control: expected NotADirectory for a file id, got {other:?}"),
     }
 }
 
