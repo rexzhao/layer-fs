@@ -297,6 +297,10 @@ impl Inner {
 }
 
 impl WorkspaceOps for MockBackend {
+    fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
+        MockBackend::mkdir(self, path)
+    }
+
     fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
         let mut inner = self.inner.lock().expect("mock lock");
         inner

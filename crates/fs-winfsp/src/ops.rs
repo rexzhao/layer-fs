@@ -166,6 +166,14 @@ pub trait WorkspaceOps {
     /// and the existing kind disagree.
     fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome>;
 
+    /// Creates a directory (and only a directory — `create_or_open` has no kind argument in this trait, because the
+    /// adapter only ever needs "make a directory" or "make/open a file").
+    ///
+    /// # Errors
+    ///
+    /// [`OpsError::NameCollision`] when the name is taken, [`OpsError::NotFound`] for a missing parent.
+    fn mkdir(&self, path: &[u8]) -> OpsResult<u64>;
+
     /// Reads up to `len` bytes at `offset`; a short read at EOF is zero-padded by the caller's contract, not here.
     ///
     /// # Errors
