@@ -51,14 +51,27 @@ impl LoadError {
     }
 }
 
-/// The default location of the SDK's dynamic library on this machine, if the environment says otherwise use
-/// [`resolve_library`].
+/// Where the real WinFsp runtime lives on a normal install (WinFsp 2.x, 64-bit).
 ///
-/// **Not** the `SxS/DYNAMIC/bin` copy: loading that one and calling `FspVersion` through `GetProcAddress` **crashes**
-/// (`0xC0000005`), because it is the dynamic-loader flavour of the library and expects to be entered through its own API
-/// rather than have its exports called directly. Recorded here so the next person does not re-try it: the crash was found
-/// by this very handshake, which is what it is for.
-pub const DEFAULT_LIBRARY: &str = "F:/work/winfsp-sdk/DYN/x64/winfsp-x64.dll";
+/// Verified on this machine: `LoadLibraryW` + `GetProcAddress("FspVersion")` → **2.0.1**. This is the only copy of the three
+/// same-named DLLs on this box that may be called through its export table.
+pub const PROGRAM_FILES_X86: &str = "C:/Program Files (x86)/WinFsp/bin/winfsp-x64.dll";
+
+/// Environment override, so a test can point at another build without editing code.
+pub const ENV_OVERRIDE: &str = "WINFSP_DLL";
+
+/// The library a caller should try by default: the environment override if set, else [`PROGRAM_FILES_X86`].
+///
+/// **Do not** use `F:/work/winfsp-sdk/.../DYNAMIC/SxS/.../winfsp-x64.dll`: that is the dynamic-loader variant, and calling
+/// its exports through `GetProcAddress` crashes with `0xC0000005`. Three same-named DLLs on one machine, only one callable
+/// that way — which is why the handshake exists.
+#[must_use]
+pub fn default_library() -> PathBuf {
+    match std::env::var_os(ENV_OVERRIDE) {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => PathBuf::from(PROGRAM_FILES_X86),
+    }
+}
 
 /// Checks that `path` exists before a loader call.
 ///
