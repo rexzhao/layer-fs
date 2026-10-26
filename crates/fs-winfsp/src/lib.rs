@@ -21,3 +21,9 @@ pub use ops::{
     Attributes, DirEntry, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, RenameOutcome, Times,
     WorkspaceOps,
 };
+
+/// The P3-3a contract scenarios, re-exported so a backend living in another crate can run **the same** functions.
+///
+/// They are `include!`d rather than copied: one definition, two instantiations (mock here, real backend in `fs-api`). A
+/// copy would let the two drift, and the drift would look like "the backend has its own contract".
+pub mod scenarios;

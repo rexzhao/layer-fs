@@ -46,6 +46,8 @@ mod read_view;
 mod repo;
 mod stats;
 mod verify;
+
+pub mod winfsp_backend;
 mod workspace;
 
 pub use error::{ApiError, ApiResult};

@@ -14,6 +14,10 @@ fs-semantics.workspace = true
 fs-snapshot.workspace = true
 fs-overlay.workspace = true
 fs-workspace.workspace = true
+# The real `WorkspaceOps` backend lives here because this is the only crate that may depend on both sides: `fs-winfsp`
+# defines the trait and must stay free of SQLite, while the implementation needs a workspace. Direction: frontend trait
+# ← api implementation, no cycle.
+fs-winfsp.workspace = true
 
 [dev-dependencies]
 # `verify`'s legacy-store test forges a P1 metadata database directly.

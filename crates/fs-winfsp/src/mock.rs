@@ -21,9 +21,13 @@ use crate::ops::{
     WorkspaceOps,
 };
 
-/// The root directory's id. Fixed, because a root that moved with the allocation counter would make every test's
-/// `parent` argument depend on test order.
-pub const ROOT: u64 = 1;
+/// The root directory's id.
+///
+/// **0**, matching `fs_namespace::FileId::ROOT`. It used to be 1, which was a mock-only choice — and it made every
+/// scenario that passes `ROOT` as `parent` **wrong against the real backend**, silently: the scenario would ask the core
+/// about serial 1 (the first *file*) and get `NotADirectory`. The trait-level constant has to agree with the core, because
+/// the scenarios are shared.
+pub const ROOT: u64 = 0;
 
 /// One call the adapter made, in order.
 ///

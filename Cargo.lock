@@ -116,6 +116,7 @@ dependencies = [
  "fs-overlay",
  "fs-semantics",
  "fs-snapshot",
+ "fs-winfsp",
  "fs-workspace",
  "rusqlite",
 ]
