@@ -149,6 +149,32 @@ impl Workspace {
         Ok(self.overlay.read_at_id(file_id, offset, len)?)
     }
 
+    /// Writes by **FileId** (P3-3b): the write-side twin of [`Self::read_at_id`].
+    ///
+    /// A handle names an object, not a path. Writing through the path version after a rename or a `SUPERSEDE` would write
+    /// to whatever now carries that name — the TOCTOU that G1 and G2 removed, re-introduced one layer up.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Overlay`] with `IsADirectory`/`NotFound`.
+    pub fn write_at_id(
+        &self,
+        file_id: fs_namespace::FileId,
+        offset: u64,
+        bytes: &[u8],
+    ) -> WorkspaceResult<()> {
+        Ok(self.overlay.write_at_id(file_id, offset, bytes)?)
+    }
+
+    /// Sets the size by **FileId** (P3-3b) — the twin of [`Self::write_at_id`].
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Overlay`] with `IsADirectory`/`NotFound`.
+    pub fn truncate_id(&self, file_id: fs_namespace::FileId, size: u64) -> WorkspaceResult<()> {
+        Ok(self.overlay.truncate_id(file_id, size)?)
+    }
+
     /// Lists a directory by **FileId**, resumable after `after` (P3-2 G2).
     ///
     /// A directory handle must survive a rename, so enumeration cannot go through a path. The order is the tree's:

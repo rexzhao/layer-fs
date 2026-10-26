@@ -113,6 +113,81 @@ impl OverlayStore {
             .map_err(|error| into_namespace(OverlayError::Sqlite(error)))
     }
 
+    /// Writes by **FileId** instead of path (P3-3b).
+    ///
+    /// The read side got this in G2 and the write side did not; that asymmetry is why the real `WorkspaceOps` backend has
+    /// no honest way to implement `write(file_id, …)`. Implementing it with the path version would put the TOCTOU back
+    /// that G1/G2 removed: a handle whose name was renamed or replaced would write to **whatever is at the old path now**.
+    ///
+    /// # Errors
+    ///
+    /// `IsADirectory` for a directory, `NotFound` for an id that is not live, or a store failure.
+    pub fn write_at_id(
+        &self,
+        id: fs_namespace::FileId,
+        offset: u64,
+        bytes: &[u8],
+    ) -> NamespaceResult<()> {
+        let _guard = ScopeGuard::enter().map_err(into_namespace)?;
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction()
+            .map_err(|error| into_namespace(OverlayError::Sqlite(error)))?;
+        // Same check the path version got from `resolve_file`, for the same reason as `read_at_id`: going straight to the
+        // id skips it, and writing a directory's "bytes" is worse than an error because it looks like data.
+        let view = crate::view::inode_impl(&transaction, &self.base, id).map_err(into_namespace)?;
+        let Some(view) = view else {
+            return Err(into_namespace(OverlayError::Namespace(
+                NamespaceError::NotFound {
+                    path: format!("{}", id.serial()),
+                },
+            )));
+        };
+        if view.kind == fs_namespace::Kind::Directory {
+            return Err(into_namespace(OverlayError::Namespace(
+                NamespaceError::IsADirectory {
+                    path: format!("{}", id.serial()),
+                },
+            )));
+        }
+        write_at_impl(&transaction, &self.base, id, offset, bytes).map_err(into_namespace)?;
+        transaction
+            .commit()
+            .map_err(|error| into_namespace(OverlayError::Sqlite(error)))
+    }
+
+    /// Sets the size by **FileId** instead of path (P3-3b) — the write-side twin of `read_at_id`.
+    ///
+    /// # Errors
+    ///
+    /// `IsADirectory` for a directory, `NotFound` for an id that is not live, or a store failure.
+    pub fn truncate_id(&self, id: fs_namespace::FileId, new_size: u64) -> NamespaceResult<()> {
+        let _guard = ScopeGuard::enter().map_err(into_namespace)?;
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction()
+            .map_err(|error| into_namespace(OverlayError::Sqlite(error)))?;
+        let view = crate::view::inode_impl(&transaction, &self.base, id).map_err(into_namespace)?;
+        let Some(view) = view else {
+            return Err(into_namespace(OverlayError::Namespace(
+                NamespaceError::NotFound {
+                    path: format!("{}", id.serial()),
+                },
+            )));
+        };
+        if view.kind == fs_namespace::Kind::Directory {
+            return Err(into_namespace(OverlayError::Namespace(
+                NamespaceError::IsADirectory {
+                    path: format!("{}", id.serial()),
+                },
+            )));
+        }
+        truncate_impl(&transaction, &self.base, id, new_size).map_err(into_namespace)?;
+        transaction
+            .commit()
+            .map_err(|error| into_namespace(OverlayError::Sqlite(error)))
+    }
+
     /// Sets the file's size, zero-extending or cutting it (ADR-006 §7.3).
     ///
     /// # Errors
