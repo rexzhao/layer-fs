@@ -168,6 +168,10 @@ batch.commit()?;                             // 下面的 1–4
   以及它独占打开的那条 overlay 连接。每个库的状态（含 `ov_meta.pending_root`、`ov_inode.sealed_content`）必须经**该库
   自己的**连接读取，**不得在已持锁的库上另开连接**（"谁的锁，谁读"）：锁外读到的是未受保护的快照，窗口期内 overlay
   被改会漏掉 pending 引用，从而误删数据。日常 `Repo::open` 不受此约束；
+- **GC 根集不含活句柄**：离线独占的承重件是 **overlay 的 `locking_mode=EXCLUSIVE`**（ADR-006 §5.1，每次打开都执行），
+  不是 `store.sqlite` 的锁（WAL 下读者与维护者可以共存）。GC 逐个独占打开 overlay，任何挂载中的 workspace 都会以
+  `WorkspaceInUse` 拒绝，因此 GC 期间不存在句柄；SUPERSEDE 产生的"旧 inode 记录保留但名字已解除"状态因此不需要作为
+  根输入。若将来允许在线 GC，或允许 GC 与只读挂载并存，根集必须增加 live-handle 输入；
 - 运行期间其他进程的 `Repo::open` 失败（不等待：GC 可能很长，有界等待没有意义）；
 - 理由：在线 GC 的经典竞争——物化中 put 一个"索引里已有"的对象（`AlreadyPresent`，不写），GC 恰好把它
   当垃圾删掉，随后发布的根引用了它 → 悬空。离线排除了一切并发写入者，正确性论证最简单；
@@ -279,6 +283,7 @@ GcReport { roots, marked_objects, freed_objects, freed_bytes, packs_repacked, pa
 | 历史过期（reflog/snapshot 保留期） | owner 定策略后 **[G2 已定]** |
 | pack 压缩、delta | 非 P2 |
 | loose → pack 的批量迁移 | 不需要（v2 Store 拒绝；v3 新对象全部进 pack） |
+| overlay 不可达 inode 行（SUPERSEDE 保留）的回收 | backlog **B-10**（推荐方案 C：离线 GC 在 overlay 排他锁下扫描并删除不可达行） |
 
 ## 9. 测试清单
 

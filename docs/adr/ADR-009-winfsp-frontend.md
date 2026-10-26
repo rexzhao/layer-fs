@@ -27,6 +27,17 @@
 | W13 | **通知**：adapter 在自己的变更后发 `FspFileSystemNotify`；不做跨 workspace/底层目录的外部更改监听（不可达）。 |
 | W14 | **byte-range locks 依赖 WinFsp 内核实现**（2.1 无用户态 LockControl 回调）；adapter 不实现、不干预，L2 用 `LockFileEx` 双进程验证。 |
 
+### W2 的边界：一个 workspace 同时只有一个打开者（含只读）
+
+> **一个 workspace 同时只允许一个打开者，包括只读者。**
+> `Workspace::open` 在返回前就会打开 overlay（`repo.rs:517`）并执行一次 `ov_meta` 查询（`pending_root`，`repo.rs:525`），
+> 而 overlay 连接带 `PRAGMA locking_mode = EXCLUSIVE`（`fs-overlay/src/schema.rs:76`），因此**该锁在 `workspace_open`
+> 成功返回时就已被持有**。
+> 第二个打开者（无论读写）得到 `WorkspaceInUse` / `StoreInUse`，不会等待、也不会并发只读。
+> 后果：`fs-cli`（wcas CLI）在挂载期间不能打开同一 workspace（`status`/`log` 这类只读命令也会被拒）；**这是有意的，不是缺陷**。
+
+（行号是当前实现；语义以符号为准。**不要**为了“只读方便”把 overlay 改成共享锁——那会直接破掉 §6.1“GC 期无句柄”的前提。）
+
 **两处需要 owner 决策（阻塞 P3-2，不阻塞 P3-1）**：
 
 1. **metadata 扩展**：时间戳（access/change）、属性字、默认 SD 若要与 commit/snapshot 同行，需要 inode record 的 **profile v3**（ADR-005 修订，旧根拒绝）。替代方案（adapter 侧旁路 DB）会让元数据在 commit/restore/多挂载间丢失，本 ADR 不推荐。**见 §10.1**。
@@ -114,7 +125,7 @@ adapter **禁止**：解析 CAS 对象、访问 `store.sqlite`/`overlay.sqlite`�
 
 | disposition \ 目标 | 不存在 | 文件（同路径） | 目录（请求文件/目录） |
 | --- | --- | --- | --- |
-| SUPERSEDE | 创建（新 FileId） | **替换：删除旧名字/旧 inode 并创建新 inode（默认新 FileId）**；旧 FileId 的打开句柄先过 share 检查（不满足 → `STATUS_SHARING_VIOLATION`）；属性按 Create 参数重置（以 L2 的 NTFS 对照确认） | `STATUS_FILE_IS_A_DIRECTORY` |
+| SUPERSEDE | 创建（新 FileId） | **解除旧名字绑定并创建新 inode（新 FileId）**；旧 inode 的**记录保留、不在替换时删除**（`DELETE` 旧 inode 会当场破坏旧句柄的读），旧 FileId 仍可解析；旧句柄先过 share 检查（不满足 → `STATUS_SHARING_VIOLATION`）；属性按 Create 参数重置（以 L2 的 NTFS 对照确认） | `STATUS_FILE_IS_A_DIRECTORY` |
 | OPEN | `OBJECT_NAME_NOT_FOUND` | 打开（保留 FileId） | 打开 |
 | CREATE | 创建 | `OBJECT_NAME_COLLISION` | `OBJECT_NAME_COLLISION` |
 | OPEN_IF | 创建 | 打开（保留 FileId） | 打开 |
@@ -122,6 +133,8 @@ adapter **禁止**：解析 CAS 对象、访问 `store.sqlite`/`overlay.sqlite`�
 | OVERWRITE_IF | 创建 | 截断为 0（**保留 FileId**） | `STATUS_FILE_IS_A_DIRECTORY` |
 
 SUPERSEDE 与 OVERWRITE/OVERWRITE_IF 的区别是**FileId**：前者按 NT 语义替换（旧文件删除后重建），后者打开并截断同一文件。QA 预审指出"18 格表缺 FileId 列"——两种 disposition 在外部（`GetFileInformationByHandle::FileIndex`）必须可区分，L2 用 NTFS 对照确认：`CREATE_ALWAYS` 命中既有文件时 FileIndex 变化、`TRUNCATE_EXISTING` 不变。若实测 NTFS 与"新 FileId"不符，以实测为准并在 ADR 记修订。
+
+**SUPERSEDE 造出的"名字已解除、旧 FileId 仍被句柄引用"状态**由 overlay 持有：旧 inode 记录**保留（只增）**，旧句柄可继续按 FileId 读；`DELETE` 旧 inode 会当场破坏旧句柄的读，禁止。保留**不产生内容副本**：base 来源的内容本来就被历史根引用，overlay 来源的页是替换前已有的那一行，不是复制。代价是**不可达的 inode 行（及 overlay 页）在挂载期只增**，直到 `workspace_discard` 或未来回收（backlog **B-10**，推荐方案 C：离线 GC 在 overlay 排他锁下扫描并删除不可达行）。P3 **不实现**该回收；当前 GC 不扫描 overlay 行，因此它不参与本状态，也不需要活句柄输入（ADR-008 §6.1）。
 
 目录请求（`FILE_DIRECTORY_FILE`）与上表交叉：对"文件"目标一律 `STATUS_NOT_A_DIRECTORY`；对"目录"目标的覆盖类 disposition 一律 `STATUS_FILE_IS_A_DIRECTORY`。**整表由 L1 穷举，不得缺格**。
 
@@ -236,7 +249,9 @@ G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后
 
 用**计数 source** 做阳性对照（故意读整个 pack 必须红）。rename 之后同一 FileId 的读必须继续满足该判据（name 绑定变了，inode 未变）。
 
-**delete-pending 期间的读不属于 G2**：两段删除（W7）把真正的 `remove` 推迟到最后一个句柄的 `Cleanup`，所以核心不存在"已 unlink 但句柄仍开"的状态；pending 期间的读只是普通 FileId 读，由 **adapter 的句柄表**保证有效。G2 不要求核心支持"已 unlink 的 inode 读取"；若将来支持 POSIX unlink，再改 ADR。
+**SUPERSEDE 可以造出"已解除名字、旧句柄仍开"的状态**（§4.2），所以不能说"核心不存在该状态"：旧 inode 记录**保留（只增）**、旧 FileId 可读，直到 `workspace_discard` 或未来 **B-10** 回收；`DELETE` 旧 inode 会破坏旧句柄的读。这**不是 G2 的要求**——G2 只要求 rename 后按 FileId 读；SUPERSEDE 的保留由 overlay/句柄层负责，当前 GC 不扫描这些不可达行。**delete-pending 期间的读**只是普通 FileId 读，由 **adapter 的句柄表**保证（两段删除把真正的 `remove` 推迟到最后一个 `Cleanup`）。
+
+**GC 不需要活句柄输入**：离线 GC 的承重件是 **overlay 的 `locking_mode=EXCLUSIVE`**（ADR-006 §5.1；每次打开都执行），不是 `store.sqlite` 的锁。任何挂载中的 adapter 必持有某个 workspace 的 overlay 排他锁，GC 试图独占打开该 overlay 会得到 `WorkspaceInUse`；因此 GC 期间不可能存在句柄，SUPERSEDE 的保留记录无需成为 GC 根。`store.sqlite` 在 WAL 下允许读者与维护者共存，**不能**作为该论证的依据。
 
 ---
 
