@@ -11,6 +11,7 @@ members = [
     "crates/fs-api",
     "crates/fs-cli",
     "crates/fs-windows",
+    "crates/fs-winfsp",
 ]
 
 [workspace.package]
@@ -24,6 +25,8 @@ cas-core = { path = "crates/cas-core" }
 cas-store = { path = "crates/cas-store" }
 fs-namespace = { path = "crates/fs-namespace" }
 fs-semantics = { path = "crates/fs-semantics" }
+fs-windows = { path = "crates/fs-windows" }
+fs-winfsp = { path = "crates/fs-winfsp" }
 fs-snapshot = { path = "crates/fs-snapshot" }
 fs-overlay = { path = "crates/fs-overlay" }
 fs-workspace = { path = "crates/fs-workspace" }

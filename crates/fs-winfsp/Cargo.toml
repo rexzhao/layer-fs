@@ -1,0 +1,18 @@
+[package]
+name = "fs-winfsp"
+description = "WinFsp frontend skeleton: WorkspaceOps trait, handle table, dirent cursors, error mapping (P3-3a; no FFI)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# No FFI, no platform dependency: this crate is the driver-independent half of the frontend (P3-3a card §0). The real
+# WinFsp bindings arrive in P3-4; nothing here may `LoadLibrary` or declare `extern "C"`.
+[dependencies]
+fs-semantics.workspace = true
+fs-windows.workspace = true
+
+[dev-dependencies]
+# The mock backend is part of the public test surface for P3-3b (which runs the same contract tests against the real
+# `fs-api` backend), so it is a dev-dependency of itself rather than `#[cfg(test)]` only.
+fs-winfsp = { path = "." }
