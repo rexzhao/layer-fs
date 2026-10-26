@@ -141,7 +141,26 @@ fn every_cell_has_an_action_a_kind_and_a_file_id() {
             drop(fixture);
         }
     }
+    // Real cardinality, the same shape as `fs-semantics/tests/disposition.rs`: rows, columns and the product are
+    // asserted separately, with literals — a loop counter (`cells`) only proves the loops ran.
+    assert_eq!(
+        Disposition::ALL.len(),
+        6,
+        "enum cardinality: six dispositions"
+    );
+    assert_eq!(
+        [Exists::Absent, Exists::File, Exists::Directory].len(),
+        3,
+        "column cardinality: three existence states"
+    );
     assert_eq!(cells, 18, "cell count: 6 dispositions × 3 states");
+    let rows: std::collections::BTreeSet<u8> = Disposition::ALL.iter().map(|d| *d as u8).collect();
+    assert_eq!(
+        rows.len(),
+        6,
+        "missing row: {} distinct dispositions exercised",
+        rows.len()
+    );
 }
 
 // ------------------------------------------------------- g1_atomicity (three structural criteria)
@@ -152,6 +171,18 @@ fn every_cell_has_an_action_a_kind_and_a_file_id() {
 /// *outside* it: an implementation that resolved first and wrote second would still pass every behavioural cell above
 /// (single-threaded), and would still be a TOCTOU. This is a source scan because the property is structural — no
 /// amount of single-threaded behaviour distinguishes "atomic" from "two steps that happened not to interleave".
+/// The rule the scan applies: the existence read must not precede the write closure.
+///
+/// Extracted so the positive control exercises **the same code** as the real scan — a control written as a separate
+/// paraphrase proves only that its own copy works.
+fn flags_early_resolve(body: &str) -> bool {
+    let Some(write_at) = body.find("self.store.write(") else {
+        return false;
+    };
+    let before = &body[..write_at];
+    before.contains("self.resolve(") || before.contains("tree.lookup(")
+}
+
 #[test]
 fn create_or_open_resolves_inside_the_single_write_closure() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -159,7 +190,10 @@ fn create_or_open_resolves_inside_the_single_write_closure() {
         .join("fs-namespace")
         .join("src")
         .join("rules.rs");
-    let text = std::fs::read_to_string(&path).expect("read rules.rs");
+    // Normalise line endings first: the function-boundary search below is textual, and a CRLF checkout would move
+    // every anchor by one byte (the earlier version "worked" only because the anchors happened to match anyway).
+    let raw = std::fs::read_to_string(&path).expect("read rules.rs");
+    let text = raw.replace("\r\n", "\n");
     let start = text
         .find("pub fn create_or_open")
         .expect("create_or_open must exist");
@@ -177,36 +211,95 @@ fn create_or_open_resolves_inside_the_single_write_closure() {
     // What must **not** happen before the transaction is the existence test: that read is what the action depends
     // on, so doing it outside the closure is the TOCTOU. Resolving the *parent* first is fine — it answers "which
     // directory", not "is the name taken", and the closure re-reads the name itself.
-    let before_write = &body[..body.find("self.store.write(").expect("write closure")];
     assert!(
-        !before_write.contains("self.resolve(") && !before_write.contains("tree.lookup("),
+        !flags_early_resolve(body),
         "cell atomicity: the existence test must happen inside the transaction, found a read before it"
     );
     assert!(
         body.contains("tree.lookup("),
         "cell atomicity: the closure itself asks the tree whether the name is taken"
     );
+
+    // **The scanner must be able to fire.** The same rule, applied to a planted function body that resolves first,
+    // has to report a violation — otherwise "no early resolve" is a claim about a dead check.
+    let planted = "pub fn create_or_open(x) {
+        let _ = self.resolve(x);
+        self.store.write(op, |t| Ok(()))
+    }";
+    assert!(
+        flags_early_resolve(planted),
+        "cell atomicity control: a body that resolves before the write must be reported"
+    );
+    assert!(
+        !flags_early_resolve(body),
+        "cell atomicity: the real body must not be reported by the control's own rule"
+    );
 }
 
-/// Criterion 2 — **two creators, exactly one entry** (the two-step version must show two successes).
+/// Criterion 2 — **two creators, exactly one entry**.
 ///
-/// The negative control is the point: with the same fixture, a `resolve`-then-`create` sequence performed by the test
-/// *can* produce two successes, which is exactly the race the atomic call removes. If the control also produced one
-/// success, this test would only be showing that the fixture is single-threaded.
+/// What this proves, stated precisely: under contention exactly one `Create` wins and the loser sees `AlreadyExists`.
+///
+/// What a two-step (`resolve` then `create`) version would do is **not** "two successes" here: QA measured **0/20**
+/// rounds with two successes, and the code says why — the store's mutex is held for the whole write closure, and
+/// `bind` re-checks uniqueness inside that same transaction, so the loser is refused even in the two-step shape.
+///
+/// That makes the race **unconstructible at this layer**, which is why atomicity is asserted *structurally*
+/// (criterion 1): a behavioural test cannot distinguish "atomic" from "accidentally serialised" when the lock already
+/// serialises everything. Earlier versions of this comment claimed two successes; that claim was wrong in both
+/// directions and is kept only as this note, so nobody re-derives it.
+#[test]
+fn a_two_step_version_cannot_produce_two_successes_at_this_layer() {
+    use std::sync::Barrier;
+
+    // The control, measured rather than asserted from theory: 20 rounds of "resolve, then create", two threads each.
+    let mut both = 0usize;
+    for round in 0..20 {
+        let fixture = fixture(&format!("twostep-{round}"));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles: Vec<std::thread::JoinHandle<bool>> = Vec::new();
+        for _ in 0..2 {
+            let store = fixture.workspace.store();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let rules = Rules::new(store);
+                barrier.wait();
+                // The two steps: ask first (its own transaction), then act (another).
+                let seen = rules.resolve(&p("/twostep")).is_ok();
+                let _ = seen;
+                rules
+                    .create_or_open(&p("/twostep"), Disposition::Create)
+                    .is_ok()
+            }));
+        }
+        let mut successes = 0usize;
+        for handle in handles {
+            if handle.join().expect("thread") {
+                successes += 1;
+            }
+        }
+        if successes == 2 {
+            both += 1;
+        }
+    }
+    assert_eq!(
+        both, 0,
+        "cell control: the two-step shape must not produce two successes at this layer (QA measured 0/20);          if this ever reports more, the mutex no longer covers the whole closure"
+    );
+}
+
+/// Criterion 2 (behavioural) — under contention exactly one entry is created and the loser sees the typed refusal.
 #[test]
 fn concurrent_creators_produce_exactly_one_entry() {
     use std::sync::Barrier;
 
-    let rounds = 20usize;
-    for round in 0..rounds {
+    for round in 0..20usize {
         let fixture = fixture(&format!("barrier-{round}"));
         let barrier = Arc::new(Barrier::new(2));
         let mut handles: Vec<
             std::thread::JoinHandle<Result<FileId, fs_namespace::NamespaceError>>,
         > = Vec::new();
         for _ in 0..2 {
-            // Each thread gets its own `Rules` over the same store: the store serialises writers, which is what the
-            // criterion is about (two creators, one entry).
             let store = fixture.workspace.store();
             let barrier = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
@@ -217,26 +310,26 @@ fn concurrent_creators_produce_exactly_one_entry() {
                     .map(|outcome| outcome.file_id)
             }));
         }
-        let results: Vec<_> = handles
-            .into_iter()
-            .map(|handle| handle.join().expect("thread"))
-            .collect();
-        let created = results.iter().filter(|result| result.is_ok()).count();
-        let refused = results.iter().filter(|result| result.is_err()).count();
+        let mut created = 0usize;
+        let mut refusals = Vec::new();
+        for handle in handles {
+            match handle.join().expect("thread") {
+                Ok(_) => created += 1,
+                Err(error) => refusals.push(error),
+            }
+        }
         assert_eq!(
-            (created, refused),
+            (created, refusals.len()),
             (1, 1),
-            "cell barrier round={round}: exactly one creator may win, got {results:?}"
+            "cell barrier round={round}: exactly one creator may win, refusals were {refusals:?}"
         );
-
-        // And the loser's refusal is the collision, not something else.
-        let error = results
-            .iter()
-            .find_map(|result| result.as_ref().err())
-            .expect("one refusal");
         assert!(
-            matches!(error, fs_namespace::NamespaceError::AlreadyExists { .. }),
-            "cell barrier round={round}: the loser must see AlreadyExists, got {error:?}"
+            matches!(
+                refusals[0],
+                fs_namespace::NamespaceError::AlreadyExists { .. }
+            ),
+            "cell barrier round={round}: the loser must see AlreadyExists, got {:?}",
+            refusals[0]
         );
     }
 }
