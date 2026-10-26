@@ -4,7 +4,18 @@
 //! failed after 5 ms was told "the main database stayed locked for 5000 ms" — a statement
 //! about the configuration dressed up as a measurement. The thread-local clock below is set
 //! when an operation starts touching a contended database and read when the failure is
-//! translated, so the number reported is the time the caller actually spent.
+//! translated, so the number reported is **how long this crate waited**, measured rather than assumed. It is not the
+//! caller's total: see the note on clock origins below.
+//!
+//! **The two clocks have different origins, and `waited_ms` may legitimately exceed a caller-measured window.**
+//! [`start`] is called at the point where this crate begins waiting on the main database; a test that times a whole
+//! `commit` includes the work *before* that point (staging, materialisation, opening a connection), so its own
+//! `Instant` can start earlier and still end up with a *smaller* total only if the driver's wait is longer than the
+//! caller's own pre-work — which is the normal case. An assertion of the form `waited_ms ≈ measured` is therefore
+//! comparing unlike quantities; the defensible comparisons are one-sided (`waited_ms >= measured` is also wrong in
+//! general — see below) and the honest statement is that `waited_ms` is a lower bound on the driver's own wait and
+//! says nothing about the caller's total. See `tests/core.rs::a_blocked_cas_index_also_waits_boundedly`, which is
+//! marked as an observation for exactly this reason.
 
 use std::cell::Cell;
 use std::time::Instant;
