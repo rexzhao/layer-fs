@@ -26,7 +26,7 @@
 | P5 | GC **离线**：独占打开主库与全部 overlay；有任何使用者即拒绝 **[G3 已定]** |
 | P6 | 根集合 = 提交（各 branch head 的祖先 ∪ `branch_log` 出现过的提交的祖先）∪ `snapshot` 表 ∪ 每个 workspace 的 `base_root`、root(`base_commit`)、overlay `pending_root`、全部 `sealed_content` |
 | P7 | 保留策略：P2b **不做过期**；新增 `snapshot drop`；删除 branch 保留其 `branch_log` **[G2 已定]** |
-| P8 | mark 用临时 SQLite 文件存标记集（不全量驻留内存，spec §5.4）；sweep：loose 直接删，pack 存活率低于阈值则**拷贝式重打包** |
+| P8 | mark 用临时 SQLite 文件存标记集（不全量驻留内存，spec §5 第 4 条）；sweep：loose 直接删，pack 存活率低于阈值则**拷贝式重打包** |
 | P9 | 每一步：新数据先落盘 → 索引原子切换 → 旧数据删除；任意点崩溃只留多余文件，绝无悬空引用 |
 
 ### 2.1 owner 决策记录

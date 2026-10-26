@@ -131,7 +131,7 @@ content_role=chunk;max_object_value=16777216;name_max=255;hash=blake3;domains=in
 | `fs_namespace::FileId` / `Entry` | 不变 | — |
 | `fs_api::Workspace` | +`security(id) -> ApiResult<Option<Vec<u8>>>`；`set_times`/`set_attributes`（P3-2） | 纯新增 |
 | snapshot profile | `Profile::CURRENT` 变 v3 | 旧根 `UnsupportedProfile`；`Profile::V2` 仅测试夹具保留 |
-| workspace_policy | `snapshot_profile` 写 v3 | 旧 workspace（v2）打开即 `UnsupportedProfile`（owner 已接受零部署） |
+| workspace_policy | `snapshot_profile` 写 v3 | 旧 workspace（v2）打开即 `WorkspaceError::SchemaMismatch`（`main_db.rs:179-185`，workspace 层，**不是** `UnsupportedProfile`——后者是读根时的 `SnapshotReader` 层错误；两入口说明见 ADR-009 §10.1）（owner 已接受零部署，升级语义 (a) 拒绝） |
 
 ---
 

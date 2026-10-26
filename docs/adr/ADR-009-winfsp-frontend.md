@@ -345,7 +345,11 @@ G1/G2/G4 是**必须**（否则 adapter 只能 TOCTOU 或无法保证 rename 后
 - **选项 B**：adapter 侧旁路 DB（按 FileId）；**不推荐**：commit/restore/rebuild 后丢失、与其他 workspace 不一致、GC/verify 看不见。
 - **选项 C**：全部拒绝写（只读时间/属性/SD）；P3 兼容性差（安装器/编辑器会失败）。
 - 若选 A：`attributes` 只强制 `READONLY`；`HIDDEN/SYSTEM/ARCHIVE` 存储但只报告；SD 仅存取不强制（与 W10 一致）；`access/change` 由 adapter 在读写/元数据变更时更新或按策略保留（写明）。
-- **有意行为，不是 bug（owner 2026-10-26 裁：升级语义 (a) 拒绝）**：v2 workspace / v2 根在 v3 构建下**打开即被拒**（类型化错误，名称以 ADR-005 §8 判据与实现为准），**不迁移、不降级读、不自动升级**。理由：未上线、无真实部署，**不承诺跨 profile 兼容**（ADR-005 §10 第 4 条"旧库零迁移"）。**不得"修"成兼容读或静默迁移**——那会引入一条无判据保护的第二解码路径；若将来有真实部署，须另立迁移 ADR（带自己的判据），而不是放宽这里的拒绝。
+- **有意行为，不是 bug（owner 2026-10-26 裁：升级语义 (a) 拒绝）**：v2 workspace / v2 根在 v3 构建下**打开即被拒**，**不迁移、不降级读、不自动升级**。理由：未上线、无真实部署，**不承诺跨 profile 兼容**（ADR-005 §10 第 4 条"旧库零迁移"）。**不得"修"成兼容读或静默迁移**——那会引入一条无判据保护的第二解码路径；若将来有真实部署，须另立迁移 ADR（带自己的判据），而不是放宽这里的拒绝。
+  - **两个入口、两个错误，不要合并**：
+    - **打开工作区**（workspace 层）：`workspace_policy.snapshot_profile` 与本构建不符 ⇒ `WorkspaceError::SchemaMismatch { expected: "snapshot_profile <v3 id>", found: <v2 id> }`（`crates/fs-workspace/src/main_db.rs:179-185`，`validate()`）。v2 workspace 在 v3 构建下撞的是**这一个**，在任何快照读之前。
+    - **读快照对象**（`SnapshotReader` 层）：根的 `profile_id` 不符 ⇒ `UnsupportedProfile`（ADR-005 §7/§8，`crates/fs-snapshot`）。不经 workspace 直接读 v2 根（如 `verify`、GC 遍历、测试夹具）撞的是这一个。
+    - 两者分别守"工作区元数据是哪个构建写的"和"这个根能不能按本构建解码"；任一被删或改成放行，另一个**不能**代替它（workspace 层放行后仍会在首次读根时失败，但错误类型与时机都变了）。
 
 ### 10.2 WinFsp 绑定与 license
 
