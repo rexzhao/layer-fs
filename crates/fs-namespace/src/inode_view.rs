@@ -24,4 +24,12 @@ pub struct InodeView {
     pub created_ns: i64,
     /// Last modification time, Unix epoch nanoseconds.
     pub modified_ns: i64,
+    /// Last access time (v3). **Absent** in a v2 overlay: 0 there means "this store has no such field", which is why the
+    /// update rule is "only when explicitly set" rather than "on every read".
+    pub accessed_ns: i64,
+    /// Metadata change time (v3); absent (0) in a v2 overlay, same reasoning as `accessed_ns`.
+    pub changed_ns: i64,
+    /// **Stored** attribute bits (v3). Only the writable four are legal on disk; `DIRECTORY`/`NORMAL` are derived and
+    /// therefore never appear here.
+    pub attributes: u32,
 }

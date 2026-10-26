@@ -187,6 +187,11 @@ pub(crate) fn inode_impl(
             size: row.size as u64,
             created_ns: row.created_ns,
             modified_ns: row.modified_ns,
+            // The overlay schema is v2's: it has no columns for these, so they are **absences**, and `stat` reporting 0
+            // here is the truth about this store rather than a placeholder to be "filled in" later.
+            accessed_ns: 0,
+            changed_ns: 0,
+            attributes: 0,
         }));
     }
     Ok(base.inode(id.serial())?.map(|record| InodeView {
@@ -198,6 +203,11 @@ pub(crate) fn inode_impl(
         size: record.size,
         created_ns: record.created_ns,
         modified_ns: record.modified_ns,
+        // A v2 record cannot carry them; a v3 record does, and this is where the two formats meet without a second
+        // struct (the record type carries both, the format decides which fields exist).
+        accessed_ns: record.accessed_ns,
+        changed_ns: record.changed_ns,
+        attributes: record.attributes,
     }))
 }
 

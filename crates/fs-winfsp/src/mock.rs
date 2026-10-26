@@ -492,6 +492,13 @@ impl WorkspaceOps for MockBackend {
     }
 
     fn set_attributes(&self, file_id: u64, attributes: Attributes) -> OpsResult<()> {
+        // `DIRECTORY` (0x10) and `NORMAL` (0x80) are **derived**, not stored, so they are not in the value domain of this
+        // call: refusing is the honest answer, and silently ignoring them would be worse — the caller would believe it
+        // set DIRECTORY (i.e. turned a file into a directory) while nothing happened. Windows behaves the same way:
+        // `SetFileAttributes` rejects `FILE_ATTRIBUTE_DIRECTORY`; a directory is made with `CreateDirectory`.
+        if attributes.0 & (0x10 | 0x80) != 0 {
+            return Err(OpsError::InvalidParameter);
+        }
         let mut inner = self.inner.lock().expect("mock lock");
         let node = inner.nodes.get_mut(&file_id).ok_or(OpsError::NotFound)?;
         if !node.live {

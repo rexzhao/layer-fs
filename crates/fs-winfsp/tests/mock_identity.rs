@@ -249,3 +249,27 @@ fn read_dir_by_id_survives_another_directory_taking_the_old_path() {
         "cell control: the directory that took the path has three entries"
     );
 }
+
+/// `set_attributes` refuses the **derived** bits (`DIRECTORY 0x10`, `NORMAL 0x80`): they are outside the stored value
+/// domain, so "set DIRECTORY on a file" must not look like it worked.
+#[test]
+fn set_attributes_refuses_derived_bits() {
+    let backend = MockBackend::new();
+    let file = create(&backend, b"/f");
+    for derived in [0x10u32, 0x80, 0x10 | 0x01] {
+        assert_eq!(
+            backend.set_attributes(file, fs_winfsp::Attributes(derived)),
+            Err(OpsError::InvalidParameter),
+            "cell {derived:#x}: a derived bit is refused, not silently dropped"
+        );
+    }
+    // Control: the writable bits really are accepted, so the refusal above is about the bit, not about the call.
+    backend
+        .set_attributes(file, fs_winfsp::Attributes(0x01 | 0x20))
+        .expect("cell control: writable bits are accepted");
+    assert_eq!(
+        backend.get_info(file).expect("info").attributes,
+        fs_winfsp::Attributes(0x01 | 0x20),
+        "cell control: and the stored value is what comes back"
+    );
+}

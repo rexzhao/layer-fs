@@ -225,11 +225,17 @@ pub trait WorkspaceOps {
         created: Option<i64>,
     ) -> OpsResult<()>;
 
-    /// Replaces the attribute bits.
+    /// Replaces the **stored** attribute bits.
+    ///
+    /// Accepts only the four writable bits (`READONLY`, `HIDDEN`, `SYSTEM`, `ARCHIVE`). `DIRECTORY` and `NORMAL` are
+    /// **derived** — they are reported by `get_info`/`Stat`, never stored — so passing either is a refusal, not a
+    /// no-op: a caller that "set DIRECTORY" on a file would otherwise believe it had changed the kind of an entry.
+    /// (`SetFileAttributes` rejects `FILE_ATTRIBUTE_DIRECTORY` for the same reason: directories are made with
+    /// `CreateDirectory`.)
     ///
     /// # Errors
     ///
-    /// [`OpsError::NotFound`].
+    /// [`OpsError::NotFound`], or [`OpsError::InvalidParameter`] for a derived/unknown bit.
     fn set_attributes(&self, file_id: u64, attributes: Attributes) -> OpsResult<()>;
 
     /// Moves `from` to `to`, replacing the destination when `replace` is true.

@@ -572,6 +572,10 @@ impl<S: TreeStore> Rules<S> {
                 content_root: None,
                 created_ns: view.created_ns,
                 modified_ns: view.modified_ns,
+                accessed_ns: view.accessed_ns,
+                changed_ns: view.changed_ns,
+                // Reporting is complete, storage stays minimal: the derived bits are computed here, not stored.
+                attributes: crate::model::derived_attributes(view.kind, view.attributes),
             })
         })
     }

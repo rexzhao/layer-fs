@@ -74,6 +74,12 @@ impl ReadView {
             content_root: None,
             created_ns: inode.created_ns,
             modified_ns: inode.modified_ns,
+            accessed_ns: inode.accessed_ns,
+            changed_ns: inode.changed_ns,
+            attributes: fs_namespace::derived_attributes(
+                namespace_kind(inode.kind),
+                inode.attributes,
+            ),
         })
     }
 
@@ -230,6 +236,9 @@ impl TreeRead for SnapshotTree<'_> {
                 size: record.size,
                 created_ns: record.created_ns,
                 modified_ns: record.modified_ns,
+                accessed_ns: record.accessed_ns,
+                changed_ns: record.changed_ns,
+                attributes: record.attributes,
             }))
     }
 

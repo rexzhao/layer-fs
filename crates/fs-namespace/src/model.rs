@@ -67,4 +67,35 @@ pub struct Stat {
     pub created_ns: i64,
     /// Last modification time, Unix epoch nanoseconds.
     pub modified_ns: i64,
+    /// Last access time, Unix epoch nanoseconds (v3; 0 from a v2 backend, where the field does not exist).
+    pub accessed_ns: i64,
+    /// Metadata change time, Unix epoch nanoseconds (v3; 0 from a v2 backend).
+    pub changed_ns: i64,
+    /// **Derived** attribute bits, ready for the Windows frontend.
+    ///
+    /// The store keeps only the four writable bits (`READONLY`, `HIDDEN`, `SYSTEM`, `ARCHIVE`); `DIRECTORY` and `NORMAL`
+    /// are computed here from `kind` and from "nothing else is set". Deriving them in one place is what lets the stored
+    /// form stay minimal without the frontend having to re-derive a fact the core already knows — and it is why writing
+    /// a derived bit is `Malformed` at the record layer.
+    pub attributes: u32,
+}
+
+/// `FILE_ATTRIBUTE_DIRECTORY` (derived, never stored).
+pub const ATTRIBUTE_DIRECTORY: u32 = 0x10;
+/// `FILE_ATTRIBUTE_NORMAL` (derived: meaningful only when no other bit is set).
+pub const ATTRIBUTE_NORMAL: u32 = 0x80;
+
+/// The attribute bits `stat` reports: `stored` plus whatever `kind` and emptiness imply.
+#[must_use]
+pub fn derived_attributes(kind: Kind, stored: u32) -> u32 {
+    match kind {
+        Kind::Directory => stored | ATTRIBUTE_DIRECTORY,
+        Kind::File => {
+            if stored == 0 {
+                ATTRIBUTE_NORMAL
+            } else {
+                stored
+            }
+        }
+    }
 }
