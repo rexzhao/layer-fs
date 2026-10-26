@@ -60,8 +60,16 @@ impl Content {
     }
 }
 
-/// One inode (ADR-005 §3.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One inode (ADR-005 §3.2; v3 adds the four metadata fields — ADR-005-v3 draft §2.2).
+///
+/// The v3 fields exist on **one** struct rather than on a parallel `InodeRecordV3`, because a caller that has a record
+/// nearly always wants to pass it to both encoders, and two structs would mean a conversion whose only job is to forget
+/// the fields that v2 cannot store. The v2 codec simply **ignores** them: v2 has nowhere to put them, so "v2 keeps the
+/// metadata" is not a representable state.
+///
+/// `Copy` is gone: `security` is a `Vec<u8>`. That is deliberate — a security descriptor can be 64 KiB, and a type that
+/// copies 64 KiB per record assignment invites the very cost this stage is trying to measure.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InodeRecord {
     /// The inode's serial within the snapshot's scope.
     pub serial: u64,
@@ -73,6 +81,18 @@ pub struct InodeRecord {
     pub created_ns: i64,
     /// Last modification time, Unix epoch nanoseconds.
     pub modified_ns: i64,
+    /// Last access time (v3+; v2 stores nothing and reads back 0).
+    ///
+    /// Zero in v2 is not "accessed at the epoch": it is "this format has no such field". Any code that treats a v2
+    /// record's `accessed_ns` as data is reading a default, which is why the update rule for it is "only when explicitly
+    /// set" rather than "on every read".
+    pub accessed_ns: i64,
+    /// Metadata change time (v3+).
+    pub changed_ns: i64,
+    /// Stored attribute bits (v3+); only the writable four are legal (see [`crate::inode_v3`]).
+    pub attributes: u32,
+    /// The self-relative security descriptor (v3+); empty means "no explicit SD".
+    pub security: Vec<u8>,
     /// Where the bytes are.
     pub content: Content,
 }

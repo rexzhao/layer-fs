@@ -305,6 +305,11 @@ fn k9_dead_frames_without_dead_objects_report_zero_objects_and_one_repack() {
             size: 32,
             created_ns: 0,
             modified_ns: 0,
+
+            accessed_ns: 0,
+            changed_ns: 0,
+            attributes: 0,
+            security: Vec::new(),
             content: fs_snapshot::Content::Blob(survivor),
         }),
         &mut sink,
@@ -563,6 +568,11 @@ fn crash_points_3_and_4_hold_their_own_invariants() {
                 size: 32,
                 created_ns: 0,
                 modified_ns: 0,
+
+                accessed_ns: 0,
+                changed_ns: 0,
+                attributes: 0,
+                security: Vec::new(),
                 content: fs_snapshot::Content::Blob(survivor),
             }),
             &mut sink,

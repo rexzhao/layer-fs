@@ -54,6 +54,11 @@ fn inode(serial: u64, kind: Kind, size: u64, content: Content) -> InodeRecord {
         created_ns: 1_000 + serial as i64,
         modified_ns: 2_000 + serial as i64,
         content,
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
     }
 }
 

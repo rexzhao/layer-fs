@@ -1000,6 +1000,11 @@ impl Repo {
             size: 0,
             created_ns: now,
             modified_ns: now,
+
+            accessed_ns: 0,
+            changed_ns: 0,
+            attributes: 0,
+            security: Vec::new(),
             content: Content::Empty,
         }];
         let table = crate::materialize::publish(&mut sink, |sink| {

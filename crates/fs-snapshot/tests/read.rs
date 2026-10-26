@@ -63,6 +63,11 @@ fn inode(serial: u64, kind: Kind, size: u64, content: Content) -> InodeRecord {
         created_ns: 1_000 + serial as i64,
         modified_ns: 2_000 + serial as i64,
         content,
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
     }
 }
 
@@ -420,6 +425,11 @@ fn build_large_directory(store: &Store, profile: &Profile) -> (ObjectId, Vec<Dir
         created_ns: 0,
         modified_ns: 0,
         content: Content::Dir(dir_root),
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
     }];
     let table = fs_snapshot::encode_inode_table(profile, records.into_iter(), &mut sink)
         .expect("encode table");
@@ -513,6 +523,11 @@ fn reading_an_extent_longer_than_the_profile_allows_is_refused() {
         created_ns: 0,
         modified_ns: 0,
         content: Content::Extents(leaf),
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
     }];
     let table = fs_snapshot::encode_inode_table(&profile, records.into_iter(), &mut sink)
         .expect("encode table");
@@ -567,6 +582,11 @@ fn reading_an_oversized_page_is_refused() {
         created_ns: 0,
         modified_ns: 0,
         content: Content::Dir(dir_root),
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
     }];
     let table = fs_snapshot::encode_inode_table(&profile, records.into_iter(), &mut sink)
         .expect("encode table");
@@ -667,6 +687,11 @@ fn reading_an_extent_past_the_object_value_limit_is_refused() {
         created_ns: 0,
         modified_ns: 0,
         content: Content::Extents(leaf),
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
     }];
     let table = fs_snapshot::encode_inode_table(&profile, records.into_iter(), &mut sink)
         .expect("encode table");
@@ -713,6 +738,11 @@ fn an_empty_directory_lists_and_looks_up_as_empty() {
         created_ns: 0,
         modified_ns: 0,
         content: Content::Empty,
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
     }];
     let table = fs_snapshot::encode_inode_table(&profile, records.into_iter(), &mut sink)
         .expect("encode table");
@@ -756,6 +786,11 @@ fn an_empty_file_reports_no_extents() {
         created_ns: 0,
         modified_ns: 0,
         content: Content::Empty,
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
     }];
     let table = fs_snapshot::encode_inode_table(&profile, records.into_iter(), &mut sink)
         .expect("encode table");

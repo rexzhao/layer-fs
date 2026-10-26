@@ -85,6 +85,11 @@ fn create_base(dir: &Path) -> ObjectId {
         size: 0,
         created_ns: 0,
         modified_ns: 0,
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
         content: Content::Empty,
     }];
     let table = encode_inode_table(&profile, records.into_iter(), &mut sink).expect("table");

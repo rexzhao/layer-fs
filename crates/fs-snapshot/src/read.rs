@@ -811,6 +811,11 @@ fn decode_inode(reader: &mut Reader<'_>, profile: Profile) -> SnapshotResult<Ino
         size,
         created_ns,
         modified_ns,
+        // v2 pages have no such fields: these are **absences**, not values (see `InodeRecord::accessed_ns`).
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
         content,
     };
     if let Some(reason) = record.illegal_reason(&profile) {

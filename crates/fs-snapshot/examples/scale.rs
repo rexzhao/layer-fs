@@ -57,6 +57,11 @@ fn file_inode(serial: u64) -> InodeRecord {
         size: 5,
         created_ns: 1_000,
         modified_ns: 2_000,
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
         content: Content::Blob(ObjectId::from_bytes([1u8; 32])),
     }
 }
@@ -96,6 +101,11 @@ fn main() {
             size: 0,
             created_ns: 0,
             modified_ns: 0,
+
+            accessed_ns: 0,
+            changed_ns: 0,
+            attributes: 0,
+            security: Vec::new(),
             content: Content::Empty,
         });
         for serial in 1..200_000u64 {

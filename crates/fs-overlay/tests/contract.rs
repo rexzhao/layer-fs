@@ -79,6 +79,11 @@ fn empty_base(dir: &std::path::Path) -> (Store, ObjectId) {
             size: 0,
             created_ns: 0,
             modified_ns: 0,
+
+            accessed_ns: 0,
+            changed_ns: 0,
+            attributes: 0,
+            security: Vec::new(),
             content: Content::Empty,
         }];
         let table = encode_inode_table(&profile, records.into_iter(), &mut sink).expect("table");
@@ -594,6 +599,11 @@ fn a_base_file_reads_through_the_overlay() {
                     size: 0,
                     created_ns: 0,
                     modified_ns: 0,
+
+                    accessed_ns: 0,
+                    changed_ns: 0,
+                    attributes: 0,
+                    security: Vec::new(),
                     content: Content::Dir({
                         fs_snapshot::encode_directory(
                             &profile,
@@ -613,6 +623,11 @@ fn a_base_file_reads_through_the_overlay() {
                     size: 5,
                     created_ns: 0,
                     modified_ns: 0,
+
+                    accessed_ns: 0,
+                    changed_ns: 0,
+                    attributes: 0,
+                    security: Vec::new(),
                     content: Content::Blob(blob),
                 },
             ];
@@ -710,6 +725,11 @@ fn empty_base_like(dir: &std::path::Path, _root: ObjectId) -> (Store, ObjectId) 
             size: 0,
             created_ns: 0,
             modified_ns: 0,
+
+            accessed_ns: 0,
+            changed_ns: 0,
+            attributes: 0,
+            security: Vec::new(),
             content: Content::Empty,
         }];
         let table = encode_inode_table(&profile, records.into_iter(), &mut sink).expect("table");

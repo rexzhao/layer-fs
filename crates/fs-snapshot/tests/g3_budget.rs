@@ -38,6 +38,11 @@ fn file_inode(serial: u64) -> InodeRecord {
         size: 4096,
         created_ns: 1_700_000_000_000_000_000,
         modified_ns: 1_700_000_001_000_000_000,
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
         content: Content::Blob(ObjectId::from_bytes(
             [u8::try_from(serial % 251).expect("fits"); 32],
         )),
@@ -58,6 +63,11 @@ fn shape(profile: Profile) -> Shape {
         size: 0,
         created_ns: 0,
         modified_ns: 0,
+
+        accessed_ns: 0,
+        changed_ns: 0,
+        attributes: 0,
+        security: Vec::new(),
         content: Content::Empty,
     }];
     for serial in 1..100_000u64 {

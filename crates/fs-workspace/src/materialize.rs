@@ -233,6 +233,11 @@ pub(crate) fn encode(
                 created_ns: node.created_ns,
                 modified_ns: node.modified_ns,
                 content,
+
+                accessed_ns: 0,
+                changed_ns: 0,
+                attributes: 0,
+                security: Vec::new(),
             },
         );
     }
