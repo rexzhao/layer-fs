@@ -53,6 +53,11 @@ impl LoadError {
 
 /// The default location of the SDK's dynamic library on this machine, if the environment says otherwise use
 /// [`resolve_library`].
+///
+/// **Not** the `SxS/DYNAMIC/bin` copy: loading that one and calling `FspVersion` through `GetProcAddress` **crashes**
+/// (`0xC0000005`), because it is the dynamic-loader flavour of the library and expects to be entered through its own API
+/// rather than have its exports called directly. Recorded here so the next person does not re-try it: the crash was found
+/// by this very handshake, which is what it is for.
 pub const DEFAULT_LIBRARY: &str = "F:/work/winfsp-sdk/DYN/x64/winfsp-x64.dll";
 
 /// Checks that `path` exists before a loader call.
