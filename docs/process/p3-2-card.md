@@ -230,8 +230,9 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 1. `grep -n 'pub use.*PACK_TAIL_BYTES' crates/cas-store/src/lib.rs` = **1 行**；
 2. `grep -rn 'const TAIL_BYTES' crates/*/tests/` = **0 行**；
 3. `grep -rn 'PACK_TAIL_BYTES == 48' crates/` = **1 行**，且**不是** `assert!(PACK_TAIL_BYTES > 0)` 这类弱断言；
-4. `grep -rn 'PACK_TAIL_BYTES' crates/ | wc -l` = **11**（1 定义 + 1 导出 + 4 src + 5 tests）：
-   逐文件 `src/pack.rs` 5、`src/lib.rs` 1、`tests/pack.rs` 4、`tests/sync_probe.rs` 1。
+4. `grep -rn 'PACK_TAIL_BYTES' crates/ | wc -l` = **12**（2026-10-26 由 11 改为 12）：
+   逐文件 `src/pack.rs` 5、`src/lib.rs` 1、`tests/pack.rs` 4、`tests/sync_probe.rs` 1、**`fs-workspace/tests/g2_read_side.rs` 1**（G2 的读放大上界要用**常量**而不是字面量 48 来界定）。
+   这一处新增正是该判据的设计意图：`tail_constant` 的逐文件 pin 表**先红了一次**，逼着新消费点**显式登记**——这正是“绝对数比 ≥ 使用点数硬”的现场演示。
    **绝对数比“≥ 使用点数”硬**：少一处 = 漏改（别名常量还在，仍能编译）；多一处 = 多留副本。
 
 ## 6. 判据预审四问（QA，开工前逐条答完）
