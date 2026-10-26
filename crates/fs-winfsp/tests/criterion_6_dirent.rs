@@ -1,0 +1,171 @@
+//! §3 criterion 6: directory cursors with first-read snapshot semantics (P3-3a).
+//!
+//! The criterion has two halves that fail in opposite ways, so both are asserted for every scenario:
+//!
+//! - a **new** entry created after the first read must **not** appear — that is the promise, not a caching bug;
+//! - the entries that existed must **all** still appear, in the same order — a snapshot that dropped or reordered
+//!   entries would satisfy "no new entries" trivially.
+//!
+//! `.`/`..` and de-duplication are asserted **absent** by construction: the cursor has no way to produce them, and the
+//! tests below show `A` and `a` both survive.
+
+use fs_semantics::disposition::Disposition;
+use fs_winfsp::{DirentCursor, MockBackend, WorkspaceOps};
+
+fn create(backend: &MockBackend, path: &[u8]) {
+    backend
+        .create_or_open(path, Disposition::Create)
+        .expect("create");
+}
+
+/// The snapshot is taken on the first read and never refreshed: entries created afterwards do not appear.
+#[test]
+fn a_new_entry_created_after_the_first_read_does_not_appear() {
+    let backend = MockBackend::new();
+    let dir = backend.mkdir(b"/d").expect("mkdir");
+    create(&backend, b"/d/one");
+    create(&backend, b"/d/two");
+
+    let mut cursor = DirentCursor::new();
+    let first = cursor
+        .fill(backend.read_dir(dir).expect("read_dir"), |name| {
+            name.to_ascii_lowercase()
+        })
+        .len();
+    assert_eq!(
+        first, 2,
+        "cell first read: both entries are in the snapshot"
+    );
+
+    // The world changes after the snapshot.
+    create(&backend, b"/d/three");
+    assert_eq!(
+        backend.read_dir(dir).expect("read_dir").len(),
+        3,
+        "cell control: the backend now has three entries — so a cursor that re-read would show three"
+    );
+
+    let page = cursor.page(None, 32);
+    assert_eq!(
+        page.len(),
+        2,
+        "cell snapshot: the handle keeps showing the two entries it started with (snapshot semantics, not a cache bug)"
+    );
+    assert!(
+        page.iter().all(|entry| entry.name != b"three"),
+        "cell snapshot: the new entry is not in the listing"
+    );
+}
+
+/// Pages are cut by marker **from the same snapshot**, so a second page cannot see anything the first page did not.
+#[test]
+fn later_pages_are_cut_from_the_same_snapshot() {
+    let backend = MockBackend::new();
+    let dir = backend.mkdir(b"/d").expect("mkdir");
+    for name in [&b"/d/a"[..], b"/d/b", b"/d/c"] {
+        create(&backend, name);
+    }
+    let mut cursor = DirentCursor::new();
+    cursor.fill(backend.read_dir(dir).expect("read_dir"), |name| {
+        name.to_ascii_lowercase()
+    });
+
+    let first = cursor.page(None, 2).to_vec();
+    assert_eq!(
+        first
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>(),
+        vec![b"a".to_vec(), b"b".to_vec()],
+        "cell page 1: the first two entries in folded order"
+    );
+
+    // Change the directory between the two pages: the second page must not notice.
+    create(&backend, b"/d/bb");
+    let marker = first.last().expect("a marker exists").name.clone();
+    let second: Vec<Vec<u8>> = cursor
+        .page(Some(&marker), 2)
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    assert_eq!(
+        second,
+        vec![b"c".to_vec()],
+        "cell page 2: the remaining snapshot entry, without the entry created in between"
+    );
+}
+
+/// A marker that is no longer in the snapshot yields an **empty** page, not a restart — a restart would duplicate the
+/// whole directory for a caller that is iterating.
+#[test]
+fn an_unknown_marker_yields_an_empty_page_rather_than_restarting() {
+    let backend = MockBackend::new();
+    let dir = backend.mkdir(b"/d").expect("mkdir");
+    create(&backend, b"/d/a");
+    create(&backend, b"/d/b");
+    let mut cursor = DirentCursor::new();
+    cursor.fill(backend.read_dir(dir).expect("read_dir"), |name| {
+        name.to_ascii_lowercase()
+    });
+
+    assert!(
+        cursor.page(Some(b"gone"), 32).is_empty(),
+        "cell marker: a stale marker ends the enumeration instead of duplicating it"
+    );
+    assert_eq!(
+        cursor.page(None, 32).len(),
+        2,
+        "cell control: without a marker the same snapshot still lists both entries"
+    );
+}
+
+/// Raw-byte names: `A` and `a` are two entries, and the folded key only decides their **order**, never their presence.
+#[test]
+fn folding_orders_entries_without_merging_them() {
+    let backend = MockBackend::new();
+    let dir = backend.mkdir(b"/d").expect("mkdir");
+    create(&backend, b"/d/A");
+    create(&backend, b"/d/a");
+    let mut cursor = DirentCursor::new();
+    let list = cursor
+        .fill(backend.read_dir(dir).expect("read_dir"), |name| {
+            name.to_ascii_lowercase()
+        })
+        .to_vec();
+
+    assert_eq!(
+        list.len(),
+        2,
+        "cell count: two entries, not one merged entry"
+    );
+    assert_eq!(
+        list.iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>(),
+        vec![b"A".to_vec(), b"a".to_vec()],
+        "cell order: equal folded keys fall back to raw bytes, so the order is deterministic"
+    );
+    assert_eq!(
+        list[0].folded, list[1].folded,
+        "cell fold: both fold to the same key — that is why the raw name must be the secondary key"
+    );
+}
+
+/// The cursor never invents `.`/`..`: they are the adapter's to synthesise, and a backend that also returned them would
+/// make the adapter show them twice.
+#[test]
+fn the_cursor_does_not_synthesise_dot_entries() {
+    let backend = MockBackend::new();
+    let dir = backend.mkdir(b"/d").expect("mkdir");
+    create(&backend, b"/d/only");
+    let mut cursor = DirentCursor::new();
+    let list = cursor.fill(backend.read_dir(dir).expect("read_dir"), |name| {
+        name.to_ascii_lowercase()
+    });
+
+    assert!(
+        list.iter()
+            .all(|entry| entry.name != b"." && entry.name != b".."),
+        "cell dots: absent — the adapter synthesises them"
+    );
+}

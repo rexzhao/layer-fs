@@ -7,10 +7,12 @@
 
 #![deny(missing_docs)]
 
+pub mod dirent;
 pub mod handles;
 pub mod mock;
 pub mod ops;
 
+pub use dirent::{DirentCursor, SortEntry};
 pub use handles::{close_removes, CloseEffect, Handle, HandleId, HandleTable};
 pub use mock::{Call, MockBackend, ROOT};
 pub use ops::{
