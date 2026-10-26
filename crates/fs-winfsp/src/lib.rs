@@ -14,6 +14,7 @@ pub mod dirent;
 pub mod error;
 pub mod file_info;
 pub mod handles;
+pub mod loader;
 pub mod mock;
 pub mod ops;
 
