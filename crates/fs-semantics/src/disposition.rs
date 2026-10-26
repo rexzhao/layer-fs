@@ -102,9 +102,15 @@ pub enum Action {
     /// Open as-is.
     Open,
     /// Truncate the existing file to zero length and open it.
+    ///
+    /// SUPERSEDE and OVERWRITE share this action (ADR-009 §4.2, owner ruling (a)): on a real Windows system both arrive as
+    /// `Overwrite(Supersede=…)` on the **same** file object, so the entry keeps its identity. The only difference is the
+    /// attribute replacement policy (`ReplaceFileAttributes`), which is not a property of the disposition table — it is
+    /// applied by the caller that performs the truncation.
+    ///
+    /// The former `ReplaceExisting` variant is **deleted, not aliased**: an alias would leave a second semantic path whose
+    /// readers could keep assuming "a new FileId appears".
     TruncateExisting,
-    /// Delete the existing entry and create a new one.
-    ReplaceExisting,
 }
 
 /// How the call ends.
@@ -122,7 +128,7 @@ pub enum Outcome {
 /// and would also silently accept a new disposition.
 #[must_use]
 pub fn decide(disposition: Disposition, exists: Exists) -> Outcome {
-    use Action::{CreateNew, Open, ReplaceExisting, TruncateExisting};
+    use Action::{CreateNew, Open, TruncateExisting};
     use Exists::{Absent, Directory, File};
     use Failure::{AccessDenied, NameCollision, NotADirectory};
 
@@ -147,9 +153,10 @@ pub fn decide(disposition: Disposition, exists: Exists) -> Outcome {
         (Disposition::Overwrite, Absent) => Outcome::Failed(Failure::LeafMissing),
         (Disposition::Overwrite, File) => Outcome::Opened(TruncateExisting),
         (Disposition::Overwrite, Directory) => Outcome::Failed(NotADirectory),
-        // SUPERSEDE: replaces the *entry*, which a directory is not allowed to be.
+        // SUPERSEDE: same action as OVERWRITE on an existing file — the entry keeps its identity and is truncated in place
+        // (ADR-009 §4.2 ruling (a)); the attribute replacement happens where the truncation is performed.
         (Disposition::Supersede, Absent) => Outcome::Opened(CreateNew),
-        (Disposition::Supersede, File) => Outcome::Opened(ReplaceExisting),
+        (Disposition::Supersede, File) => Outcome::Opened(TruncateExisting),
         (Disposition::Supersede, Directory) => Outcome::Failed(AccessDenied),
     }
 }
@@ -239,7 +246,7 @@ pub const TABLE: [(Disposition, Exists, Outcome); 18] = [
     (
         Disposition::Supersede,
         Exists::File,
-        Outcome::Opened(Action::ReplaceExisting),
+        Outcome::Opened(Action::TruncateExisting),
     ),
     (
         Disposition::Supersede,

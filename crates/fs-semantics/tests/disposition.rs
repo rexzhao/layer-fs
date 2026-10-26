@@ -62,18 +62,27 @@ fn every_cell_of_the_product_has_a_row_and_matches_decide() {
     assert_eq!(visited, 18, "the walk must visit every cell exactly once");
 }
 
-/// The two dispositions that both truncate an existing file differ only in whether the entry is replaced, which
-/// is exactly the FileId difference P3-2's G1 table has to add.
+/// SUPERSEDE and OVERWRITE_IF take the **same action** on an existing file (ADR-009 §4.2, owner ruling (a)).
+///
+/// They used to differ (replace-the-entry vs reuse-it); on a real Windows system both arrive as an overwrite of the same
+/// file object, so the entry keeps its identity. The difference that remains is the **attribute replacement policy**,
+/// which belongs to the caller performing the truncation, not to this table — that is why this test no longer has an
+/// "new FileId" cell to assert.
 #[test]
-fn supersede_replaces_the_entry_while_overwrite_if_reuses_it() {
+fn supersede_and_overwrite_if_take_the_same_action_on_a_file() {
     assert_eq!(
         decide(Disposition::Supersede, Exists::File),
-        Outcome::Opened(fs_semantics::disposition::Action::ReplaceExisting),
-        "cell disposition=Supersede exists=File: the entry is replaced (new FileId)"
+        Outcome::Opened(fs_semantics::disposition::Action::TruncateExisting),
+        "cell disposition=Supersede exists=File: truncated in place (same FileId)"
     );
     assert_eq!(
         decide(Disposition::OverwriteIf, Exists::File),
         Outcome::Opened(fs_semantics::disposition::Action::TruncateExisting),
-        "cell disposition=OverwriteIf exists=File: the entry is reused (same FileId)"
+        "cell disposition=OverwriteIf exists=File: also in place — the two cells are now equal"
+    );
+    assert_eq!(
+        decide(Disposition::Supersede, Exists::File),
+        decide(Disposition::OverwriteIf, Exists::File),
+        "cell equality: the table may not re-introduce a difference that the OS does not have"
     );
 }

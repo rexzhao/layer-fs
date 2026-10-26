@@ -42,25 +42,26 @@ pub fn scenario_identity_across_rename<B: WorkspaceOps>(backend: &B) {
     assert_eq!(backend.get_info(id).expect("info").file_id, id);
 }
 
-/// `SUPERSEDE`: the name moves to a fresh id, the old object stays readable and keeps its size.
-pub fn scenario_supersede_keeps_old_object<B: WorkspaceOps>(backend: &B) {
-    let old = create(backend, b"/f");
-    backend.write(old, 0, b"original").expect("write");
+/// `SUPERSEDE`: the entry keeps its id and is truncated in place (ADR-009 §4.2 ruling (a)).
+pub fn scenario_supersede_truncates_in_place<B: WorkspaceOps>(backend: &B) {
+    let id = create(backend, b"/f");
+    backend.write(id, 0, b"original").expect("write");
     let outcome = backend
         .create_or_open(b"/f", Disposition::Supersede)
         .expect("supersede");
-    assert_eq!(outcome.replaced, Some(old), "cell replaced");
-    assert_ne!(outcome.file_id, old, "cell new id");
-    assert_eq!(outcome.size, 0, "cell new size");
     assert_eq!(
-        backend.get_info(old).expect("old info").size,
-        8,
-        "cell old size: a truncate-in-place implementation would report 0 here"
+        outcome.replaced, None,
+        "cell replaced: nothing was replaced"
     );
     assert_eq!(
-        backend.read(old, 0, 8).expect("old read"),
-        b"original",
-        "cell old content"
+        outcome.file_id, id,
+        "cell identity: the same entry — a handle opened before it stays valid and now reads the new content"
+    );
+    assert_eq!(outcome.size, 0, "cell new size: the content is gone");
+    assert_eq!(
+        backend.read(id, 0, 8).expect("read"),
+        vec![0u8; 8],
+        "cell content: reading the (only) id yields the overwritten bytes, not the old ones"
     );
 }
 
@@ -120,7 +121,7 @@ fn the_mock_satisfies_the_trait_contract() {
     let backend = MockBackend::new();
     scenario_identity_across_rename::<MockBackend>(&backend);
     let backend = MockBackend::new();
-    scenario_supersede_keeps_old_object::<MockBackend>(&backend);
+    scenario_supersede_truncates_in_place::<MockBackend>(&backend);
     let backend = MockBackend::new();
     scenario_removal_cases::<MockBackend>(&backend);
     let backend = MockBackend::new();

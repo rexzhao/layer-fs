@@ -114,25 +114,19 @@ fn every_cell_has_an_action_a_kind_and_a_file_id() {
                         rules.resolve(&p("/target")).expect("the name resolves"),
                         "cell disposition={disposition:?} exists={exists:?}: the outcome must name the entry the name carries"
                     );
-                    // The truncating dispositions must leave an **empty** file, and must keep the same entry
-                    // (that pair is the whole observable difference from SUPERSEDE).
+                    // Every truncating disposition — OVERWRITE_IF, OVERWRITE **and SUPERSEDE** — leaves an empty file
+                    // **and keeps the entry**. They used to differ in exactly that pair; ADR-009 §4.2 (a) removed the
+                    // difference, because a real system sends all three as an overwrite of the same file object.
                     if action == Action::TruncateExisting {
                         assert_eq!(
                             Some(file_id),
                             before,
-                            "cell disposition={disposition:?} exists={exists:?}: overwriting reuses the entry"
+                            "cell disposition={disposition:?} exists={exists:?}: the entry keeps its FileId"
                         );
                         assert_eq!(
                             fixture.workspace.content_size("/target").expect("size"),
                             0,
                             "cell disposition={disposition:?} exists={exists:?}: the file must be truncated to zero"
-                        );
-                    }
-                    if action == Action::ReplaceExisting {
-                        assert_ne!(
-                            Some(file_id),
-                            before,
-                            "cell disposition=Supersede exists={exists:?}: replacing means a new entry"
                         );
                     }
                 }
@@ -460,10 +454,16 @@ fn the_outcome_reports_the_binding_and_the_replaced_entry() {
     let superseded = rules
         .create_or_open(&p("/f"), Disposition::Supersede)
         .expect("supersede");
+    // Ruling (a): SUPERSEDE keeps the entry, so nothing loses a name and `replaced` is `None` — the same value every
+    // other disposition reports. `RenameOutcome::replaced` (G4) still means "the inode that lost the destination name";
+    // the two fields share a name and nothing else.
     assert_eq!(
-        superseded.replaced,
-        Some(created.file_id),
-        "cell replaced: Supercede names the entry that lost the name"
+        superseded.replaced, None,
+        "cell replaced: SUPERSEDE keeps the entry, so there is no replaced inode to name"
+    );
+    assert_eq!(
+        superseded.file_id, created.file_id,
+        "cell identity: and that is the *reason* replaced is None — the entry itself survived"
     );
     assert_eq!(
         superseded.binding.0,

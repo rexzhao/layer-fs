@@ -71,7 +71,7 @@ fn every_cell_of_the_product_has_a_row_and_matches_decide() {
 fn supersede_replaces_the_entry_while_overwrite_if_reuses_it() {
     assert_eq!(
         decide(Disposition::Supersede, Exists::File),
-        Outcome::Opened(fs_windows::disposition::Action::ReplaceExisting)
+        Outcome::Opened(fs_windows::disposition::Action::TruncateExisting)
     );
     assert_eq!(
         decide(Disposition::OverwriteIf, Exists::File),

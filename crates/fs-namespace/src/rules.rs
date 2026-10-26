@@ -200,7 +200,8 @@ impl<S: TreeStore> Rules<S> {
                 Outcome::Failed(failure) => return Err(into_namespace_failure(failure, path)),
             };
             use fs_semantics::disposition::Action;
-            let mut replaced: Option<FileId> = None;
+            // Always `None` on this path (see below); kept as a binding so the struct initialiser reads the same as before.
+            let replaced: Option<FileId> = None;
             let (file_id, kind) = match action {
                 // `Open`: nothing to do, including the directory case (no file handle is created).
                 Action::Open => {
@@ -213,24 +214,18 @@ impl<S: TreeStore> Rules<S> {
                     tree.bind(parent, name.as_bytes(), id)?;
                     (id, Kind::File)
                 }
-                // OVERWRITE_IF / OVERWRITE: the entry is **reused**, so the FileId does not change — that is the
-                // one observable difference from SUPERSEDE, and it is why this arm must not create an inode.
+                // OVERWRITE_IF / OVERWRITE / **SUPERSEDE**: the entry is reused, so the FileId does not change.
+                //
+                // SUPERSEDE shares this arm (ADR-009 §4.2, owner ruling (a)): on a real system it arrives as an overwrite of
+                // the *same* file object, so a handle opened before it must read the **overwritten** content, not the old
+                // bytes. The attribute replacement that distinguishes SUPERSEDE from OVERWRITE is applied by the caller
+                // that performs the truncation — it is not a difference in identity.
                 Action::TruncateExisting => {
-                    let id = existing.expect("OVERWRITE requires an existing entry");
+                    let id = existing.expect("this action requires an existing entry");
                     // Truncated **inside** this transaction: the entry keeps its FileId, and no reader can observe the
                     // old bytes after the disposition was granted.
                     tree.truncate(id, 0)?;
                     (id, Kind::File)
-                }
-                Action::ReplaceExisting => {
-                    let old = existing.expect("SUPERSEDE requires an existing entry");
-                    replaced = Some(old);
-                    // Unbind the name only: the old inode row (and its content) stays for anyone holding it, which
-                    // is what lets a frontend keep serving a handle opened before the replace.
-                    tree.unbind(parent, name.as_bytes())?;
-                    let fresh = tree.create_inode(Kind::File)?;
-                    tree.bind(parent, name.as_bytes(), fresh)?;
-                    (fresh, Kind::File)
                 }
             };
             Ok(CreateOutcome {
@@ -432,7 +427,9 @@ impl<S: TreeStore> Rules<S> {
             }
 
             let binding = (target_parent, target_name.as_bytes().to_vec());
-            let mut replaced = None;
+            // This is `RenameOutcome::replaced` — it still means "the inode that lost the destination name" (G4). It is
+            // **not** the same field as `CreateOutcome::replaced`, which is now always `None`.
+            let mut replaced: Option<FileId> = None;
             match tree.lookup(target_parent, target_name.as_bytes())? {
                 None => {}
                 // The destination name already names the source inode itself (a backend that folded two spellings, or

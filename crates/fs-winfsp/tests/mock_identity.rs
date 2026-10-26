@@ -69,35 +69,38 @@ fn bindings_are_raw_bytes_so_a_and_upper_a_coexist() {
     );
 }
 
-/// M4 — `ReplaceExisting` retires the **name**, not the inode: the old id stays live and readable.
+/// M4 — SUPERSEDE **keeps the id** and drops the content (ADR-009 §4.2 ruling (a)).
 ///
-/// This is "plan B" in the card (ADR-009 ruling (a)) and it is what criterion 2 asserts through the adapter. A mock that
-/// deleted the old inode would make the adapter's "old handle still reads the old bytes" test fail for the wrong reason.
+/// The old semantics (retire the name, keep the old inode readable through its handle) described what a *replacement*
+/// would do; a real system sends SUPERSEDE as an overwrite of the same file object, so a handle opened before it reads
+/// the **overwritten** content. This test is the mock's half of that: same id, size 0, replaced `None`.
 #[test]
-fn replace_existing_keeps_the_old_inode_readable() {
+fn supersede_truncates_in_place_and_keeps_the_id() {
     let backend = MockBackend::new();
-    let old = create(&backend, b"/f");
-    backend.write(old, 0, b"old").expect("write");
+    let id = create(&backend, b"/f");
+    backend.write(id, 0, b"old").expect("write");
 
     let outcome = backend
         .create_or_open(b"/f", Disposition::Supersede)
-        .expect("replace");
-    assert_eq!(outcome.replaced, Some(old), "cell outcome: the replaced id");
-    assert_ne!(outcome.file_id, old, "cell outcome: a new inode");
-    assert_eq!(outcome.size, 0, "cell outcome: the new entry is empty");
-    assert!(
-        backend.is_live(old),
-        "cell liveness: the old inode is retired from the name but still live"
+        .expect("supersede");
+    assert_eq!(
+        outcome.file_id, id,
+        "cell identity: the entry keeps its FileId — nothing is replaced"
     );
     assert_eq!(
-        backend.read(old, 0, 3).expect("old still readable"),
-        b"old",
-        "cell content: the old inode still holds its bytes"
+        outcome.replaced, None,
+        "cell replaced: no inode lost the name, so there is nothing to report"
     );
+    assert_eq!(outcome.size, 0, "cell size: the content is gone");
     assert_eq!(
         backend.resolve(b"/f"),
-        Some(outcome.file_id),
-        "cell name: the name now refers to the new inode"
+        Some(id),
+        "cell name: still the same entry"
+    );
+    assert_eq!(
+        backend.read(id, 0, 3).expect("read after supersede"),
+        vec![0u8; 3],
+        "cell content: a handle on the old id now reads the **overwritten** bytes (zeros), not the old ones"
     );
 }
 

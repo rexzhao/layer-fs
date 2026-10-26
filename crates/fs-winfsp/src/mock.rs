@@ -340,22 +340,17 @@ impl WorkspaceOps for MockBackend {
                 })
             }
             fs_semantics::disposition::Outcome::Opened(action) => match action {
+                // SUPERSEDE shares the truncate arm (ADR-009 §4.2 ruling (a)): same id, content dropped, attributes
+                // replaced. A handle opened before it therefore reads the **overwritten** content, because on a real
+                // system both dispositions arrive as an overwrite of the same file object.
                 Action::TruncateExisting => {
                     let id = existing.expect("truncate implies an existing entry");
                     let node = inner.nodes.get_mut(&id).expect("existing");
                     node.content.clear();
+                    node.attributes = crate::ops::Attributes(0x80);
                     node.times.written = clock;
                     node.times.changed = clock;
                     (id, action, None)
-                }
-                Action::ReplaceExisting => {
-                    // Retire the **name** only: the old inode stays live and readable (ADR-009 ruling (a)), which is
-                    // what makes criterion 2's "old handle still reads the old bytes" testable.
-                    let old = existing.expect("replace implies an existing entry");
-                    inner.children.remove(&(parent, name.clone()));
-                    let id = inner.allocate(Kind::File, clock);
-                    inner.children.insert((parent, name.clone()), id);
-                    (id, action, Some(old))
                 }
                 Action::CreateNew | Action::Open => match existing {
                     Some(id) => (id, action, None),

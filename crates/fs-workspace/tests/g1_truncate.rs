@@ -119,37 +119,35 @@ fn overwrite_without_a_target_is_refused_and_creates_nothing() {
     );
 }
 
-/// `SUPERSEDE` replaces the **name**, and the old entry's bytes stay readable through its FileId — that is what lets a
-/// frontend keep serving a handle opened before the replace.
+/// `SUPERSEDE` **truncates in place**: the name and the FileId are unchanged, and the content is gone
+/// (ADR-009 §4.2 ruling (a)).
+///
+/// The former test asserted the opposite (a new entry, the old one still readable by its id). It is rewritten rather than
+/// deleted because the *question* is still worth asking: what does a handle opened before a SUPERSEDE see afterwards?
 #[test]
-fn supersede_unbinds_the_name_and_leaves_the_old_entry_readable() {
-    let payload = b"bytes the old entry keeps".to_vec();
+fn supersede_truncates_in_place() {
+    let payload = b"bytes the old entry loses".to_vec();
     let (fixture, rules) = seeded("supersede", &payload);
-    let old = rules.resolve(&p("/f")).expect("old entry");
+    let before = rules.resolve(&p("/f")).expect("entry before");
 
     let outcome = rules
         .create_or_open(&p("/f"), Disposition::Supersede)
         .expect("supersede is legal on an existing file");
-    assert_ne!(
-        outcome.file_id, old,
-        "cell disposition=Supersede: the name now carries a different entry"
+    assert_eq!(
+        outcome.file_id, before,
+        "cell identity: SUPERSEDE keeps the entry (same FileId) — it is an overwrite of the same object"
+    );
+    assert_eq!(
+        outcome.replaced, None,
+        "cell replaced: Constant `None` on the create path; `RenameOutcome::replaced` (G4) is a different field"
     );
     assert!(
         read_all(&fixture.workspace, "/f").is_empty(),
-        "cell disposition=Supersede: the new entry starts empty"
+        "cell content: the entry is now empty"
     );
-
-    // The old entry is still **addressable by FileId**: nothing was hard-deleted. Asked through the tree, because the
-    // path no longer names it — that is exactly the state a frontend handle keeps using.
-    {
-        use fs_namespace::{TreeRead, TreeStore};
-        let store = fixture.workspace.store();
-        let still_there = store
-            .read(|tree| Ok(tree.inode(old)?.is_some()))
-            .expect("query the tree");
-        assert!(
-            still_there,
-            "cell disposition=Supersede: the old inode row must survive (unbound, not destroyed)"
-        );
-    }
+    assert_eq!(
+        rules.resolve(&p("/f")).expect("entry after"),
+        before,
+        "cell name: still bound to the same entry"
+    );
 }
