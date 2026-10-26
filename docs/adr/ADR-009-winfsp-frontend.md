@@ -196,6 +196,15 @@ remove_at(parent: FileId, name: &[u8], expected_id: FileId) -> Result<()>
 **正常删除** = `remove_at`（内部解除绑定 + 删除内容 + 把 inode 行置为 **tombstone `live=0`**；by-id 的 `read/stat/read_dir` 一律 `NotFound`；行保留"只增"，由 **B-10** 回收）。**不得**保留"live 且 size>0 但内容已删"的行——那会让读返回零或错数据。
 **SUPERSEDE** = 解除旧名字 + 创建新 inode，**不**对旧 inode 调 `remove_at`（旧 inode 保留，§4.2）；核心返回 `replaced: Option<FileId>`，adapter 把旧 FileId 的所有句柄标记为 **unbound**。
 
+**两类"行保留"的可见性相反**（两者都只增，最终由 **B-10** 回收）：
+
+| 路径 | inode 行状态 | 旧句柄 | by-id 读 |
+| --- | --- | --- | --- |
+| **SUPERSEDE** | **live**（保留） | 仍然有效，读到旧内容 | 可读（句柄存在期间） |
+| **`remove_at`** | **tombstone `live=0`** | 无（已在最后 cleanup 调用） | `NotFound` |
+
+这个区别是承重的：SUPERSEDE 若把旧行置 tombstone，旧句柄立刻读不到（B-8 破）；`remove_at` 若保留 live 行而删内容，`read_at_id` 会返回零/错数据（静默数据损坏）。
+
 **为什么排他性使其成立**：W2 保证一个 workspace 同时只有一个打开者（含只读），SDK/CLI 在挂载期间打不开；名字绑定只可能由本 adapter 改变，它能在自己的句柄表里同步。**若将来放宽 W2（多挂载、并发只读或外部写者），B 立刻失效**：必须改实现为 A（`child` 反向索引 + base 侧父指针/全量索引）或维护 per-open 名字注册表——**签名仍是 `remove_at`，实现忽略 `name`**，这就是"先取 B 形状"的价值。
 
 ---
@@ -258,7 +267,7 @@ remove_at(parent: FileId, name: &[u8], expected_id: FileId) -> Result<()>
 
 | # | 缺口 | 内容 | 归属 |
 | --- | --- | --- | --- |
-| G1 | 原子 open/create | `OpenDisposition`（§4.2）+ 目录/文件 + 一个 overlay 事务；返回 `{stat, created, binding, replaced}`（supersede 的旧 FileId） | fs-overlay/fs-api |
+| G1 | 原子 open/create | `OpenDisposition`（§4.2）+ 目录/文件 + 一个 overlay 事务；返回 `{file_id, kind, action, stat, created, binding, replaced}`（**只加不减**：18 格表继续用 `file_id/kind/action`；`replaced` 是 supersede 的旧 FileId） | fs-overlay/fs-api |
 | G2 | 按 FileId 的操作 | `stat_id` / `read_at_id`（range；见下方读放大判据）/ `write_at_id` / `truncate_id` / `read_dir_id` / `open_id`（返回 FileId 的 open）；删除侧为 `remove_at(parent,name,expected_id)`（§5.4） | fs-overlay/fs-api |
 | G3 | 元数据写 | `set_times`（creation/write，若 §10.1 扩展则 access/change）、`set_attributes`；`stat` 暴露 FileId | fs-namespace（profile v3，若批准） |
 | G4 | 条件 rename | `rename(..., replace: bool)` 原子；返回 `{binding, replaced: Option<FileId>}`；替换/不替换语义同 ADR-003 R3–R7 | fs-namespace/fs-api |
