@@ -67,3 +67,23 @@ fn stored_and_reported_are_different_quantities() {
         "cell domain: the reported value is not the stored one"
     );
 }
+
+/// The **stored-domain** rule lives in the core (`validate_attributes`), so the mock and the future real backend share
+/// one implementation instead of each refusing derived bits in its own way.
+#[test]
+fn validate_attributes_accepts_only_writable_bits() {
+    use fs_namespace::{validate_attributes, NamespaceError};
+
+    for stored in [0x00u32, 0x01, 0x02, 0x04, 0x20, 0x01 | 0x02 | 0x04 | 0x20] {
+        validate_attributes(stored).unwrap_or_else(|error| {
+            panic!("cell stored {stored:#x}: writable bits are legal, got {error:?}")
+        });
+    }
+    for stored in [0x10u32, 0x80, 0x10 | 0x01, 0x08, 0x40] {
+        let error = validate_attributes(stored).expect_err("cell derived/unknown: must be refused");
+        assert!(
+            matches!(error, NamespaceError::InvalidParameter { .. }),
+            "cell {stored:#x}: InvalidParameter (a bad argument), not InvalidRecord (bad data on disk): {error:?}"
+        );
+    }
+}

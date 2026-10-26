@@ -54,6 +54,16 @@ pub enum NamespaceError {
         /// The occupied path.
         path: String,
     },
+    /// A caller supplied a value that is outside the domain the operation accepts.
+    ///
+    /// Distinct from [`Self::InvalidRecord`], which means "the data **on disk** is not something this build can
+    /// interpret". This one is about the **call argument**: nothing on disk is wrong, the request is. Keeping them apart
+    /// matters because they map to different `NTSTATUS` values (`InvalidParameter` vs `Internal`), and because a log that
+    /// says "corrupt record" for a bad argument sends the reader looking at the wrong component.
+    InvalidParameter {
+        /// Which argument, and what was wrong with it.
+        detail: String,
+    },
     /// A conditional `rename` (`replace = false`) found the destination name taken.
     ///
     /// Distinct from [`Self::AlreadyExists`]: that one reports the *type* rules (R4/R5), this one reports the caller's
@@ -150,6 +160,7 @@ impl fmt::Display for NamespaceError {
             NamespaceError::NameCollision { path } => {
                 write!(f, "name collision (replace = false): {path}")
             }
+            NamespaceError::InvalidParameter { detail } => write!(f, "invalid parameter: {detail}"),
             NamespaceError::NotADirectory { path } => write!(f, "not a directory: {path}"),
             NamespaceError::IsADirectory { path } => write!(f, "is a directory: {path}"),
             NamespaceError::DirectoryNotEmpty { path } => {
@@ -191,6 +202,7 @@ impl std::error::Error for NamespaceError {
             | NamespaceError::DirectoryNotEmpty { .. }
             | NamespaceError::IntoOwnSubtree { .. }
             | NamespaceError::NameCollision { .. }
+            | NamespaceError::InvalidParameter { .. }
             | NamespaceError::IsRoot
             | NamespaceError::InvalidPath(_)
             | NamespaceError::NamespaceNotFound { .. }

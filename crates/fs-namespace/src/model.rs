@@ -81,21 +81,41 @@ pub struct Stat {
 }
 
 /// `FILE_ATTRIBUTE_DIRECTORY` (derived, never stored).
-pub const ATTRIBUTE_DIRECTORY: u32 = 0x10;
+pub const ATTRIBUTE_DIRECTORY: u32 = fs_semantics::attributes::DIRECTORY;
 /// `FILE_ATTRIBUTE_NORMAL` (derived: meaningful only when no other bit is set).
-pub const ATTRIBUTE_NORMAL: u32 = 0x80;
+pub const ATTRIBUTE_NORMAL: u32 = fs_semantics::attributes::NORMAL;
+
+/// Rejects attribute bits that are not **storable** (`DIRECTORY`/`NORMAL` are derived; unknown bits are unknown).
+///
+/// This lives in the core, not in the adapter, because otherwise the rule exists twice: the mock would refuse derived
+/// bits and the real backend (P3-3b) — which talks to the core directly — would not. One rule, one implementation, and
+/// the refusal is the same shape on both paths.
+///
+/// # Errors
+///
+/// [`crate::NamespaceError::InvalidParameter`] naming the offending bit.
+pub const WRITABLE_ATTRIBUTES: u32 = fs_semantics::attributes::WRITABLE;
+
+/// Rejects attribute bits that are not **storable** (`DIRECTORY`/`NORMAL` are derived; unknown bits are unknown).
+///
+/// This lives in the core, not in the adapter, because otherwise the rule exists twice.
+///
+/// # Errors
+///
+/// [`crate::NamespaceError::InvalidParameter`] naming the offending bit.
+pub fn validate_attributes(stored: u32) -> crate::NamespaceResult<()> {
+    // The rule itself is in `fs-semantics` (zero-dependency, shared with the Windows frontend). Only the error type is
+    // translated here: the core says `InvalidParameter`, the frontend says `Failure::InvalidParameter`, and neither
+    // re-implements the bit test.
+    fs_semantics::attributes::validate(stored).map_err(|failure| {
+        crate::NamespaceError::InvalidParameter {
+            detail: format!("attributes {stored:#x}: {failure:?}"),
+        }
+    })
+}
 
 /// The attribute bits `stat` reports: `stored` plus whatever `kind` and emptiness imply.
 #[must_use]
 pub fn derived_attributes(kind: Kind, stored: u32) -> u32 {
-    match kind {
-        Kind::Directory => stored | ATTRIBUTE_DIRECTORY,
-        Kind::File => {
-            if stored == 0 {
-                ATTRIBUTE_NORMAL
-            } else {
-                stored
-            }
-        }
-    }
+    fs_semantics::attributes::report(kind == Kind::Directory, stored)
 }

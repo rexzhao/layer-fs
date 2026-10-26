@@ -47,7 +47,8 @@ mod tree_store;
 pub use error::{InvalidPath, NamespaceError, NamespaceResult, MAX_DEPTH, MAX_NAME_BYTES};
 pub use inode_view::InodeView;
 pub use model::{
-    derived_attributes, Entry, FileId, Kind, Stat, ATTRIBUTE_DIRECTORY, ATTRIBUTE_NORMAL,
+    derived_attributes, validate_attributes, Entry, FileId, Kind, Stat, ATTRIBUTE_DIRECTORY,
+    ATTRIBUTE_NORMAL, WRITABLE_ATTRIBUTES,
 };
 pub use path::Path;
 /// The path walks, for a backend that must resolve inside its own transaction.

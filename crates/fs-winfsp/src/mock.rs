@@ -496,9 +496,13 @@ impl WorkspaceOps for MockBackend {
         // call: refusing is the honest answer, and silently ignoring them would be worse — the caller would believe it
         // set DIRECTORY (i.e. turned a file into a directory) while nothing happened. Windows behaves the same way:
         // `SetFileAttributes` rejects `FILE_ATTRIBUTE_DIRECTORY`; a directory is made with `CreateDirectory`.
-        if attributes.0 & (0x10 | 0x80) != 0 {
-            return Err(OpsError::InvalidParameter);
-        }
+        // The rule lives in the core (`fs_namespace::validate_attributes`) and this call site only translates the error:
+        // otherwise the mock would refuse derived bits while P3-3b's real backend — which talks to the core directly —
+        // would not, and the same rule would exist twice.
+        fs_semantics::attributes::validate(attributes.0).map_err(|failure| match failure {
+            fs_semantics::disposition::Failure::InvalidParameter => OpsError::InvalidParameter,
+            other => OpsError::Other(format!("{other:?}")),
+        })?;
         let mut inner = self.inner.lock().expect("mock lock");
         let node = inner.nodes.get_mut(&file_id).ok_or(OpsError::NotFound)?;
         if !node.live {
