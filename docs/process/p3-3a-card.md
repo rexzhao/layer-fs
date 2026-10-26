@@ -81,6 +81,26 @@ flush()                                     // workspace 级
    **`未验证（依赖 G2）`**——与 P3-3a 清单 J0 同档。**不得写"部分通过"**（三态里没有第四态）。
 8. **错误映射不重复实现**：`fs-winfsp/src/error.rs` 只能**调用** `fs_windows` 的映射（`pub use`/函数调用）；不得出现 `match err` 分支或第二份状态码表。形状查：`grep -n 'match .*err' crates/fs-winfsp/src` 为空；`STATUS_` 只出现在调用点与测试断言，不出现在映射分支。
 
+## 3.9 「身份 vs 名字」的判别招：**路径复用**（QA，2026-10-26；对 P3-2 G2 同样适用）
+
+**招法**：把**旧路径指向另一个对象**，再用**旧 id** 操作。
+
+```text
+create "/a" → id1
+rename "/a" → "/b"
+create "/a" → id2          ← 旧路径被复用，指向不同的对象
+remove_id(id1)              ← 用旧身份操作
+```
+
+**期望**：`/b` 消失（删除生效）、**`/a` 仍在且仍是 id2**（未被误删）。
+**红法**：实现若“反查名字再 unlink”，会删掉 `/a`(id2) ⇒ 第二条断言红，且这是**数据丢失级**错误。
+
+**为什么不用单纯 rename**：rename 之后旧路径**空着**，按名字的实现会**失败**（红得似是而非）；
+复用之后，按名字的实现会**成功地操作错误的对象**——那种红才指向真缺陷。
+
+**同一招用于 `read_dir(dir_id)`**：`mkdir /d1`(2 条)、`mkdir /d2`(3 条)、`rename /d1→/d1-renamed`、`rename /d2→/d1`，
+再用**旧 dir1** 枚举 ⇒ 必须返回 **2** 条（dir1 的内容），不是 dir2 的 3 条。
+
 ## 4. 明确不做（本卡范围外）
 
 - 任何 `extern "C"`、`LoadLibrary`、`winfsp.h` 的 `use`、`#[cfg(windows)]`、`#[link]`；**CI 必须能在 Linux 上 `cargo test -p fs-winfsp`**（用 `fs-windows` 现成的源码级扫描器扩展一条）；
