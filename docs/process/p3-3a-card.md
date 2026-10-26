@@ -31,7 +31,7 @@
 按"一次调用 = 一个核心动作"设：
 
 ```
-create_or_open(disposition, path, kind_hint) -> OpenOutcome { file_id, kind, size, times, attributes }
+create_or_open(disposition, path, kind_hint) -> OpenOutcome { file_id, kind, action, size, times, attributes, binding, replaced }
 // `size`/`times` 必须是**取回时从核心读到的值**，不是打开时缓存的值，也不是 adapter 自己维护的副本。
 // 否则 §3.2 的“新句柄 size == 0”在“缓存旧值”的实现下会**假绿**（读到的是替换前的缓存）。
 
@@ -53,14 +53,14 @@ read_dir(dir_id) -> Vec<DirEntry>          // 目录句柄在 rename 后仍有�
 get_info(file_id) -> NodeInfo
 set_times(file_id, access, write, change, create)
 set_attributes(file_id, attributes)
-rename(from, to, replace)
-remove_id(file_id)                          // 最后一个句柄关闭时调用一次
+rename(from, to, replace) -> RenameOutcome { binding, replaced }
+remove_at(parent, name, expected_id)        // 最后一个句柄关闭时一次；expected_id 不符 ⇒ NotFound
 flush()                                     // workspace 级
 ```
 
-**不属于 trait**（adapter 策略/记账）：`delete_pending`、`set_delete`、`close(file_id)`、share 判定、`DELETE_ON_CLOSE`、句柄引用计数。两段删除的 `remove_id` 只在最后一个句柄 `cleanup` 时调用（§3 判据 3）。
+**不属于 trait**（adapter 策略/记账）：`delete_pending`、`set_delete`、`close(file_id)`、share 判定、`DELETE_ON_CLOSE`、句柄引用计数。两段删除的 `remove_at` 只在最后一个句柄 `cleanup` 时调用（§3 判据 3），且 `expected_id` 必须由句柄的 `binding` 与核心返回值核对。
 
-> 判据 3/4/5 里的 `set_delete`/`close` 均指 **adapter 句柄表操作**，不是 trait 方法；trait 只有 `remove_id` 在最后一个句柄关闭时被调用一次。
+> 判据 3/4/5 里的 `set_delete`/`close` 均指 **adapter 句柄表操作**，不是 trait 方法；trait 只有 `remove_at` 在最后一个句柄关闭时被调用一次。
 
 **约束**：本卡**只定义 trait 与 mock 实现**；真实后端（`Repo`/`Workspace` 适配）在 **P3-3b** 实现并重跑同一份契约测试——本卡不写真实后端，也不改 `fs-api`。
 
@@ -92,11 +92,13 @@ flush()                                     // workspace 级
 create "/a" → id1
 rename "/a" → "/b"
 create "/a" → id2          ← 旧路径被复用，指向不同的对象
-remove_id(id1)              ← 用旧身份操作
+remove_at(parent_of_b, "b", expected = id1)   ← 旧绑定已随 rename 更新；用旧身份 + 当前名字
 ```
 
 **期望**：`/b` 消失（删除生效）、**`/a` 仍在且仍是 id2**（未被误删）。
-**红法**：实现若“反查名字再 unlink”，会删掉 `/a`(id2) ⇒ 第二条断言红，且这是**数据丢失级**错误。
+**红法**：① 实现若用**打开时的旧名字 `/a`** 去删，`expected_id` 核对失败 ⇒ `NotFound`，`/b` 仍在 ⇒ 第一条断言红（删除没生效，而不是误删）；② 实现若跳过 `expected_id` 直接按名字删，会删掉 `/a`(id2) ⇒ 第二条断言红，这是**数据丢失级**错误。
+
+**mock 的前置**：mock 必须像核心一样维护真实的 `(parent, name) -> child` 绑定，并在 rename 时更新；否则"路径复用"这个构造本身不成立，§3.9 会变成空转（不是实现通过，而是测试没造出来）。
 
 **为什么不用单纯 rename**：rename 之后旧路径**空着**，按名字的实现会**失败**（红得似是而非）；
 复用之后，按名字的实现会**成功地操作错误的对象**——那种红才指向真缺陷。
@@ -128,7 +130,7 @@ remove_id(id1)              ← 用旧身份操作
 | --- | --- |
 | `fs-windows` 的 NTSTATUS 映射 | 已在 main（P3-1 合入 `737c646`），`Kind`/`Failure` 已上移 `fs-semantics`（P3-2 G1） |
 | `fs-api` 的公开面 | `Repo` / `Workspace`：`create_file`/`mkdir`/`remove`/`rename`/`truncate`/`write_at`/`read_at`/`read_dir`/`stat` |
-| P3-2 的 `Rules::create_or_open` | 已在 worker 分支（`CreateOutcome { file_id, kind, action }`），**本卡按它的形状写 trait**，若形状有变以 main 上的为准 |
+| P3-2 的 `Rules::create_or_open` | 已在 worker 分支（`CreateOutcome { file_id, kind, action }`）；本卡 `OpenOutcome` **只加不减**，保留这三项并追加 `size/times/attributes/binding/replaced`，形状以 main 上的 ADR-009 G1 为准 |
 | WinFsp SDK | 已就位（`F:/work/winfsp-sdk/DYNAMIC/{inc,lib}`），本卡不用 |
 
 ## 8. 卡外补的三条判据（QA 验收清单 + manager 追加，2026-10-26）
