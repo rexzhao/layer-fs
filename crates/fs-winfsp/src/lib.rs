@@ -7,12 +7,14 @@
 
 #![deny(missing_docs)]
 
+pub mod adapter;
 pub mod dirent;
 pub mod error;
 pub mod handles;
 pub mod mock;
 pub mod ops;
 
+pub use adapter::Adapter;
 pub use dirent::{DirentCursor, SortEntry};
 pub use error::{to_failure, to_status_of};
 pub use handles::{close_removes, CloseEffect, Handle, HandleId, HandleTable};

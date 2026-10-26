@@ -102,6 +102,11 @@ pub struct OpenOutcome {
 /// What `rename` produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenameOutcome {
+    /// The entry that moved.
+    ///
+    /// Added in P3-4: the adapter has to update its `(parent, name)` binding after a rename, and deriving the id from a
+    /// path is exactly the kind of guessing this crate avoids. The core already knows it.
+    pub file_id: u64,
     /// Where the moved entry now lives: `(parent id, raw destination name bytes)`.
     pub binding: (u64, Vec<u8>),
     /// The entry that lost the destination name, already retired by the core.

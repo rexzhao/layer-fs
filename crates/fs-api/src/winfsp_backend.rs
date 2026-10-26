@@ -229,6 +229,7 @@ impl WorkspaceOps for ApiBackend<'_> {
             .rename_with(&path_of(from)?, &path_of(to)?, replace)
             .map_err(to_ops)?;
         Ok(RenameOutcome {
+            file_id: outcome.file_id.serial(),
             binding: (outcome.binding.0.serial(), outcome.binding.1),
             replaced: outcome.replaced.map(FileId::serial),
         })

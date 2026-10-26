@@ -579,6 +579,7 @@ impl WorkspaceOps for MockBackend {
             node.times.changed = clock;
         }
         Ok(RenameOutcome {
+            file_id: source,
             binding: (to_parent, to_name),
             replaced,
         })
