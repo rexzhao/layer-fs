@@ -12,6 +12,10 @@
 //!   `git diff --stat 41694d0..HEAD -- crates/fs-snapshot/`), so the **shape** is reused while the **numbers are
 //!   re-measured**: re-running costs two seconds, judging a new encoder against stale numbers costs a wrong verdict.
 //!
+//! The **timing** criterion (card §3.3 criterion 4) lives here as an `#[ignore]`d measurement, and only here: in CI a
+//! timing assertion is a flaky criterion, and a flaky criterion gets muted. The page/height criteria are live assertions
+//! in `g3_budget.rs`, because those are properties of the product rather than of the machine.
+//!
 //! Nothing here asserts a threshold. A measurement that also asserted would go red on a busy machine, and its number
 //! would then be read as "the change is slow". Numbers belong in the report; thresholds belong in the change's own test.
 
