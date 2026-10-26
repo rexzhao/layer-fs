@@ -137,6 +137,7 @@ dependencies = [
  "cas-store",
  "fs-overlay",
  "fs-semantics",
+ "fs-snapshot",
 ]
 
 [[package]]

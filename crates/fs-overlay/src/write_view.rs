@@ -197,6 +197,8 @@ pub(crate) fn tombstone_impl(
     base: &BaseLayer,
     id: FileId,
 ) -> OverlayResult<()> {
+    #[cfg(feature = "gc-test-hooks")]
+    crate::counting::note_tombstone();
     match inode_row(connection, id.serial())? {
         Some(row) if row.origin == schema::ORIGIN_LOCAL => {
             // A **local** inode is tombstoned, not deleted (ADR-009, single deletion semantics): a held id must keep

@@ -14,4 +14,5 @@ cas-store.workspace = true
 
 [dev-dependencies]
 cas-store.workspace = true
-fs-overlay.workspace = true
+fs-overlay = { workspace = true, features = ["gc-test-hooks"] }
+fs-snapshot.workspace = true

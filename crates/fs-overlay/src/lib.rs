@@ -44,6 +44,10 @@ mod content;
 mod error;
 mod publish;
 pub mod schema;
+
+/// Test-only counters (P3-2 G2).
+#[cfg(feature = "gc-test-hooks")]
+pub mod counting;
 mod store;
 mod store_impl;
 mod view;
