@@ -60,15 +60,18 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
         "cell configure: this test configures the callbacks first; a second configuration in the same process fails by design"
     );
 
-    let mount_point: PathBuf = std::env::temp_dir().join(format!(
-        "layer-fs-mnt-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0)
-    ));
+    // An **explicitly created empty directory**: WinFsp refuses a mount point that does not exist, and `0xC0000035` is what
+    // that refusal looks like from the caller's side (it reads as "name collision").
+    let mount_point: PathBuf = std::env::var_os("LAYER_FS_MNT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("layer-fs-mnt-{}-{}", std::process::id(), 1))
+        });
     std::fs::create_dir_all(&mount_point).expect("empty mount point directory");
+    assert!(
+        std::fs::read_dir(&mount_point).expect("mount point exists").next().is_none(),
+        "cell mount point: an empty directory is a precondition — a non-empty one is refused with 0xC0000035"
+    );
 
     // The probe runs **while mounted**; its error is captured for the report.
     let mut probe_result: Option<Result<(), String>> = None;
