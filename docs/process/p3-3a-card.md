@@ -95,8 +95,20 @@ flush()                                     // workspace 级
 ① real 用例 `#[ignore]`/提前 `return`；② real 只断言 `is_ok()`；③ 场景函数在两个后端参数不同（不是"同一批"）。
 覆盖表必须**来自执行**；本卡只有 mock，真实后端的覆盖表由 P3-3b 提供（不得把 mock 覆盖写成"两个实现"）。
 
-**N1 句柄里不得有路径**（W3 的形状判据）：`struct Handle` 的字段里不出现 `Path`/`PathBuf`/路径语义的 `String`。
-红法：给 `Handle` 加 `path: PathBuf` ⇒ 必须红。理由：一旦存路径，`rename` 后旧句柄指向旧路径——**判据 1 只抓行为，抓不到"为什么错"**，N1 抓结构端。
+**N1 句柄不得存绝对路径**（W3 的形状判据，2026-10-26 修订）：`struct Handle` 的字段里不出现 `Path`/`PathBuf`/绝对路径语义的 `String`。
+
+- 允许存 `(parent_id, name)` **定位键**（P3-2 G2 的 `remove_at(parent, name, expected_id)` 可能采用它，见 ADR-009 W3 修订）；
+- 但该定位键只是**提示不是身份**：必须校验 `entry.child == expected_id`，不符即 `NotFound`；
+- 采用它的实现必须在注释里写明**依赖 W2（workspace 排他打开）**——一旦允许并发打开者即刻失效。
+
+机械核对两条：
+```sh
+grep -A20 'struct Handle' crates/fs-winfsp/src/handles.rs | grep -cE 'path\s*:\s*(String|PathBuf)'   # 0
+grep -A20 'struct Handle' crates/fs-winfsp/src/handles.rs | grep -cE '(parent|name)\s*:'            # 允许，但注释须有 W2 依据
+```
+
+红法：给 `Handle` 加 `path: PathBuf` 并**让它参与解析** ⇒ 判据 1 必须红（只加死字段不会红——`[read]` 型的坑）。
+理由：path 一旦过期就指错对象；而 `(parent, name)` 在排他前提下由本进程维护，且仍需 `child == expected_id` 兜底。
 
 **N2 `.` / `..` 只能由 adapter 合成，且各恰好一次**：mock 的 `read_dir` 返回不含 `.`/`..` ⇒ adapter 枚举结果里两者各 1 次且在最前。
 红法：mock 也返回 `.` ⇒ 枚举里出现两次 ⇒ 必须红。
