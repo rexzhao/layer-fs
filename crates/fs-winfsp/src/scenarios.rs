@@ -1,3 +1,17 @@
+//! # Criterion 3 is split: the core half lives here, the adapter half lives in P3-4
+//!
+//! The card's two-phase deletion has two halves and they belong to different layers:
+//!
+//! - **core half (this file, `scenario_removal_cases`)**: `remove_at` refuses another inode's name with a *stale identity*
+//!   error, is idempotent for an already-retired id, and reports `NotFound` when the name is free but the id is still
+//!   live. A backend can be held to all three without any handle bookkeeping.
+//! - **adapter half (P3-4)**: `set_delete(true)` making a *new* open fail with `DeletePending` while the handles opened
+//!   before it keep working. The core has no notion of "handle", so this half cannot be asserted here — it needs the
+//!   adapter's handle table, which arrives with the FFI layer.
+//!
+//! Written down because the absence of those assertions looks like an omission otherwise: the scenario runs on both
+//! backends and passes, and a reader would reasonably ask "where is the `DeletePending` case?".
+//!
 //! The P3-3a contract scenarios, as **library code** (P3-3b moved them out of `tests/`).
 //!
 //! They were written generic over `WorkspaceOps` so that a real backend could run the same functions; keeping them in a
