@@ -7,6 +7,7 @@
 
 #![deny(missing_docs)]
 
+pub mod abi;
 pub mod adapter;
 pub mod boundary;
 pub mod dirent;
