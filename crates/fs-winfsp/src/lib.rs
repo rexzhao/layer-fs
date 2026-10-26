@@ -8,6 +8,7 @@
 #![deny(missing_docs)]
 
 pub mod adapter;
+pub mod boundary;
 pub mod dirent;
 pub mod error;
 pub mod handles;
