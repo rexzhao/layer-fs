@@ -293,6 +293,52 @@ impl<S: TreeStore> Rules<S> {
         })
     }
 
+    /// Removes a **specific** entry by name, guarded by its identity (P3-2 G2, ADR-009).
+    ///
+    /// `expected_id` is a guard, not a hint: a caller that decided to delete entry *X* passes `X`, and if the name now
+    /// belongs to something else the call is refused. Without it, "delete the path" is a TOCTOU whose worst case is
+    /// deleting a file somebody else just created under the same name.
+    ///
+    /// Repeating the call is **idempotent**: if the name is gone and `expected_id` is already a tombstone, the answer is
+    /// `Ok(())` — a second cleanup after a crash or a duplicate callback must not turn into an error.
+    ///
+    /// # Errors
+    ///
+    /// [`NamespaceError::NotFound`] when the name is gone and `expected_id` is not a tombstone;
+    /// [`NamespaceError::InvalidRecord`] when the name belongs to another entry.
+    pub fn remove_at(
+        &self,
+        parent: FileId,
+        name: &[u8],
+        expected_id: FileId,
+    ) -> NamespaceResult<()> {
+        self.store.write(OpLabel::Unlink, |tree| {
+            match tree.lookup(parent, name)? {
+                Some(current) if current == expected_id => {
+                    tree.unbind(parent, name)?;
+                    tree.tombstone(current)?;
+                    Ok(())
+                }
+                Some(current) => Err(NamespaceError::InvalidRecord {
+                    field: "remove_at(expected_id)",
+                    detail: format!(
+                        "the name now belongs to {:?}, not to the expected {:?}",
+                        current, expected_id
+                    ),
+                }),
+                None => {
+                    // Idempotent second call: the entry we were told to delete is already a tombstone.
+                    match tree.inode(expected_id)? {
+                        None => Ok(()),
+                        Some(_) => Err(NamespaceError::NotFound {
+                            path: String::from_utf8_lossy(name).into_owned(),
+                        }),
+                    }
+                }
+            }
+        })
+    }
+
     /// Moves `from` to `to` (ADR-003 §3.3 R1–R12).
     ///
     /// # Errors

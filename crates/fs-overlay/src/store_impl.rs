@@ -2,8 +2,6 @@
 
 use fs_namespace::{NamespaceResult, OpLabel, TreeStore};
 
-use rusqlite::OptionalExtension;
-
 use crate::error::{OverlayError, OverlayResult};
 use crate::store::{OverlayStore, ScopeGuard};
 use crate::view::{into_namespace, OverlayRead};
@@ -69,6 +67,7 @@ impl OverlayStore {
     pub fn live_marker(&self, serial: u64) -> OverlayResult<Option<i64>> {
         let _guard = ScopeGuard::enter()?;
         let connection = self.lock();
+        use rusqlite::OptionalExtension;
         let live: Option<i64> = connection
             .query_row(
                 "SELECT live FROM ov_inode WHERE serial = ?1",

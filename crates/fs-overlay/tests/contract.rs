@@ -194,6 +194,28 @@ fn k1_unlink_of_a_local_file_tombstones_its_row() {
         "cell paired: the surviving row must be marked dead"
     );
 
+    // **The "invisible" half belongs to `TreeRead`**, so it is asserted there and not inferred from a read error:
+    // a tombstoned inode must be absent from the view the rules actually use.
+    {
+        use fs_namespace::{TreeRead, TreeStore};
+        let store = fixture.rules.backend();
+        let hidden = store.read(|tree| tree.inode(id)).expect("query the view");
+        assert!(
+            hidden.is_none(),
+            "cell paired: `TreeRead` must not report a tombstoned inode"
+        );
+        // **Control in the same test**: an implementation that always returned `None` would satisfy the line above while
+        // breaking every read. The live id must still be reported by the same call.
+        let live_id = fixture.rules.resolve(&p("/")).expect("root");
+        let visible = store
+            .read(|tree| tree.inode(live_id))
+            .expect("query the view");
+        assert!(
+            visible.is_some(),
+            "cell control: a live inode must still be reported by `TreeRead`"
+        );
+    }
+
     // What the caller can observe, and what the old "delete the row" behaviour got wrong:
     // 1. the id still means "this entry, deleted": reading it is NotFound, not somebody else's bytes;
     // 2. the serial is not recycled into a new entry (a reused slot would make the held id point at a live file).

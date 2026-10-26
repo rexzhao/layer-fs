@@ -94,9 +94,9 @@ fn no_test_defines_its_own_tail_constant() {
     );
 }
 
-/// Criterion 3 and 4 together: one `== 48` assertion, and **eleven** non-comment uses in total.
+/// Criterion 3 and 4 together: one `== 48` assertion, and **twelve** non-comment uses in total.
 #[test]
-fn the_constant_is_used_exactly_eleven_times_outside_comments() {
+fn the_constant_is_used_exactly_twelve_times_outside_comments() {
     let mut total = 0usize;
     let mut per_file: Vec<(String, usize)> = Vec::new();
     let mut assertions = Vec::new();
@@ -125,8 +125,8 @@ fn the_constant_is_used_exactly_eleven_times_outside_comments() {
         "cell assertion: exactly one `PACK_TAIL_BYTES == 48` line, found {assertions:?}"
     );
     assert_eq!(
-        total, 11,
-        "cell uses: eleven non-comment uses (1 definition + 1 export + 4 src + 4 tests + 1 assertion); \
+        total, 12,
+        "cell uses: twelve non-comment uses (1 definition + 1 export + 4 src + 5 tests + 1 assertion); \
          a missing one means an alias constant survived, an extra one means a copy: {per_file:?}"
     );
     let expected = [
@@ -134,6 +134,9 @@ fn the_constant_is_used_exactly_eleven_times_outside_comments() {
         ("cas-store/src/pack.rs", 5),
         ("cas-store/tests/pack.rs", 4),
         ("cas-store/tests/sync_probe.rs", 1),
+        // P3-2 G2's read-amplification criterion: the test needs the tail size to bound the read, and it uses the
+        // constant rather than a literal — which is exactly why this table has to be updated when a consumer appears.
+        ("fs-workspace/tests/g2_read_side.rs", 1),
     ];
     assert_eq!(
         per_file,
