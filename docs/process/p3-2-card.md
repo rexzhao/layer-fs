@@ -30,6 +30,14 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 
 `stat/read_at/write_at/truncate/remove` 接受 **FileId**（inode serial），不是路径。
 
+**同批补的两个入口（2026-10-26，architect 在 P3-3a 评审时提出的缺面）**
+
+- **`read_dir(dir_id)`**：目录句柄在 rename 之后必须能继续枚举，所以入口只能是 FileId（`fs-api` 目前只有 `read_dir(path)`）。
+  判据：① rename 后用**旧 dir_id** 仍能枚举出同样集合；② 枚举顺序**稳定**（同一目录两次枚举顺序相同；顺序由折叠键 + 二级键决定，
+  见 P3-3a 卡 §3）；③ 目录被 `remove` 后再枚举得到 typed 错误，不是 panic。
+- **`remove_id(file_id)`**：两段删除时最后一个 `close` 调它（W7）。判据：① 幂等（再调一次不报错、无副作用）；
+  ② **恰好一次**真正删除（计数 source：mock/计数后端断言调用次数）；③ rename 后仍删对了对象（按 FileId，不按打开时的路径）。
+
 **判据**
 
 1. **范围读只触及覆盖帧**：观测点在 pack 读取器 `read_exact_at`（不是 `Store::get` 返回处）；总读字节 == 帧长之和；
