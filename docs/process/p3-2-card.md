@@ -93,20 +93,60 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 - **`Stat` 破坏性变更一次性改完**（加三个字段，不保留旧构造）；
 - **v2 读取路径不得因 v3 被删**（拒绝判据与兼容读取不得打架）。
 
-**旧根拒绝判据**
+### 3.1 接受侧：fmt / 字段矩阵（必须逐行有测试）
+
+| 情形 | 期望 |
+| --- | --- |
+| v3 根 → inode 页 `fmt=2`；目录/extent/root 页仍 `fmt=1` | 往返成功 |
+| profile v3 + inode 页 `fmt=1` | `UnsupportedFormat`（**不是** `Malformed`） |
+| profile v2 + inode 页 `fmt=2` | `UnsupportedFormat` |
+| v3 根 + 目录/extent 页 `fmt=2` | `UnsupportedFormat` |
+| `attributes` 含 `DIRECTORY(0x10)`/`NORMAL(0x80)` 或未知位 | `Malformed` |
+| `security_len = 0 / 1 / 65535 / 65536 / 65537` | 前四接受（0 = 默认 SD），65537 拒绝；非零 SD 字节原样往返 |
+| 四个时间 `i64::MIN/MAX/0` | 往返成功；不校验时间顺序 |
+| `profile_id != BLAKE3(§2.3 描述串)` | `UnsupportedProfile` |
+| `Profile::CURRENT.id()` | == BLAKE3(描述串)；v2 id 保持不变（夹具仍可读） |
+
+**`Stat` 兼容判据**
+- 编译期：旧 `Stat { .. }` 字面量构造在所有 crate 里编译失败（CI 即可，不需要运行测试）；
+- 运行期：`Stat` 含 `accessed_ns/changed_ns/attributes`，**不含 security**；`Workspace::security(id)` 单独返回 `Option<Vec<u8>>`；
+- `stat` 的读放大：计数 source 断言它只读 inode 记录，不读 SD 字节（不把 SD 复制进每次 stat）。
+
+**时间/属性更新语义**
+- `write` / `truncate` → `modified_ns` 与 `changed_ns` 都更新；`set_times` / `set_attributes` → `changed_ns` 更新；
+- **读不更新 `accessed_ns`**：读前后 root id 不变（否则每次读都产生新根）；
+- 用**注入时钟**测，不用墙钟。
+
+### 3.2 拒绝侧：旧根/旧 workspace
 
 1. **v2：真实夹具**（`crates/fs-snapshot/tests/fixtures/snapshot-v2-store/`）→ `UnsupportedProfile`；README 的字节清单作外部事实；
 2. **v1：只对合成的 profile 字段断言** `UnsupportedProfile`，并在卡里标注"**合成根只测字段识别，不证明历史兼容**"
    （本 build 造不出真 v1，P3-0c 已证明）；
 3. **拒绝前后 `store.sqlite` + `-wal` 字节哈希不变**（`-shm` 不计）；**同一夹具连续两次都被拒**；
-4. **fmt 自识别**：把 v3 根的 inode fmt 改回 1 → `UnsupportedFormat`（证明不是只靠 profile 串）。
+4. **fmt 自识别**：把 v3 根的 inode fmt 改回 1 → `UnsupportedFormat`（证明不是只靠 profile 串）；
+5. **反向（v3 → 旧读取器）**：v3 根 + 强制 `Profile::V2` 读取 → `UnsupportedProfile`（同一 build 的 L1 代理，**标注"不是真实旧二进制"**）；
+   另立**发布前手工项**：用 v2 构建产物打开 v3 夹具，必须拒绝且字节不变（结果贴报告，不在常规 CI）；
+6. **workspace 侧**：`workspace_policy.snapshot_profile` 仍为 v2 的 workspace → `workspace_open` 必须 typed 拒绝，且无任何写入；
+7. **v2 正读**：v2 夹具 + `Profile::V2` 能读出目录与文件内容（不能只有"被拒"用例）。
 
-**基线与阈值（不含阈值的"原始数据"只是报告）**
+### 3.3 基线与阈值（**修正：原 `24/4096` 式作废**）
 
-- 改动**前**先测基线（10 万 inode）：树高 / 页数 / 写放大 / 耗时；
-- 阈值：**树高 ≤ 基线**；**页数 ≤ 基线 × (1 + 24/4096) + 5%**；**耗时 ≤ 基线 × 1.2**。超出即红，并作为**代价问题**上报给 owner（我转）；
-- **每页 inode 数的分母要写出来**：`floor(PAGE_BYTES / inode_old)` → `floor(PAGE_BYTES / inode_new)`
-  （具体两个数由 QA 预先算出填入本卡，见 §8）。
+**原式作废的理由**：
+- 分母用错：`24/4096` 用了 overlay 的 `PAGE_BYTES=4096`，而 snapshot 页是 `max_page_bytes=16384`；
+- 机制不对：ADR-005 §4 的分页由**键哈希 + `mask_bits`** 驱动（平均约 64 条/页），`floor(PAGE_BYTES/inode)` 只是
+  `max_page_bytes` 的**字节护栏**，不是"按容量打包"的目标。记录 +24 B（无 SD，约 66→90 B）时平均页仍远小于 16384，
+  **页数通常不变**；只有某页撞到字节护栏才会提前切。原式既无机制依据，也可能把正确实现判红或放过真实退化。
+
+**基线要求**：**改动前**、同机、同参数（10 万 inode）测，报告带 commit SHA 与机器；记录
+`record_old`、`record_new`、`pages_old`、`height_old`、`time_old`、`avg_entries_per_page`、`max_page_bytes` 命中次数。
+
+**判据（数值由 QA 从基线填入；未填前本段视为未定稿，不得派发执行）**：
+1. `pages_new ≤ pages_old × (1 + __%)`（默认建议 5%，QA 按基线定）；
+2. **任一 v3 页的字节数 > `max_page_bytes` ⇒ 红**（这是记录膨胀唯一会改变页数的机制；报告触发页数/最满页）；
+3. `height_new ≤ height_old + __`（记录膨胀可能多一层；QA 按基线定 0 或 1）；
+4. `time_new ≤ time_old × __`（写放大/耗时容忍；QA 定）。
+
+超出任一阈值 ⇒ 红，并作为**代价问题**上报给 owner（manager 转）。
 
 ## 4. G4：带 `replace` 的 rename
 
