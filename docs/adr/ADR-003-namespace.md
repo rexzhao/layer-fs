@@ -300,7 +300,7 @@ T3 卡的措辞"root 不可变：写前 root 的完整视图在写后逐项不�
 两 crate **互不校验对方的表**。
 
 **`PRAGMA user_version` 由 `cas-store` 治理，`fs-namespace` 不使用它。** `cas-store` 在建库时
-把它设为 1，并在每次打开时按自己的版本策略校验（ADR-002 §4.2）；`fs-namespace` 既不读写也不
+把它设为 1，并在每次打开时按自己的版本策略校验（ADR-002 §4）；`fs-namespace` 既不读写也不
 校验它，只用自己的 `namespace_policy` 表。这两个版本载体互不相干，任一 crate 的版本演进都不
 影响对方。
 
