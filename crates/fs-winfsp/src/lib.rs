@@ -7,8 +7,11 @@
 
 #![deny(missing_docs)]
 
+pub mod mock;
 pub mod ops;
 
+pub use mock::{Call, MockBackend, ROOT};
 pub use ops::{
-    Attributes, DirEntry, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, RenameOutcome, Times, WorkspaceOps,
+    Attributes, DirEntry, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, RenameOutcome, Times,
+    WorkspaceOps,
 };

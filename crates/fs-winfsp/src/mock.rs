@@ -1,0 +1,604 @@
+//! An in-memory `WorkspaceOps` backend for the contract tests (P3-3a card §1, "mock.rs").
+//!
+//! The mock is not a stub: it keeps a real `(parent, name) -> child` binding table, allocates **fresh, never reused**
+//! file ids, and updates bindings on rename. §3.9's path-reuse trick only reds a name-based implementation if the mock
+//! behaves like a namespace, so a mock that "just remembers the last path" would turn the sharpest criterion in the card
+//! into a formality.
+//!
+//! What it deliberately does **not** do: persist anything, model handles, share bits, or `DELETE_ON_CLOSE`. Those are
+//! adapter policy (card §2) and are tested through the adapter's own handle table, not here.
+//!
+//! Timestamps come from a logical clock that only moves when the test asks it to ([`MockBackend::tick`]). Wall-clock and
+//! randomness are excluded on purpose: a criterion that depends on them cannot be replayed when it fails.
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use fs_semantics::disposition::Disposition;
+
+use crate::ops::{
+    Attributes, DirEntry, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, RenameOutcome, Times,
+    WorkspaceOps,
+};
+
+/// The root directory's id. Fixed, because a root that moved with the allocation counter would make every test's
+/// `parent` argument depend on test order.
+pub const ROOT: u64 = 1;
+
+/// One call the adapter made, in order.
+///
+/// Recorded rather than counted: M12's criteria are about **orderings** (`remove_at` after the last close,
+/// `rename` before `remove_at`), and a bare counter cannot express "before".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Call {
+    /// `create_or_open`.
+    CreateOrOpen(Vec<u8>, Disposition),
+    /// `read`.
+    Read(u64, u64, usize),
+    /// `write`.
+    Write(u64, u64, usize),
+    /// `set_size`.
+    SetSize(u64, u64),
+    /// `read_dir`.
+    ReadDir(u64),
+    /// `get_info`.
+    GetInfo(u64),
+    /// `rename`.
+    Rename(Vec<u8>, Vec<u8>, bool),
+    /// `remove_at`.
+    RemoveAt(u64, Vec<u8>, u64),
+    /// `flush`.
+    Flush,
+}
+
+#[derive(Clone, Debug)]
+struct Node {
+    kind: Kind,
+    content: Vec<u8>,
+    times: Times,
+    attributes: Attributes,
+    live: bool,
+}
+
+#[derive(Debug)]
+struct Inner {
+    nodes: BTreeMap<u64, Node>,
+    children: BTreeMap<(u64, Vec<u8>), u64>,
+    next_id: u64,
+    clock: i64,
+    calls: Vec<Call>,
+    flush_count: usize,
+}
+
+/// An in-memory namespace that implements [`WorkspaceOps`].
+#[derive(Debug)]
+pub struct MockBackend {
+    inner: Mutex<Inner>,
+}
+
+impl Default for MockBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn split(path: &[u8]) -> OpsResult<Vec<Vec<u8>>> {
+    if path.first() != Some(&b'/') {
+        return Err(OpsError::InvalidParameter);
+    }
+    let mut out = Vec::new();
+    for component in path[1..].split(|byte| *byte == b'/') {
+        if component.is_empty() {
+            // A trailing slash is a malformed path here: the adapter normalises before calling, and accepting it would
+            // hide a normalisation bug behind a lenient mock.
+            return Err(OpsError::InvalidParameter);
+        }
+        out.push(component.to_vec());
+    }
+    Ok(out)
+}
+
+impl MockBackend {
+    /// A backend whose root directory exists and whose clock starts at 0.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            ROOT,
+            Node {
+                kind: Kind::Directory,
+                content: Vec::new(),
+                times: Times::default(),
+                attributes: Attributes(u32::from(0x10_u8)), // FILE_ATTRIBUTE_DIRECTORY
+                live: true,
+            },
+        );
+        Self {
+            inner: Mutex::new(Inner {
+                nodes,
+                children: BTreeMap::new(),
+                next_id: ROOT + 1,
+                clock: 0,
+                calls: Vec::new(),
+                flush_count: 0,
+            }),
+        }
+    }
+
+    /// Advances the logical clock by `nanos`, so a test can assert that a timestamp changed **without** sleeping.
+    pub fn tick(&self, nanos: i64) {
+        self.inner.lock().expect("mock lock").clock += nanos;
+    }
+
+    /// Every call so far, in order.
+    #[must_use]
+    pub fn calls(&self) -> Vec<Call> {
+        self.inner.lock().expect("mock lock").calls.clone()
+    }
+
+    /// Forgets the recorded calls (counters keep their values).
+    pub fn clear_calls(&self) {
+        self.inner.lock().expect("mock lock").calls.clear();
+    }
+
+    /// How many times `flush` was called.
+    #[must_use]
+    pub fn flush_count(&self) -> usize {
+        self.inner.lock().expect("mock lock").flush_count
+    }
+
+    /// Creates a directory (a mock-only helper: `WorkspaceOps` has no `mkdir`, because the adapter creates directories
+    /// through `create_or_open` with a kind hint).
+    ///
+    /// # Errors
+    ///
+    /// [`OpsError::NameCollision`] when the name is taken, [`OpsError::NotFound`] for a missing parent.
+    pub fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        let clock = inner.clock;
+        let components = split(path)?;
+        let (parent, name) = parent_and_name(&inner, &components)?;
+        if inner.children.contains_key(&(parent, name.clone())) {
+            return Err(OpsError::NameCollision);
+        }
+        let id = inner.allocate(Kind::Directory, clock);
+        inner.children.insert((parent, name), id);
+        Ok(id)
+    }
+
+    /// Resolves a path to an id, or `None`.
+    #[must_use]
+    pub fn resolve(&self, path: &[u8]) -> Option<u64> {
+        let inner = self.inner.lock().expect("mock lock");
+        let components = split(path).ok()?;
+        let mut current = ROOT;
+        for component in components {
+            current = *inner.children.get(&(current, component))?;
+        }
+        Some(current)
+    }
+
+    /// Whether an id is still live (not retired).
+    #[must_use]
+    pub fn is_live(&self, id: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("mock lock")
+            .nodes
+            .get(&id)
+            .is_some_and(|node| node.live)
+    }
+
+    /// Directory entries as raw names, unsorted (the mock does not sort: the adapter owns ordering).
+    #[must_use]
+    pub fn raw_names(&self, dir: u64) -> Vec<Vec<u8>> {
+        let inner = self.inner.lock().expect("mock lock");
+        inner
+            .children
+            .keys()
+            .filter(|(parent, _)| *parent == dir)
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+}
+
+/// Resolves the parent of `components` and returns it with the final name.
+fn parent_and_name(inner: &Inner, components: &[Vec<u8>]) -> OpsResult<(u64, Vec<u8>)> {
+    let Some((name, parents)) = components.split_last() else {
+        return Err(OpsError::InvalidParameter);
+    };
+    let mut current = ROOT;
+    for component in parents {
+        let next = inner
+            .children
+            .get(&(current, component.clone()))
+            .copied()
+            .ok_or(OpsError::NotFound)?;
+        match inner.nodes.get(&next).map(|node| node.kind) {
+            Some(Kind::Directory) => current = next,
+            Some(Kind::File) => return Err(OpsError::NotADirectory),
+            None => return Err(OpsError::NotFound),
+        }
+    }
+    Ok((current, name.clone()))
+}
+
+impl Inner {
+    fn allocate(&mut self, kind: Kind, clock: i64) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.nodes.insert(
+            id,
+            Node {
+                kind,
+                content: Vec::new(),
+                times: Times {
+                    created: clock,
+                    accessed: clock,
+                    written: clock,
+                    changed: clock,
+                },
+                attributes: Attributes(match kind {
+                    Kind::Directory => u32::from(0x10_u8),
+                    Kind::File => u32::from(0x80_u8), // FILE_ATTRIBUTE_NORMAL
+                }),
+                live: true,
+            },
+        );
+        id
+    }
+
+    fn retire(&mut self, id: u64) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.live = false;
+            node.content.clear();
+        }
+        // Retiring an id also drops every name bound to it: a tombstone must not be reachable by name.
+        self.children.retain(|_, child| *child != id);
+    }
+
+    fn live_node(&self, id: u64) -> OpsResult<&Node> {
+        self.nodes
+            .get(&id)
+            .filter(|node| node.live)
+            .ok_or(OpsError::NotFound)
+    }
+
+    fn outcome(
+        &self,
+        id: u64,
+        action: fs_semantics::disposition::Action,
+        replaced: Option<u64>,
+    ) -> OpenOutcome {
+        let node = self.nodes.get(&id).expect("just allocated");
+        let parent = self
+            .children
+            .iter()
+            .find(|(_, child)| **child == id)
+            .map(|((parent, _), _)| *parent)
+            .unwrap_or(ROOT);
+        let name = self
+            .children
+            .iter()
+            .find(|(_, child)| **child == id)
+            .map(|((_, name), _)| name.clone())
+            .unwrap_or_default();
+        OpenOutcome {
+            file_id: id,
+            kind: node.kind,
+            action,
+            size: node.content.len() as u64,
+            times: node.times,
+            attributes: node.attributes,
+            binding: (parent, name),
+            replaced,
+        }
+    }
+}
+
+impl WorkspaceOps for MockBackend {
+    fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        inner
+            .calls
+            .push(Call::CreateOrOpen(path.to_vec(), disposition));
+        let clock = inner.clock;
+        let components = split(path)?;
+        let (parent, name) = parent_and_name(&inner, &components)?;
+        use fs_semantics::disposition::Action;
+
+        let existing = inner.children.get(&(parent, name.clone())).copied();
+        let kind = existing.and_then(|id| inner.nodes.get(&id).map(|node| node.kind));
+        // The disposition table (`fs-semantics`) decides; the mock only carries it out. `Failure` outcomes become typed
+        // errors, which is the one place this mock adds judgement of its own.
+        let (id, action, replaced) = match fs_semantics::disposition::decide(
+            disposition,
+            match kind {
+                None => fs_semantics::disposition::Exists::Absent,
+                Some(Kind::File) => fs_semantics::disposition::Exists::File,
+                Some(Kind::Directory) => fs_semantics::disposition::Exists::Directory,
+            },
+        ) {
+            fs_semantics::disposition::Outcome::Failed(failure) => {
+                return Err(match failure {
+                    fs_semantics::disposition::Failure::NameCollision => OpsError::NameCollision,
+                    fs_semantics::disposition::Failure::LeafMissing
+                    | fs_semantics::disposition::Failure::ParentMissing => OpsError::NotFound,
+                    fs_semantics::disposition::Failure::NotADirectory => OpsError::NotADirectory,
+                    fs_semantics::disposition::Failure::IsADirectory => OpsError::IsADirectory,
+                    fs_semantics::disposition::Failure::DirectoryNotEmpty => OpsError::NotEmpty,
+                    fs_semantics::disposition::Failure::AccessDenied => OpsError::ReadOnly,
+                    fs_semantics::disposition::Failure::InvalidName
+                    | fs_semantics::disposition::Failure::InvalidParameter => {
+                        OpsError::InvalidParameter
+                    }
+                    other => OpsError::Other(format!("{other:?}")),
+                })
+            }
+            fs_semantics::disposition::Outcome::Opened(action) => match action {
+                Action::TruncateExisting => {
+                    let id = existing.expect("truncate implies an existing entry");
+                    let node = inner.nodes.get_mut(&id).expect("existing");
+                    node.content.clear();
+                    node.times.written = clock;
+                    node.times.changed = clock;
+                    (id, action, None)
+                }
+                Action::ReplaceExisting => {
+                    // Retire the **name** only: the old inode stays live and readable (ADR-009 ruling (a)), which is
+                    // what makes criterion 2's "old handle still reads the old bytes" testable.
+                    let old = existing.expect("replace implies an existing entry");
+                    inner.children.remove(&(parent, name.clone()));
+                    let id = inner.allocate(Kind::File, clock);
+                    inner.children.insert((parent, name.clone()), id);
+                    (id, action, Some(old))
+                }
+                Action::CreateNew | Action::Open => match existing {
+                    Some(id) => (id, action, None),
+                    None => {
+                        let id = inner.allocate(Kind::File, clock);
+                        inner.children.insert((parent, name.clone()), id);
+                        (id, action, None)
+                    }
+                },
+            },
+        };
+        Ok(inner.outcome(id, action, replaced))
+    }
+
+    fn read(&self, file_id: u64, offset: u64, len: usize) -> OpsResult<Vec<u8>> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        inner.calls.push(Call::Read(file_id, offset, len));
+        let node = inner.live_node(file_id)?;
+        if node.kind == Kind::Directory {
+            return Err(OpsError::IsADirectory);
+        }
+        let mut out = vec![0u8; len];
+        let start = usize::try_from(offset).map_err(|_| OpsError::OutOfRange)?;
+        if start < node.content.len() {
+            let available = (node.content.len() - start).min(len);
+            out[..available].copy_from_slice(&node.content[start..start + available]);
+        }
+        Ok(out)
+    }
+
+    fn write(&self, file_id: u64, offset: u64, bytes: &[u8]) -> OpsResult<usize> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        inner.calls.push(Call::Write(file_id, offset, bytes.len()));
+        let clock = inner.clock;
+        let node = inner.nodes.get_mut(&file_id).ok_or(OpsError::NotFound)?;
+        if !node.live {
+            return Err(OpsError::NotFound);
+        }
+        if node.kind == Kind::Directory {
+            return Err(OpsError::IsADirectory);
+        }
+        let start = usize::try_from(offset).map_err(|_| OpsError::OutOfRange)?;
+        let end = start.checked_add(bytes.len()).ok_or(OpsError::OutOfRange)?;
+        if node.content.len() < end {
+            node.content.resize(end, 0);
+        }
+        node.content[start..end].copy_from_slice(bytes);
+        node.times.written = clock;
+        node.times.changed = clock;
+        Ok(bytes.len())
+    }
+
+    fn set_size(&self, file_id: u64, len: u64) -> OpsResult<()> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        inner.calls.push(Call::SetSize(file_id, len));
+        let clock = inner.clock;
+        let node = inner.nodes.get_mut(&file_id).ok_or(OpsError::NotFound)?;
+        if !node.live {
+            return Err(OpsError::NotFound);
+        }
+        if node.kind == Kind::Directory {
+            return Err(OpsError::IsADirectory);
+        }
+        let new_len = usize::try_from(len).map_err(|_| OpsError::OutOfRange)?;
+        node.content.resize(new_len, 0);
+        node.times.written = clock;
+        node.times.changed = clock;
+        Ok(())
+    }
+
+    fn read_dir(&self, dir_id: u64) -> OpsResult<Vec<DirEntry>> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        inner.calls.push(Call::ReadDir(dir_id));
+        let node = inner.live_node(dir_id)?;
+        if node.kind == Kind::File {
+            return Err(OpsError::NotADirectory);
+        }
+        let mut entries = Vec::new();
+        for ((parent, name), child) in &inner.children {
+            if *parent != dir_id {
+                continue;
+            }
+            let child_node = inner.nodes.get(child).ok_or(OpsError::NotFound)?;
+            if !child_node.live {
+                continue;
+            }
+            entries.push(DirEntry {
+                name: name.clone(),
+                kind: child_node.kind,
+            });
+        }
+        Ok(entries)
+    }
+
+    fn get_info(&self, file_id: u64) -> OpsResult<NodeInfo> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        inner.calls.push(Call::GetInfo(file_id));
+        let node = inner.live_node(file_id)?;
+        Ok(NodeInfo {
+            file_id,
+            kind: node.kind,
+            size: node.content.len() as u64,
+            times: node.times,
+            attributes: node.attributes,
+        })
+    }
+
+    fn set_times(
+        &self,
+        file_id: u64,
+        accessed: Option<i64>,
+        written: Option<i64>,
+        changed: Option<i64>,
+        created: Option<i64>,
+    ) -> OpsResult<()> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        let node = inner.nodes.get_mut(&file_id).ok_or(OpsError::NotFound)?;
+        if !node.live {
+            return Err(OpsError::NotFound);
+        }
+        if let Some(value) = accessed {
+            node.times.accessed = value;
+        }
+        if let Some(value) = written {
+            node.times.written = value;
+        }
+        if let Some(value) = changed {
+            node.times.changed = value;
+        }
+        if let Some(value) = created {
+            node.times.created = value;
+        }
+        Ok(())
+    }
+
+    fn set_attributes(&self, file_id: u64, attributes: Attributes) -> OpsResult<()> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        let node = inner.nodes.get_mut(&file_id).ok_or(OpsError::NotFound)?;
+        if !node.live {
+            return Err(OpsError::NotFound);
+        }
+        node.attributes = attributes;
+        Ok(())
+    }
+
+    fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        inner
+            .calls
+            .push(Call::Rename(from.to_vec(), to.to_vec(), replace));
+        let clock = inner.clock;
+        let from_components = split(from)?;
+        let to_components = split(to)?;
+        let (from_parent, from_name) = parent_and_name(&inner, &from_components)?;
+        let (to_parent, to_name) = parent_and_name(&inner, &to_components)?;
+        let source = inner
+            .children
+            .get(&(from_parent, from_name.clone()))
+            .copied()
+            .ok_or(OpsError::NotFound)?;
+        let source_kind = inner.live_node(source)?.kind;
+
+        // The destination's identity is remembered for two separate reasons: `r9` (a directory may not move into its
+        // own subtree) needs the ancestor chain, and the `replaced` field is the caller's handle on what it just lost.
+        if source_kind == Kind::Directory {
+            let mut current = Some(to_parent);
+            while let Some(id) = current {
+                if id == source {
+                    return Err(OpsError::InvalidParameter);
+                }
+                current = inner
+                    .children
+                    .iter()
+                    .find(|(_, child)| **child == id)
+                    .map(|((parent, _), _)| *parent);
+            }
+        }
+
+        let mut replaced = None;
+        if let Some(existing) = inner.children.get(&(to_parent, to_name.clone())).copied() {
+            if existing != source {
+                if !replace {
+                    return Err(OpsError::NameCollision);
+                }
+                let existing_kind = inner.live_node(existing)?.kind;
+                match (source_kind, existing_kind) {
+                    (Kind::File, Kind::File) => {}
+                    (Kind::Directory, Kind::Directory) => {
+                        if inner.children.keys().any(|(parent, _)| *parent == existing) {
+                            return Err(OpsError::NotEmpty);
+                        }
+                    }
+                    _ => return Err(OpsError::TypeMismatch),
+                }
+                inner.children.remove(&(to_parent, to_name.clone()));
+                inner.retire(existing);
+                replaced = Some(existing);
+            }
+        }
+
+        inner.children.remove(&(from_parent, from_name));
+        inner.children.insert((to_parent, to_name.clone()), source);
+        if let Some(node) = inner.nodes.get_mut(&source) {
+            node.times.changed = clock;
+        }
+        Ok(RenameOutcome {
+            binding: (to_parent, to_name),
+            replaced,
+        })
+    }
+
+    fn remove_at(&self, parent: u64, name: &[u8], expected_id: u64) -> OpsResult<()> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        inner
+            .calls
+            .push(Call::RemoveAt(parent, name.to_vec(), expected_id));
+        // Three cases, matching the core's three cases (card §10 M6, ADR-009's ruling). The **structure** is the same;
+        // the **error type** is folded, because `OpsError` has no `InvalidRecord`: the core returns
+        // `NamespaceError::InvalidRecord { field }` for case 1 and this returns `NotFound`. That fold is recorded for
+        // P3-3b: the real adapter will see `InvalidRecord` there, and the two map to *different* NTSTATUS values, so
+        // either `OpsError` grows an `InvalidRecord` variant or the mapping layer documents the fold — it must not be
+        // reported as a bug at that point.
+        //   1. the name belongs to **another** inode  -> `NotFound` (deleting "whatever is there" would delete the
+        //      wrong object: this is the guard that makes §3.9's path-reuse case safe). The core reports
+        //      `InvalidRecord` here; see the fold note above;
+        //   2. the name is free and `expected_id` is **already retired** -> `Ok(())`: a repeated removal is a no-op,
+        //      not an error, because NT sends `Cleanup` and `Close` on the same handle;
+        //   3. the name is free and `expected_id` is still **live** -> `NotFound`: the entry moved away and the caller's
+        //      identity no longer names anything.
+        match inner.children.get(&(parent, name.to_vec())).copied() {
+            Some(bound) if bound != expected_id => Err(OpsError::NotFound),
+            Some(bound) => {
+                inner.children.remove(&(parent, name.to_vec()));
+                inner.retire(bound);
+                Ok(())
+            }
+            None => match inner.nodes.get(&expected_id) {
+                Some(node) if !node.live => Ok(()),
+                _ => Err(OpsError::NotFound),
+            },
+        }
+    }
+
+    fn flush(&self) -> OpsResult<()> {
+        let mut inner = self.inner.lock().expect("mock lock");
+        inner.calls.push(Call::Flush);
+        inner.flush_count += 1;
+        Ok(())
+    }
+}
