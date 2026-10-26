@@ -35,8 +35,19 @@ adapter（P3-3a）需要它们才能不是 TOCTOU、才能保证 rename 后旧�
 - **`read_dir(dir_id)`**：目录句柄在 rename 之后必须能继续枚举，所以入口只能是 FileId（`fs-api` 目前只有 `read_dir(path)`）。
   判据：① rename 后用**旧 dir_id** 仍能枚举出同样集合；② 枚举顺序**稳定**（同一目录两次枚举顺序相同；顺序由折叠键 + 二级键决定，
   见 P3-3a 卡 §3）；③ 目录被 `remove` 后再枚举得到 typed 错误，不是 panic。
-- **`remove_id(file_id)`**：两段删除时最后一个 `close` 调它（W7）。判据：① 幂等（再调一次不报错、无副作用）；
-  ② **恰好一次**真正删除（计数 source：mock/计数后端断言调用次数）；③ rename 后仍删对了对象（按 FileId，不按打开时的路径）。
+- **`remove_at(parent, name, expected_id)`**：两段删除时最后一个 `close` 调它（W7）。
+  **签名取 B 形状且 `expected_id` 必带**（manager 裁决，2026-10-26；architect 未回，按 QA 的不对称性分析定案）：
+
+  > **两个签名不对称**：B 形状（`parent, name, expected_id`）**不封死** A —— 有了反向索引后，实现可以**忽略** `name`、
+  > 直接用 `expected_id` 定位；反之 A 形状（只有 `id`）**封死** B，因为核心拿不到 `(parent, name)`。
+  > ⇒ **先取 B 形状把取舍下推到实现内部**；ADR 复核后若改 A，**trait 签名不动**，只改实现。
+  > 实现暂定 B：定位键 `(parent, name)` 只是**提示不是身份**，必须校验 `entry.child == expected_id`，不符 ⇒ `NotFound`（绝不误删）。
+
+  **依赖前提**：`(parent, name)` 由 adapter 维护，成立的前提是 **W2（workspace 排他打开）**——见 backlog **B-14**（W2 目前只有叙述，没有判据）。
+  失效模式是**安全但功能坏**：校验不过 ⇒ `NotFound`，删不掉而不是误删。
+
+  判据：① 幂等（再调一次不报错、无副作用）；② **恰好一次**真正删除（计数 source）；
+  ③ **rename 后仍删对了对象**，且**路径复用时不得误删新对象**（§3.9 的招法：`/a→/b` 后重建 `/a` 指向 id2，`remove_at(…, id1)` 不得删 id2）。
 
 **判据**
 
