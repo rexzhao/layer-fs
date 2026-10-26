@@ -111,6 +111,30 @@ impl Workspace {
         self.base_root
     }
 
+    /// The explicit security descriptor of `file_id`, if the store has one.
+    ///
+    /// **Separate from `stat` on purpose** (ADR-005-v3 draft, V6): a descriptor can be 64 KiB, and `GetFileInformation`
+    /// is called far more often than `GetSecurityInfo`. Folding it into `Stat` would copy 64 KiB per stat and make the
+    /// read-amplification criterion unmeasurable.
+    ///
+    /// A v2 overlay has no column for it, so this returns `Ok(None)`: that is the truth about this store ("inherit the
+    /// default"), not a placeholder waiting to be filled. A v3 overlay will return the stored bytes verbatim.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Overlay`] when the overlay cannot answer.
+    pub fn security(
+        &self,
+        file_id: fs_namespace::FileId,
+    ) -> crate::WorkspaceResult<Option<Vec<u8>>> {
+        // Deliberately not a lookup of the record: the point of a separate accessor is that ordinary stat paths never
+        // pay for the descriptor. When the v3 column exists, the read happens here and only here.
+        // `file_id` is unused until the v3 column exists; naming that explicitly keeps a future reader from thinking the
+        // parameter was forgotten.
+        let _ = file_id;
+        Ok(None)
+    }
+
     /// Reads a file by **FileId** (P3-2 G2): the entry the caller holds, not the name it had.
     ///
     /// # Errors
