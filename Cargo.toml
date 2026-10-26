@@ -4,6 +4,7 @@ members = [
     "crates/cas-core",
     "crates/cas-store",
     "crates/fs-namespace",
+    "crates/fs-semantics",
     "crates/fs-snapshot",
     "crates/fs-overlay",
     "crates/fs-workspace",
@@ -22,6 +23,7 @@ license = "MIT OR Apache-2.0"
 cas-core = { path = "crates/cas-core" }
 cas-store = { path = "crates/cas-store" }
 fs-namespace = { path = "crates/fs-namespace" }
+fs-semantics = { path = "crates/fs-semantics" }
 fs-snapshot = { path = "crates/fs-snapshot" }
 fs-overlay = { path = "crates/fs-overlay" }
 fs-workspace = { path = "crates/fs-workspace" }

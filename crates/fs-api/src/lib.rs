@@ -49,7 +49,7 @@ mod verify;
 mod workspace;
 
 pub use error::{ApiError, ApiResult};
-pub use fs_namespace::disposition;
+pub use fs_semantics::disposition;
 pub use read_view::ReadView;
 pub use repo::{
     gc, BranchInfo, CommitInfo, GcSummary, Repo, WorkspaceStatus, WorkspaceSummary,

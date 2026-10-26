@@ -106,7 +106,7 @@ impl NtStatus {
 ///
 /// The table that produces these values lives in `fs_namespace::disposition`, because the core performs the
 /// action; this crate's job is only to say what Windows should see for each of them.
-pub use fs_namespace::disposition::Failure;
+pub use fs_semantics::disposition::Failure;
 
 /// The mapping. **Exhaustive on purpose**: every `Failure` names its own `NtStatus`, and there is no
 /// fallback arm, so a new variant is a compile error until somebody decides what Windows should see
@@ -135,7 +135,7 @@ pub const fn to_status(failure: Failure) -> NtStatus {
 }
 
 /// Every [`Failure`] variant, for completeness checks in tests (re-exported from the core's table).
-pub use fs_namespace::disposition::ALL_FAILURES;
+pub use fs_semantics::disposition::ALL_FAILURES;
 
 /// Every [`NtStatus`] value this build can return.
 pub const ALL_STATUSES: [NtStatus; 17] = [

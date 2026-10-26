@@ -114,6 +114,7 @@ dependencies = [
  "cas-store",
  "fs-namespace",
  "fs-overlay",
+ "fs-semantics",
  "fs-snapshot",
  "fs-workspace",
  "rusqlite",
@@ -148,6 +149,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-semantics"
+version = "0.1.0"
+
+[[package]]
 name = "fs-snapshot"
 version = "0.1.0"
 dependencies = [
@@ -160,7 +165,7 @@ dependencies = [
 name = "fs-windows"
 version = "0.1.0"
 dependencies = [
- "fs-namespace",
+ "fs-semantics",
 ]
 
 [[package]]

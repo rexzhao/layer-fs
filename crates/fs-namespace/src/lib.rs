@@ -44,8 +44,6 @@ mod path;
 mod rules;
 mod tree_store;
 
-pub mod disposition;
-
 pub use error::{InvalidPath, NamespaceError, NamespaceResult, MAX_DEPTH, MAX_NAME_BYTES};
 pub use inode_view::InodeView;
 pub use model::{Entry, FileId, Kind, Stat};

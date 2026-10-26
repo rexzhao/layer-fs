@@ -1,0 +1,12 @@
+[package]
+name = "fs-semantics"
+description = "Semantics shared by the core and the frontend, with no dependencies of its own (P3-2 §12)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# **Zero dependencies on purpose.** The Windows frontend depends on this crate for the disposition table; if the
+# table lived in `fs-namespace` (which pulls SQLite), the frontend's dependency closure would drag a C toolchain into
+# a crate that must stay buildable anywhere. Nothing may be added here that is not `core` itself.
+[dependencies]

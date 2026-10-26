@@ -10,6 +10,7 @@ license.workspace = true
 cas-core.workspace = true
 cas-store.workspace = true
 fs-namespace.workspace = true
+fs-semantics.workspace = true
 fs-snapshot.workspace = true
 fs-overlay.workspace = true
 fs-workspace.workspace = true

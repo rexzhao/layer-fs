@@ -1,7 +1,7 @@
 //! The eighteen-cell disposition table now lives in the core (P3-2 §12), so its "missing cell is red" check
 //! lives here too — with the rows/columns/product assertions split, and literals on the right-hand side.
 
-use fs_namespace::disposition::{decide, Disposition, Exists, Outcome, TABLE};
+use fs_semantics::disposition::{decide, Disposition, Exists, Outcome, TABLE};
 
 #[test]
 fn every_cell_of_the_product_has_a_row_and_matches_decide() {
@@ -68,12 +68,12 @@ fn every_cell_of_the_product_has_a_row_and_matches_decide() {
 fn supersede_replaces_the_entry_while_overwrite_if_reuses_it() {
     assert_eq!(
         decide(Disposition::Supersede, Exists::File),
-        Outcome::Opened(fs_namespace::disposition::Action::ReplaceExisting),
+        Outcome::Opened(fs_semantics::disposition::Action::ReplaceExisting),
         "cell disposition=Supersede exists=File: the entry is replaced (new FileId)"
     );
     assert_eq!(
         decide(Disposition::OverwriteIf, Exists::File),
-        Outcome::Opened(fs_namespace::disposition::Action::TruncateExisting),
+        Outcome::Opened(fs_semantics::disposition::Action::TruncateExisting),
         "cell disposition=OverwriteIf exists=File: the entry is reused (same FileId)"
     );
 }

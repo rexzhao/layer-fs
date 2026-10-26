@@ -378,7 +378,7 @@ pub(crate) fn verify(layout: &Layout, pack_id: &str) -> StoreResult<PackTail> {
             &format!("tail declares {frames_len} frame bytes but the file holds {length}"),
         ));
     }
-    let recorded = &bytes[at + 16..at + 48];
+    let recorded = &bytes[at + 16..at + 48]; // tail-allow: the digest's end offset inside the tail, not a tail size
     let actual = blake3::hash(&bytes[..at]);
     if recorded != actual.as_bytes() {
         return Err(corrupt_pack(
