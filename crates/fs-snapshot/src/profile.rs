@@ -65,6 +65,13 @@ pub struct Profile {
     pub name_max: usize,
     /// How a file's bytes are cut into objects (ADR-007 §3).
     pub chunker: Chunker,
+    /// The `fmt` byte of **inode table** pages under this profile (ADR-005-v3 draft §2.1).
+    ///
+    /// A page's wire format is chosen by the **profile**, not by the page: v3 changes only the inode record, so
+    /// directory/extent/root pages stay `fmt = 1` and only inode pages become `fmt = 2`. Keeping it as a profile field
+    /// (rather than as "if the profile is v3 then 2") means the decoder can compare one number and the description
+    /// string below cannot disagree with the encoder.
+    pub inode_fmt: u8,
 }
 
 /// How a file's content is cut into objects.
@@ -105,6 +112,7 @@ impl Profile {
         max_object_value: 16_777_216,
         name_max: 255,
         chunker: Chunker::FixedBlocks,
+        inode_fmt: 1,
     };
 
     /// The P2b profile (ADR-007 §3.5): content-defined chunking replaces fixed blocks.
@@ -120,6 +128,27 @@ impl Profile {
         max_object_value: 16_777_216,
         name_max: 255,
         chunker: Chunker::FastCdc(crate::cdc::CdcParams::V2),
+        inode_fmt: 1,
+    };
+
+    /// The P3 profile (ADR-005-v3 draft): the inode record gains `accessed_ns`, `changed_ns`, `attributes`,
+    /// `security_len` + security bytes.
+    ///
+    /// `fmt` stays 1 and `inode_fmt` becomes 2, which is the whole of the write-side change: directory, extent and root
+    /// pages keep their layout, so a v2 reader can still parse everything except the inode table. That is exactly why
+    /// the refusal must be `UnsupportedFormat` (a version difference it can see) rather than `Malformed` (a corrupt
+    /// file it cannot).
+    pub const V3: Profile = Profile {
+        fmt: 1,
+        mask_bits: 6,
+        min_entries: 4,
+        max_page_bytes: 16_384,
+        block_bytes: 32_768,
+        max_extent_len: 32_768,
+        max_object_value: 16_777_216,
+        name_max: 255,
+        chunker: Chunker::FastCdc(crate::cdc::CdcParams::V2),
+        inode_fmt: 2,
     };
 
     /// The profile this build writes.
@@ -134,6 +163,37 @@ impl Profile {
     /// The canonical description string. Any character change is a new profile.
     #[must_use]
     pub fn description(&self) -> String {
+        // The v3 description is **literally** the string in ADR-005-v3 draft §2.3: the profile id is its BLAKE3, so a
+        // reformatted line here silently creates a different profile. It is written as one `concat!`-style literal with
+        // the numeric fields interpolated only where the struct owns the value.
+        if self.inode_fmt == 2 {
+            return format!(
+                "wcas/snapshot/v3;fmt={};inode_fmt={};mask_bits={};min_entries={};max_page_bytes={};cdc=fastcdc-nc{};cdc_min={};cdc_avg={};cdc_max={};gear=blake3:wcas/gear/v1;content_role=chunk;max_object_value={};name_max={};hash=blake3;domains=inode,dir,extent",
+                self.fmt,
+                self.inode_fmt,
+                self.mask_bits,
+                self.min_entries,
+                self.max_page_bytes,
+                match self.chunker {
+                    Chunker::FastCdc(params) => params.normalisation,
+                    Chunker::FixedBlocks => 0,
+                },
+                match self.chunker {
+                    Chunker::FastCdc(params) => params.min,
+                    Chunker::FixedBlocks => 0,
+                },
+                match self.chunker {
+                    Chunker::FastCdc(params) => params.avg,
+                    Chunker::FixedBlocks => 0,
+                },
+                match self.chunker {
+                    Chunker::FastCdc(params) => params.max,
+                    Chunker::FixedBlocks => 0,
+                },
+                self.max_object_value,
+                self.name_max
+            );
+        }
         match self.chunker {
             Chunker::FixedBlocks => format!(
                 "wcas/snapshot/v1;fmt={};mask_bits={};min_entries={};max_page_bytes={};\
