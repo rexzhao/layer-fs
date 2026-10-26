@@ -11,6 +11,8 @@ use fs_workspace::Repo;
 
 struct Fixture {
     dir: std::path::PathBuf,
+    /// Kept alive for the fixture's lifetime; the parked amplification/restart tests will need it (one handle at a
+    /// time), which is why it stays a field rather than being dropped in `fixture()`.
     _repo: Arc<Repo>,
     workspace: fs_workspace::Workspace,
 }
@@ -182,3 +184,11 @@ fn reading_a_directory_by_file_id_is_refused() {
         b"abc"
     );
 }
+
+// ---------------------------------------------- read amplification / restart: fixture restructure pending
+//
+// Both criteria below need a fixture that holds **at most one** `Workspace` handle at a time (a second handle on the
+// same overlay is `Busy` by design), and the amplification one additionally needs the content to live in a pack
+// (uncommitted bytes are overlay pages, so the pack counter would stay at zero for the wrong reason). Rather than
+// loosen the assertions to fit the current fixture, they are left out of this commit and land next with a fixture that
+// opens exactly the handles each test needs.
