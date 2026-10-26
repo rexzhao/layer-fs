@@ -280,3 +280,49 @@ fn set_attributes_refuses_derived_bits() {
         "cell control: and the stored value is what comes back"
     );
 }
+
+/// **The two-way attribute rule** (`ReplaceFileAttributes`), which is the only difference left between the dispositions
+/// that share the truncate action (ADR-009 §4.2 ruling (a)).
+///
+/// SUPERSEDE **replaces** the stored attributes wholesale; OVERWRITE / OVERWRITE_IF **keep** them. Two assertions in
+/// opposite directions, because a backend that always replaced (or never did) satisfies either one alone:
+///
+/// | disposition | content | stored attributes |
+/// | --- | --- | --- |
+/// | SUPERSEDE | dropped | back to nothing set |
+/// | OVERWRITE / OVERWRITE_IF | dropped | unchanged |
+#[test]
+fn supersede_replaces_attributes_while_overwrite_keeps_them() {
+    for (disposition, expect_replaced) in [
+        (Disposition::Supersede, true),
+        (Disposition::Overwrite, false),
+        (Disposition::OverwriteIf, false),
+    ] {
+        let backend = MockBackend::new();
+        let id = create(&backend, b"/f");
+        backend.write(id, 0, b"body").expect("write");
+        backend
+            .set_attributes(id, fs_winfsp::Attributes(0x01 | 0x20))
+            .expect("set attributes");
+
+        let outcome = backend
+            .create_or_open(b"/f", disposition)
+            .expect("truncating disposition");
+        assert_eq!(outcome.file_id, id, "cell {disposition:?}: identity kept");
+        assert_eq!(outcome.size, 0, "cell {disposition:?}: content dropped");
+        let attributes = backend.get_info(id).expect("info").attributes.0;
+        if expect_replaced {
+            assert_eq!(
+                attributes, 0,
+                "cell {disposition:?}: SUPERSEDE replaces the attributes (ReplaceFileAttributes = TRUE)"
+            );
+        } else {
+            assert_eq!(
+                attributes,
+                0x01 | 0x20,
+                "cell {disposition:?}: OVERWRITE keeps them (ReplaceFileAttributes = FALSE) — the content is dropped, \
+                 the metadata is not"
+            );
+        }
+    }
+}

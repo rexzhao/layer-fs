@@ -347,7 +347,14 @@ impl WorkspaceOps for MockBackend {
                     let id = existing.expect("truncate implies an existing entry");
                     let node = inner.nodes.get_mut(&id).expect("existing");
                     node.content.clear();
-                    node.attributes = crate::ops::Attributes(0x80);
+                    // The **only** remaining difference between the dispositions that share this action
+                    // (ADR-009 §4.2 ruling (a), `ReplaceFileAttributes`):
+                    //   SUPERSEDE ⇒ replace the stored attributes wholesale (they go back to "nothing set");
+                    //   OVERWRITE / OVERWRITE_IF ⇒ keep them (the content is dropped, the metadata is not).
+                    // A backend that got this backwards would be invisible to every FileId/内容 assertion.
+                    if disposition == Disposition::Supersede {
+                        node.attributes = crate::ops::Attributes(0);
+                    }
                     node.times.written = clock;
                     node.times.changed = clock;
                     (id, action, None)

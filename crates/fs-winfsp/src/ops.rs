@@ -91,7 +91,11 @@ pub struct OpenOutcome {
     pub attributes: Attributes,
     /// Where the name lives: `(parent id, raw name bytes)`.
     pub binding: (u64, Vec<u8>),
-    /// The entry that lost the name, for `SUPERSEDE`. Still readable by its own handle.
+    /// The entry that lost the name.
+    ///
+    /// **Always `None`** for `SUPERSEDE` since ruling (a): the disposition truncates the entry in place, so nothing loses a
+    /// name. The field stays for the dispositions that might later replace an entry, and `RenameOutcome::replaced` is a
+    /// different field with different semantics (the inode that lost a *destination* name during a rename).
     pub replaced: Option<u64>,
 }
 
