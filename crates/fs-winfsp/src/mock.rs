@@ -330,6 +330,27 @@ impl WorkspaceOps for MockBackend {
             .push(Call::CreateOrOpen(path.to_vec(), disposition));
         let clock = inner.clock;
         let components = split(path)?;
+        // **The root is answered here, once.** It has no parent segment, so `parent_and_name` cannot place it — and a caller that merely opens
+        // the volume (`FILE_OPEN` on `\`) must succeed, or every later operation on that path dies with "path not found". A creating disposition
+        // on the root is a collision: the root always exists.
+        if components.is_empty() {
+            return match disposition {
+                Disposition::Open | Disposition::OpenIf => {
+                    let node = inner.nodes.get(&ROOT).ok_or(OpsError::NotFound)?;
+                    Ok(OpenOutcome {
+                        file_id: ROOT,
+                        kind: node.kind,
+                        action: fs_semantics::disposition::Action::Open,
+                        size: node.content.len() as u64,
+                        times: node.times,
+                        attributes: node.attributes,
+                        binding: (ROOT, Vec::new()),
+                        replaced: None,
+                    })
+                }
+                _ => Err(OpsError::NameCollision),
+            };
+        }
         let (parent, name) = parent_and_name(&inner, &components)?;
         use fs_semantics::disposition::Action;
 
