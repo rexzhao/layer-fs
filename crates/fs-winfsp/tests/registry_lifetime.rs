@@ -116,3 +116,53 @@ fn an_unregistered_pointer_answers_nothing() {
         "cell unknown: no adapter, no fallback"
     );
 }
+
+/// **The configuration belongs to the mount** (352): two adapters injected with different hooks answer differently, and an
+/// adapter with none answers "nothing" rather than sporting somebody else's configuration.
+#[test]
+fn configuration_belongs_to_the_mount() {
+    use fs_winfsp::adapter::AdapterConfig;
+
+    let first = Adapter::with_config(
+        MockBackend::new(),
+        AdapterConfig {
+            resolve: Some(|path| (path == "/first").then_some(1)),
+            ..AdapterConfig::default()
+        },
+    );
+    let second = Adapter::with_config(
+        MockBackend::new(),
+        AdapterConfig {
+            resolve: Some(|path| (path == "/second").then_some(2)),
+            ..AdapterConfig::default()
+        },
+    );
+
+    let first_resolve = first
+        .config()
+        .resolve
+        .expect("first: a resolver was injected");
+    let second_resolve = second.config().resolve.expect("second: its own resolver");
+    assert_eq!(
+        first_resolve("/first"),
+        Some(1),
+        "cell first: answers its own path"
+    );
+    assert_eq!(
+        first_resolve("/second"),
+        None,
+        "cell first: and not the other mount's path — the configuration is not shared"
+    );
+    assert_eq!(
+        second_resolve("/second"),
+        Some(2),
+        "cell second: answers its own path"
+    );
+
+    // An adapter built without configuration answers nothing at all — the answer a process-wide static could not give.
+    let bare: Adapter<MockBackend> = Adapter::new(MockBackend::new());
+    assert!(
+        bare.config().resolve.is_none() && bare.config().lookup.is_none(),
+        "cell bare: no configuration means `None`, never a leftover from another mount"
+    );
+}

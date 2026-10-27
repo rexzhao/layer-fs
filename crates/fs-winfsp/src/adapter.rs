@@ -15,10 +15,43 @@ use crate::ops::{
     Attributes, DirEntry, Kind, NodeInfo, OpsError, OpsResult, RenameOutcome, WorkspaceOps,
 };
 
+/// The per-mount configuration the callbacks need: what a path resolves to, what an entry looks like, how to create one, and
+/// what a directory holds.
+///
+/// These used to be process-wide `OnceLock`s. That worked for exactly one mount and made every test share one configuration —
+/// and worse, a lookup with no configuration returned **the previous configuration** instead of nothing (352: a process-wide
+/// static invents an answer where `None` is the truth). They live here now because they belong to the mount.
+#[derive(Clone, Copy, Default)]
+pub struct AdapterConfig {
+    /// `path -> FileId`, for `Open`/`Create`/`GetSecurityByName`.
+    pub resolve: Option<fn(&str) -> Option<u64>>,
+    /// `FileId -> metadata`, for `GetFileInfo`.
+    pub lookup: Option<fn(u64) -> Option<NodeInfo>>,
+    /// `path -> FileId`, creating the entry: the one path→id entry point (`create_or_open`), not a second translation.
+    pub make: Option<fn(&str) -> Option<u64>>,
+    /// `dir id -> entries`, for `ReadDirectory`.
+    pub list: Option<fn(u64) -> Vec<ListEntry>>,
+}
+
+impl std::fmt::Debug for AdapterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdapterConfig")
+            .field("resolve", &self.resolve.is_some())
+            .field("lookup", &self.lookup.is_some())
+            .field("make", &self.make.is_some())
+            .field("list", &self.list.is_some())
+            .finish()
+    }
+}
+
+/// One directory entry as the callbacks see it.
+pub type ListEntry = (Vec<u16>, NodeInfo);
+
 /// A backend plus the handle table that gives its operations Windows handle semantics.
 pub struct Adapter<B: WorkspaceOps> {
     ops: B,
     handles: HandleTable,
+    config: AdapterConfig,
 }
 
 impl<B: WorkspaceOps> std::fmt::Debug for Adapter<B> {
@@ -35,7 +68,23 @@ impl<B: WorkspaceOps> Adapter<B> {
         Self {
             ops,
             handles: HandleTable::new(),
+            config: AdapterConfig::default(),
         }
+    }
+
+    /// Wraps a backend together with this mount's configuration.
+    pub fn with_config(ops: B, config: AdapterConfig) -> Self {
+        Self {
+            ops,
+            handles: HandleTable::new(),
+            config,
+        }
+    }
+
+    /// This mount's configuration.
+    #[must_use]
+    pub fn config(&self) -> AdapterConfig {
+        self.config
     }
 
     /// The backend, for the operations that are path-based by nature.
