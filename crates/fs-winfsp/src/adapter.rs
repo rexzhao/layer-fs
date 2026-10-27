@@ -53,7 +53,9 @@ pub type ListEntry = (Vec<u16>, NodeInfo);
 /// A backend plus the handle table that gives its operations Windows handle semantics.
 pub struct Adapter<B: WorkspaceOps> {
     ops: B,
-    handles: HandleTable,
+    /// Behind a `Mutex` so every adapter method can take `    handles: HandleTable,self`: the registry holds `Arc<Adapter>` and the callbacks arrive on
+    /// several dispatcher threads at once. A `RefCell` here would be a data race with a tidy-looking API.
+    handles: std::sync::Mutex<HandleTable>,
     config: AdapterConfig,
     /// `FileContext` allocations and frees **for this mount**.
     ///
@@ -68,7 +70,7 @@ pub struct Adapter<B: WorkspaceOps> {
 impl<B: WorkspaceOps> std::fmt::Debug for Adapter<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Adapter")
-            .field("handles", &self.handles.handles_of(0).len())
+            .field("handles", &self.handles.lock().expect("handle table").handles_of(0).len())
             .finish_non_exhaustive()
     }
 }
@@ -78,7 +80,7 @@ impl<B: WorkspaceOps> Adapter<B> {
     pub fn new(ops: B) -> Self {
         Self {
             ops,
-            handles: HandleTable::new(),
+            handles: std::sync::Mutex::new(HandleTable::new()),
             config: AdapterConfig::default(),
             contexts: (
                 std::sync::atomic::AtomicUsize::new(0),
@@ -91,7 +93,7 @@ impl<B: WorkspaceOps> Adapter<B> {
     pub fn with_config(ops: B, config: AdapterConfig) -> Self {
         Self {
             ops,
-            handles: HandleTable::new(),
+            handles: std::sync::Mutex::new(HandleTable::new()),
             config,
             contexts: (
                 std::sync::atomic::AtomicUsize::new(0),
@@ -165,19 +167,26 @@ impl<B: WorkspaceOps> Adapter<B> {
             .ops
             .create_or_open(path, fs_semantics::disposition::Disposition::Open)
         {
-            if self.handles.is_pending(existing.file_id) {
+            if self
+                .handles
+                .lock()
+                .expect("handle table")
+                .is_pending(existing.file_id)
+            {
                 return Err(OpsError::DeletePending);
             }
         }
 
         let outcome = self.ops.create_or_open(path, disposition)?;
-        self.handles.remember_binding(
+        self.handles.lock().expect("handle table").remember_binding(
             outcome.file_id,
             outcome.binding.0,
             outcome.binding.1.clone(),
         );
         let handle = self
             .handles
+            .lock()
+            .expect("handle table")
             .open(outcome.file_id, desired, share, delete_on_close)?;
         Ok((handle, outcome.file_id, outcome.kind))
     }
@@ -197,11 +206,16 @@ impl<B: WorkspaceOps> Adapter<B> {
     ///
     /// [`OpsError::NotFound`] for an unknown handle, [`OpsError::AccessDenied`] without write access.
     pub fn write(&self, handle: HandleId, offset: u64, bytes: &[u8]) -> OpsResult<usize> {
-        let bound = self.handles.get(handle).ok_or(OpsError::NotFound)?;
-        if !bound.desired.has(fs_windows::share::Term::Write) {
-            return Err(OpsError::AccessDenied);
-        }
-        self.ops.write(bound.file_id, offset, bytes)
+        let file_id = {
+            let table = self.handles.lock().expect("handle table");
+            let bound = table.get(handle).ok_or(OpsError::NotFound)?;
+            if !bound.desired.has(fs_windows::share::Term::Write) {
+                return Err(OpsError::AccessDenied);
+            }
+            bound.file_id
+        };
+        // Outside the lock: the backend call must not run under the table lock.
+        self.ops.write(file_id, offset, bytes)
     }
 
     /// `get_info` through a handle.
@@ -236,45 +250,60 @@ impl<B: WorkspaceOps> Adapter<B> {
     /// # Errors
     ///
     /// [`OpsError::AccessDenied`] without `DELETE` access, [`OpsError::NotFound`] for an unknown handle.
-    pub fn set_delete(&mut self, handle: HandleId) -> OpsResult<()> {
-        self.handles.set_delete(handle)
+    pub fn set_delete(&self, handle: HandleId) -> OpsResult<()> {
+        self.handles.lock().expect("handle table").set_delete(handle)
     }
 
     /// Closes a handle; on the last one of a pending entry the entry is removed **once**, here.
     ///
-    /// The removal is the adapter's single call to `remove_at` — the table decides *when*, this performs it *once*. The
-    /// name passed is the **current** one from the binding table, which is why that table exists: a stale name would make
-    /// the guard refuse, and a refused removal reads as "cannot delete" rather than "wrong name".
+    /// The removal is the adapter's single call to `remove_at` — the table decides *when*, this performs it *once*. The name passed
+    /// is the **current** one from the binding table, which is why that table exists: a stale name would make the guard refuse, and
+    /// a refused removal reads as "cannot delete" rather than "wrong name".
+    ///
+    /// **The lock is released before the backend is called.** Holding it across `remove_at` would turn a slow backend into lock
+    /// contention on every other handle operation, and would make any future backend-to-adapter call a deadlock rather than a bug.
     ///
     /// # Errors
     ///
     /// [`OpsError::NotFound`] for an unknown handle or a missing binding, or whatever the backend reports.
-    pub fn close(&mut self, handle: HandleId) -> OpsResult<()> {
-        match self.handles.close(handle)? {
-            CloseEffect::Nothing => Ok(()),
-            CloseEffect::Remove(file_id) => {
-                let (parent, name) = self
-                    .handles
-                    .binding_of(file_id)
-                    .ok_or_else(|| OpsError::InvalidRecord(format!("no binding for {file_id}")))?;
+    pub fn close(&self, handle: HandleId) -> OpsResult<()> {
+        let removal = {
+            let mut table = self.handles.lock().expect("handle table");
+            match table.close(handle)? {
+                CloseEffect::Nothing => None,
+                CloseEffect::Remove(file_id) => {
+                    let (parent, name) = table
+                        .binding_of(file_id)
+                        .ok_or_else(|| OpsError::InvalidRecord(format!("no binding for {file_id}")))?;
+                    Some((parent, name, file_id))
+                }
+            }
+        };
+        match removal {
+            None => Ok(()),
+            Some((parent, name, file_id)) => {
+                // Outside the lock, deliberately.
                 self.ops.remove_at(parent, &name, file_id)?;
-                self.handles.removed(file_id);
+                self.handles
+                    .lock()
+                    .expect("handle table")
+                    .removed(file_id);
                 Ok(())
             }
         }
     }
 
-    /// Renames by path and moves the recorded binding: the handle keeps naming the entry, the entry keeps being findable
-    /// by the adapter's deletion path.
+    /// Renames by path and moves the recorded binding: the handle keeps naming the entry, the entry keeps being findable by the
+    /// adapter's deletion path.
     ///
     /// # Errors
     ///
     /// Whatever the backend reports.
-    pub fn rename(&mut self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome> {
+    pub fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome> {
         let outcome = self.ops.rename(from, to, replace)?;
-        // The backend reports which id moved (P3-4 added that field): deriving it from the path would be guessing, and a
-        // wrong guess means the binding keeps the old name, so the eventual deletion is refused by the guard.
-        self.handles.rebind(
+        // The backend reports which id moved (P3-4 added that field): deriving it from the path would be guessing, and a wrong guess
+        // means the binding keeps the old name, so the eventual deletion is refused by the guard.
+        self.handles.lock().expect("handle table").rebind(
             outcome.file_id,
             outcome.binding.0,
             outcome.binding.1.clone(),
@@ -283,6 +312,12 @@ impl<B: WorkspaceOps> Adapter<B> {
     }
 
     fn file_of(&self, handle: HandleId) -> OpsResult<u64> {
-        Ok(self.handles.get(handle).ok_or(OpsError::NotFound)?.file_id)
+        Ok(self
+            .handles
+            .lock()
+            .expect("handle table")
+            .get(handle)
+            .ok_or(OpsError::NotFound)?
+            .file_id)
     }
 }
