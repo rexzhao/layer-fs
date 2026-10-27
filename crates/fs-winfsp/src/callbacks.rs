@@ -463,6 +463,42 @@ pub unsafe fn get_file_info_shell(
     }
 }
 /// Live `FileContext` allocations, and how many have been released.
+/// Every `FileContext` currently handed out, **by address**.
+///
+/// The release side had never been checked: heap corruption can be a double free just as easily as an out-of-bounds write, and both look
+/// alike from the outside. This set is the witness — an address that is closed twice is caught here, by name, instead of being left to the
+/// allocator to notice much later. (Reuse after free is fine and invisible: the entry is removed on the first close.)
+static LIVE_CONTEXTS: std::sync::Mutex<Option<std::collections::BTreeSet<usize>>> =
+    std::sync::Mutex::new(None);
+
+/// How many times a context was released twice.
+static DOUBLE_RELEASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times a context was released twice.
+#[must_use]
+pub fn double_release_count() -> usize {
+    DOUBLE_RELEASES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Registers a context as live.
+///
+/// Production registers inside `open_like`; the direct tests build an `EntryContext` by hand and must register it too, otherwise the
+/// release-side witness refuses their `close_shell` — which is the behaviour working as intended.
+pub fn note_context_live(address: usize) {
+    let mut guard = LIVE_CONTEXTS.lock().expect("live contexts");
+    guard
+        .get_or_insert_with(std::collections::BTreeSet::new)
+        .insert(address);
+}
+
+/// Returns `false` when the address was **not** live, which means this is a second release (or a pointer we never handed out).
+fn take_context_live(address: usize) -> bool {
+    let mut guard = LIVE_CONTEXTS.lock().expect("live contexts");
+    guard
+        .get_or_insert_with(std::collections::BTreeSet::new)
+        .remove(&address)
+}
+
 ///
 /// Counted rather than merely asserted: when a mount crashes, the log's last numbers are the only evidence of whether contexts
 /// leaked or were freed twice — and a crash is exactly when `debug_assert` is too late.
@@ -657,6 +693,7 @@ unsafe fn open_like(
         return NOT_IMPLEMENTED;
     };
     let context = Box::into_raw(Box::new(EntryContext { file_id, handle }));
+    note_context_live(context as usize);
     CONTEXTS_ALLOCATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: both out-pointers were checked non-null and are valid for their writes per the caller's contract.
     unsafe {
@@ -854,7 +891,18 @@ pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_v
     if context.is_null() {
         return;
     }
-    // SAFETY: the caller guarantees this pointer came from `Box::into_raw` in `open_like`.
+    // **Release-side witness.** A second `Close` of the same address used to go straight into `Box::from_raw` — a double free, which is
+    // the other way `0xc0000374` is produced (the hunt had only looked at writes until now). The address is claimed out of the live set
+    // first: if it is not there, this is a second release of something already freed, so it is **counted and refused** instead of freed
+    // again.
+    if !take_context_live(context as usize) {
+        DOUBLE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "close: {context:p} is not a live context — refusing to free it a second time (that is a double free)"
+        );
+        return;
+    }
+    // SAFETY: the caller guarantees this pointer came from `Box::into_raw` in `open_like`, and it was just claimed from the live set.
     let entry = unsafe { Box::from_raw(context.cast::<EntryContext>()) };
     if let Some(adapter) = adapter {
         // The adapter performs the single `remove_at` (outside its table lock, see `Adapter::close`). A failure here is recorded by
