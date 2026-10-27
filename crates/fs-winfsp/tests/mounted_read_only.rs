@@ -87,11 +87,11 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
 
     // An **explicitly created empty directory**: WinFsp refuses a mount point that does not exist, and `0xC0000035` is what
     // that refusal looks like from the caller's side (it reads as "name collision").
+    // **Z: by owner's ruling** (`Y:` already exists on this machine, which silently invalidated a batch of earlier readings).
+    // The environment variable stays for other machines; the default is a letter that is expected to be free.
     let mount_point: PathBuf = std::env::var_os("LAYER_FS_MNT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("layer-fs-mnt-{}-{}", std::process::id(), 1))
-        });
+        .unwrap_or_else(|| PathBuf::from("Z:"));
     // A **drive letter** is a different kind of mount point: it must not exist as a directory, and WinFsp picks the volume
     // itself. Testing both shapes separately is what tells "our parameters are wrong" from "directory mounts need more setup".
     let drive_letter = {
@@ -99,6 +99,14 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
         text.len() == 2 && text.ends_with(':')
     };
     if drive_letter {
+        // The precondition the `Y:` incident taught: a letter that is already in use makes every later reading meaningless,
+        // so it is asserted rather than assumed.
+        assert_eq!(
+            fs_winfsp::mounted::drive_present(&mount_point),
+            Some(false),
+            "cell precondition: {} must be free before mounting — an existing drive letter silently invalidates the run              (the `Y:` incident)",
+            mount_point.display()
+        );
         eprintln!("mounting at drive letter {}", mount_point.display());
     } else {
         std::fs::create_dir_all(&mount_point).expect("empty mount point directory");
