@@ -273,3 +273,19 @@ scheme those addresses are not ids, so every one of them must go through `regist
 test files, plus a check that `mounted_write_chain` still passes.
 
 The work-in-progress is in `git stash` under `id-table-wip`; the branch itself is green (`170/170`, clippy 0) at `c50e3c7` + docs.
+
+## `QueryDirectory IoStatus=c0000010` in the L2 run: not the directory open
+
+A minimal sequence (mount → `Create` root → `QueryDirectory` root) **works**:
+
+```
+>>Create "\", FILE_OPEN → <<Create IoStatus=0[1] UserContext=0000000000000006
+>>QueryDirectory 0000000000000006 → <<QueryDirectory IoStatus=0[128]
+```
+
+So the directory open does register a context and the listing answers — the `c0000010` in the L2 script must come from a *different* point of that
+script (it creates files, renames, sets attributes, tries long names and a delete-while-open). The trace to read is the one from a full L2 run,
+paired with the `>>Create` line that precedes each failing `>>QueryDirectory`.
+
+Note also what the same trace shows: `>>Create "\written.txt", FILE_OPEN` answered `c0000034` (not found) right after a successful create of the
+same name — worth pairing as well, since it suggests the second open used a **different name shape** than the first.
