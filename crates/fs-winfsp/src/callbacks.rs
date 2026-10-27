@@ -1129,6 +1129,88 @@ pub unsafe fn can_delete_shell(adapter: Option<&crate::DynAdapter>, context: *co
     }
 }
 
+/// `SetBasicInfo`'s two sentinels, both **"leave this alone"** — and they are different values, which is exactly the kind of thing that has to be read
+/// from the header rather than assumed.
+///
+/// `FileAttributes == 0xFFFFFFFF` (`INVALID_FILE_ATTRIBUTES`) means "do not change the attributes"; a time of `0` means "do not change this time".
+const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+
+/// The `SetBasicInfo` **shell**: attributes first, then the four timestamps — each field independently optional.
+///
+/// Windows sends one call for any combination (touch, attribute change, both), with the untouched fields carrying their sentinel. Applying them
+/// separately is what keeps a timestamp-only call from clearing the attribute bits and vice versa.
+///
+/// # Safety
+///
+/// `context` is an opaque token (looked up, never dereferenced); `out` (when not null) must be writable for `size_of::<FileInfo>()`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn set_basic_info_shell(
+    adapter: Option<&crate::DynAdapter>,
+    context: *const c_void,
+    file_attributes: u32,
+    creation_time: u64,
+    last_access_time: u64,
+    last_write_time: u64,
+    change_time: u64,
+    out: *mut FileInfo,
+) -> i32 {
+    let Some(entry) = entry_of(context) else {
+        return NOT_IMPLEMENTED;
+    };
+    let Some(adapter) = adapter else {
+        return NOT_IMPLEMENTED;
+    };
+    if file_attributes != INVALID_FILE_ATTRIBUTES {
+        // The adapter accepts only the four writable bits; `DIRECTORY`/`NORMAL` are derived, so masking them off here is what keeps a caller that
+        // passes the ordinary "normal file" value from being refused.
+        let writable = file_attributes & fs_semantics::attributes::WRITABLE;
+        if adapter
+            .backend()
+            .set_attributes(entry.file_id, crate::ops::Attributes(writable))
+            .is_err()
+        {
+            return NOT_IMPLEMENTED;
+        }
+    }
+    // A zero means "leave this one alone"; the four are independent.
+    let as_time = |raw: u64| {
+        if raw == 0 {
+            None
+        } else {
+            Some(i64::try_from(raw).unwrap_or(i64::MAX))
+        }
+    };
+    // Only call the backend when at least one timestamp actually changed: a call whose four fields are all "leave alone" would be a write with no
+    // reason, and on a read-only backend it would turn a perfectly valid attribute-only call into a failure.
+    let touches_time =
+        creation_time != 0 || last_access_time != 0 || last_write_time != 0 || change_time != 0;
+    if touches_time
+        && adapter
+            .backend()
+            .set_times(
+                entry.file_id,
+                as_time(last_access_time),
+                as_time(last_write_time),
+                as_time(change_time),
+                as_time(creation_time),
+            )
+            .is_err()
+    {
+        return NOT_IMPLEMENTED;
+    }
+    if !out.is_null() {
+        let Ok(info) = adapter.backend().get_info(entry.file_id) else {
+            return OURS_OBJECT_NAME_NOT_FOUND;
+        };
+        let Ok(record) = crate::file_info::file_info(&info) else {
+            return NOT_IMPLEMENTED;
+        };
+        if !unsafe { write_file_info(out, record) } {
+            return OURS_INVALID_PARAMETER;
+        }
+    }
+    0
+}
 /// The `Rename` **shell**: two names in, one `rename` on the mount's backend.
 ///
 /// `ReplaceIfExists` is a **BOOLEAN** — the fourth sub-register argument in this layer, so it is declared `u8` (process 400: only the low

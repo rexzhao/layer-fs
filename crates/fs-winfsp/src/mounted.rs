@@ -372,6 +372,35 @@ mod platform {
     /// Registered because **its absence is visible**: a `WriteFile` followed by a close makes WinFsp flush, and an unset slot answers
     /// `STATUS_INVALID_DEVICE_REQUEST`, which surfaces as `ERROR_INVALID_FUNCTION` on the very operation that had just succeeded.
     /// The backend's own `flush` is the answer; a null `FileContext` means "the whole volume", which this layer has nothing to add to.
+    /// `SetBasicInfo` — `winfsp.h:538-543`, slot **12**.
+    ///
+    /// `(fs, ctx, UINT32 FileAttributes, UINT64 CreationTime, UINT64 LastAccessTime, UINT64 LastWriteTime, UINT64 ChangeTime, FileInfo*)`.
+    unsafe extern "system" fn set_basic_info_trampoline(
+        file_system: *mut c_void,
+        file_context: *mut c_void,
+        file_attributes: u32,
+        creation_time: u64,
+        last_access_time: u64,
+        last_write_time: u64,
+        change_time: u64,
+        info_out: *mut crate::abi::FileInfo,
+    ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
+        // SAFETY: WinFsp's contract for this callback.
+        unsafe {
+            crate::callbacks::set_basic_info_shell(
+                adapter.as_deref(),
+                file_context,
+                file_attributes,
+                creation_time,
+                last_access_time,
+                last_write_time,
+                change_time,
+                info_out,
+            )
+        }
+    }
+
     /// `CanDelete` — `winfsp.h:606-607`, slot **14**.
     ///
     /// `(FSP_FILE_SYSTEM*, PVOID FileContext, PWSTR FileName)`.
@@ -707,6 +736,20 @@ mod platform {
                 ) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(set_file_size_trampoline));
+            // `SetBasicInfo` — slot **12**: attributes + four timestamps, each with its own "leave alone" sentinel.
+            interface.slots[slot::SET_BASIC_INFO] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    u32,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    *mut crate::abi::FileInfo,
+                ) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(set_basic_info_trampoline));
             // `CanDelete` — slot **14**: `(fs, FileContext, FileName)`.
             interface.slots[slot::CAN_DELETE] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(*mut c_void, *mut c_void, *const u16) -> i32,
