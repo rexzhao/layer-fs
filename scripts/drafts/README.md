@@ -846,3 +846,23 @@ all, which points at the mount handshake (volume info / root open) as the first 
 **Difference to nail down with QA before diagnosing further:** with `MockBackend` the same shape works (`mounted_read_only`, `mounted_write_chain`),
 so the variable is the real backend, not the mount code path — but the first reader to check is the handshake sequence, printed from inside the
 callbacks, because "the mount returned Ok" and "the drive answers" are two different facts.
+
+## The mount reports success and is still not there (`MountReport`, real backend)
+
+```
+MOUNT create=0x00000000 mount=0x00000000 start=0x00000000 unmount=0xC000000D dispatcher=0x00000000
+RUST read_dir("Z:")    -> NotFound (os error 3)
+RUST read_dir("Z:/")   -> NotFound        ← the 317 trap is not the explanation
+bash ls 'Z:/'          -> No such file or directory
+BACKEND read_dir(root) -> Ok([])          ← the workspace itself is fine
+```
+
+`create`, `mount` and `start` all returned 0 and the dispatcher result is 0 (alive), yet **neither Rust nor bash can see the volume**, and no
+callback line appears. So "the mount call succeeded" and "the volume is reachable" are two different facts, and the first does not imply the second —
+exactly the shape the `MountReport` doc block predicts for a dead dispatcher, except the dispatcher says it is alive.
+
+Next readings needed, in this order:
+1. **log every callback entry** (`Create`/`GetVolumeInfo`/`GetSecurityByName`/`ReadDirectory`) — "no output" is currently used as evidence that the FSD
+   never called us, but nothing is logged on the success path, so that inference is unsupported (the eprintln calls only fire on error branches);
+2. **run the same mount code with `MockBackend` from this same test file** — QA's working mount uses a different backend *and* a different scaffold, so
+   "backend" and "scaffold" are two variables and only one has been varied so far.
