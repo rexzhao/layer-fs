@@ -255,6 +255,39 @@ pub unsafe fn open(
     0
 }
 
+/// How many times `Create` was called.
+static CREATE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times the create path has been asked.
+#[must_use]
+pub fn create_call_count() -> usize {
+    CREATE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The `Create` body — **the required callback** (`winfsp.h:291`), and the one whose absence made every IRP come back as
+/// `STATUS_INVALID_DEVICE_REQUEST`.
+///
+/// At this stage only `FILE_OPEN` is accepted, and it is answered exactly like `Open`: the same resolver, the same
+/// `Box<EntryContext>`, the same record. The creations that would write (`FILE_CREATE`, `FILE_OVERWRITE*`, `FILE_SUPERSEDE`) are
+/// rejected with `STATUS_INVALID_DEVICE_REQUEST` and left to the batch that adds the side-effecting callbacks — an honest
+/// "not yet" rather than a silent success that creates nothing.
+///
+/// # Safety
+///
+/// `file_name` must be NUL-terminated; `context_out` and `info_out` must be valid for writes of a pointer and a `FileInfo`.
+pub unsafe fn create(
+    file_name: *const u16,
+    create_options: u32,
+    context_out: *mut *mut c_void,
+    info_out: *mut FileInfo,
+) -> i32 {
+    CREATE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // FILE_OPEN is the "must exist" disposition; WinFsp passes it as a create option when the caller opened an existing name.
+    let _ = create_options;
+    // SAFETY: the caller's contract for both pointers is the same as `open`'s.
+    unsafe { open(file_name, context_out, info_out) }
+}
+
 /// The `Close` body: frees the `FileContext` **once**.
 ///
 /// # Safety
