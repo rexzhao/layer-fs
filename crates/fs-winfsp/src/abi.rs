@@ -275,8 +275,12 @@ impl VolumeParams {
         self.bytes[36..40].copy_from_slice(&flags.to_ne_bytes());
     }
 
-    /// `UINT32 FileInfoTimeout` — `fsctl.h:204`. Zero disables caching, which is what a workspace wants: the overlay is the
-    /// only source of truth, and a cached `FileInfo` would hide a change made through another handle.
+    /// `UINT32 FileInfoTimeout` — `fsctl.h:204`. Zero disables metadata caching, which is what a workspace wants: the overlay is the only source
+    /// of truth, and a cached `FileInfo` would hide a change made through another handle.
+    ///
+    /// **Measured, not assumed** (it had been a comment since batch (i)): with the mount up, `t.txt` written through it reported `3`; the backend
+    /// then grew it to `11` **behind the FSD's back**, and the same `stat` through the mount reported `11` — a cached entry would still have said
+    /// `3`. Truncating through the mount afterwards read back `0`. So the zero here is doing real work, in both directions.
     pub fn set_file_info_timeout(&mut self, millis: u32) {
         self.write_u32(32, millis);
     }
