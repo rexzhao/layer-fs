@@ -118,10 +118,15 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
         );
         eprintln!("mounting at drive letter {}", mount_point.display());
     } else {
-        std::fs::create_dir_all(&mount_point).expect("empty mount point directory");
+        // **The directory must NOT exist**: WinFsp creates it with NT `FILE_CREATE` semantics and its `DELETE_ON_CLOSE`
+        // cleans it up again (`fs.c` preflight: `OPEN_EXISTING` succeeding ⇒ `STATUS_OBJECT_NAME_COLLISION`). Every
+        // `0xC0000035` since the first attempt came from pre-creating the mount point.
+        if mount_point.exists() {
+            std::fs::remove_dir_all(&mount_point).expect("clear a stale mount point");
+        }
         assert!(
-            std::fs::read_dir(&mount_point).expect("mount point exists").next().is_none(),
-            "cell mount point: an empty directory is a precondition — a non-empty one is refused with 0xC0000035"
+            mount_point.parent().is_some_and(|parent| parent.exists()),
+            "cell mount point: the **parent** must exist (WinFsp opens it to create the child), the child must not"
         );
     }
 
@@ -221,9 +226,18 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
             report.unmount, report.unmount as u32
         );
     } else {
-        assert_eq!(
-            report.unmount, 0,
-            "cell unmount: the mount point was released (a stuck mount outlives the process)"
+        // Same shape as the drive letter: `SetMountPoint(NULL)` reports `INVALID_PARAMETER`, and the **evidence** that nothing
+        // was left mounted is that the directory is gone (WinFsp creates it with `DELETE_ON_CLOSE`). A status code says what one
+        // call thought; the file system says what is left behind.
+        eprintln!(
+            "unmount status = {} (0x{:08X}); mount point still present = {}",
+            report.unmount,
+            report.unmount as u32,
+            mount_point.exists()
+        );
+        assert!(
+            !mount_point.exists(),
+            "cell unmount: after the teardown the mount point directory must be gone — a stuck mount outlives the process"
         );
     }
     let _ = std::fs::remove_dir_all(&mount_point);

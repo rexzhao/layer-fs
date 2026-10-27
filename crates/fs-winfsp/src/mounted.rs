@@ -528,9 +528,9 @@ mod platform {
                 let text = mount_point.to_string_lossy();
                 text.len() == 2 && text.ends_with(':')
             };
-            if !is_drive_letter {
-                params.set_prefix(r"\layer-fs\workspace");
-            }
+            // **No `Prefix` for a directory mount.** It is the UNC form (`\server\share`); a volume whose name looks like a
+            // network share is refused as a junction target (`mount.c`: `VolumeName` with three or more backslashes ⇒
+            // `STATUS_NETWORK_ACCESS_DENIED`). The accessor stays, the call does not: one variable at a time.
             // **The table must outlive the file system.** `FspFileSystemCreate` takes a pointer to the interface and — like
             // most C libraries — keeps it rather than copying it; a table owned by this stack frame would be dangling the
             // moment `create` returns, and a dangling table reads as "every slot is None", which WinFsp reports as
