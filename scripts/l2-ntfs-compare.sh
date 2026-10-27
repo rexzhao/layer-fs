@@ -22,10 +22,15 @@ if [ -z "$ROOT" ]; then
 fi
 ROOT="${ROOT%/}"
 
+# `[ -d ]` on a **bare drive letter** is not the same question as `[ -d ]` on that drive's root: bash (Git Bash) answers `d=1` for `Z:` and `d=0` for
+# `Z:/`. The trailing separator is stripped above so paths can be built without doubling it, so the class that asks "is the root a directory" has to
+# put one back — otherwise the class is red for a reason that has nothing to do with the filesystem under test (measured: `Z:` -> 1, `Z:/` -> 0).
+ROOT_AS_DIR="$ROOT/"
+
 note() { printf '%s\n' "$*"; }
 
 # 01 — does the root exist and is it a directory (the very first thing every caller asks).
-if [ -d "$ROOT" ]; then note "01 root: directory"; else note "01 root: not a directory or missing"; fi
+if [ -d "$ROOT_AS_DIR" ]; then note "01 root: directory"; else note "01 root: not a directory or missing"; fi
 
 # 02 — creating a file, then reading it back: content round trip.
 printf 'alpha' >"$ROOT/l2-file" 2>/dev/null

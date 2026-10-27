@@ -730,3 +730,25 @@ the bisect is cheap: run the script with an early `exit` after each class and no
 
 `08` (case-only rename) is unchanged by this — it is the remaining functional gap, and it has its own criterion to run (manager 442: fold matching,
 case-only is not a collision, identity preserved).
+
+## `01` cracked — and it was the **script**, not the backend
+
+The bisect (ask `[ -d ]` after every class) answered `yes` at every point, so no class leaves state that breaks the root stat. The difference was
+in the question itself:
+
+```
+[ -d 'Z:' ]   -> d=1     ← the script's `ROOT="${ROOT%/}"` leaves a bare drive letter
+[ -d 'Z:/' ]  -> d=0     ← the same root, with its separator
+```
+
+Git Bash does not accept a bare drive letter as a directory. On NTFS the root is a plain path, so the class was never asked this question there —
+which is exactly why `01` looked like "our side is broken" while every instrument that used `Z:/` passed. Fix: the script keeps `ROOT_AS_DIR="$ROOT/"`
+for the class that asks "is the root a directory", with the measurement written next to it.
+
+## L2 now: **11 of 12**, only `08` red
+
+```
+01 directory ✓   02 alpha ✓   03 ok ✓   04 not found ✓   05a/05b a,b, ✓   06 refused ✓
+07 old=gone new=present ✓   09 name=gone ✓   10 beta ✓   11 refused ✓   12a readonly=yes ✓ (raw `R`)   12b ✓
+08 case-only rename: <missing> ✗
+```
