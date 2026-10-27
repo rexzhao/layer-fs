@@ -504,3 +504,19 @@ directory lists `a` where the caller wrote `A`. Measured: `raw_names` answered `
 So `split()` must return **`(folded, raw)`** per component, and only the last one is needed for display. That is the shape of the next attempt; the
 work was reverted rather than left half-applied, because a fold that silently rewrites names is exactly the "looks right, means something else"
 state this project keeps paying for.
+
+## Fold step 1 is **two coupled changes**, not one — measured attempt, reverted
+
+`split() -> Vec<Component { folded, raw }>` was implemented and it compiles in isolation, but it is inseparable from the *other* half:
+`children` must become `BTreeMap<(parent, folded), Binding { id, display }>` **in the same commit**, because every read of `children` now needs the
+binding's `id` while every write needs the component's `raw`. Doing one without the other leaves the tree uncompilable in between.
+
+So the cut is:
+
+1. `Component { folded, raw }` + `split` returning pairs;
+2. `Binding { id, display }` as the `children` value;
+3. the ~15 sites that read `children` switch from `*child` to `child.id`, and the ~4 write sites from `id` to `Binding { id, display: raw }`;
+4. the two expectation flips (inverted `mock_identity` case; synthetic entries in `criterion_6_dirent`);
+5. then the core side, then L2.
+
+Measured on the attempt: it is a **single-commit** change of about 20 sites; splitting it produces a red tree, which is worse than not starting.
