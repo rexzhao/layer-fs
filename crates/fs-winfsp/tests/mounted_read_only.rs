@@ -149,6 +149,7 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
         "dispatcher result = {} (0x{:08X}) — 0 means the dispatcher threads survived",
         report.dispatcher_result, report.dispatcher_result as u32
     );
+    eprintln!("probe hits = {}", report.probe_hits);
     eprintln!(
         "callbacks reached: volume_info={} security={} create={}",
         callbacks::volume_call_count(),

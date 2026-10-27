@@ -31,6 +31,10 @@ pub struct MountReport {
     /// produces exactly the shape we observed: the volume is mounted, every callback counter is zero, and IRPs come back as
     /// `ERROR_INVALID_FUNCTION`. Reading it replaces "we infer the dispatcher is fine" with a value.
     pub dispatcher_result: i32,
+    /// How many times the **probe marker** callback fired (all 64 slots filled with it, `LAYER_FS_PROBE=1`).
+    ///
+    /// `> 0` proves the table we filled is the table the dispatcher reads; `0` means it is not, whatever the indices say.
+    pub probe_hits: usize,
     /// Whether the drive letter / directory was **gone after `delete`**.
     ///
     /// A status code says what one call thought; this says what the OS now believes. For a drive letter it is read back with
@@ -230,8 +234,51 @@ mod platform {
         }
     }
 
+    /// The marker used by the slot probe: records that it was called, changes nothing else.
+    unsafe extern "system" fn probe_marker() -> i32 {
+        PROBE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Refuse, so the probe does not accidentally answer something correctly and hide the fact that it fired.
+        0xC000_0010u32 as i32
+    }
+
+    /// How many times the probe marker fired.
+    static PROBE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     fn interface_with_callbacks() -> FileSystemInterface {
         let mut interface = FileSystemInterface::empty();
+        // `LAYER_FS_PROBE=1` fills **every** slot with one marker: if the marker never fires, the dispatcher is not reading the
+        // table we filled, and no amount of index arithmetic will help.
+        // `LAYER_FS_PROBE_SLOT=n` fills only that index: running it for 0..24 says **which** slot the dispatcher actually calls,
+        // which is what turns "our indices are wrong" into a number.
+        if let Some(raw) = std::env::var_os("LAYER_FS_PROBE_SLOT") {
+            if let Ok(index) = raw.to_string_lossy().parse::<usize>() {
+                // SAFETY: same shape assertion as the bulk probe below.
+                let marker: unsafe extern "C" fn() -> i32 = unsafe {
+                    std::mem::transmute::<
+                        unsafe extern "system" fn() -> i32,
+                        unsafe extern "C" fn() -> i32,
+                    >(probe_marker)
+                };
+                if let Some(slot) = interface.slots.get_mut(index) {
+                    *slot = Some(marker);
+                }
+                return interface;
+            }
+        }
+        if std::env::var_os("LAYER_FS_PROBE").is_some() {
+            // SAFETY: `probe_marker` has the shape the slot type encodes; the cast is the same hand-asserted match the real
+            // registrations use.
+            let marker: unsafe extern "C" fn() -> i32 = unsafe {
+                std::mem::transmute::<
+                    unsafe extern "system" fn() -> i32,
+                    unsafe extern "C" fn() -> i32,
+                >(probe_marker)
+            };
+            for slot in interface.slots.iter_mut() {
+                *slot = Some(marker);
+            }
+            return interface;
+        }
         // SAFETY: the slot type carries **no signature** (the SDK's slots differ in arity), so registering a callback is a
         // hand-asserted shape match. Each index comes from `abi::slot`, which cites the header line it was read from.
         unsafe {
@@ -418,6 +465,12 @@ mod platform {
             let debug_log = std::env::var_os("LAYER_FS_DEBUG_LOG")
                 .map(std::path::PathBuf::from)
                 .and_then(|path: std::path::PathBuf| crate::debuglog::open(path.as_path()));
+            eprintln!(
+                "interface table: filled at {:p}, passed at {:p}, equal = {}",
+                interface,
+                interface,
+                std::ptr::eq(interface, interface)
+            );
             let create_status = create(device.as_ptr(), &params, interface, &mut file_system);
             if create_status != 0 || file_system.is_null() {
                 return Ok(super::MountReport {
@@ -426,6 +479,7 @@ mod platform {
                     start: 0,
                     unmount: 0,
                     dispatcher_result: 0,
+                    probe_hits: 0,
                     released_after_delete: true,
                     looked_like_a_mount: false,
                 });
@@ -480,6 +534,7 @@ mod platform {
                 start: start_status,
                 unmount: unmount_status,
                 dispatcher_result,
+                probe_hits: PROBE_HITS.load(std::sync::atomic::Ordering::Relaxed),
                 released_after_delete,
                 looked_like_a_mount,
             })
