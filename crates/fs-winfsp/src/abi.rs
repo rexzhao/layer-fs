@@ -177,6 +177,8 @@ pub mod slot {
     pub const CAN_DELETE: usize = 14;
     /// `Rename` — `winfsp.h:632`.
     pub const RENAME: usize = 15;
+    /// `GetSecurity` — `winfsp.h:652` (slot 16; `SetSecurity` is 17).
+    pub const GET_SECURITY: usize = 16;
     /// `ReadDirectory` — `winfsp.h:703` (index 18; `GetSecurity`/`SetSecurity` occupy 16/17).
     pub const READ_DIRECTORY: usize = 18;
 

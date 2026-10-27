@@ -167,10 +167,11 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
         callbacks::open_exit_counts().2
     );
     eprintln!(
-        "callbacks reached: volume_info={} security={} create={}",
+        "callbacks reached: volume_info={} security={} create={} read_dir={}",
         callbacks::volume_call_count(),
         callbacks::security_call_count(),
-        callbacks::create_call_count()
+        callbacks::create_call_count(),
+        callbacks::read_dir_call_count()
     );
     eprintln!(
         "file contexts: allocated={} freed={} (before: {before_contexts:?})",

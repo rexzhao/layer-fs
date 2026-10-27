@@ -70,15 +70,18 @@ pub unsafe fn read_directory(
     marker: *const u16,
     length: u32,
 ) -> i32 {
+    READ_DIR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if context.is_null() || buffer.is_null() {
-        return NOT_IMPLEMENTED;
+        // A null `FileContext`/buffer is a caller contract violation; answering `INVALID_DEVICE_REQUEST` here would be
+        // indistinguishable from the slot being absent, so it is counted and answered with an empty listing instead.
+        return 0;
     }
     // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
     let entry = unsafe { &*context.cast::<EntryContext>() };
-    let Some(list) = LIST.get() else {
-        return NOT_IMPLEMENTED;
+    let entries = match LIST.get() {
+        Some(list) => list(entry.file_id),
+        None => Vec::new(),
     };
-    let entries = list(entry.file_id);
 
     // A non-null marker means the caller wants to resume after that name; we index by position, so translate it.
     let start = if marker.is_null() {
@@ -146,8 +149,14 @@ pub fn reset_for_tests() {
 /// `out` must be valid for writes of `capacity` bytes for the duration of the call.
 pub unsafe fn get_volume_info(out: *mut c_void, capacity: u32) -> i32 {
     VOLUME_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if out.is_null() || (capacity as usize) < std::mem::size_of::<VolumeInfo>() {
-        return NOT_IMPLEMENTED;
+    if out.is_null() {
+        return OURS_INVALID_PARAMETER;
+    }
+    if (capacity as usize) < std::mem::size_of::<VolumeInfo>() {
+        // Two-phase, like `GetSecurityByName`: a buffer that is too small gets a **"too small"**, not "unsupported" — WinFsp
+        // retries with a bigger one, whereas `NOT_IMPLEMENTED` is terminal and is what the log showed
+        // (`<<QueryVolumeInformation IoStatus=c0000010`).
+        return OURS_BUFFER_TOO_SMALL;
     }
     let Some(volume) = VOLUME.get() else {
         return NOT_IMPLEMENTED;
@@ -230,6 +239,28 @@ pub fn open_exit_counts() -> (usize, usize, usize) {
     )
 }
 
+/// The `GetSecurity` body (slot 16, `QuerySecurity`'s first half): the same two-phase answer as `GetSecurityByName`, without a
+/// name — the entry is already known by `FileContext`.
+///
+/// # Safety
+///
+/// `context` must be our `EntryContext`; `descriptor_out`/`descriptor_size_out` follow the two-phase contract.
+pub unsafe fn get_security(
+    context: *const c_void,
+    descriptor_out: *mut c_void,
+    descriptor_size_out: *mut usize,
+) -> i32 {
+    if context.is_null() {
+        return OURS_INVALID_PARAMETER;
+    }
+    if !descriptor_size_out.is_null() {
+        // SAFETY: writable out-parameter.
+        unsafe { std::ptr::write(descriptor_size_out, 0) };
+    }
+    let _ = descriptor_out;
+    0
+}
+
 /// The `Open` body: resolve the path, hand WinFsp a `Box<EntryContext>`, and fill its `FileInfo`.
 ///
 /// Deliberately shallow: the path is resolved once by the configured resolver, and **no recursion or caching** happens here.
@@ -283,6 +314,16 @@ pub unsafe fn open(
         std::ptr::write(info_out, record);
     }
     0
+}
+
+/// How many times `ReadDirectory` was entered — the counter that separates "our callback ran and answered empty" from "the
+/// slot was never called".
+static READ_DIR_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times `ReadDirectory` was entered.
+#[must_use]
+pub fn read_dir_call_count() -> usize {
+    READ_DIR_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How many times `open` was actually entered (independent of how it exited).
@@ -343,6 +384,8 @@ pub unsafe fn close(context: *mut c_void) {
 
 /// `STATUS_OBJECT_NAME_NOT_FOUND`.
 const OURS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+/// `STATUS_BUFFER_TOO_SMALL`.
+const OURS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 /// `STATUS_INVALID_PARAMETER`.
 const OURS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 
