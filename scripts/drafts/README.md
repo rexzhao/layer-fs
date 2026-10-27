@@ -156,3 +156,17 @@ read path. Candidate order (unchanged, but now narrower): an out-pointer write i
 
 The log gives the neighbourhood, not the first fault: the next step is **PageHeap** (`gflags /p /enable <exe> /full`), which breaks at the
 offending write instead of at the abort.
+
+### Guard in place, crash still there — so it is not a `FileInfo` out-pointer
+
+With `write_is_safe` (VirtualQuery) guarding every `FileInfo` write, the L2 mounted run still aborts and the guard **never fires**:
+`bad_output_pointer_count()` stays 0, and no "refusing to write ... to 0x..." line is printed. So the corrupting write is somewhere else.
+
+Remaining candidates, in the order the log's neighbourhood suggests:
+
+1. `read_directory`'s `DirBuffer` (records + alignment) — the one callback that writes a **variable-length** payload;
+2. `get_security` / `get_security_by_name` (`*size` and an attribute word);
+3. `get_volume_info`'s prefix write for classes other than `FileFsSizeInformation` (QA cleared only that class: the query that passes a
+   filesystem-name string has a different length and shape).
+
+The same VirtualQuery guard can be applied to each of those in turn — one guard, one run, until one of them refuses.
