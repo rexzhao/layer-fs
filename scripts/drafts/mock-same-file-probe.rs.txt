@@ -1,0 +1,99 @@
+//! Instrument: a mount over the **real** backend, asked the three questions QA's L2 run answered wrong.
+//!
+//! Rules 431/434: one mount, one test file, `--test` alone, every line names the call it reports.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use fs_winfsp::mock::MockBackend;
+use fs_winfsp::abi::VolumeInfo;
+use fs_winfsp::loader::{default_library, resolve_library, LoadError};
+use fs_winfsp::mounted::mount_read_only;
+use fs_winfsp::ops::{DynOps, WorkspaceOps};
+
+fn volume() -> VolumeInfo {
+    VolumeInfo {
+        total_size: 1 << 20,
+        free_size: 1 << 19,
+        volume_label_length: 4,
+        volume_label: {
+            let mut label = [0u16; 32];
+            label[..4].copy_from_slice(&[b'l' as u16, b'a' as u16, b'y' as u16, b'r' as u16]);
+            label
+        },
+    }
+}
+
+fn bash(script: &str) -> String {
+    let output = std::process::Command::new("C:/Program Files/Git/bin/bash.exe")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("bash");
+    format!(
+        "out={:?} err={:?}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+#[test]
+fn subdirectories_through_a_real_backend_mount() {
+    let library = default_library();
+    if let Err(LoadError::NotFound { path }) = resolve_library(&library) {
+        eprintln!("SKIP: no winfsp at {}", path.display());
+        return;
+    }
+    let mount_point = std::env::var_os("LAYER_FS_MNT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("Z:"));
+    // `DynOps` is `Box<dyn WorkspaceOps + Send + Sync>` (no lifetime parameter), so the backend must outlive the call: leak the workspace for the
+    // duration of this instrument — a probe, not production code.
+    let backend: DynOps = Box::new(MockBackend::new());
+    let mounted = mount_read_only(&library, &mount_point, backend, volume(), |path: &std::path::Path| {
+        let root = path
+            .to_string_lossy()
+            .trim_end_matches(char::from(92))
+            .replace(char::from(92), "/");
+        // **Write first, list second**: the working test (`mounted_write_chain`) only ever writes/reads a file, never lists a directory. If writing
+        // works and listing does not, then the root is usable and the defect is `ReadDirectory`.
+        println!(
+            "RUST write = {:?}",
+            std::fs::write(format!("{root}/w.txt"), b"x").map_err(|e| e.to_string())
+        );
+        println!("RUST read back = {:?}", std::fs::read(format!("{root}/w.txt")).map_err(|e| e.to_string()));
+        // **Ask the same question from Rust first**: if Rust can list the mount and bash cannot, the difference is the client, not the FSD.
+        println!(
+            "RUST read_dir = {:?}",
+            std::fs::read_dir(&root).map(|entries| entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>())
+        );
+        println!("RUST metadata = {:?}", std::fs::metadata(&root).is_ok());
+        // The 317 trap: `Z:` is *the current directory on Z*, not the root of Z. The same path **with** its separator is the root.
+        println!("RUST raw arg = {:?}", path.to_string_lossy());
+        println!(
+            "RUST read_dir(with sep) = {:?}",
+            std::fs::read_dir(format!("{root}/")).map(|entries| entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>())
+        );
+        println!("MKDIR   {}", bash(&format!("mkdir '{root}/l2-dir' 2>&1; echo rc=$?")));
+        println!("LSROOT  {}", bash(&format!("ls -1 '{root}/' 2>&1")));
+        println!("WRITE   {}", bash(&format!("printf x > '{root}/l2-dir/a' 2>&1; echo rc=$?")));
+        println!("LSDIR   {}", bash(&format!("ls -1 '{root}/l2-dir' 2>&1")));
+        println!("STATDIR {}", bash(&format!("stat -c '%n %F' '{root}/l2-dir' 2>&1")));
+        // The same three questions asked **of the backend directly**, in the same session: if these are right while the mount is wrong, the defect is
+        // above the backend.
+        Ok(())
+    });
+    match mounted {
+        Ok(report) => println!(
+            "MOUNT create=0x{:08X} mount=0x{:08X} start=0x{:08X} unmount=0x{:08X} dispatcher=0x{:08X}",
+            report.create, report.mount, report.start, report.unmount, report.dispatcher_result
+        ),
+        Err(error) => println!("MOUNT failed: {error:?}"),
+    }
+}

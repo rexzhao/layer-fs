@@ -885,3 +885,22 @@ mine is the **scaffold**, not the backend.
 
 Next reading, still unvaried: run the *same* mount code from the *same* test file with `MockBackend`. Two variables have been changed at once so far
 (backend **and** scaffold), and only by holding one still does the third answer mean anything.
+
+## The probe is the thing that is broken — narrowing so far (494)
+
+```
+Mock + 1 MiB volume + 1 GiB volume + Z: / X: / V: / W: / U: / P: + fs-api crate + fs-winfsp crate
+   -> every combination: RUST write = os error 3, read_dir = os error 3, bash ls = No such file
+MOUNT create=0 mount=0 start=0 dispatcher=0    (the call reports success every time)
+```
+
+And yet, **in the same test binary**, `mounted_write_chain` mounts on `X:` and writes, reads, truncates and deletes successfully. So the mount machinery,
+the volume geometry, the backend and the drive letter are **all excluded** — what is left is *how the probe uses `mount_read_only`*.
+
+The one structural difference visible in the code: `mounted_write_chain` **returns `Err` from its probe when anything fails**, so a mount that does not
+work is reported as "the mount did not work" (and its assertion fails loudly). My probe prints the failure and **returns `Ok(())`**, which makes
+`looked_like_a_mount` trivially true — the mount is then torn down and the prints are the only trace. That is exactly the "instrument that cannot fail"
+shape (434): a probe whose success condition is `Ok(())` measures nothing.
+
+Next step: rewrite the probe so that **every failure comes back as `Err`** and let the existing mount machinery fail the test. Until that is done, no
+reading from this probe means anything about the file system.
