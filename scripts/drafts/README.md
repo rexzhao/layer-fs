@@ -659,3 +659,31 @@ Two facts:
 That points at the lifecycle again, from a new side: **the FSD is still issuing reads for a handle whose context we released**, and my EOF shortcut hides
 it (it made `cat` fail quietly instead of loudly). The next instrument must print the *context id* per read on both sides — the buffer addresses already
 show the pairing is not 1:1.
+
+## id pairing: `CLOSE 8 … READ 8 … CLOSE 8` — the FSD closes, reads, and closes again
+
+Ids printed on our side during one `printf > f1; cat f1` (EOF fallback off):
+
+```
+OPEN 5 file_id=1
+CLOSE 5
+OPEN 6 file_id=1        OPEN 7 file_id=1
+CLOSE 6                 CLOSE 6          ← the same id closed twice
+OPEN 8 file_id=1        OPEN 9 file_id=1
+CLOSE 8
+READ STALE id=8         ← a read on a context we have released
+CLOSE 8                 ← and the same id closed a third time
+```
+
+Three facts, and they choose between the three candidate mechanisms:
+
+1. the id **really was released** before the read (`CLOSE 8` precedes `READ STALE id=8`) — so **(c) is excluded**, this is not our bookkeeping marking
+   a live context as closed;
+2. **`CLOSE` arrives more than once for the same id** (6 twice, 8 twice) — the FSD closes the same file object repeatedly, which is the
+   double-close family we first met in the heap-corruption hunt;
+3. the read sits **between** two closes of that id, so the object is still alive from the FSD's point of view while we consider it gone.
+
+So the mechanism is (a)/(b): **the FSD keeps using a file object after (and across) our `Close`**. The honest next step is not another fallback but deciding
+*what a `Close` means for us*: today it frees the context immediately, and everything arriving afterwards is refused — including operations that belong to a
+still-live file object. Keeping the context alive until the object is really gone (a graveyard with an explicit "never reused" id) would make the later
+operations answerable instead of refused.
