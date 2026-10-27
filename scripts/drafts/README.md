@@ -405,3 +405,19 @@ Two facts:
 
 So the next question is narrow and answerable with one print: **what create options does Windows use for `write("d/a")` inside a directory it just
 created** — and why is the disposition `Open` there while the same operation in the root arrives as `OpenIf` (`raw=0x03000060`)?
+
+## Three-way print: the child `Create` **succeeds** (status 0) and the OS still says "path not found"
+
+```
+FFI create raw=0x02200021 disposition=Create  options=0x200021  → status=0   (mkdir "d")
+STEP mkdir: Ok(())
+STEP write: Err(3 NotFound)
+FFI create raw=0x03000060 disposition=OpenIf  options=0x60      → status=0   (create "d\a")
+```
+
+So per the dispatcher's own decomposition (`fsop.c` `FileOpenIf`: GSBN → maybe `Open` → `Create`, upgrading only on exactly `0xC0000034`), the
+create of the child was **asked for and answered successfully**. Nothing failed at the create. The "path not found" comes from something *after*
+it — a callback that is not `Create`, and that we are not printing.
+
+Next instrument: log **every** callback that answers non-zero (a one-line hook in the shells' single exit path), not just `Create`. The failure is now
+known to be downstream of a successful create, which is a much smaller place to look than "the directory is broken".
