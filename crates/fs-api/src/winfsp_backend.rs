@@ -108,7 +108,7 @@ impl WorkspaceOps for ApiBackend<'_> {
         Ok(resolved.serial())
     }
 
-    fn dir_binding(&self, path: &[u8]) -> Option<(u64, Vec<u8>)> {
+    fn dir_binding(&self, path: &[u8]) -> Option<fs_winfsp::ops::DirOutcome> {
         // Split the path once: the parent is resolved through the same rules layer, the name is the last segment bytes.
         let text = String::from_utf8_lossy(path).replace('\\', "/");
         let (parent_text, name) = text.rsplit_once('/')?;
@@ -119,7 +119,13 @@ impl WorkspaceOps for ApiBackend<'_> {
         };
         let rules = self.rules();
         let parent = rules.resolve(&path_of(parent_path.as_bytes()).ok()?).ok()?;
-        Some((parent.serial(), name.as_bytes().to_vec()))
+        // The entry itself, resolved through the **same** rules layer: asking both here is what keeps an identity and a binding from disagreeing, and a
+        // path that names nothing gets `None` rather than a name that would only fail later, at `remove_at`.
+        let entry = rules.resolve(&path_of(path).ok()?).ok()?;
+        Some(fs_winfsp::ops::DirOutcome {
+            id: entry.serial(),
+            binding: (parent.serial(), name.as_bytes().to_vec()),
+        })
     }
 
     fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {

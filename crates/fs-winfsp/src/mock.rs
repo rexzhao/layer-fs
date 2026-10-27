@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use fs_semantics::disposition::Disposition;
 
 use crate::ops::{
-    Attributes, DirEntry, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, RenameOutcome, Times,
-    WorkspaceOps,
+    Attributes, DirEntry, DirOutcome, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult,
+    RenameOutcome, Times, WorkspaceOps,
 };
 
 /// The root directory's id.
@@ -351,13 +351,21 @@ impl WorkspaceOps for MockBackend {
         Ok(id)
     }
 
-    fn dir_binding(&self, path: &[u8]) -> Option<(u64, Vec<u8>)> {
+    fn dir_binding(&self, path: &[u8]) -> Option<DirOutcome> {
         // The parent segment is already walked by `parent_and_name` — this is the same resolution the doors do, so the binding cannot disagree
         // with the id they answered.
         let inner = self.inner.lock().expect("mock lock");
         let components = split(path).ok()?;
         let (parent, name) = parent_and_name(&inner, &components).ok()?;
-        Some((parent, name.raw))
+        // Walk the same components the binding used, so the identity cannot come from a different resolution than the name.
+        let mut entry = ROOT;
+        for component in &components {
+            entry = inner.children.get(&(entry, component.folded.clone()))?.id;
+        }
+        Some(DirOutcome {
+            id: entry,
+            binding: (parent, name.raw),
+        })
     }
 
     fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {

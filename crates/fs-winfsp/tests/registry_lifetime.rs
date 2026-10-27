@@ -246,3 +246,31 @@ fn the_volume_answer_belongs_to_the_mount() {
         "cell second: a bare mount describes no volume — no borrowed answer"
     );
 }
+
+/// `DirOutcome` — an identity and a binding, answered **once**.
+///
+/// The pairing is the criterion: the id the door answers and the id the binding resolves to are the same question asked twice, and a value that
+/// carries both makes a disagreement observable instead of silent. The negative half (a path that names nothing has no binding at all) is what keeps
+/// `None` meaning "cannot tell" rather than becoming a binding that fails later, at `remove_at`.
+#[test]
+fn dir_outcome_pairs_the_identity_with_the_binding() {
+    use fs_winfsp::mock::MockBackend;
+    use fs_winfsp::ops::WorkspaceOps;
+
+    let backend = MockBackend::new();
+    let dir = backend.mkdir(b"/d").expect("mkdir");
+    let outcome = backend
+        .dir_binding(b"/d")
+        .expect("a directory that exists has a binding");
+    assert_eq!(
+        outcome.id, dir,
+        "the binding resolves to the entry the door answered"
+    );
+    assert_eq!(outcome.binding.0, 0, "the parent is the root");
+    assert_eq!(outcome.binding.1, b"d".to_vec(), "the raw name bytes");
+
+    assert!(
+        backend.dir_binding(b"/nope").is_none(),
+        "a path that names nothing has no binding — not a name that would fail later"
+    );
+}

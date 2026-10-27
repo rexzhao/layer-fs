@@ -844,7 +844,21 @@ unsafe fn open_like(
             Ok(file_id) => adapter
                 .backend()
                 .get_info(file_id)
-                .map(|_| (file_id, adapter.backend().dir_binding(path.as_bytes())))
+                .map(|_| {
+                    let found = adapter.backend().dir_binding(path.as_bytes());
+                    // The id the door answered and the id the binding resolves to are the **same question twice**; answering them in one value is
+                    // what makes a disagreement observable. The door's id wins (it is the one already handed out), so a mismatch is reported, not
+                    // silently preferred.
+                    if let Some(ref outcome) = found {
+                        if outcome.id != file_id {
+                            eprintln!(
+                                "create: dir_binding id {} disagrees with the door's {file_id}",
+                                outcome.id
+                            );
+                        }
+                    }
+                    (file_id, found)
+                })
                 .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
             // The name is taken: `FILE_CREATE` means **fail if it exists**, and that is a collision, not a silent open.
             Err(crate::ops::OpsError::NameCollision) => Err(OURS_OBJECT_NAME_COLLISION),
@@ -854,7 +868,18 @@ unsafe fn open_like(
             Ok(file_id) => adapter
                 .backend()
                 .get_info(file_id)
-                .map(|_| (file_id, adapter.backend().dir_binding(path.as_bytes())))
+                .map(|_| {
+                    let found = adapter.backend().dir_binding(path.as_bytes());
+                    if let Some(ref outcome) = found {
+                        if outcome.id != file_id {
+                            eprintln!(
+                                "open: dir_binding id {} disagrees with the door's {file_id}",
+                                outcome.id
+                            );
+                        }
+                    }
+                    (file_id, found)
+                })
                 .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
             // Windows opens a directory with `FILE_OPEN_IF`, which means "open it, or make it": the make half is `mkdir`, and doing it here is
             // what keeps the 2x2 from needing a fifth verb.
@@ -879,14 +904,33 @@ unsafe fn open_like(
             .create_or_open(path.as_bytes(), disposition)
         {
             // The backend's own answer carries where the name lives — that is the binding `remove_at` will guard with.
-            Ok(outcome) => Ok((outcome.file_id, Some(outcome.binding))),
+            Ok(outcome) => Ok((
+                outcome.file_id,
+                Some(crate::ops::DirOutcome {
+                    id: outcome.file_id,
+                    binding: outcome.binding,
+                }),
+            )),
             // **A directory opened without `FILE_DIRECTORY_FILE`.** Windows does open directories with a plain `FILE_OPEN` (that is how it walks into
             // one before creating a child), and the file door correctly refuses it — so the directory door gets the second attempt. Without this
             // fallback the open of a perfectly good directory answers NotADirectory, and every child operation under it fails with
             // "path not found" (measured: `/d` Open -> NotADirectory, then `/d/a` -> NotFound, four calls in a row).
             Err(crate::ops::OpsError::NotADirectory) => {
                 match adapter.backend().open_dir(path.as_bytes()) {
-                    Ok(file_id) => Ok((file_id, None)),
+                    Ok(file_id) => {
+                        // The binding comes with an identity, and the identity must agree with the id the door just answered: same question twice,
+                        // answered together so a disagreement is visible.
+                        let found = adapter.backend().dir_binding(path.as_bytes());
+                        if let Some(ref outcome) = found {
+                            if outcome.id != file_id {
+                                eprintln!(
+                                    "create: dir_binding id {} disagrees with the fallback door's {file_id}",
+                                    outcome.id
+                                );
+                            }
+                        }
+                        Ok((file_id, found))
+                    }
                     Err(crate::ops::OpsError::NotADirectory) => Err(OURS_NOT_A_DIRECTORY),
                     Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
                 }
@@ -926,7 +970,9 @@ unsafe fn open_like(
     };
     // Register the handle **after** the record is built: a refused open must not leave a handle behind, and the table is the thing
     // `Cleanup`/`Close` will act on. Coming last also means the earlier refusal paths need no undo.
-    let Ok(handle) = adapter.open_handle(file_id, binding) else {
+    // The binding travels as a pair from here on: `open_handle` and `remove_at` both take `(parent, name)`, and the identity half has already
+    // been checked against the door's answer above.
+    let Ok(handle) = adapter.open_handle(file_id, binding.map(|outcome| outcome.binding)) else {
         OPEN_EXITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
     };

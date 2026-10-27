@@ -237,6 +237,22 @@ pub enum OpsError {
 /// The result type of every operation.
 pub type OpsResult<T> = Result<T, OpsError>;
 
+/// Where an entry **lives** and **what it is**: its identity and the binding its name carries.
+///
+/// The two halves travel together because a caller that needs one almost always needs the other, and resolving them separately is how they drift
+/// apart. `remove_at` guards with `(parent, name, expected id)`; a handle that knows only the binding cannot say *which* entry it is about to
+/// remove, and a handle that knows only the id cannot name it.
+///
+/// Keeping them in one value also gives the adapter a **free consistency check**: the id the door answered and the id the binding resolves to are
+/// the same question asked twice, and answering them together makes a disagreement observable instead of silent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirOutcome {
+    /// The entry's identity.
+    pub id: u64,
+    /// Where its name is bound: the parent's id and the raw name bytes.
+    pub binding: (u64, Vec<u8>),
+}
+
 /// Everything the adapter needs from the core.
 ///
 /// Implementors: `mock::MockBackend` (this card) and the real `fs-api` adapter (P3-3b). The contract tests are generic
@@ -285,7 +301,7 @@ pub trait WorkspaceOps {
     ///
     /// The information is not new work for a backend: resolving the path already **walked the parent segment**. The default answers `None`,
     /// which means "this backend cannot tell", and a directory then behaves as it did before — an explicit gap rather than a guessed name.
-    fn dir_binding(&self, _path: &[u8]) -> Option<(u64, Vec<u8>)> {
+    fn dir_binding(&self, _path: &[u8]) -> Option<DirOutcome> {
         None
     }
 
