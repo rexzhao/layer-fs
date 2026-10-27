@@ -40,7 +40,10 @@ if [ -r "$ROOT/l2-missing" ]; then note "04 missing file: readable (wrong)"; els
 # 05 — directory creation, then listing it (ordering is the part both sides must agree on).
 mkdir "$ROOT/l2-dir" 2>/dev/null
 : >"$ROOT/l2-dir/b"; : >"$ROOT/l2-dir/a"
-note "05 dir listing: $(ls -1 "$ROOT/l2-dir" 2>/dev/null | tr '\n' ',' )"
+note "05a dir listing (sorted): $(ls -1 "$ROOT/l2-dir" 2>/dev/null | sort | tr '
+' ',')"
+note "05b dir listing (raw order): $(ls -1 "$ROOT/l2-dir" 2>/dev/null | tr '
+' ',')"
 
 # 06 — removing a non-empty directory (NTFS: refused).
 rmdir "$ROOT/l2-dir" 2>/dev/null && note "06 rmdir non-empty: removed (wrong)" || note "06 rmdir non-empty: refused"
@@ -68,8 +71,17 @@ long_name="$(printf 'x%.0s' $(seq 1 300))"
 : >"$ROOT/$long_name" 2>/dev/null && note "11 long name: created (check component limit)" || note "11 long name: refused"
 
 # 12 — attributes: setting the read-only bit and reading it back.
+#
+# `attrib`'s output format belongs to cmd, not to the volume: the comparable part is the **semantics** (is the read-only bit
+# set, is it a directory), and the raw line is recorded for the report.
 attrib +R "$ROOT/L2-RENAMED" >/dev/null 2>&1
-note "12 attributes: $(attrib "$ROOT/L2-RENAMED" 2>/dev/null | tr -s ' ' || echo '<unavailable>')"
+raw_attrs="$(attrib "$ROOT/L2-RENAMED" 2>/dev/null | tr -s ' ')"
+readonly=no
+case "$raw_attrs" in *\ R\ *|*R*) readonly=yes;; esac
+directory=no
+[ -d "$ROOT/L2-RENAMED" ] && directory=yes
+note "12a attributes (semantic): readonly=$readonly directory=$directory"
+note "12b attributes (raw): ${raw_attrs:-<unavailable>}"
 attrib -R "$ROOT/L2-RENAMED" >/dev/null 2>&1
 
 # Cleanup is deliberately *not* attempted: on the mounted side a failing cleanup would itself be an observation, and the
