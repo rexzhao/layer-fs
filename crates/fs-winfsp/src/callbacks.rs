@@ -553,6 +553,31 @@ pub fn clear_contexts() {
         .expect("contexts")
         .get_or_insert_with(std::collections::BTreeMap::new)
         .clear();
+    CLOSED_CONTEXTS
+        .lock()
+        .expect("closed contexts")
+        .get_or_insert_with(std::collections::BTreeSet::new)
+        .clear();
+}
+
+/// Ids that were handed out and then **closed**.
+///
+/// A close frees the context, but Windows can still be *in flight* with that handle: the measured shape is a cached read of 128 KiB arriving after
+/// `Close` (the cache manager's read-ahead, or the two dispatcher threads processing out of order — the pairing instrument distinguishes them, the
+/// answer to the caller does not). The lookup distinguishes "closed" from "never existed", which is the difference between answering a dead handle
+/// and inventing one.
+static CLOSED_CONTEXTS: std::sync::Mutex<Option<std::collections::BTreeSet<u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether `context` names a handle that was handed out and has since been closed.
+fn is_closed(context: *const c_void) -> bool {
+    let id = context as usize as u64;
+    id != 0
+        && CLOSED_CONTEXTS
+            .lock()
+            .expect("closed contexts")
+            .get_or_insert_with(std::collections::BTreeSet::new)
+            .contains(&id)
 }
 
 /// Removes the context behind `context`, or `None` when the id was never handed out (a stale close).
@@ -561,11 +586,19 @@ fn release_context(context: *const c_void) -> Option<Box<EntryContext>> {
     if id == 0 {
         return None;
     }
-    CONTEXTS
+    let released = CONTEXTS
         .lock()
         .expect("contexts")
         .get_or_insert_with(std::collections::BTreeMap::new)
-        .remove(&id)
+        .remove(&id);
+    if released.is_some() {
+        CLOSED_CONTEXTS
+            .lock()
+            .expect("closed contexts")
+            .get_or_insert_with(std::collections::BTreeSet::new)
+            .insert(id);
+    }
+    released
 }
 
 ///
@@ -1176,8 +1209,17 @@ pub unsafe fn read_shell(
     if context.is_null() || (buffer.is_null() && length > 0) {
         return OURS_INVALID_PARAMETER;
     }
-    // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
     let Some(entry) = entry_of(context) else {
+        // **A read of an already-closed handle is answered as EOF, not as an error.** The measured shape is the cache manager's 128 KiB read-ahead
+        // arriving after `Close`: the file object is dead, nobody consumes those bytes, and refusing it turned a successful `cat` into
+        // "Invalid request code". Zero bytes is both true (there is no data to give) and harmless (nothing is written into the caller's buffer).
+        if is_closed(context) {
+            if !bytes_transferred.is_null() {
+                // SAFETY: writable out-pointer per WinFsp's contract.
+                unsafe { std::ptr::write(bytes_transferred, 0) };
+            }
+            return 0;
+        }
         return NOT_IMPLEMENTED;
     };
     let entry = &entry;
