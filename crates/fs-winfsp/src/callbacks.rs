@@ -495,6 +495,12 @@ pub fn note_context_live(address: usize) {
 }
 
 /// Returns `false` when the address was **not** live, which means this is a second release (or a pointer we never handed out).
+/// When non-zero, released contexts are **deliberately leaked** so the allocator can never hand the same address out again.
+///
+/// This is an **instrument, not a fix**: it separates "the same address came back because memory was reused" from "WinFsp really closed the
+/// same context twice". It must never be on in production — every open would leak 24 bytes.
+pub static PIN_ADDRESSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn take_context_live(address: usize) -> bool {
     let mut guard = LIVE_CONTEXTS.lock().expect("live contexts");
     guard
@@ -917,6 +923,11 @@ pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_v
         // The adapter performs the single `remove_at` (outside its table lock, see `Adapter::close`). A failure here is recorded by
         // the backend's own error, and the context is freed either way.
         let _ = adapter.close(entry.handle);
+    }
+    if PIN_ADDRESSES.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        // **Instrument only**: keep the block alive so the allocator cannot hand this address out again. If the same pointer then shows
+        // up in `CLOSE-TRACE` a second time, the repeated close is real rather than memory reuse.
+        std::mem::forget(entry);
     }
     CONTEXTS_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }

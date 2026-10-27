@@ -207,3 +207,25 @@ Two readings are consistent with that, and the trace alone cannot separate them:
 
 The experiment that separates them is to **stop reuse**: in trace mode, keep every freed context in a `Vec` (leak them on purpose) so an
 address can never come back. Then a repeated pointer in `CLOSE-TRACE` is proof of (2), and its absence proves (1).
+
+## Pinned-address experiment: the ambiguity resolves against "reuse"
+
+With `PIN_ADDRESSES = 1` (released contexts are deliberately leaked, so an address can never come back) and `CLOSE_TRACE = 1`:
+
+```
+CLOSE-TRACE #00000 ctx=0x…298c0     #00001 ctx=0x…294e0     #00002 ctx=0x…29580
+CLOSE-TRACE #00005 ctx=0x…f9520  ← refused: not a live context
+CLOSE-TRACE #00008 ctx=0x…f98a0  ← refused: not a live context
+```
+
+Two facts, and they change the question:
+
+1. **No address repeats** once reuse is impossible — so the earlier "same pointer many times" was mostly **allocator reuse**, not repeated closes of one
+   context;
+2. The refusals are for addresses that **never appear as opened** in this trace — i.e. `close_shell` is being handed contexts that `open_like`
+   never produced. That is a different defect from a double close: something returns success **without** handing out a context, and the OS closes
+   whatever was in that slot.
+
+Next question is therefore: **which path returns success without setting `PFileContext`?** Candidates to read in order: `create_shell`'s early
+returns, `open_like`'s refusal paths (they return non-zero, so their slot stays untouched — the FSD then must not close it), and
+`overwrite_shell` (no context parameter at all).
