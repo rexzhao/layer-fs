@@ -214,3 +214,35 @@ fn context_counts_are_per_mount() {
         "cell second: and this one is still holding a context, which the first mount's numbers cannot hide"
     );
 }
+
+/// The volume answer is per-mount configuration too: two adapters can describe different volumes, and a bare adapter describes
+/// none — the property a process-wide static could not provide (352).
+#[test]
+fn the_volume_answer_belongs_to_the_mount() {
+    use fs_winfsp::abi::VolumeInfo;
+    use fs_winfsp::adapter::AdapterConfig;
+
+    let first = Adapter::with_config(
+        MockBackend::new(),
+        AdapterConfig {
+            volume: Some(VolumeInfo {
+                total_size: 1 << 20,
+                free_size: 1 << 19,
+                volume_label_length: 0,
+                volume_label: [0; 32],
+            }),
+            ..AdapterConfig::default()
+        },
+    );
+    let second: Adapter<MockBackend> = Adapter::new(MockBackend::new());
+
+    assert_eq!(
+        first.config().volume.map(|volume| volume.total_size),
+        Some(1 << 20),
+        "cell first: its own volume size"
+    );
+    assert!(
+        second.config().volume.is_none(),
+        "cell second: a bare mount describes no volume — no borrowed answer"
+    );
+}

@@ -23,6 +23,9 @@ use crate::ops::{
 /// static invents an answer where `None` is the truth). They live here now because they belong to the mount.
 #[derive(Clone, Copy, Default)]
 pub struct AdapterConfig {
+    /// The volume answer (`GetVolumeInfo`). Configuration, not state: it is decided before the mount starts and does not
+    /// change while it runs — which is why it belongs to the mount rather than to the process.
+    pub volume: Option<crate::abi::VolumeInfo>,
     /// `path -> FileId`, for `Open`/`Create`/`GetSecurityByName`.
     pub resolve: Option<fn(&str) -> Option<u64>>,
     /// `FileId -> metadata`, for `GetFileInfo`.
