@@ -492,3 +492,15 @@ known to have (manager 436: `\WRITTEN.TXT`, `\D\a`), now measured on the rename 
 
 Where it belongs: at **resolution**, once — not in each shell. Both backends must fold the same way (the shared contract can assert it), and the
 frontend must not grow a second, different folding.
+
+## The fold cannot live in `split()` — it loses the display bytes
+
+Attempted step 1 (fold the **matching key** while keeping the **display bytes**), and hit the structural reason it is not a one-line change:
+
+`split()` is the single entry point every path goes through, so folding there is the cheapest place — **but `split()` returns the components, and
+folding them means the raw bytes are gone**. `mkdir`/`create_or_open` then store `Binding { id, display: name }` with `name` already folded, so the
+directory lists `a` where the caller wrote `A`. Measured: `raw_names` answered `[[97]]` for an entry created as `A`.
+
+So `split()` must return **`(folded, raw)`** per component, and only the last one is needed for display. That is the shape of the next attempt; the
+work was reverted rather than left half-applied, because a fold that silently rewrites names is exactly the "looks right, means something else"
+state this project keeps paying for.
