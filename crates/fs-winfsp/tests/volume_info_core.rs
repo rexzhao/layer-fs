@@ -105,14 +105,12 @@ fn a_null_buffer_is_refused_before_anything_else() {
 /// answers "no volume" instead of borrowing somebody else's configuration.
 #[test]
 fn the_shell_reads_the_volume_from_the_mount_it_was_given() {
-    use fs_winfsp::abi::VolumeInfo;
     use fs_winfsp::adapter::AdapterConfig;
     use fs_winfsp::callbacks::get_volume_info_shell;
     use fs_winfsp::mock::MockBackend;
     use fs_winfsp::ops::DynOps;
     use fs_winfsp::DynAdapter;
 
-    let capacity = u32::try_from(std::mem::size_of::<VolumeInfo>()).expect("fits");
     let configured: DynAdapter = DynAdapter::with_config(
         Box::new(MockBackend::new()) as DynOps,
         AdapterConfig {
@@ -124,13 +122,8 @@ fn the_shell_reads_the_volume_from_the_mount_it_was_given() {
 
     let read = |adapter: Option<&DynAdapter>| {
         let mut out = volume(0);
-        let status = unsafe {
-            get_volume_info_shell(
-                adapter,
-                std::ptr::addr_of_mut!(out).cast::<c_void>(),
-                capacity,
-            )
-        };
+        let status =
+            unsafe { get_volume_info_shell(adapter, std::ptr::addr_of_mut!(out).cast::<c_void>()) };
         (status, out.total_size)
     };
 

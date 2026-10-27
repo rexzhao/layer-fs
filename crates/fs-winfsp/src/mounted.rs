@@ -140,24 +140,21 @@ mod platform {
         mask & (1 << index) != 0
     }
 
-    /// `GetVolumeInfo`: `(FSP_FILE_SYSTEM*, PVOID VolumeInfo, ULONG Length)` — `winfsp.h:206`.
+    /// `GetVolumeInfo`: `(FSP_FILE_SYSTEM*, FSP_FSCTL_VOLUME_INFO *VolumeInfo)` — **two** arguments (`winfsp.h:206-207`).
+    ///
+    /// There is **no length argument**. The third parameter this trampoline used to declare was a phantom: the dispatcher calls
+    /// `GetVolumeInfo(FileSystem, &VolumeInfo)` with an 88-byte stack local, memsets it and copies all 88 bytes back
+    /// (`fsop.c:1245-1260`). Reading a third slot read **whatever was left on the stack** — which is where the "WinFsp asks with 8
+    /// bytes" reading came from, and why every answer built on that number answered a constraint nobody had set.
     unsafe extern "system" fn volume_info_trampoline(
         file_system: *mut c_void,
         volume_info: *mut c_void,
-        volume_info_length: u32,
     ) -> i32 {
         // The **mount this callback belongs to**, not the process's last configuration: the pointer WinFsp hands back is the key
         // it was registered under. `None` means the pointer is not a live mount; the shell refuses rather than inventing an answer.
         let adapter = crate::registry::mounts().get(file_system as usize);
-        // SAFETY: WinFsp passes a buffer of `volume_info_length` bytes, which is what the callee validates against its own
-        // structure size.
-        unsafe {
-            crate::callbacks::get_volume_info_shell(
-                adapter.as_deref(),
-                volume_info,
-                volume_info_length,
-            )
-        }
+        // SAFETY: WinFsp passes a buffer of `sizeof(FSP_FSCTL_VOLUME_INFO)` bytes; the shell writes exactly that much.
+        unsafe { crate::callbacks::get_volume_info_shell(adapter.as_deref(), volume_info) }
     }
 
     /// `GetFileInfo`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PVOID FileInfo)` — `winfsp.h:507`.
@@ -477,7 +474,7 @@ mod platform {
         // SAFETY: the slot type carries **no signature** (the SDK's slots differ in arity), so registering a callback is a
         // hand-asserted shape match. Each index comes from `abi::slot`, which cites the header line it was read from.
         unsafe {
-            let volume: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> i32 =
+            let volume: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32 =
                 volume_info_trampoline;
             let file: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 =
                 file_info_trampoline;
@@ -491,7 +488,7 @@ mod platform {
                 *mut u32,
             ) -> i32 = read_directory_trampoline;
             interface.slots[slot::GET_VOLUME_INFO] = Some(std::mem::transmute::<
-                unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> i32,
+                unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(volume));
             let opening: unsafe extern "system" fn(

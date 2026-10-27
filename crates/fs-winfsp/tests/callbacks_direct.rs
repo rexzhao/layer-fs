@@ -5,7 +5,6 @@
 //! its own test and its own adapter — the criterion is the same, but the tests no longer share state, so a failure names itself.
 
 use std::ffi::c_void;
-use std::mem::size_of;
 
 use fs_semantics::disposition::Disposition;
 use fs_winfsp::abi::{FileInfo, VolumeInfo};
@@ -181,7 +180,6 @@ fn the_volume_record_is_copied_verbatim() {
         get_volume_info_shell(
             Some(&adapter),
             (&mut out as *mut VolumeInfo).cast::<c_void>(),
-            size_of::<VolumeInfo>() as u32,
         )
     };
     assert_eq!(status, 0, "cell status: STATUS_SUCCESS");
@@ -189,26 +187,45 @@ fn the_volume_record_is_copied_verbatim() {
 }
 
 #[test]
-fn a_short_buffer_gets_the_prefix_that_fits() {
-    // The dispatcher really asks with eight bytes (measured on this machine), and refusing forever is what left the volume showing no
-    // size at all. The structure is leading-first, so a prefix is a true answer — and writing the whole 88 bytes into an 8-byte buffer
-    // would be an overrun, not an answer.
+fn the_volume_answer_is_the_whole_structure_because_there_is_no_length() {
+    // `GetVolumeInfo` takes **two** arguments (`winfsp.h:206-207`); the dispatcher hands over an 88-byte stack local it has just zeroed
+    // and copies all 88 bytes back (`fsop.c:1245-1260`). The old "short buffer" case tested a phantom: the length we were reading was
+    // stack residue, and every answer derived from it was answering a constraint that did not exist.
+    const SENTINEL: u8 = 0xAA;
     let adapter = adapter();
-    let mut small = [0u8; 8];
+    let mut raw = [SENTINEL; 96];
     let status =
-        unsafe { get_volume_info_shell(Some(&adapter), small.as_mut_ptr().cast::<c_void>(), 8) };
-    assert_eq!(status, 0, "cell short: answered, not refused");
+        unsafe { get_volume_info_shell(Some(&adapter), raw.as_mut_ptr().cast::<c_void>()) };
+    assert_eq!(status, 0, "cell whole: answered");
+    let written = VolumeInfo {
+        total_size: u64::from_ne_bytes(raw[..8].try_into().expect("eight bytes")),
+        free_size: u64::from_ne_bytes(raw[8..16].try_into().expect("eight bytes")),
+        volume_label_length: u16::from_ne_bytes(raw[16..18].try_into().expect("two bytes")),
+        volume_label: [0; 32],
+    };
     assert_eq!(
-        u64::from_ne_bytes(small),
-        VOLUME.total_size,
-        "cell short: the eight bytes that fit are `TotalSize` — the field the caller asked for"
+        (
+            written.total_size,
+            written.free_size,
+            written.volume_label_length
+        ),
+        (
+            VOLUME.total_size,
+            VOLUME.free_size,
+            VOLUME.volume_label_length
+        ),
+        "cell whole: all of it, not a prefix chosen by a number we made up"
+    );
+    assert_eq!(
+        raw[88], SENTINEL,
+        "cell whole: and exactly 88 bytes — the byte after the structure is untouched"
     );
 }
 
 #[test]
 fn a_null_buffer_is_refused_for_the_volume() {
     let adapter = adapter();
-    let status = unsafe { get_volume_info_shell(Some(&adapter), std::ptr::null_mut(), 88) };
+    let status = unsafe { get_volume_info_shell(Some(&adapter), std::ptr::null_mut()) };
     assert_eq!(status, OURS_INVALID_PARAMETER, "cell null out: refused");
 }
 
@@ -278,7 +295,6 @@ fn null_pointers_are_refused_before_anything_is_dereferenced() {
             get_volume_info_shell(
                 None,
                 (&mut VolumeInfo::default() as *mut VolumeInfo).cast::<c_void>(),
-                size_of::<VolumeInfo>() as u32,
             )
         },
         NOT_IMPLEMENTED,

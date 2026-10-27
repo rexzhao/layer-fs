@@ -172,15 +172,12 @@ pub unsafe fn read_directory_from(
 /// # Safety
 ///
 /// `out` must be valid for writes of `capacity` bytes for the duration of the call.
-pub unsafe fn get_volume_info_shell(
-    adapter: Option<&crate::DynAdapter>,
-    out: *mut c_void,
-    capacity: u32,
-) -> i32 {
+pub unsafe fn get_volume_info_shell(adapter: Option<&crate::DynAdapter>, out: *mut c_void) -> i32 {
     VOLUME_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let volume = adapter.and_then(|adapter| adapter.config().volume);
-    // SAFETY: the caller's contract covers `out`.
-    unsafe { get_volume_info_for(volume, out, capacity) }
+    // SAFETY: the caller's contract covers `out`; the size is the structure's own, because the dispatcher always passes an
+    // 88-byte local (`fsop.c:1245-1260`).
+    unsafe { get_volume_info_for(volume, out, std::mem::size_of::<VolumeInfo>() as u32) }
 }
 
 /// The `GetVolumeInfo` body with the volume handed in: **the logic lives here, the process-wide lookup lives above** (361).
