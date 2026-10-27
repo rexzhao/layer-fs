@@ -39,5 +39,8 @@ pub use ops::{
 /// They are `include!`d rather than copied: one definition, two instantiations (mock here, real backend in `fs-api`). A
 /// copy would let the two drift, and the drift would look like "the backend has its own contract".
 pub mod registry;
+
+/// A mount held by the registry: backend-erased, so the callbacks can serve any mount.
+pub type DynAdapter = adapter::Adapter<ops::DynOps>;
 pub mod scenarios;
 pub mod volume;

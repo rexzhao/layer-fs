@@ -282,3 +282,69 @@ pub trait WorkspaceOps {
     /// [`OpsError::Other`] when the backend reports a failure that has no dedicated variant.
     fn flush(&self) -> OpsResult<()>;
 }
+
+/// A boxed backend is a backend: the mount entry point does not know which concrete type it was given, and saying so once here
+/// is what lets the registry hold `dyn WorkspaceOps` without the adapter layer ever naming a backend.
+///
+/// The forwarding is deliberate and mechanical — eleven `(**self)` calls, no logic. `Deref` would have been shorter but would
+/// also make a boxed backend *auto-deref* into other traits; an explicit impl keeps "this is a backend" a statement rather than
+/// a side effect.
+impl WorkspaceOps for Box<dyn WorkspaceOps> {
+    fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
+        (**self).create_or_open(path, disposition)
+    }
+
+    fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
+        (**self).mkdir(path)
+    }
+
+    fn read(&self, file_id: u64, offset: u64, len: usize) -> OpsResult<Vec<u8>> {
+        (**self).read(file_id, offset, len)
+    }
+
+    fn write(&self, file_id: u64, offset: u64, bytes: &[u8]) -> OpsResult<usize> {
+        (**self).write(file_id, offset, bytes)
+    }
+
+    fn set_size(&self, file_id: u64, len: u64) -> OpsResult<()> {
+        (**self).set_size(file_id, len)
+    }
+
+    fn read_dir(&self, dir_id: u64) -> OpsResult<Vec<DirEntry>> {
+        (**self).read_dir(dir_id)
+    }
+
+    fn get_info(&self, file_id: u64) -> OpsResult<NodeInfo> {
+        (**self).get_info(file_id)
+    }
+
+    fn set_times(
+        &self,
+        file_id: u64,
+        accessed: Option<i64>,
+        written: Option<i64>,
+        changed: Option<i64>,
+        created: Option<i64>,
+    ) -> OpsResult<()> {
+        (**self).set_times(file_id, accessed, written, changed, created)
+    }
+
+    fn set_attributes(&self, file_id: u64, attributes: Attributes) -> OpsResult<()> {
+        (**self).set_attributes(file_id, attributes)
+    }
+
+    fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome> {
+        (**self).rename(from, to, replace)
+    }
+
+    fn remove_at(&self, parent: u64, name: &[u8], expected_id: u64) -> OpsResult<()> {
+        (**self).remove_at(parent, name, expected_id)
+    }
+
+    fn flush(&self) -> OpsResult<()> {
+        (**self).flush()
+    }
+}
+
+/// The backend type a mount entry point hands over: the registry (and therefore the callbacks) never names a concrete one.
+pub type DynOps = Box<dyn WorkspaceOps>;
