@@ -118,6 +118,9 @@ pub mod slot {
     /// `SetVolumeLabel` — `winfsp.h:221` (not implemented: labels are read-only here).
     pub const SET_VOLUME_LABEL: usize = 1;
     /// `GetSecurityByName` — `winfsp.h:252`.
+    ///
+    /// **2**, not 1: slot 1 is `SetVolumeLabel` (`:221`). The neighbouring labels are easy to confuse, which is why the index
+    /// was extracted from the header rather than counted by hand.
     pub const GET_SECURITY_BY_NAME: usize = 2;
     /// `Create` — `winfsp.h:291`.
     pub const CREATE: usize = 3;

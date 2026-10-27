@@ -272,3 +272,74 @@ pub unsafe fn close(context: *mut c_void) {
 const OURS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 /// `STATUS_INVALID_PARAMETER`.
 const OURS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+
+/// How many times `GetSecurityByName` was called — the counter that makes "we were never asked" visible.
+static SECURITY_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times the security query has been answered.
+#[must_use]
+pub fn security_call_count() -> usize {
+    SECURITY_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The `GetSecurityByName` body: attributes plus an **empty** descriptor.
+///
+/// Windows asks this **before** it opens anything, including the volume root — which is why this callback, not `Open`, is the
+/// first place a listing can die. An empty descriptor (`*size = 0`) means "no explicit security"; the volume inherits, which is
+/// what a workspace-backed file system wants.
+///
+/// # Safety
+///
+/// `file_name` must be NUL-terminated; `attributes_out` and `descriptor_size_out` may be null (WinFsp allows both to be);
+/// when `descriptor_out` is not null, `*descriptor_size_out` must be its capacity on entry.
+pub unsafe fn get_security_by_name(
+    file_name: *const u16,
+    attributes_out: *mut u32,
+    descriptor_out: *mut c_void,
+    descriptor_size_out: *mut usize,
+) -> i32 {
+    SECURITY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if file_name.is_null() {
+        return OURS_INVALID_PARAMETER;
+    }
+    // SAFETY: `file_name` is NUL-terminated per WinFsp's contract.
+    let units = unsafe { crate::boundary::utf16_len(file_name) };
+    // SAFETY: same pointer, bounded by the terminator.
+    let slice = unsafe { std::slice::from_raw_parts(file_name, units) };
+    let path = String::from_utf16_lossy(slice);
+    let Some(resolve) = RESOLVE.get() else {
+        return NOT_IMPLEMENTED;
+    };
+    let Some(file_id) = resolve(&path) else {
+        return OURS_OBJECT_NAME_NOT_FOUND;
+    };
+    let Some(node) = LOOKUP.get().and_then(|lookup| lookup(file_id)) else {
+        return OURS_OBJECT_NAME_NOT_FOUND;
+    };
+
+    if !attributes_out.is_null() {
+        // SAFETY: the caller says this is writable (it asked us to fill it).
+        unsafe { std::ptr::write(attributes_out, node.attributes.0) };
+    }
+    if !descriptor_size_out.is_null() {
+        let capacity = unsafe { std::ptr::read(descriptor_size_out) };
+        if !descriptor_out.is_null() && capacity >= 4 {
+            // A minimal self-relative descriptor: revision 1, control 0, no owner/group/sacl/dacl. Four bytes is the documented
+            // minimum, and "no explicit security" is exactly what an empty one means.
+            // SAFETY: `descriptor_out` is non-null and at least 4 bytes per the capacity check.
+            unsafe {
+                let bytes = descriptor_out.cast::<u8>();
+                std::ptr::write(bytes, 1);
+                std::ptr::write(bytes.add(1), 0);
+                std::ptr::write(bytes.add(2), 0);
+                std::ptr::write(bytes.add(3), 0);
+            }
+            // SAFETY: writable out-parameter.
+            unsafe { std::ptr::write(descriptor_size_out, 4) };
+        } else {
+            // SAFETY: writable out-parameter.
+            unsafe { std::ptr::write(descriptor_size_out, 4) };
+        }
+    }
+    0
+}

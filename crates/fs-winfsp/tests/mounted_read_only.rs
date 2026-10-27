@@ -112,7 +112,15 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
     let mut probe_result: Option<Result<(), String>> = None;
     let before_contexts = callbacks::context_counts();
     let report = mount_read_only(&library, &mount_point, |path| {
-        let outcome = std::fs::read_dir(path)
+        // `Y:` alone means "the current directory on Y:", which a file system without directory state cannot answer; `Y:\`
+        // is the volume root. This distinction is exactly the kind of thing that fails as ERROR_INVALID_FUNCTION rather than as
+        // "not found".
+        let root = if path.to_string_lossy().ends_with(':') {
+            PathBuf::from(format!("{}\\", path.display()))
+        } else {
+            path.to_path_buf()
+        };
+        let outcome = std::fs::read_dir(&root)
             .map(|mut entries| {
                 // Reading one entry is enough to prove the OS served the directory from us; the callback table has no
                 // ReadDirectory yet, so a `None` here is expected and recorded as such.
@@ -125,6 +133,10 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
     .expect("the mount path is available");
 
     let after_contexts = callbacks::context_counts();
+    eprintln!(
+        "security queries answered: {}",
+        callbacks::security_call_count()
+    );
     eprintln!(
         "file contexts: allocated={} freed={} (before: {before_contexts:?})",
         after_contexts.0, after_contexts.1

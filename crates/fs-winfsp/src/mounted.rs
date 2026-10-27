@@ -161,6 +161,26 @@ mod platform {
         unsafe { crate::callbacks::close(file_context) }
     }
 
+    /// `GetSecurityByName`: `(FSP_FILE_SYSTEM*, PWSTR FileName, PUINT32 Attributes, PSECURITY_DESCRIPTOR,
+    /// SIZE_T *Size)` — `winfsp.h:252`.
+    unsafe extern "system" fn security_by_name_trampoline(
+        _file_system: *mut c_void,
+        file_name: *const u16,
+        attributes_out: *mut u32,
+        descriptor_out: *mut c_void,
+        descriptor_size_out: *mut usize,
+    ) -> i32 {
+        // SAFETY: WinFsp's contract for this callback.
+        unsafe {
+            crate::callbacks::get_security_by_name(
+                file_name,
+                attributes_out,
+                descriptor_out,
+                descriptor_size_out,
+            )
+        }
+    }
+
     fn interface_with_callbacks() -> FileSystemInterface {
         let mut interface = FileSystemInterface::empty();
         // SAFETY: the slot type carries **no signature** (the SDK's slots differ in arity), so registering a callback is a
@@ -192,6 +212,23 @@ mod platform {
                 *mut crate::abi::FileInfo,
             ) -> i32 = open_trampoline;
             let closing: unsafe extern "system" fn(*mut c_void, *mut c_void) = close_trampoline;
+            let security: unsafe extern "system" fn(
+                *mut c_void,
+                *const u16,
+                *mut u32,
+                *mut c_void,
+                *mut usize,
+            ) -> i32 = security_by_name_trampoline;
+            interface.slots[slot::GET_SECURITY_BY_NAME] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const u16,
+                    *mut u32,
+                    *mut c_void,
+                    *mut usize,
+                ) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(security));
             interface.slots[slot::OPEN] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(
                     *mut c_void,
