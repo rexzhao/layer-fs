@@ -366,3 +366,21 @@ So the "file replaced the directory" accident is gone (the directory survives an
 
 Next step is the recorder backend again, this time printing every call **with its raw bytes**, for exactly the two operations `mkdir("d")` and
 `write("d/a")`, to see whether the nested path arrives as `\d\a` (and whether anything translates the backslashes).
+
+## Recorder vs real backend: two different sequences (so the recorder is the wrong instrument here)
+
+With a **recorder** backend (every call returns an error) the sequence for `create_dir("d")` + `write("d/a")` is:
+
+```
+CALL create_or_open "\"     Open
+CALL create_or_open "\d"    Open
+CALL create_or_open "\d\a"  Open
+CALL create_or_open "\d\a"  Open
+CALL create_or_open "\d"    Open
+```
+
+No `mkdir` at all — but the earlier run **with the real backend** did show the directory create (`raw=0x02200021`, disposition `Create`). So the recorder
+changes what the FSD sends (its blanket failures short-circuit the create path), and it cannot be used to study the nested-name question.
+
+The instrument for the remaining question has to be the **real backend plus a trace inside `SlashBackend`** (print the path it receives and the path it
+forwards), because that is where a nested name could be translated differently from a single-component one.
