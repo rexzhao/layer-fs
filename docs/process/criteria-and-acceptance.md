@@ -569,3 +569,786 @@
 177. 【提交时可分性 = 未来可错性】“fmt 与记录同提交”的自检要具体到 diff：inode_fmt 的行与 inode_v3 接线同批——
      防下一个人 cherry-pick 一半。
 
+
+## 十七、后续积累（P3-3b 收口至 P3-4 挂载期，第 178 条起）
+
+（178–355 由 manager pending-docs 归档；P3-4 期间的 FFI/探针/挂载方法论集中于此）
+
+178. 【改代码的脚本也要自证】机械补字段的脚本把 impl 块也当字面量插了字段（编译立刻红救了它）；
+     修法：匹配加前提（必须有 content 字段、前缀不能是 struct/impl/->）。
+     规则：**这类脚本必须带“我到底改到了什么”的断言**（改了多少处、都在哪些文件），否则它会安静地改错位置。
+     与扫描器三件同族：读代码的扫描器与改代码的脚本，都需要自证。
+179. 【该不变的数不变，同样有信息量】1a 步（InodeRecord 扩字段、v2 编码忽略新字段）全量 512 不变——
+     这是“零格式变化”的计数证据，与“测试用例数变了就是信号”方向相反、价值相同。
+180. 【用设计消灭错误类，而不是用测试抓】“不用两个 struct”——两个 struct 会引入“只为了忘掉 v2 存不下的字段”
+     的转换函数，那个函数正是半 v3 格式的滋生地；同类：“去掉 Copy”（按值复制会邀请 64 KiB SD 的拷贝成本）。
+
+181. 【基线四数反验 = “SHA + 编码器没动”的机械化】“格式零变化”的验证从提交说明（人写的，可能错——声称与代码不符已 5 次）
+     改为四个基线数字可对（pages 1472 / avg 69.06 / largest 16110 / 护栏 2.3%）——从产物算出，错了对不上。
+     四数本来就是基线表现成的，反验成本≈零。若偏了：先怀疑 fixture 构造（顺序/随机性差异会让页数先漂），再怀疑编码器。
+
+182. 【变长记录解码：take(used) 而非 take(remaining)】v3 记录先解析才知道长度（security_len 决定）；
+     take(remaining) 在单记录页完全正确、多记录页吞掉第一条之后的全部——bug 只在“多条”时显形。
+     ⇒ 用例至少 2 条记录（单条断言全绿）；配套 Reader::rest()（窥视不消费）+ 文档写明陷阱。
+183. 【设计级消灭：“两处同形”】记录字节的选择与页 fmt 的选择用同一个判据（profile.inode_fmt）——
+     “页说一种格式、记录是另一种”这个错误状态在代码结构上不可表达，不是被测试抓。
+     与“不用两个 struct”（180）同族：用设计消灭错误类，优于用测试抓。
+
+184. 【第 0 条自证的现场证据】Memory::get 返回裸页字节而 reader 期望带信封对象 ⇒ 四行拒绝用例全部通过——
+     通过理由是 Malformed: wrong magic，与判据毫无关系。第 0 条（同一夹具先读出健康 v2/v3）立刻红。
+     ⇒ 没有第 0 条，拒绝矩阵是一排假绿：四行“通过”看起来是判据在工作，实际是夹具坏在判据之前。
+185. 【“值”与“缺失”分开钉】v3 断言 accessed_ns == 3（值）；v2 断言 == 0（缺失）——两种含义分别钉住，
+     防止“v2 也有这个字段、只是为 0”的误读。写入侧注释（1a）与读取侧断言（1c）闭环。
+186. 【discriminant 断言：两个变体必须不同】用 std::mem::discriminant 断言 Malformed ≠ UnsupportedFormat——
+     把“两个变体必须不同”本身变成断言；一条 is_err() 会让“对损坏报 unsupported”的实现全绿。
+
+187. 【零写入检查用哈希不用长度】拒绝前后对比 store 内每文件的 BLAKE3（不是文件长度）——
+     长度相同内容不同正是“拒绝时顺手写了点东西”的形态。零写入 = 零字节变化。
+188. 【靠结构不靠纪律】基线探针读 Profile::CURRENT 而非硬编码 v2 ⇒ v3 切换那批若忘了更新数字，
+     探针拿 v2 数字判 v3 产物立刻红。与“两处同形”（183）同族：忘掉就红，优于“记得就改”。
+     配套：读 CURRENT 的理由写在文档头，防后人“好心”改回硬编码。
+189. 【第 0 条自证推到判据所在的层】v2 夹具自证不只断言 root 读得动，还断言 inode(1) 真有记录——
+     “root 解析成功、inode 表坏掉也会通过”。自证的深度要达到判据的深度。
+
+190. 【存储的克制与报告的完整是同一设计的两面】盘上不落派生位（DIRECTORY/NORMAL，落盘 ⇒ Malformed——防属性与
+     kind 打架）；但 Stat.attributes 作为**给前端的报告值**必须**合成**派生位（目录必返 0x10；无其它位的文件返回 0x80 NORMAL；
+     READONLY 文件不含 NORMAL）。报 0 会让 Windows 层把目录显示成“无属性的目录”。
+     set_attributes 的输入是**存储值**（Windows 语义不接受 DIRECTORY/NORMAL）；往返断言 = stat 返回 派生(存储值)。
+
+191. 【“读”的一半与“写”的一半】attributes 报派生值裁定了读侧四条用例；QA 指出写侧开着：
+     set_attributes(DIRECTORY/NORMAL) 的行为卡里没定。裁决：**拒绝**（存储值域只有四个可写位；静默忽略 = “接受了但没生效”
+     更易造成下游误判；Windows SetFileAttributes 同样不接受 DIRECTORY）。错误类型用现有 InvalidParameter 类变体，不新造。
+192. 【两向量分开断言】“读对象数不随 SD 变化”中 stat 的读数必须不变，但 encode 的对象图**应该**变（SD 属于记录）——
+     分两条断言，否则两边互相“顺带满足”。
+
+193. 【“不新造变体”的准确边界】新变体要么**有既有词汇表可挂靠**（NamespaceError::InvalidParameter 挂靠
+     Failure::InvalidParameter → STATUS_INVALID_PARAMETER 的既有映射），要么**有可预见的第二处消费者**
+     （set_times 的参数校验同词汇）；两者皆无才不许造。“不新造”防的是孤儿变体，不是词汇表的自然生长。
+     决定性理由（worker 给的）：规则只在 mock 层 ⇒ P3-3b 真后端直接调核心会绕过它。
+194. 【InvalidRecord 与 InvalidParameter 的分工】前者 = “盘上的数据本 build 解释不了”（数据损坏）；
+     后者 = “调用方给了不在值域里的值”（参数非法）。混用会让两类错误在日志里无法区分。
+
+195. 【零依赖 crate 的职责（第二次验证）】fs-semantics 装“跨层共享的规则”（disposition 表、attributes 的
+     validate/report），不装“某一层的实现”。判据：若一条规则要被核心、前端 mock、真后端三方使用，
+     它必须落在零依赖 crate——否则依赖方向（fs-winfsp 不能拖 bundled SQLite）会逼出“规则写两份”，
+     而“两份”意味着规则在其中一处失效。第一次验证是 disposition 表（QA 用 cargo tree 抓的）；
+     第二次是 attributes（编译失败当场暴露）。
+196. 【不造半边入口】校验存在、写入没接的入口（set_attributes 有 validate 但 overlay v2 没有三列）
+     会诱导调用方绕过它直接改存储——入口存在但接错方向的规则比没有更糟。等写入列同批做。
+
+197. 【T1 全列清单的第二次救场】新增四列（accessed_ns/changed_ns/attributes/security）时 T1 立刻要求登记
+     “是不是 GC 根”——若 security 存的是 oid 而非内联字节，一个隐藏根会静默漏扫，未来的 GC 会把还被引用的对象收走。
+     四列均登记 NotARoot（时间戳/属性位/内联字节都不是对象引用）。第一次救场是 ov_meta.pending_root。
+198. 【“元数据不进内容寻址”的两端】SD 不进 Stat（报告路径不付 64 KiB 拷贝）+ SD 不进 CAS（security 内联 BLOB、
+     不是 GC 根、不必付对象解码）——同一条设计的两端。
+
+199. 【防御深度：盘前校验】值域校验放在最接近盘的那一层（fs-overlay 写入前调
+     fs_semantics::attributes::validate）——规则层校验挡住正常调用者，盘前校验挡住绕过 Rules 的调用者
+     （未来 CLI、导入工具）。两层挡同一规则不是冗余：是同一个函数（fs-semantics::validate）被多个入口调用，
+     不是多份实现。“派生位不落盘”必须在最接近盘的层也成立。
+     （fs-overlay 加依赖 fs-semantics 不违反零依赖原则：fs-semantics 本就是零依赖、被依赖是它的用途；方向与 fs-namespace 同向。）
+
+200. 【没写完就不出现】“不在提交里放注释掉的尸体，也不在消息里假装它存在”——消息声称、代码缺失（四次教训）的
+     完整反面不是“下次把代码带上”，而是未完成的部分完全不出现：不留死代码诱导误读，不留半句声明制造虚假完整感。
+     编译器否掉猜的函数名只花几秒；按纪律停手比继续猜难得多。
+
+201. 【零提交 > 编译绿但判据够不着的代码】提交一段没有任何调用者的函数 ⇒ 编译通过、clippy 干净、
+     但没有任何东西能证明它对。这比“消息声称、代码缺失”更隐蔽：代码是真的、检查是绿的，唯独判据够不着。
+     死代码会诱导下一个人“既然存在就调一下”，而它从未被证明对。
+202. 【操作只能改它声称要改的】materialise 对照用例：改属性后 size 与 created/modified **保持 base 的值**
+     ——证明 insert 没顺手改写别的字段。这是“拒绝不留副作用”的正面版。
+
+203. 【时钟注入的选型】(a) gc-test-hooks 风格的 feature + 线程局部时钟（与 crash-points/sync-probe 同族，生产零成本）。
+     决定性理由：判据要“把时钟拨到已知值”而不是“前进”⇒ 必须有 set/读取两动作。
+     排除 (b)：把测试概念塞进生产配置结构（OverlayOptions.clock）= 判据渗透进产品面；
+     排除 (c)：只有“前进”没有“设定”，语义不够。
+     feature 名沿用 gc-test-hooks（不新起名——两个缝就是两道门）。
+204. 【manager 的等待链错觉】三方都在线且无阻塞，“所有人停了”其实是 manager 自己的 review 停顿造成的观感。
+     ⇒ manager 收到提交后 review 信要在下一封邮件前发出（哪怕只是“收到，稍后回”），否则整条链观感停摆。
+
+205. 【标题/摘要/清单都是索引，不是内容】按标题判“通过信”漏掉了 3 条实际要求。
+     ⇒ 标题只用来排序；判断“要不要动”必须读正文。与“清单里没有行号的条目不给已验”（91）同族。
+206. 【failure_for：病因级修复】NamespaceError → Failure 的映射此前不存在（只有 Failure → NtStatus）——
+     P3-3b 会被迫自写一份；且 InvalidRecord 映到 Internal 而非 LeafMissing（“盘上数据解释不了” ≠ “文件不存在”）。
+     mock 侧的折叠是症状，缺 failure_for 是病因——补上后病灶消失。
+
+207. 【传输层可触发性】ADR 定义一个外部可见语义时，必须同时写“传输层如何触发它”——
+     写不出来的语义是纸面语义。SUPERSEDE=新 FileId 在 WinFsp 的 fsop.c 里走 FileOverwriteIf 同一路径、
+     同一 FileContext，用户态拿不到新建 inode 的时机 ⇒ 该语义经真实挂载无法表达。
+     （本该在 ADR-009 写 §4.2 时发现——“以实测为准”写了，“能否触发”没查。）
+
+208. 【删 worktree 前先 grep 未跟踪文件】清理事故：qa-main3 的 zz_doc_refs.rs（B-13 的测试草稿）随 worktree 删除丢失。
+     规则：删 worktree 前 git status --porcelain 的 ?? 行先拷再删——未跟踪文件没有任何 ref，删了就是没了。
+     （B-13 开工时从报告重建：判定表与三条规则在邮件与流程记录里完整。）
+
+209. 【CURRENT 切换后基线四数“应该变”】v3 的 24 B 在 Blob 内容下被忽略（CURRENT 仍 V2）⇒ 页数不变是当前的特征；
+     一旦 CURRENT = V3，inode 记录进页布局，1472 → ~1533 是**预期中的红**——不变才是问题（= 切换没生效）。
+     验收 CURRENT 切换批时：四数变化是正确信号；探针同批更新数字。
+
+210. 【裁决“保留”时必须问“保留的是什么”】行保留 / 内容保留 / 可达性保留是三件不同的事。
+     B-8 裁“旧 inode 行保留”时被无意识地假设了“Blob 数据也保留”——但行与 Blob 是两份存储。
+     “行可以保留而数据被删”是完全可能的（SUPERSEDE 的真实形态）。
+211. 【存储层证据比源码证据更硬】QA 的 (ii)：Blob 整对象替换后旧字节无指针可达 ⇒ “旧句柄读旧内容”
+     在当前格式不可表达——**与传输层无关**。即使 NTFS 实测显示 FileIndex 变化，我们也做不出旧语义。
+     两条独立证据（传输层不给时机 + 存储层表达不了）⇒ (a) 不依赖任何外部证据。
+
+212. 【owner 总原则（2026-10-26，SUPERSEDE 裁决附带）】“只要保证用起来和普通文件系统真实行为一致即可，
+     **包括以前和以后的开发内容**。”
+     ⇒ “与真实行为一致”是后续所有语义裁决的最高准则：手册说 X 但实测是 Y 的分歧，以实测为准
+     （ADR-009 §4.2 的“以实测为准”升为全局）；G1 修订卡 / P3-3b / P3-4 / NTFS 对照 12 类都从它出。
+213. 【SUPERSEDE 裁决定案：(a)】同 FileId + 截断 + 属性替换。三重证据（传输层不给时机 / (b) 自相矛盾——
+     FileNode 缓存让旧句柄的 FileId 也变新 / 存储层表达不了）。ReplaceFileAttributes=TRUE 是 SUPERSEDE 的
+     唯一传输层判别信号（可断言：SUPERSEDE 必达 TRUE、OVERWRITE 必为 FALSE）。
+
+214. 【归因错了处置就全错（两个方向都趟过了）】B-15 那次把格式代价误读成实现缺陷（差点假修：24 KiB 判据其实
+     低于格式下限）；CURRENT=V3 这次把实现缺陷误读成格式代价（差点假接受：456 ms 其实是每记录一次 Vec 分配）。
+     ⇒ 报告数字前先问“这个代价属于格式还是实现”——修实现再重测，归因才能立住。
+215. 【回退保绿优于交付红分支】23 个红里有两类判断（读路径认哪些 profile / 夹具刻意用 v2 验历史），
+     混在一次提交改会让“v2 夹具回归”不再是证据（改了它要验的东西）。分开改，每处都能回答“这是设计还是夹具”。
+
+216. 【“调参到刚好过”会让数字失去意义】v3 编码 225 ms vs 红界 224 ms：231 ms 的实现浪费已修（encode_into），
+     剩下的 1 ms 是“每条记录多写 24 B”的真实代价。为过线继续“优化”= 指标成为目标的最纯粹形态。
+     处置：保留红、报数字与原因、转 owner（选项：接受并调红界至 ×1.25 / release 重测——判据 4 本就标“同 build 同机”）。
+217. 【执行序：先怀疑自己的实现，再怀疑格式】214 的两例镜像完成：B-15（查实现 → 确认无缺陷 → 接受格式代价）
+     与 CURRENT=V3（查实现 → 发现 10 万次分配 → 修掉 231 ms → 剩余为真代价）。
+
+218. 【“重跑就绿”的合规版本】crash.rs 3 例 IOERR → 单跑 11/11 绿 → 次轮全量也绿 ⇒ 并发环境抖动。
+     不是“绿了就算”，而是单跑对照证明了环境因素才算。CI 遇 crash.rs 报 IOERR 先单跑再定性。
+219. 【期望值随 CURRENT 翻转的断言】encode 侧的“对象图应变”在 CURRENT=V2 下的正确期望是“不变”（SD 不进 v2 页）；
+     切 V3 后才应变。与 baseline_reverse 四数同一机制、同一翻转时刻——此类断言必须与探针在切换提交里一起翻，
+     谁都不许单独留旧期望。
+
+220. 【版本翻转断言的同批核对（QA 落成验收判据）】期望值随 CURRENT 翻转的断言（探针四数 / encode 侧 / Stat-SD-fmt 的
+     版本依赖期望），切换提交必须**同批全部翻转**；验收判据：git show --stat 核三处，**缺任何一个 = 切换提交不收**。
+     把“谁都不许单独留旧期望”从纪律变成机械核对。
+
+221. 【“改测试让它过 = 悄悄定成 (c)”（产品级版本）】CURRENT=V3 切换后 24 个测试红，根因是升级语义未定
+     （v3 build 遇 v2 workspace：拒绝/只读/迁移）。改夹具让它过 = 替 owner 做了产品决定。
+     ⇒ 测试红是“语义未定”的忠实反映；洗红等于洗决定。在裁决前不提交切换批。
+222. 【v2→v3 升级语义（待 owner 裁）】(a) 拒绝（现状连带：所有旧 workspace 打不开）/
+     (b) 只读打开（worker 与 manager 倾向：能读不丢数据、不写不错配，与“真实行为一致”及 policy 初衷都合）/
+     (c) 自动迁移 policy（危险：静默改语义，正是 policy 机制要防的）。
+     依据：main_db.rs:132 钉 Profile::CURRENT.id() 进 policy、:179-185 每次打开比对。
+
+223. 【worker 交接清单（865ebcc，544/0/9）】等 policy 裁决的切换批四件：
+     ① CURRENT=V3；② 两探针同翻（sd_v2_shape→应变、baseline_reverse→1533/16116/3）；③ 24 红按裁决分类处置；
+     ④ debug（保留红 225>224）与 release（v2=68ms，只作记录）两套耗时。
+     两个交接提醒：g3_budget 与 baseline_reverse 切换时自己先红是设计意图；3722c33 的 base_root 断言不随切换翻。
+
+224. 【“待补清单” ≠ “分支上的全部提交”】验收按后者——manager 给 QA 列“三处待补”时漏了中间 4 个提交
+     （性能修复与两个 encode 侧）。“我关心的”与“存在的”是两个口径，验收必须按存在的。
+225. 【靠巧合成立的正确】open_any 原列表 [CURRENT, V1] 只在“CURRENT 恰好是最新可读格式”时碰巧对——
+     它一直绿着，直到切换日才破。与“看起来是它其实不是它”同族但更隐蔽。
+     规则：读历史的入口永远列**全部可读格式**，不列 CURRENT。
+
+226. 【未提交观察有保质期；转发前按当前 ref 重核】QA 在旧时点报的 "?? sd_two_way.rs" 在 52ee70d 后已 tracked，
+     但观察行残留在报告里；manager 转发时未复核，差点让 worker 删掉刚验收的证据——worker 用四条可复跑证据
+     （ls-files/log/status/test）挡住了错误指令。
+     规则：① 转发他人的未提交观察前，先在自己这边按当前 ref 核一次；② 接到指令先按证据复核——
+     错误的指令应该被证据挡住，而不是被执行。
+
+227. 【“结论有保质期，命令没有”（worker 的实操建议）】转发未提交/工作树类观察时贴复核命令
+     （git ls-files <path> / git log -1 -- <path> / git status --porcelain -- <path>）而不是结论——
+     接收方可逐条复跑。
+     真残留 vs 旧快照的区分，一行判断：git ls-files 有它就不是残留（已被提交纳入）。
+228. 【“不道歉”的立场】指令被证据挡住而不是被执行——流程起作用的证明，比零失误更值得记录。
+     worker 拒绝执行错误指令 + 四条可复跑证据，是这套体系的预期形态。
+
+229. 【“第二个传播者”（QA 自认）】报告里的任何 git 状态断言，必须在**报告发出前重跑一次** git status 取当轮值——
+     状态断言也是观察，也有保质期。事故链：旧观察（8ca05fd 真值）→ QA 报告未重取 → manager 转发未复核
+     → 差点删掉已验收证据 → worker 四条证据挡住。两个传播点各断一半、执行端守住——
+     “删之前要证据”在两端都要立：提删方给当轮证据，执行方核证据。
+
+230. 【升级语义裁决定案：(a) 拒绝】owner 2026-10-26：未上线、不需要兼容。
+     v3 build 遇 v2 workspace ⇒ SchemaMismatch（现状连带效果，无需新代码）。
+     24 红的处置：v2 建库夹具重建为 v3（这是 (a) 的正确处置，不是"改测试让它过"——语义由 owner 定死）；
+     v2 夹具回归（open_any 路径）必须仍绿——若红是 bug。
+
+231. 【裁决命名带域】两个 (a) 撞名：裁决-S（SUPERSEDE 同 FileId）与裁决-P（policy 拒绝 v2 库）——
+     引用必须带域。编号撞名的第 N 例（§10、M1、B-1 之后）。
+232. 【夹具重建 vs 期望松动的机械边界】切换批验收第 1 条：git show 看断言改动落在哪个文件——
+     断言文本变了的红不算处置、算改测试，除非属于 220 同批翻转的那两处（探针）。
+     “合法处置”与“洗红”的边界用文件位置定，不用意图定。
+
+233. 【事故未外溢时报告它，比事故外溢后解释它便宜】解冲突脚本把冲突标记提交进本地（未推送）→ architect
+     主动报告含“中途一次失败”→ reset 重做。事故链：发生 → 发现 → 修复 → 声明外溢范围（“没有推送过”）。
+     主动报未外溢的事故 = 下一个人不用从远处发现它。
+
+234. 【按角色选页格式的检查点要 grep 枚举】references_of 的 InodeTable 分支用 fmt 而非 inode_fmt（第三处同型错误；
+     前两处 inode()/decode_inode 已修）⇒ GC mark 在 v3 store 上走不动，22 条测试同红。
+     规则：grep -rn 'profile.fmt' 逐处问“这一处是哪种页”；修过一处不等于修完。
+     若当夹具问题改 22 个测试 = 灾难性洗红（留下坏掉的 GC）。
+235. 【跨线不稳定比通过诚实】同批两个 debug 读数 225/180，红界 224，波动 25% 足以横跳 ⇒ 不把 180 当通过，
+     报“180–225 ms（跨 224 红界，波动约 25%）”。重跑就绿不是解释的正向版：数字不稳定就说不稳定。
+236. 【sd_v2_shape 泛化】断言 CURRENT.inode_fmt == 2 而非硬编码 V3——跟 CURRENT 走，v4 出现时不用再改。
+
+237. 【234 的闭环：穷举代替感觉】worker 对 grep -rn 'profile.fmt|profile.inode_fmt' 的 20 处逐一列出
+     "哪一页、该用哪个、为什么对"——inode 页三处全用 inode_fmt（含本次修的 references_of），
+     其余 17 处都是非 inode 页。"没有第四处"是穷举的证据，不是感觉修完了。
+     （可机械化方向：fmt 选择只经 pager::page_fmt 单点，散落直读不可达——记 P3-3b 顺手项。）
+
+238. 【防错结构两个方向要对称】写侧有 pager::page_fmt 单点、读侧 20 处各自判断 profile.fmt——
+     不对称的一侧正是本轮出问题的地方（references_of 是第三处、且在读侧）。
+     完整形态：读侧 page_format(profile, role)（Role::InodeTable ⇒ inode_fmt，其余 ⇒ fmt），
+     与写侧对称；role 是 fetch 已有参数，成本是搬移不是发明。
+     落点：P3-3b 顺手项（真后端正好再读一遍这些页）；不挂 G1 修订卡（与页格式无关会被遗忘）。
+
+239. 【合并多提交分支：按内容核，不按 SHA 核】cherry-pick 只挑了链上的一个提交就以为齐了（supersede-a 是五个提交的链）；
+     P3-4 卡冲突时 checkout origin/main 的版本——但 main 上还没有该文件，checkout 不存在的路径 = 什么都不恢复，
+     冲突中的文件被静默删掉。合入后看 log 出现过某 SHA 就以为齐——log 有 ≠ 内容在。
+     核对方式 = 分支头与 main 的**文件级 diff 为空**（architect 的做法）。它救回了 6 个提交。
+
+240. 【239 的机械化口径（architect 给的命令版）】git diff --name-only main...<branch> 列出分支动过的每个文件，
+     对每个跑 git diff <branch> main -- <file>，结果必须为空。
+     该方法也能发现“解冲突时文件被删”：文件在 --name-only 列表里、但 main 上不存在 ⇒ diff 不为空。
+
+241. 【合入后核对归 QA（两道关卡）】每张卡合入后，QA 对分支头与 main 做文件级 diff 为空核对（240 的命令）——
+     manager 出错的那次恰好没有第二道核对；机制化后 manager 第一道（自己跑）、QA 验收道，合入动作有必经关卡。
+242. 【(b) 死因的两层链路】DLL 侧 fsop.c:981（Overwrite 返回的 FileInfo 写进 Response）+
+     内核侧 sys_create.c:1263（FspFileNodeSetFileInfo 写进共享 FileNode 缓存）——两层各一步、各带行号；
+     只引 DLL 半步，读者会问"写进 Response 怎么就影响旧句柄"，内核那半步才是答案。
+
+243. 【行号引用必须带版本 + 贴 grep 原行】QA 报 create.c:1263、architect 核为 1265（1263-1264 是相邻的
+     FspFileNodeOverwriteStreams）——同一 tag 下的读数偏差（QA 从上下文块"数行"，错了 2 行）。
+     两条规则：① ADR/报告引用外部源码行号必须带 tag/commit；② 必须贴 grep -n 的原行输出，
+     不许从 sed 块里数行——机器可复核的引用不经过人手转抄。主张与证据链不受影响（1265 成立，两层链路完整）。
+
+244. 【数字是观测量，名字才是证据】worker 两次"failed=1 名字未捕获"的根因（QA 点中）：只记了数字。
+     抓捕协议：① 全量 --no-fail-fast，任何失败原样留档（测试名 + panic 行 + 所在二进制）；
+     ② 失败即对照（同二进制单跑 → 绿则 --test-threads=1 串行）；③ 合入核（241）后紧跟一次全量，
+     边界与观测绑同轮；④ 第三次出现且两轮对照不能复现 ⇒ 记 KI-* 进 ignored 挂 owner（与 KI-11 同待遇）。
+245. 【replaced 字段裁决：保留恒 None】create 侧恒 None / rename 侧仍是 Some——两个同名字段语义分叉，
+     两处文档各写一句“不是同一件事”。不删字段（避免第三次破坏性变更；P3-4 后若实测不需要再删，那时是收尾不是破坏）。
+
+246. 【判据失去意义时：删除，而不是改成恒真】G1 修订判据 2 的第二例（“旧对象未删”）在 SUPERSEDE=同 id 后
+     失去意义（没有第二个对象）——删除是诚实处理，改成恒真是把它变成装饰（= 洗红的判据版）。
+     提交说明写明减了几条、为什么（否则下一个人会当误删）。
+247. 【因果断言比改值高一档】翻转期望时同时断言“值”与“值的原因”：
+     例① SUPERSEDE 与 OVERWRITE 两格必须相等（守表的结构，防将来重新开格）；
+     例② replaced=None 处同时断言 file_id==created.file_id（None 的原因是条目活着，不是字段坏了）。
+     只改值会让读者怀疑字段故障；因果断言把翻转的语义一并钉住。
+
+248. 【机械等价用作证据传递】全量跑在验收提交（3f5b56c）上、main 相对它只多 docs 提交且 crates/ diff 为空
+     ⇒ 不重复跑同一份内容。一次运行 + 一份 diff 等价证明 = 两次运行的效力。省的是时间，没省证据。
+
+249. 【P3-3b 派卡（2026-10-26）】顺序：③ 读侧 page_format 单点化 + 20 行审计转用例（先做，不依赖真后端）
+     → ① 真后端 WorkspaceOps + 7a 改“每场景恰好两处（Mock+Real），只加不减，按名点名缺哪个”
+     → ② C1-b/c/d（判据 3 拆“核心可判 / 必须 adapter”两半，拆分线写进文档注释，adapter 半边留 P3-4）
+     → ④ 属性落盘两向（判据形态：set→close→重开 workspace→stat 读回——跨 open 的持久性才是落盘的证据）。
+     分支 p3-3b/real-backend，基于 2e2e500。
+
+250. 【“审计过”与“不可能再犯”是两件事】十月审计过 20 处（一次性、读一次）≠ 第 21 处不可能再犯——
+     后者需要一条会自己跑的断言（page_format 单点 + 扫描器断言 reader.format 裸用为 0）。
+     审计 → 断言的升级与就地红法同族，但对象是结构性约定（哪类页用哪个 fmt）。
+251. 【扫描器 needle 用 format! 拼】静态 needle 会被自己的扫描命中（源码里包含要找的字符串）；
+     format! 拼出则 needle 不以字面量形态存在——与 is_scanner 排除自己同族但手法相反。
+252. 【role 枚举无 _ 兜底】page_format 的七个非 inode 角色逐个列出——将来加新 Role 时编译器逼你回答
+     “它用什么 fmt”。穷举 + 无兜底 = 新增时不许沉默通过（与 18 格表 match 同一纪律）。
+
+253. 【真后端的放置（P3-3b 裁决）】fs-api 实现 WorkspaceOps（新增 fs-api→fs-winfsp 依赖，方向无环：
+     前端 trait ← api 实现）；场景函数留 fs-winfsp（零平台依赖不动）、Real 实例化放 fs-api/tests/、
+     7a 扫两个目录（常量 + 失败消息列两路径 + **两目录存在性也要断言**——防“只加不减”在目录维度漏）。
+     转错误用 failure_for，不写第二份映射（206 的病因不复发）。
+
+254. 【读写 API 面对称】G2 补了读侧（read_at_id/read_dir_id）却漏了写侧（write/truncate 只有路径入口）——
+     WorkspaceOps::write(file_id) 用 write_at(path) 冒充 = 把 G1/G2 消掉的 TOCTOU 在适配层请回来
+     （§3.9 路径复用红法在真后端上的形态）。与 238（检查点两方向对称）同族，这次是 API 面对称。
+     夹具：写入→rename→按旧 id 写→新路径内容必须变（truncate 同样要 rename 对照）。
+     适配层抵消核心层的成果，是 adapter 卡最大的风险——开工前拦住。
+
+255. 【“免费得到的检查”在按 id 的 API 里是系统性风险】路径版从 resolve_file 免费拿到目录检查（IsADirectory），
+     按 id 直达就会漏——写目录的字节比报错更糟（看起来像数据）。read_at_id 当初漏过（读侧），
+     write_at_id/truncate_id 这次主动补上（写侧）。补 API 时把“路径版免费、id 版必须显式”的每一项过一遍。
+256. 【“rename 才是牙”（再确认）】只写不 rename 的用例会通过“内部偷偷按路径解析”的实现；
+     “让新对象占用旧路径”比“rename 后旧路径空着”更强——前者让错误实现成功写错对象，后者只让它失败。
+
+257. 【共享场景的常量必须与核心同源】fs_winfsp::ROOT=1 与核心 FileId::ROOT=0 不同源——mock 上恰好对、
+     真后端上问到“第一个文件”⇒ NotADirectory。单后端测试永远不红（mock 自己的常量“恰好也对”）；
+     只有第二个后端才暴露。C1-d（同一变异两个后端各自红）的镜像：变异是意外植入的。
+     修法：常量同源优于常量翻译。
+258. 【状态映射与动作分派是两个消费者】failure_for 把 InvalidRecord 映成 Internal 对**状态**正确（NTSTATUS 层词汇统一），
+     但 adapter 对“句柄过期”与“条目没了”的动作相反——需要**变体**粒度，Internal 把变体信息丢了。
+     ⇒ 映射前单独处理变体：状态可折叠（206），动作分派不可。进 ADR-009 错误语义段。
+259. 【定义的位置要能被所有消费者够到】场景函数从 tests/ 上移 src/scenarios.rs——tests/ 里的东西跨 crate 够不到
+     （Rust 的边界提示）。一处定义、两处实例化，不是两份。
+
+260. 【P3-3b 全卡完成（2d8e80d，554 passed）】五提交：③ 读侧单点化 → ① 写侧补口 → ② 真后端+7a → 拆分线 → ④ 属性落盘。
+     ④ 抓到核心缺陷：核心从未实现属性替换（只有 mock 实现）——同会话读回通过（内存态），只有重开才暴露。
+     修复：TreeWrite::set_attributes + TruncateExisting 按 Supersede 清零。
+     口径修正：SUPERSEDE 后 get_info 报 0x80（NORMAL 派生）而非 0——“替换”= 存储位清零 + 派生 NORMAL。
+     本卡实质产出：三个只有跨后端/跨会话才暴露的缺陷（ROOT 常量 / 属性替换 / 场景跨 crate）——
+     C1-d 的现场证明：意外变异 + 真后端 = 免费的变异测试。
+
+261. 【P3-3b 合入（6ed9aae）】QA 验收：C1-d 定向变异红在预测位置（真后端 read 改路径缓存 ⇒ 只有
+     scenario_identity_across_rename 红、其余 4 绿）——场景集承重证明（变异只红一个 = 那个场景独占那个失败面）。
+     抓捕协议第三次带全名：concurrent_puts（cas-store/store.rs:740）MissingPack——与 KI-11 同族；
+     KI-11 证据从复现描述升级为三处独立现场 + 完整留档。定性：并发发布→MissingPack 是一个待诊断问题的
+     三个症状面（记 B-17，不阻塞 P3-4）。
+
+262. 【P3-4 已派（2026-10-26）】分支 p3-4/mount，基于 6ed9aae。六点：
+     ① 第 0 步 = 纯 Rust 的判据 3 adapter 半边（接线与首次语义验证分离，把“不可用真实挂载调试”的风险提前消掉）；
+     ② FFI 纪律：catch_unwind 每回调 / UTF-16 边界一次转 / NtStatus 构造数=0 / ABI static assert；
+     ③ L2 同一脚本（NTFS 侧与挂载侧只有路径前缀不同——防脚本漂移被当成行为差异）；
+     ④ M1–M9 挂载生命周期；⑤ U1–U14 逐项消（三态，禁只打勾）；
+     ⑥ 抓捕升级：失败留档加挂载会话状态（挂载点/句柄数/进程存活）；**卸载失败的测试先卸载再报**（不留挂着的盘）。
+     QA 四件备清单：会话状态（进程级抖动归因的上下文）/ 三分档预先定落点 / 消项格式 / KI-11 第四现场预判。
+
+263. 【绑定属于 FileId 而非句柄（P3-4 第 0 步设计）】HandleTable 增 bindings: BTreeMap<FileId, (parent, name)>——
+     remove_at 的守卫用 id，绑定的生命周期就该跟 id；同 id 多句柄共享一条（每句柄各存一份会在 rename 后各说各话）。
+     三条：open 时从 OpenOutcome.binding 抄入；rename 成功后同步；x→x 时断言 binding 指向当前名字（断言状态不路径）。
+     这正是 ADR-009 W3 修订（句柄不存绝对路径、可存定位键、依赖 W2 排他）的 adapter 层落地。
+264. 【删除静默失败最难从 NTSTATUS 反推】adapter 拿旧名字去删 ⇒ 守卫拒（NotFound）⇒ 删除静默失败——
+     L2 上会被当成“偶尔删不掉”（权限/时序），真因是绑定过期。0a 的表级用例是第一道防线（不进 L2 就能红）。
+
+265. 【断言没发生的事件（比恒真更险）】用例断言“rename 后的新名字”，但用例里根本没有 rebind——措辞完全合理
+     （rename 后名字当然是新的），只是让它成立的动作没被调用。若实现碰巧在别处做了，用例会绿但证据链是断的。
+     “用例写错和实现写错一样会假绿。”判据预审“可达吗”不仅问被测物，也问用例自己的步骤是否真的执行了
+     它声称依赖的路径。
+266. 【表是投影不是副本】HandleTable 的绑定只反映自己持有过的（rebind 只更新已存在，不凭空造状态）；
+     rename 在核心层可作用于任何路径，但 adapter 的表永远不比核心多知道一件事。
+
+267. 【“拒绝即未改动”的价格明码标价】挂起检查放在后端创建/截断之前 ⇒ 每次 open 多一次后端调用——
+     这是原则的价格，不是待优化的开销。反过来（先改再拒）会留下“日志说拒绝、文件已被清空”。
+     将来想优化掉这次探测，得先推翻“拒绝不留副作用”。
+268. 【RenameOutcome.file_id：核心本来就知道】从路径反推 id 是本 crate 一直避免的猜；
+     路径→id 翻译只发生在路径语义的入口（create_or_open/rename），不发生在身份语义的地方（绑定更新）。
+     与 read_at_id 同族。
+269. 【一个挂载 = 一个 Adapter】回调里 new 会得到两张表、两个 delete-pending 视图——两张表 = 两个真相源，
+     两段删除会在两个视图里各删一次或都漏删。用类型限制生命周期（而非注释）。
+
+270. 【手写 FFI 结构体的可溯源性】手写最小结构体（不 bindgen——SDK 只在测试时需要，不成为构建依赖）时，
+     每个字段注明 SDK 头文件行号出处（// winfsp.h:xxx）；布局断言的期望值（size/offset）注明计算方式。
+     与 243（行号引用带版本）同族：手抄必须可溯源，否则布局漂移时无法核对。
+     bindgen 静默跟随头文件变化；手写 + 断言在漂移时红——更强而非更弱。
+
+271. 【结构体尺寸是推导值，不是记忆值】VolumeInfo = 8+8+2+64 = 82，u64 对齐 ⇒ round 到 88——
+     期望值旁写算术，否则 88 是魔数。判据数字纪律（第 6 条）在 ABI 尺寸上的形态。
+272. 【自洽 ≠ 正确（结构体版）】自己的 offset 断言只证内部自洽；与 SDK 自身的 static assert
+     （fsctl.h:291/:276 的 72/88）对上才证“抄写没引入错误”——第二证人。
+     与 round-trip 不证布局（169）同族。
+
+273. 【位置式表的形状必须先于行为被钉住】WinFsp 回调表按 SDK 次序排列（重排即 ABI bug）——但重排后每个函数
+     仍正确执行，任何行为测试都抓不到（或表现为“偶尔调错回调”的诡异形态）。
+     断言：尺寸=项数×指针无填充、项数钉数字、默认全 None（None=不支持，WinFsp 认的答案，比悬空指针安全）。
+274. 【空表也必须被描述成空表】只有形状、没有接线时，文档与提交说明写明“今天挂载看到的是空表”——
+     主动声明“还没有”，防读者以为 FFI 已能用。交付物的诚实（与判据的诚实 156 同族）。
+
+275. 【拒绝留给数据语义，不留给显示语义】超长卷标签截断（31 单元+终止符）而不拒绝——拒绝会让挂载卷
+     因装饰性字段不可见，代价远大于截断。内嵌 NUL 仍拒（会静默丢后半段 = 数据语义）。
+     错误的严重度要分层：功能代价 > 显示代价才值得拒绝。
+276. 【同名不同值的单位换算单点化】VolumeLabelLength 是字节、VolumeLabel 是 UTF-16 单元（off-by-two 的经典坑）——
+     换算写在函数体（最靠近数据的一层），包装层顺手做 = 每调用点各算一次、迟早一个错。与 page_format 单点化同族。
+
+277. 【载入失败的可诊断性】LoadLibraryW 失败要报 GetLastError + 尝试的路径，且**路径不存在与导出缺失分开报**——
+     前者是 SDK 没装、后者是版本不符，指向完全不同的环境问题。一句 "load failed" 让两者不可区分。
+278. 【AllocationSize 是策略不是事实】核心存精确字节，NTFS 按簇取整——报精确值会让普通文件在比对工具里
+     看起来稀疏。ALLOCATION_UNIT=4096 显式化（可讨论可改）；对齐的是消费者期望，不是模仿 NTFS。
+279. 【同一个决定只在一处做出】adapter 的 get_info 已报派生属性 ⇒ FFI 层直通，不二次派生
+     （DIRECTORY/NORMAL 的决定出现两处 = 两处可漂移）。与“错误映射只走 failure_for”同族。
+
+280. 【错误按修法分类，不只按错误码】LoadError 三臂：NotFound（装 SDK）/ MissingExport（换版本）/
+     LoadFailed 193（换架构）——每个臂对应一个不同的用户动作。错误设计从“发生时是什么”转向
+     “收到的人该做什么”。与 194（InvalidRecord/NotFound 动作分派）同族但方向相反：那是 adapter 的动作，
+     这是用户的修法。
+281. 【构造测试值，不伪造场景】无法在无 OS 环境触发的 LoadFailed 臂，用例直接构造它——伪造载入会让测试永远绿，
+     但测的不是真实路径。与 P3-0c“造不出真 v1 库就明说”同族。
+282. 【跳过也要留痕】CI 找不到 SDK 时显式跳过并打印原因，不静默通过。
+
+283. 【跳过要自报身份】CI 找不到 SDK 时 eprintln "SKIP: … (this is a skip, not a pass)"——
+     跳过的检查看起来是绿的，比没有检查更糟。skip 与 pass 必须在输出上可区分。
+284. 【同名 DLL 三份只有一份能用】本机：Program Files (x86)/WinFsp/bin/winfsp-x64.dll（真实运行时，FspVersion→2.0.1 ✓）、
+     SxS 布局同份、winfsp-sdk/DYNAMIC/SxS/DYNAMIC/bin（dynamic-loader 变体，GetProcAddress 直调即 0xC0000005）。
+     DEFAULT_LIBRARY 优先顺序 + WINFSP_DLL env 覆盖；dynamic 变体在文档注明“不要再试”。
+     握手的价值第二证明：“路径看起来对”与“这份 DLL 能不能这样用”只在真正调用时分开。
+
+285. 【FFI 签名必须逐字段核头文件——崩溃的第一嫌疑】FspVersion 崩溃（0xC0000005）根因：签名写成
+     fn() -> u32，实际是 FSP_API NTSTATUS FspVersion(PUINT32)——无参调用让它把垃圾当指针写。
+     排查时三个候选（FspLoad？调用约定？DLL 变体？）全错——**第一嫌疑应该是签名本身**。
+     修法含双断言：status == 0（NTSTATUS 成功）且 version > 0（单独 version > 0 可被 error 码假绿）。
+     worker 的 #[ignore] 处置正确：崩溃不能被跳过（带走同文件其他用例），完整理由 + 两种结果并列。
+
+286. 【FFI 崩溃排查：排除本身就是贡献】worker 列三候选（FspLoad/调用约定/DLL 变体）逐一排除；manager 在干净的
+     排除基础上看头文件一行定位签名真因。排除得越干净，定位越快——含糊的候选会淹没真因。
+287. 【两套错误码不混用】GetLastError（Win32）与 NTSTATUS（内核）数值空间重叠但语义不同——
+     NTSTATUS 包进 LoadFailed{last_error} 时注释写清，防止后人合并两套（否则 LoadLibrary 失败与
+     FspVersion 错误在日志里无法区分）。
+
+288. 【读起来像表、布局却不是表】FSP_FILE_SYSTEM_INTERFACE 实际是 64 槽数组（SDK 自身断言 winfsp.h:1091），
+     不是 10 个命名字段——第一版“按 SDK 次序排 10 项”看起来满足位置式纪律，但那纪律的前提是布局真是槽位数组。
+     形状钉错，行为层永远不会告诉（传进去的 Create 落在“恰好对上”的槽里，根本没有对应关系）。
+     只有对照头文件自身的 static assert 才会红。272（第二证人）的又一层：不仅字段值对，表的形状本身要与 SDK 断言对上。
+     worker 自纠（对照 SDK 断言发现），比外部发现好。
+289. 【观测方式的嫌疑】不稳定红三次逃过同一个文本 grep（FAILED$/panicked/1 failed）——三次都空，
+     说明问题在观测方式而非测试。升级候选：JSON 事件流（--message-format=json 解析 test failed 事件）优于文本 grep。
+
+290. 【抓捕协议 v3：JSON 事件流】文本 grep 空手是结构性的（并发下交错、折行、失败详情与 failures 块分离——
+     grep 永远在追会变形的目标）；JSON 一事件一测试，名字与结果在同一事件——观测方式不再依赖文本形状。
+     三条实现：每次全量落盘 runs/时间戳.jsonl（绿跑也留，第几次出现本身是数据）；grep '"event":"failed"'；
+     failed 立即单测级循环 ×5（比全量循环便宜两个数量级）。
+291. 【边界假设收紧（三次数据点）】不稳定红全部出现在“新构建后首次高负载并行”（冷缓存+全并发），
+     与 rebase 无关；干净边界的常规全量 0 次。⇒ 每次合入/rebase 后的首跑 = 指定抓捕窗口，永远带 JSON 落盘。
+292. 【形状类判据的唯一可靠证人】产生布局的那一方自己的断言（SDK 的 static assert winfsp.h:1091-1092
+     + 1089 注释 "always contain 64 function pointers"）——我们的测试只能证自洽。
+
+293. 【文本 grep 漏名的两层机制】① 形态变形（并发交错、折行、失败详情与 failures 块分离）；
+     ② 位置不可预测（失败在最后一个 crate 时 grep -B12 取不到上下文——crate 边界间顺序不固定）。
+     两层叠加使文本 grep 在结构上不可能稳定 ⇒ JSON 事件流是常驻观测底座，不只是猎红工具。
+
+294. 【检查顺序就是诊断顺序】库在不在 → 符号在不在 → 回调行为——每层失败直接指向下一层该看什么。
+     把检查从清单变成决策树；与 280（错误按修法分类）同族：设计的消费者是收到失败的人。
+295. 【“停止”与“停止后可重启动”是两件事】stop 与 delete 之间观测 dispatcher 线程是否已退
+     （WinFsp 不提供则记“无法观测”并注明）——M1–M9 的“重挂”依赖后者，不只依赖“能停”。
+
+296. 【位域用“不透明字节 + 访问器”，不手抄 struct】C 位域的位序编译器可自由选择（标准不保证）——
+     即使逐位对照头文件，Rust 与 MSVC 布局也可能不同。504 字节缓冲 + 带行号的类型化访问器（显式位运算）
+     把位序决定权从编译器手里拿回来。用例“36 之后全零”防的是“顺手编码几个位”——位域多设一个位
+     不会编译错，只会运行时行为漂移。
+
+297. 【unsafe 的位置本身就是文档】FFI 加载的自纠：四元组匹配 + 一次 FreeLibrary ⇒ unsafe 只留在
+     transmute 一处；调用已 transmute 的函数指针再套 unsafe 是多余的。
+     unsafe 块应该只覆盖真正不可证明的那一步——读代码的人从 unsafe 的位置就知道风险在哪。
+298. 【框架局限做成断言】stop_is_observable = false 且用例断言它就是 false——WinFsp 2.x 无
+     “dispatcher 线程已退”查询。将来提供该查询或换版本时这条会红，提醒重新评估。
+     “无法观测”从注释升级为可判事实。
+
+299. 【不要为“将来可能需要”加全局机制】④ 的两个回调不需要挂载级可变状态 ⇒ 不引入全局注册表 (b)
+     （Mutex 串行化 + 清理顺序 + 全局可变状态三重风险）。等 ReadDirectory/Rename 需要 (b) 时同批写
+     清理顺序与并发约束——“顺手加一个只有一半消费者的机制” = 造半边入口（196）的 FFI 版。
+300. 【FileContext 的生命周期纪律】由 WinFsp 决定（Cleanup/Close 后不再给）⇒ Box::from_raw 只许在
+     Close 里做一次，配 debug_assert 计数器（分配数==释放数）。双重释放/泄漏在挂载场景表现为
+     “几次操作后崩溃”——最难查的形态，计数器把它变成可判事实。
+     FileContext 最小集 { file_id } 起步——它是 WinFsp 替我们保管的指针，塞太多就是把自己的状态机寄存在别人家里。
+
+301. 【不半填，宁可不写不可半写】缓冲小于结构体 ⇒ 拒绝——半填返回成功但对面读到未初始化内存
+     （可能是 0 也可能是任意值，取决于栈残留）。拒绝让调用方重试，半填让他拿垃圾做决定。
+     同族：“未知 id 拒绝且缓冲不动”（零记录显示成空文件 = 静默错误）。
+302. 【测试合并承认生产约束】两个测试抢同一个 OnceLock ⇒ 合并成一个并写明理由——一进程一挂载是
+     生产形态，不是测试不便。--test-threads=1 是掩盖（“两个测试抢一个全局”的事实消失），合并是承认。
+
+303. 【第三次同一工具错误 ⇒ 改工作方式，不再试一次】嵌套 heredoc（bash 嵌 Python 三引号嵌 Rust）
+     三次被截断——三层引号规则间传内容，截断不是意外是必然。改用文件写入工具一次成型。
+     脚本适合机械替换，不适合写入含引号的整段新代码。
+     工具事故的处置：立即回退而非提交（工具产出的一半不是进度的一半，是损坏——200 的工具版）。
+
+304. 【"没调用"与"调用失败"分开】mount 失败时 probe=None 有歧义——短路没调用闭包 vs 调用了返回 None。
+     三态 Skipped{reason}/Ok/Err(msg)。与"无法观测 ≠ 已验证"同族。
+305. 【0xC0000035 排查记录】create=0（接口表被接受 ✓）但 SetMountPoint 拒绝。排除：WinFsp.Launcher RUNNING、
+     驱动 RUNNING。剩两候选：① 目录挂载点必须显式 create 空目录；② device_path 需 \\.\ 前缀（winfsp.Disk → \\.\winfsp.Disk）。
+     unmount=0 且 looked_like_a_mount=false ⇒ 先卸载顺序起效，无残留。
+
+306. 【0xC0000035 排查第二轮】两个候选排除（空目录必须显式建 ✓ 排除；\.\ 前缀 ⇒ create 反而变 0xC000003E ⇒
+     前缀形式错误且 winfsp.Disk 无前缀是对的）。
+     新头号候选（读 memfs 示例得出）：VolumeParams.Prefix（fsctl.h:237，UNC 形态）——目录挂载可能需要它构造
+     volume name。分叉法：先试盘符挂载（不需要 Prefix，最便宜的分叉）→ 成功则补 Prefix 再试目录 → 都失败再试 NT 路径形态。
+     memfs 示例的目录挂载传 Win32 路径（无 NT 前缀）⇒ NT 假设与示例矛盾，降级。
+
+307. 【★ 盘符挂载成功（69c3295，2026-10-26）】Windows 侧第一次看见 layer-fs：
+     create=0 / mount=0（盘符 Y:）/ start=0；read_dir 返回 ERROR_INVALID_FUNCTION——
+     “未实现”（走到了我们回调表的 None 槽）与“挂载没生效”可区分。从 spec 到真实 OS 调用走通回调链。
+     候选 ② 确认：目录挂载缺 VolumeParams.Prefix（盘符不需要）。
+     卸载 0xC000000D：SetMountPoint(NULL) 盘符形态可能不支持——memfs 退出路径只用 StopDispatcher+Delete
+     （delete 隐式清理挂载点）；验证法：delete 后 GetLogicalDrives 看盘符消失（比 NTSTATUS 更硬的证据）。
+308. 【“未实现”与“没生效”可区分】read_dir 返回 ERROR_INVALID_FUNCTION = 已进回调表但槽是 None；
+     返回“找不到路径”才是挂载没生效。挂载诊断最重要的一对区分。
+
+309. 【状态码说“调用怎么想”，OS 读数说“现在是什么”】unmount=0xC000000D 配上 GetLogicalDrives 盘符消失 ⇒
+     0xC000000D 只是“这条路径不通”，不是“没卸干净”。两个证据层分工：NTSTATUS 是某次调用的返回（调用失败 ≠ 状态残留），
+     OS 读数是状态的直接观测。断言放在状态证据（released_after_delete）上，状态码只打印——断言位置跟证据类型匹配。
+     （“这个形态不支持 SetMountPoint(NULL)”与“没卸干净”——两个事实被一个证据分开，与 308 同款。）
+
+310. 【Prefix 偏移 = 40（三层校验闭合）】标量区 0-35（Version@0/Sector@2/SAPU@4/MaxComp@6/VolCreation@8/
+     Serial@16/Transact@20/IrpTimeout@24/IrpCapacity@28/FileInfoTimeout@32）+ 位域区 36-39（32 bits 恰一 u32）
+     ⇒ Prefix(WCHAR[192]=384B) @40。
+     校验 1：SDK static assert V0==456（fsctl.h:258），40+384+32=456 精确吻合；
+     校验 2：V1 剩余 48（位域4+五timeout20+Fsext4+Reserved32 4+Reserved64 16）两头闭合；
+     校验 3：worker 已钉的 0/2/4/6/32 与推导一致。
+     worker 拒绝猜偏移（脚本两次被反斜杠打断即停）——第三次同手法失败换手法（303 的再应用）。
+
+311. 【布局联动断言】HEADER == sizeof(FileInfo) + 32 ——两个“独立”的 ABI 断言耦合成一个不变量：
+     dir_info 的 header 包含 FileInfo，两者关系本身是接口契约的一部分。分开钉各自对，合起来可能错
+     （算术错在关系上）。将来 FileInfo 变了这条跟着红。
+312. 【Rust 无对应形态时选暴露算术，不伪装 struct】柔性数组（WCHAR FileNameBuf[]）与位域（296）同一决策：
+     伪装的结构体看起来类型安全，实际只是把 unsafe 挪了个位置；算术显式、可断言、可教学。
+     header/对齐错误不产生错误码，只产生垃圾行为（文件名乱码）——与 64 槽（288）同族。
+
+313. 【差异排除法：改一处、输出不变 ⇒ 那处不在关键路径】接了 ReadDirectory 但错误码与接前一字不差
+     ⇒ 问题不在 ReadDirectory——WinFsp 的调用链是 Open →(FileContext)→ ReadDirectory，
+     没有 Open，Read 根本不会被调到。改了没变化的那个改动本身就是证据。
+
+314. 【allocated=0：Open 前面还有一环】计数器证明 Open 从未被调用 ⇒ 错误在到达我们之前。
+     头号候选：GetSecurityByName（winfsp.h:252，槽位 1）——Windows I/O 管理器 CreateFile 的固定序列里
+     它排在 Open 之前（先查安全描述符再打开）；槽位 None ⇒ 整个 Create 失败 ⇒ ERROR_INVALID_FUNCTION
+     ⇒ Open（槽位 4）轮不到被调。完美解释 allocated=0。
+     VolumeLabel 候选降级：mount=0 已证卷名不是挂载阻塞项。
+     计数器是本轮最值钱的数字——“从没被调”是可判事实（比推断早一步）。
+
+315. 【挂载点前置断言】Y: 盘符本机已存在 ⇒ 之前所有 LAYER_FS_MNT=Y: 的实测挂在已存在的盘符上，读数不可靠
+     （含 released_after_delete）。以后测试先断言挂载点不存在——把环境事故变成永久断言。
+     更正后 Z: 上结论不变（create=0 mount=0 卷在）——方向没错，读数根基被加固。
+316. 【接口表生命周期（嫌疑最大）】FspFileSystemCreate 文档没承诺拷贝，C 惯例是存指针；栈上 interface
+     在 create 后悬垂。悬垂表的表现恰好是：卷在（create 时表活）、回调全零（start 后表死——WinFsp 读到
+     悬垂内存的 None 槽 ⇒ not implemented ⇒ ERROR_INVALID_FUNCTION）。与全部观测吻合
+     （GetSecurityByName=0 / allocated=0 / probe INVALID）。若成立必须固化：接口表生命周期 ≥ FileSystem 生命周期，
+     写成类型保证（mount 持有 Box 或静态存储），不是试一次就完了。
+
+317. 【机取救了 manager 的数】GetSecurityByName 槽位是 2 不是 1（winfsp.h:221 是 SetVolumeLabel，:252 才是
+     GetSecurityByName）——manager 读行号时数错位置，worker 的机取索引救了双方。
+     人读行号会错，机取不会——包括 manager 给出的数。相邻标签极易混淆，索引一律机取。
+     probe 口径修正：Y: 意为"Y: 的当前目录"，须用 Y:\（无目录状态的 FS 无法回答前者）。
+318. 【断点定位的二计数器法】GetVolumeInfo（任何卷打开都会问的第一个问题）与 GetSecurityByName
+     （Create 路径第一环）两个计数器：全 0 ⇒ IRP 从未进入用户态（派发层/表问题）；GV>0 而 GS=0
+     ⇒ IRP 进来了但 Create 路径断。三观测判定矩阵：盘符在吗 / GetVolumeInfo 计数 / leak 后回调来吗。
+
+319. 【owner 裁定：挂载测试一律 Z:】Y: 本机已存在（Get-PSDrive: C D E F S Y）——owner 原话
+     "Y: 已经存在了，以后使用 Z: 测试"。LAYER_FS_MNT 缺省改 Z:；前置断言挂载点不存在照旧
+     （今天不存在不代表下个月不存在，断言才是保险）；Y: 历史读数的更正说明保留不回改。
+
+320. 【别猜，先读 FSD 侧观测器】"卷在、回调全 0"两个 WinFsp 自带观测器（导出已验证存在）：
+     ① FspFileSystemGetDispatcherResultF（winfsp.h:1392）——派发线程致命失败会记 DispatcherResult（:1107），
+       之后 IRP 全拒——与全部观测吻合（卷在/mount=0/回调全 0）。probe 后读一次即得确切 NTSTATUS。
+     ② FspDebugLogSetHandle + FspFileSystemSetDebugLogF（:2165/:1410）——FSD 侧 IRP 跟踪写文件
+       （memfs 的 -d 就是它）。JSON 事件流的 FFD 版：观测优先于推断。
+     注意：SetDebugLog 的 inline 版写私有字段，必须用 F 后缀导出函数版。
+321. 【VolumeParams 对照 memfs（二级候选）】逐字段比 memfs.cpp:2432-2460，我们缺：VolumeCreationTime/
+     VolumeSerialNumber（memfs 用系统时间）/**UnicodeOnDisk=1（我们 0 = ANSI 名，IRP 来了 UTF-16 解析也错——暗雷）**/
+     CasePreservedNames / PersistentAcls。全在位域区 @36-39 同一 u32——若日志指向参数，按 memfs 全集一次补齐，
+     不逐个试。587/2 首跑红 = KI-11 族老毛病（复跑绿，仍记未解释）。
+
+322. 【debug 日志三坑】① FspDebugLogSetHandle 是进程级，须在 create 之前设好（否则丢头几条）；
+     ② 日志文件放测试 temp 目录 + 时间戳；测试结束先关句柄再读文件（append 句柄开着时缓冲可能未落）。
+     ③ flags 第一轮 0xffffffff 全开——不知道哪类跟踪是关键行，先全量读到答案再收窄。
+     预读两分叉：FSD 发了 TRANSACT_REQ 而 UM 没收 = 派发断层（表对接/读取时机）；
+     FSD 自己拒 = 理由在它前一行。CaseSensitiveSearch 不设（按语义定，不照抄 memfs——它=1 是测试配置）。
+
+323. 【结构靠写，不靠 patch】303（heredoc 截断）与本次（脚本插入错位+括号失衡）的共同点：用脚本改结构
+     而不是写结构。文件到一定规模（mounted.rs 480 行 + 6 extern 块），整段重写（先完整读原文）比往里插便宜
+     ——插入位置错与括号失衡这类错误在重写里根本不存在。零提交+立即回退的处置两连正确。
+     附：extern 声明收拢成单一 ffi 模块（ABI 行号注释的单一去处）。
+
+324. 【观测器 2 战果：两行日志干掉五个假设】debug 日志（FspDebugLogSetHandle + SetDebugLogF）输出：
+     ">>Create ... FILE_OPEN" + "<<Create IoStatus=c0000010" ⇒ IRP 到达 FSD（断层/身份/表/位域假设全灭），
+     真因：Create（槽 3）是必需回调，FILE_OPEN 也走它（由它转 Open）。槽位 None ⇒ WinFsp 回
+     STATUS_INVALID_DEVICE_REQUEST——与日志字面一字不差。
+     附教训：**"槽位表里有名字相似的回调"≠"它是入口"**——我们接了 Open(槽4) 以为打开走它，
+     但 WinFsp 的入口是 Create。入口判定只能靠日志或文档，不能猜名字。
+     （回顾：接口表生命周期/派发器死/卷身份/位域/Prefix 每个都够盲试一轮——观测优先于推断的完整回报。）
+
+325. 【d83258d 后的新假说层】接上必需回调 Create 后仍 c0000010 且全计数 0 ⇒ "缺 Create"是表象，
+     根因是"表没被采用"或"索引错位"。穷举探针三补强：① 塞满全部 64 槽（不止 0..15——DLL 的 Create 可能
+     排在 15 之后）；② 同一性检查：打印传给 FspFileSystemCreate 的表指针 vs 填记号的表指针（不同则当场结案
+     ——leak 的可能不是被读的那份，悬垂表假说当初"leak 了也没变化"的真正原因）；
+     ③ Version=504 嫌疑最低：create=0 已证卷创建 IOCTL 接受了 Version（校验发生在那步）。
+
+326. 【★ 头文件知其有，探针知其位】DLL 实测 Create 在索引 32，头文件机取是 3——谁都没数错：
+     安装 DLL = 2.1.25156.ddca7bd（2025 发布版），SDK 头 = sxs.20261022T083021Z（主线），两个都报
+     FspVersion 2.1，但 FSP_FILE_SYSTEM_INTERFACE 条目顺序在两版间重排过（差 29 指针）。
+     纪律：头文件只用来知道"有哪些操作"，不用来知道"在第几个"；槽位索引必须对安装的 DLL 实测
+     （64 槽记号探针 + 同一性检查 + 逐槽触发）。三步探针：填满 64 槽（表被采用 ✓）/ 指针同一（✓）/
+     逐槽触发（Create=32）。
+327. 【勿假设平移；日志点名下一个】重排不是平移——已接的全部索引（GV=0/GSBN=2/Open=4/Close=7/RD=18）
+     都未被调用过（计数全 0）= 全部未确认，每个都要独立探针。收敛循环：挂盘→触发→日志下一个 >>Op 失败行
+     = 下一个缺失槽，每轮自动指定下一探针。校准表断言：每条注实测日期+DLL 版本+探针命令；
+     总断言：FspVersion 版本与校准时不一致 ⇒ 整表作废（防"版本号相同构建不同"——两个都叫 2.1 是教训）。
+
+328. 【码没变、来源变了】Create@32 接上后 create=1：同样的 c0000010，before 是 FSD 读空槽自答，
+     after 是我们的 NOT_IMPLEMENTED 走完全程。错误码是静态的，计数是因果的——计数器比错误码值钱。
+     早退分支区分：每个 return NOT_IMPLEMENTED 前独立计数（RESOLVE 未配 vs file_info 时间戳 Err）。
+     root id 0 lookup 覆盖 = 探针走完的最小前提（Create 第一个请求就是 "\"），不是改生产语义。
+
+329. 【矛盾读数 ⇒ 早退点枚举不全】create=1 但三条已计数早退全 0 且未分配 FileContext——两者矛盾 ⇒
+     还有未枚举的路径。最可能：Create trampoline 自己的 disposition 门（FILE_OPEN→open，其余→直接
+     c0000010 且无计数）——与全部读数吻合。具体嫌疑：Create/CreateEx 双槽（Ex 多 Pattern/EA 参数），
+     DLL 2.1.25156 若把 32 号槽当 CreateEx 调，参数从第 3 个起错位，Disposition 读歪。
+     处置：入参打印，裸值行+解读行都打——裸值是事实，解读是假设，假设错了裸值还在（观测与解释分开，
+     304 同族）。再加计数器只是把同一未知切细，不是新信息。
+
+330. 【位用探针、形用裸值、头文件只当目录】与 326 成对：槽位索引用 64 槽记号探针实测；参数签名用
+     裸值打印反推（每个参数打十六进制，指针样的限长读串）；头文件只告诉我们"有哪些操作"，
+     不告诉我们"在第几个""怎么调"。交叉核对源：DLL 自己的 debug 日志行（>>Create … CreateOptions=21
+     …）是 DLL 用它的签名解出的 ground truth——裸值序列必须能对上这些已知值，找到 CreateOptions 落在
+     哪个 pN，前后参数全定。指针解引用须限长（0xC0000005 教训）。
+
+331. 【★ 探针陷阱：槽 32 = DispatcherStopped（VOID 成员）】"实测 Create@32"是双重陷阱：
+     ① 机取脚本只匹配 NTSTATUS 返回的成员——VOID 返回的 Cleanup(6)/Close(7)/DispatcherStopped(32) 全漏数
+     （枚举 ABI 按函数指针数，不按返回类型）；
+     ② 单槽探针被顺序依赖骗：n=3 不亮是因 GSBN@2 为 NULL 短路了 Create 路径（先 GSBN 后 Create）；
+     n=32 必亮是因 DispatcherStopped 在每次 stop teardown 时被调（陷阱槽，与目标操作无关）。
+     全填探针 hits=2 = GSBN 一次 + DispatcherStopped 一次，不是两次 Create。
+     裸值 (fs,0x1,…) = DispatcherStopped(fs, Normally=TRUE)，后随寄存器垃圾。
+     修正探针：依赖链一起填（GSBN@2+Create@3+目标槽），teardown 槽留空或过滤。
+     结果：全部头文件索引（0/2/3/4/6/7/11/18）被精确源码（commit ddca7bd=2.1.25156）证实——原始机取从头就对。
+     方法教训：ground truth = 精确版本的源码（版本号里的 commit hash 可直接取 raw 文件），比头文件和朴素探针都硬。
+
+332. 【证据落在 /tmp = 没落盘】KI-11 第四现场（concurrent_opens_wait_then_publish_correctly，
+     pack_concurrency.rs:237，os error 2，release 构建，2026-10-24）因复现日志躺在 /tmp 未归档而漏报，
+     QA 清理时翻出。证据的归宿是归档目录或邮件；temp 里的证据随会话消失——尤其不稳定复现的现场，
+     丢了可能几周再见。抓捕协议第 1 条已并进"立即归档（名字+panic+归档路径）"。
+     KI-11 画像升级：四处现场 / 两条 ignored 测试都有带名复现（不是防抖静音，是症状面证据载体）/
+     debug+release 双口径（排除 debug 断言时序解释——问题在产品并发路径本身）。已转 owner。
+
+333. 【★ 门禁在成员之前（fsop.c:907 NULL 门）】ddca7bd 源码：FspFileSystemOpCreate 进门先查
+     (Create|CreateEx) + Open + (Overwrite|OverwriteEx) 三元组，缺一即 return STATUS_INVALID_DEVICE_REQUEST
+     ——不调任何接口成员。Overwrite@5 缺席 = 第一天以来所有 c0000010 的唯一根因
+     （不是槽位错/表未采用/参数序）。每类操作各有门（Read/Write/GetFileInfo/GetVolumeInfo/
+     ReadDirectory/… 同款，fsop.c:1018/1044/1095/1251/1324）。
+     方法论闭环：接了 A 但 A 计数=0 的第一候选 = 同类操作其他必填成员缺席，不是槽位错。
+     只读挂载最小必填集：Create@3+Open@4+Overwrite@5+GSBN@2+ReadDirectory@18+GetFileInfo@11+Cleanup@6+Close@7。
+     附：全填探针 hits=2 = 两 dispatcher 线程各调一次 DispatcherStopped@32（start(fs,2)），
+     read_dir 期间零接口调用（门禁挡住）。
+     ground truth 链条最终形态：精确 commit 源码（fsop.c 的控制流）> 头文件布局 > 任何探针。
+
+334. 【两段式契约 = 不半填的另一形态】GSBN 的契约是两段式（先传小缓冲/NULL 问大小 ⇒ 只写 *size
+     不碰缓冲；再传大缓冲 ⇒ 写完整描述符）；GetVolumeInfo 是单段（不够 ⇒ 拒绝）。
+     同一"不半填"原则在两种契约下的两种形态——判别信号是契约本身，不是风格偏好。
+     ACCESS_VIOLATION 的第二候选：fsop.c:797 调 GSBN 时 PFileAttributes 传 NULL（四个 0）——
+     无条件写 *file_attributes 即崩；四个输出参数（attributes/descriptor/size/size 本身 NULL）
+     全要防护（f9ee1c3 的四条拒绝接到真实 trampoline）。
+
+335. 【错误链 = 逐缺陷剥洋葱】c0000010 门禁（缺 Overwrite）→ c0000078 SD 缺 SELF_RELATIVE →
+     c0000005 写 NULL 参数 → 267 ERROR_DIRECTORY（目录语义）——四环四修，无一白走。
+     错误码前进就是链路在流动的证据（328 的姊妹条：那次码没变来源变了，这次码本身在变）。
+336. 【夹具 shape 要跟真实语义一致】探针/夹具的问题会表现成实现的问题（root 夹具按文件造 ⇒
+     GSBN 报非目录 ⇒ FILE_DIRECTORY_FILE 请求被判 ERROR_DIRECTORY）。判别法：症状指向的语义
+     与夹具声明对表。探针方法论拼图：326（位）+ 330（形）+ 331（顺序依赖/teardown 陷阱）
+     + 333（门禁）+ 336（夹具 shape）。
+
+337. 【FileContext 1:1 配平 = 生命周期纪律首次真实收账】根改目录后读数跃变：volume_info=1（Windows
+     开卷第一问终于有答案）、Open 分配 1 / Close 释放 1——"Box::from_raw 只许在 Close 做一次 + 计数器"
+     （299/300）在真实挂载上首次验证为对称。双重释放/泄漏这对最难暗病，计数器说：没有。
+     create=0 不是缺陷：fsop.c 分派 FILE_OPEN→Interface->Open，Create 只在 FILE_CREATE 型 disposition
+     被调——读数要对照控制流读（328 又一例）。失败定位先翻 debug 日志（>>Op 行已点名），
+     计数器只在日志不含该 op 行时才需要（那时是 IRP 没到，另一种问题）。
+
+338. 【★ 里程碑：dir Z:\ 成功（290985f）】Windows 侧第一次读到 layer-fs 命名空间。读链闭合：
+     volume_info→security→open→read_dir→close，FileContext 1:1。
+     错误链完整复盘（收口报告素材）：c0000010(门禁缺Overwrite)→c0000078(SD缺SELF_RELATIVE)
+     →c0000005(写NULL参数)→267(根夹具按文件造)→c0000010(三处不同来源)→Ok(())。
+     七环七修，无一"重试就绿"。
+     三条新判据：①缓冲太小≠未实现（BUFFER_TOO_SMALL 是"换大缓冲再来"）；②GetSecurityByName 与
+     GetSecurity 是两个操作（相邻名字≠同一回事，与 317 同族）；③空列表与槽没接必须可区分
+     （共用错误码则"实现错了"与"根本没到"永远分不清）。
+     下一步：内容断言（alpha.txt/beta 名字+属性）→QA 挂载验收→合入 main（滚动口径）。
+     注：user@2e9954e1 无 mailbox（owner 未注册）——owner 通报改为当面/渠道外，此前"转发 owner"的邮件均落此坑，待确认 owner 实际收件方式。
+
+339. 【ReadDirectory 精确签名（ddca7bd :703）】(fs, FileContext, Pattern, Marker, Buffer, Length,
+     PBytesTransferred)——Pattern/Marker 在 Buffer/Length 前，无 Offset 参数，末位是**输出指针**。
+     裸值逐位吻合：p4=Buffer 大地址、p5=0x328=808=Length（曾被误读为 Marker）、p6=PBytesTransferred 待写。
+     空目录双层解释：参数序错 + 未写 *PBytesTransferred（OS 拿 0 计数 ⇒ 无条目）。
+     续读协议：首查 Marker=NULL 从头；续查 Marker=上批最后一条名；结尾 SUCCESS + 计数 0 = 目录完。
+     输出指针必须写（与 GSBN 的 *PFileAttributes 同族，均带 NULL 防护）。
+     方法论：拿到精确 commit 源码后，签名问题先查源码再探针（330 的升级：源码在手，裸值只做验证）。
+
+340. 【★ ④ 读链闭合（f75a8ad）→ QA 验收启动】dir Z:\ 列出 ["alpha.txt","beta"]——内容逐字可验。
+    读链 volume_info→GSBN→Open→ReadDirectory→Close 全真实回调，FileContext 1:1，卸载干净。
+    错误链七环收尾：门禁→SD标志→NULL参数→根语义→三处未实现→参数序→传输计数。
+    分支 p3-4/mount @ f75a8ad（44 提交，基于 6ed9aae）已交 QA 挂载会话验收（滚动合入口径，241）；
+    worker 转下一批：目录挂载（Prefix@40）→ 有副作用回调 → L2 → M1–M9 → U1–U14。
+    合并报告素材清单已发 worker：功能分层 / 错误链简表 / 判据对应（326–339）。
+
+341. 【★ 目录挂载点必须不存在（源码纠正 manager）】fs.c Preflight + mount.c FspMountSet_Directory +
+     util.c FspCreateDirectoryFileW 三连证据：目录挂载点由 WinFsp 自己创建（NT FILE_CREATE，
+     带句柄 DELETE_ON_CLOSE）——已存在 ⇒ STATUS_OBJECT_NAME_COLLISION；不存在 ⇒ 创建并挂载；
+     卸载关闭句柄 ⇒ 目录自动消失（卸载断言 = 目录消失，与盘符 released_after_delete 对称）。
+     第一天以来目录挂载全部 0xC0000035 都是这一个原因——manager 当初"显式建空目录"的建议方向完全反了
+     （worker 的"前置断言存在且为空"是在诚实执行错误假设）。
+     Prefix 真面目：UNC 网络形态专用；mount.c 开头网络卷（VolumeName 反斜杠≥3）被 Directory 分支
+     拒绝（NETWORK_ACCESS_DENIED——Windows 不允许 junction 指向网络 FS）。目录形态不设 Prefix。
+     方法：挂载失败读 DLL 精确源码（fs.c/mount.c/util.c），同 fsop.c 战法。
+
+342. 【目录挂载打通（3588d9d）】挂载点必须不存在（341 的翻转）+ 目录形态不设 Prefix（撤调用点、
+     留代码）⇒ create=0 mount=0 start=0，probe 列出 ["alpha.txt","beta"]，卸载后目录消失
+     （DELETE_ON_CLOSE）。盘符与目录两形态同一份代码都通。
+     卸载纪律统一（309 同条）：两种形态断言的都是"留下的东西"（盘符消失/目录不存在），
+     SetMountPoint(NULL) 的 INVALID_PARAMETER 是 API 固定行为，不追。
+     L2 分工：worker 写对照脚本（同一脚本只差路径前缀，定向调通挂载侧），QA 跑两侧完整 12 类对照（验收）。
+     合并计划：QA 验 f75a8ad 通过后，合并到分支当前头（按内容核，240 口径）。
+
+343. 【L2 对照脚本纪律】一个脚本两个根（只收路径前缀，两侧同一份代码——差异不可能是脚本差异）；
+     只出观测（NN name: <observation>）、比较交给两侧 diff——脚本自判 pass/fail 会把措辞差异
+     和真差异一起藏掉（观测与判断分离）。两处假差异预警：05 枚举顺序（口径：内容排序后比较、
+     顺序单独记录不比较——枚举序不在承诺面，Windows 本身不保证跨 FS 枚举序）、12 属性打印
+     （口径：比属性位语义，格式差异记录不判）。三分档：一致/有据差异附证据 ref/缺陷，
+     每行落一个档不许空。挂载侧定向运行默认交 QA 完整验收（不为了看一眼改生产路径）。
+
+344. 【口径写进输出本身】05a/12a 参与比较、05b/12b 只留档——比较面与留档面在输出里自描述：
+     QA diff 时不需要翻规则文档，口径就是数据的一部分；只看 diff 也能知道哪行该红哪行不该红。
+     与"判据影响行写在提交首行"同族：规则寄生在产物上，不寄生在人的记忆里。
+     其余 10 类保持单行（语义观测无格式成分）——形式服务于比较，不服务于整齐。
+
+345. 【P3-4 读链批合入 main（18d84e3，49 提交）】QA 验收通过（独立复跑 589/0/9 + 真实挂载非 SKIP +
+     ABI 33 成员机械枚举核对 + 判据行 49/49）。ff 合入，diff 为空（240），临时 worktree 即删，
+     分支滚动续用（卡完再删）。
+     QA 附缺口（写链批第一个提交必补，缺一不收）：名字逐字断言（probe 曾故意丢弃名字）+
+     FileContext 配平断言（跨 before-after 差值）——观测不是断言（244）。
+     QA 亮点入档：第二证人原则救验收人自己（前两轮枚举漏 Obsolete0 被 Reserved[31] 交叉否定，
+     枚举配方=成员数对 Reserved[N] 核）；nextest 0.9.150 抓捕协议 v4 定稿（JSON 不可行系 owner 更正）；
+     mount_lifecycle stop 不可观测=正面形态样板。
+     不稳定红第 N 次（587/2→589/0×2）：QA 合入后首跑 nextest 全量 = 抓捕窗口。
+
+346. 【滚动合入清单 + 报告口径修正（clippy 破口复盘）】目录挂载提交破 clippy（mounted.rs:527
+     unused is_drive_letter），两个缺口叠加溜进 main：worker 后续报告丢了 clippy 项 + manager
+     滚动合入清单（ancestor/diff/判据行）没有合入头 clippy。
+     修正：①每个动代码的提交，报告必须带 fresh clippy（"clippy 0"四字）；②滚动合入清单加第四项：
+     合入头 clippy 提交方报告 + manager 复核。修复搭写链批第一个提交一次清零（三件套）。
+     QA 241 亮点：参照一律对 origin/main（本地 main 停旧位曾出 3905 行删除假象，243 同族）；
+     从"基本成立"挖到"精确说"（mounted_read_only 前置判据变了但带证据合规）——241 存在的理由。
+     不稳定红台账：5 次（2 无名+2 带名+1 无名 worker 587/2），边界假设成立（4 次提交/合入后首跑，
+     干净边界 0 次）；下个抓捕窗口=写链批合入后首跑（并发面更大）。
+
+347. 【差值配平 = 指纹带时间窗】断言 (after.alloc-before.alloc)==(after.free-before.free) 而非
+     alloc==free：绝对值会被上一轮残留计数偶然满足，差值把证据窗口收窄到本次挂载。
+     绝对值断言在"第一次跑"无懈可击，"第 N 次跑"变恒真。与"计数是指纹"同族精化：指纹要带时间窗。
+348. 【注入必先证红——静默未生效比编译失败更阴】replace 没匹配上（fmt 重排过那段）⇒"断言已加"
+     但不在文件 ⇒ 测试照旧全绿——全绿读数对"改动没进文件"完全无感（303/323 是补丁坏编译会响，
+     这次是不响）。唯一防线：注入式改动（替换/patch/生成）先证明确实改到了（理想是红法：
+     故意错期望值看它红），再相信后续绿。
+
+349. 【先接类门，让错误码说真话】只读卷上 Write 槽为 NULL ⇒ "写"类全表现 c0000010（未实现）——
+     把写保护伪装成没实现。先接槽返回 STATUS_MEDIA_WRITE_PROTECTED：Windows 看到"不许写"而非
+     "缺功能"。两个真话不能共用一个谎言的形状（338 逆用：错误码不只是入口，还是诚实度）。
+     收益：后续换真实现只改 trampoline 体，槽位与类门不动。
+     写链批纪律沿用：纯 Rust 判据先红 → 接槽真机验 → fresh clippy（346）。
+     make(path)->FileId 钩子走 adapter 既有路径链（路径→id 只在路径语义入口，P3-2 G2 老纪律）。
+
+350. 【(b) 注册表落地——299 的到期条款】写链（make 钩子/Cleanup 两段删除/SetFileSize）全是挂载级
+     状态 ⇒ 进程级 OnceLock 配置结构性到头（测试顺序依赖、配置项已四五个）。
+     299 原条款到期执行：配置下沉 Adapter 字段 + FSP_FILE_SYSTEM*→Adapter 注册表 +
+     stop→注销→delete 清理顺序同批写。一挂载一 Adapter 一 HandleTable，天然双挂载，测试无顺序依赖。
+     302 老判据（OnceLock 合并测试）被结构取代——迁移时提交说明写明"取代不是删除"。
+     执行要求：一次结构提交（不与 Create 判据混）；注册表用 Arc/显式 remove（非 leak），
+     delete 后 registry 查无此键写成断言（别让清理顺序变成新的悬垂）。
+     撤回纪律再次正确：没有判据就不提交，不留没有判据的实现（196）。
+
+351. 【对策不是注释，而是顺序+断言】悬垂风险的对策 = 代码顺序（remove 在 stop 后）+ 可判形态
+     （delete 后 registry 查无此键断言），不是"注意别在 remove 后回调"的注释——注释提醒人，
+     顺序与断言约束程序（与 344 规则寄生在产物上同族）。
+     Mutex<HandleTable> 定位：并发安全是正确性问题不是性能取舍（回调来自 dispatcher 线程，真并发；
+     RefCell 在真实挂载是 UB 风险）。锁开销若成问题是带测量的 B 项，不是现在的猜测——
+     结构提交不夹性能猜测。
+
+352. 【未注册返回 None，绝不返回默认配置】进程级 OnceLock 的病根：查不到时它编一个答案
+     （上一次配置的残留），而不是说"没有"。None 是诚实的失败——让"回调拿不到 Adapter"
+     变成可判的错误而不是静默的错答案。与 301（零记录≠空文件）、304（没调用≠调用失败）
+     同族谱：宁可显式失败，不可静默编造。
+     附：泄漏的表永远无法被证明已经不在了——Arc+remove 把生命周期规则从泄漏形态变成可断言形态；
+     注册表 insert 撞键返回旧 Arc（WinFsp 复用指针时静默覆盖会搅在一起，报旧值让事情被看见）。
+
+353. 【348 补条：注入生效的三道防线】替换没生效第二起（fmt 折行致 replace 不匹配，miss 计数没进文件）——
+     这回是断言当场抓的（left: 0, right: 1），上回是红法抓的（断言不在测试全绿）。
+     两次不同探测器、同一根因：注入后必须验证注入生效。
+     防线分层：grep 目标特征（最便宜第一道）→ 断言存在性（第二道）→ 红法（最强）。
+     附：miss 计数只数 miss 不数命中——计数器的价值在于期望值（miss 期望恒 0，
+     非零即悬垂现场），命中计数会随正常挂载增长毁掉不变量。
+
+354. 【指纹要带时间窗，也要带归属】按挂载计数（Adapter.contexts）的理由：进程级计数回答
+     "全局有没有漏"，teardown 真正要问"这一次挂载配平了吗"——后者不能被别的挂载掩盖。
+     用例形态：第二个 adapter 只分配 ⇒ (1,0)，第一个的 (1,1) 掩盖不了它。
+     不稳定红第 6 次（595/1→596/0×2，仍未留名）；抓捕窗口=写链批合入后 nextest 首跑。
+
+355. 【切换拆两步：死代码是诚实的中间态，回退是撒谎的中间态】A 步新路径活（mounted 三段接线 +
+     trampoline 读注册表 miss 即拒绝 + 直测改 Adapter 构造，OnceLock 变死代码但还在）；
+     B 步纯删（删 OnceLock ×4 + 302/300 迁移，无新行为）。
+     不要做"注册表查不到回退 OnceLock"——回退是 352 反面（查不到时编答案）。
+     改动面积与事故概率单调相关（本轮两次注入事故都在"一次动太多"）。
+     B 步的删干净证据：grep -c OnceLock 期望 0。
+     在上下文边界不硬上（交接说明形态）本身是好交付。
