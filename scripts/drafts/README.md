@@ -352,3 +352,17 @@ Three facts:
 So the assumption behind the split — "a directory create arrives with `FILE_DIRECTORY_FILE` in the low bits and a creating disposition in the high
 byte" — is **not what this DLL sends for these calls**. The next run must print the raw `create_options` word for each of these, to see which of the
 two halves is missing (or whether both are, and the FSD is opening first and creating later).
+
+## After the kind fix: `mkdir` works, listing works, **child creation still fails**
+
+```
+STEP mkdir:        Ok(())
+STEP root list:    Ok(["d"])                 ← the directory exists and is listed
+STEP write in d:   Err(3, NotFound)          ← creating a child under it still fails
+```
+
+So the "file replaced the directory" accident is gone (the directory survives and lists), and the remaining failure is one level deeper: creating
+`\d\a` — the *parent* resolution inside the backend, or the path translation for a nested name.
+
+Next step is the recorder backend again, this time printing every call **with its raw bytes**, for exactly the two operations `mkdir("d")` and
+`write("d/a")`, to see whether the nested path arrives as `\d\a` (and whether anything translates the backslashes).
