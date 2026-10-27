@@ -98,6 +98,52 @@ pub unsafe fn read_directory(
     unsafe { read_directory_from(&entries, buffer, marker, length, bytes_transferred) }
 }
 
+/// The `ReadDirectory` **shell**: the adapter comes from the mount registry, or `None` when the pointer is not a live mount.
+///
+/// Same shape as [`get_volume_info_shell`]: the miss is in the type, and the entries come from **this mount's** adapter rather
+/// than from a process-wide hook (352). `None` lists nothing — it does not fall back to whoever was configured last.
+///
+/// # Safety
+///
+/// `context` must point to `EntryContext`, `buffer` must be valid for writes of `length` bytes, `marker` (when not null) must
+/// point to a NUL-terminated UTF-16 string, and `bytes_transferred` (when not null) must be writable.
+pub unsafe fn read_directory_shell(
+    adapter: Option<&crate::DynAdapter>,
+    context: *const c_void,
+    buffer: *mut c_void,
+    marker: *const u16,
+    length: u32,
+    bytes_transferred: *mut u32,
+) -> i32 {
+    READ_DIR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if context.is_null() || buffer.is_null() {
+        eprintln!(
+            "read_directory: null argument (context={:?} buffer={:?} length={})",
+            context, buffer, length
+        );
+        return 0;
+    }
+    // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
+    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let entries = match (adapter, LIST.get()) {
+        // A live mount with a configured lister.
+        (Some(_), Some(list)) => list(entry.file_id),
+        // No mount, or nothing configured: an empty page. A miss must never fall back to another mount's lister (352).
+        _ => Vec::new(),
+    };
+    // SAFETY: the caller's contract covers every pointer handed through.
+    unsafe { read_directory_from(&entries, buffer, marker, length, bytes_transferred) }
+}
+
+/// Why the entries are still taken from the injected `LIST` hook and **not** derived from the adapter:
+///
+/// `ops::DirEntry` carries `{ name, kind }` — **no `file_id`** — while a dirent record needs the entry's metadata, which the backend
+/// answers by id. So deriving needs `DirEntry::file_id` added at the trait level (and in both backends) — a backend change, not a
+/// shell change. Recorded as a finding rather than worked around: inventing an id here would put a wrong number into every
+/// listing.
+#[allow(dead_code)]
+fn directory_entries_cannot_yet_be_derived_from_the_mount() {}
+
 /// The `ReadDirectory` body with the entries handed in — the resume, the framing and the count are all here.
 ///
 /// # Safety

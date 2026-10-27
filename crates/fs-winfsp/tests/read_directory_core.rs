@@ -7,9 +7,39 @@
 use std::ffi::c_void;
 
 use fs_semantics::attributes::DIRECTORY;
-use fs_winfsp::callbacks::{read_directory_from, ListEntry};
+use fs_winfsp::callbacks::{read_directory_from, read_directory_shell, ListEntry};
 use fs_winfsp::ops::NodeInfo;
 use fs_winfsp::Kind;
+
+/// The shell's **miss** path: no mount means an empty page, never another mount's listing (352).
+///
+/// `read_directory_shell` also proves the liveness question is asked at all — a `None` adapter is the registry miss that the
+/// `contains == false` assertion argues cannot happen at teardown, and the counter is what makes it visible if it does.
+#[test]
+fn the_shell_lists_nothing_when_there_is_no_mount() {
+    let entry = fs_winfsp::callbacks::EntryContext { file_id: 0 };
+    let context = std::ptr::addr_of!(entry).cast::<c_void>();
+    let mut buffer = vec![0u8; 4096];
+    let mut transferred = u32::MAX;
+
+    let status = unsafe {
+        read_directory_shell(
+            None,
+            context,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            std::ptr::null(),
+            4096,
+            std::ptr::addr_of_mut!(transferred),
+        )
+    };
+
+    assert_eq!(status, 0, "cell miss: an empty page, not an error status");
+    assert_eq!(transferred, 0, "cell miss: and the count says so");
+    assert!(
+        buffer.iter().all(|byte| *byte == 0),
+        "cell miss: nothing was written — **no fallback to whoever was configured last**"
+    );
+}
 
 fn info(kind: Kind) -> NodeInfo {
     NodeInfo {

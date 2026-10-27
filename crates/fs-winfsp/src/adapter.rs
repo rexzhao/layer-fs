@@ -123,6 +123,13 @@ impl<B: WorkspaceOps> Adapter<B> {
         )
     }
 
+    /// The backend, borrowed: the callbacks need `read_dir`/`get_info` directly, and going through the adapter's handle semantics
+    /// would be the wrong question for a listing (there is no handle — the directory id is already known).
+    #[must_use]
+    pub fn backend(&self) -> &B {
+        &self.ops
+    }
+
     /// This mount's configuration.
     #[must_use]
     pub fn config(&self) -> AdapterConfig {
