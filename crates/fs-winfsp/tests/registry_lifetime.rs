@@ -166,3 +166,28 @@ fn configuration_belongs_to_the_mount() {
         "cell bare: no configuration means `None`, never a leftover from another mount"
     );
 }
+
+/// A miss is **observable** (defence and observation are different jobs): the lookup still answers `None`, and the counter
+/// records that it happened, so a dangling callback cannot hide behind "some refusal".
+#[test]
+fn a_missing_lookup_is_counted() {
+    use fs_winfsp::registry::miss_count;
+
+    let registry: Registry<MockBackend> = Registry::new();
+    let before = miss_count();
+    assert_eq!(registry.get(0xBAD).map(|_| ()), None);
+    assert_eq!(
+        miss_count() - before,
+        1,
+        "cell miss: an unregistered pointer is counted, not just refused"
+    );
+    // A hit does not count.
+    registry.insert(0x1000, adapter());
+    let before = miss_count();
+    assert!(registry.get(0x1000).is_some());
+    assert_eq!(
+        miss_count() - before,
+        0,
+        "cell hit: a successful lookup is not a miss"
+    );
+}

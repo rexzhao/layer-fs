@@ -20,6 +20,19 @@ use std::sync::{Arc, Mutex};
 use crate::adapter::Adapter;
 use crate::ops::WorkspaceOps;
 
+/// How many lookups missed — the **only**现场 a dangling callback leaves behind.
+///
+/// The ordering (`remove` after `stop`) plus the `contains == false` assertion argue that a miss cannot happen; this counter is
+/// for the case where it happens anyway. **Defence and observation are different jobs**: an assertion says "this must not
+/// occur", a counter says "if it did, here it is" — a refusal that shares a status code with every other refusal would hide it.
+static REGISTRY_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many lookups have missed since process start.
+#[must_use]
+pub fn miss_count() -> usize {
+    REGISTRY_MISSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Mounts by the pointer WinFsp identifies them with.
 ///
 /// `Arc` plus an explicit [`remove`](Registry::remove) rather than `Box::leak`: a leaked table can never be shown to be gone,
@@ -66,11 +79,16 @@ impl<B: WorkspaceOps> Registry<B> {
     /// If the internal lock is poisoned.
     #[must_use]
     pub fn get(&self, file_system: usize) -> Option<Arc<Adapter<B>>> {
-        self.mounts
+        let found = self
+            .mounts
             .lock()
             .expect("registry lock")
             .get(&file_system)
-            .cloned()
+            .cloned();
+        if found.is_none() {
+            REGISTRY_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        found
     }
 
     /// Unregisters **after `stop`**. Returns whether a mount was there.
