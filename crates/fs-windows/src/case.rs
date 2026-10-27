@@ -36,9 +36,13 @@ pub enum Lookup<'a> {
 
 /// Folds one name for comparison: ASCII case only (see the module note on the Unicode policy), **no** Unicode
 /// normalization, and no trimming.
+///
+/// **The implementation lives in [`fs_semantics::name`]**, not here: the core also stores names and must match them by the same key, so a second
+/// copy in this crate would be a way for the two layers to disagree without anyone noticing (470). This function stays as the frontend-facing name
+/// so the call sites keep reading like Windows vocabulary.
 #[must_use]
 pub fn fold(name: &str) -> String {
-    name.to_ascii_uppercase()
+    fs_semantics::name::fold(name)
 }
 
 /// Looks `wanted` up in `entries`.

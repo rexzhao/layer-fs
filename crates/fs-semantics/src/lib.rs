@@ -5,3 +5,4 @@
 
 pub mod attributes;
 pub mod disposition;
+pub mod name;
