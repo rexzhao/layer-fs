@@ -763,12 +763,25 @@ unsafe fn open_like(
             Err(crate::ops::OpsError::NotADirectory) => Err(OURS_NOT_A_DIRECTORY),
             Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
         },
-        MakeVerb::File => adapter
+        MakeVerb::File => match adapter
             .backend()
             .create_or_open(path.as_bytes(), disposition)
+        {
             // The backend's own answer carries where the name lives — that is the binding `remove_at` will guard with.
-            .map(|outcome| (outcome.file_id, Some(outcome.binding)))
-            .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
+            Ok(outcome) => Ok((outcome.file_id, Some(outcome.binding))),
+            // **A directory opened without `FILE_DIRECTORY_FILE`.** Windows does open directories with a plain `FILE_OPEN` (that is how it walks into
+            // one before creating a child), and the file door correctly refuses it — so the directory door gets the second attempt. Without this
+            // fallback the open of a perfectly good directory answers NotADirectory, and every child operation under it fails with
+            // "path not found" (measured: `/d` Open -> NotADirectory, then `/d/a` -> NotFound, four calls in a row).
+            Err(crate::ops::OpsError::NotADirectory) => {
+                match adapter.backend().open_dir(path.as_bytes()) {
+                    Ok(file_id) => Ok((file_id, None)),
+                    Err(crate::ops::OpsError::NotADirectory) => Err(OURS_NOT_A_DIRECTORY),
+                    Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
+                }
+            }
+            Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
+        },
     };
     let (file_id, binding) = match outcome {
         Ok(pair) => pair,
