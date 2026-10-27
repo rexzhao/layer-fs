@@ -522,6 +522,15 @@ mod platform {
             params.set_max_component_length(255);
             // No caching: the workspace is the only source of truth, and a cached FileInfo would hide another handle's write.
             params.set_file_info_timeout(0);
+            // **A directory mount has no name of its own**, unlike a drive letter, so the volume must carry one. Applied only for
+            // that shape: a drive-letter volume should not advertise a UNC prefix it will never be reached by.
+            let is_drive_letter = {
+                let text = mount_point.to_string_lossy();
+                text.len() == 2 && text.ends_with(':')
+            };
+            if !is_drive_letter {
+                params.set_prefix(r"\layer-fs\workspace");
+            }
             // **The table must outlive the file system.** `FspFileSystemCreate` takes a pointer to the interface and — like
             // most C libraries — keeps it rather than copying it; a table owned by this stack frame would be dangling the
             // moment `create` returns, and a dangling table reads as "every slot is None", which WinFsp reports as

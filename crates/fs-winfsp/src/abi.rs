@@ -244,6 +244,24 @@ impl VolumeParams {
         self.bytes[16..20].copy_from_slice(&value.to_ne_bytes());
     }
 
+    /// `WCHAR Prefix[FSP_FSCTL_VOLUME_PREFIX_SIZE / sizeof(WCHAR)]` — `fsctl.h:237`, **offset 40**.
+    ///
+    /// A UNC prefix (`\server\share`). Directory mount points need it: a drive letter gets its identity from the letter, while
+    /// a directory mount has none unless the volume carries a name.
+    ///
+    /// The offset is not hand-counted: `Prefix` follows the single 32-bit bitfield word at 36, and the SDK's own assertion
+    /// (`fsctl.h:258`: `sizeof(V0) == 456`) closes the arithmetic from both ends —
+    /// `40 (prefix) + 384 (192 WCHAR) + 32 (FileSystemName) = 456`.
+    pub fn set_prefix(&mut self, prefix: &str) {
+        const PREFIX_BYTES: usize = 384;
+        let at = 40;
+        self.bytes[at..at + PREFIX_BYTES].fill(0);
+        for (index, unit) in prefix.encode_utf16().take(PREFIX_BYTES / 2 - 1).enumerate() {
+            let offset = at + index * 2;
+            self.bytes[offset..offset + 2].copy_from_slice(&unit.to_ne_bytes());
+        }
+    }
+
     /// The first bitfield word — `fsctl.h:206-215`, offset 36.
     ///
     /// Sets `CasePreservedNames`, `UnicodeOnDisk` and `PersistentAcls` (bits 1, 2 and 3; bit 0 is `CaseSensitiveSearch`, which a
