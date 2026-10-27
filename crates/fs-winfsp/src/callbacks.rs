@@ -411,10 +411,13 @@ pub unsafe fn get_security_by_name(
             // SAFETY: `descriptor_out` is non-null and at least 4 bytes per the capacity check.
             unsafe {
                 let bytes = descriptor_out.cast::<u8>();
+                // SECURITY_DESCRIPTOR_RELATIVE: revision 1, then `Control` as a little-endian u16 at offset 2. The
+                // `SE_SELF_RELATIVE` bit (0x8000) is **required** for a descriptor with no pointers — without it Windows
+                // rejects the whole thing with STATUS_INVALID_SECURITY_DESCR (0xC0000078), which is exactly what it did.
                 std::ptr::write(bytes, 1);
                 std::ptr::write(bytes.add(1), 0);
-                std::ptr::write(bytes.add(2), 0);
-                std::ptr::write(bytes.add(3), 0);
+                std::ptr::write(bytes.add(2), 0x00);
+                std::ptr::write(bytes.add(3), 0x80);
             }
             // SAFETY: writable out-parameter.
             unsafe { std::ptr::write(descriptor_size_out, 4) };

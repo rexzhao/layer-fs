@@ -205,6 +205,22 @@ mod platform {
         unsafe { crate::callbacks::create(file_name, create_options, context_out, info_out) }
     }
 
+    /// `Overwrite` — `winfsp.h:345`, slot **5**. Required for the whole create class (`fsop.c:907`: the dispatcher refuses the
+    /// class outright, **without calling any member**, when `Create`/`Open`/`Overwrite` are not all present).
+    ///
+    /// A read-only volume: refuse with `STATUS_MEDIA_WRITE_PROTECTED` (`0xC00000EA`). That is not "unimplemented" — WinFsp relays
+    /// it as a write-protected volume, which is the truth about this stage.
+    unsafe extern "system" fn overwrite_trampoline(
+        _file_system: *mut c_void,
+        _file_context: *mut c_void,
+        _file_attributes: u32,
+        _replace_attributes: u32,
+        _allocation_size: u64,
+        _file_info: *mut crate::abi::FileInfo,
+    ) -> i32 {
+        0xC000_00EAu32 as i32
+    }
+
     /// `Close`: `(FSP_FILE_SYSTEM*, PVOID FileContext)` — `winfsp.h:420`.
     unsafe extern "system" fn close_trampoline(
         _file_system: *mut c_void,
@@ -350,6 +366,25 @@ mod platform {
                 ) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(creating));
+            let overwriting: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                u32,
+                u32,
+                u64,
+                *mut crate::abi::FileInfo,
+            ) -> i32 = overwrite_trampoline;
+            interface.slots[slot::OVERWRITE] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    u32,
+                    u32,
+                    u64,
+                    *mut crate::abi::FileInfo,
+                ) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(overwriting));
             interface.slots[slot::OPEN] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(
                     *mut c_void,
