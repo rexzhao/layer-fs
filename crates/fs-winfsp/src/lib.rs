@@ -11,6 +11,7 @@ pub mod abi;
 pub mod adapter;
 pub mod boundary;
 pub mod callbacks;
+pub mod debuglog;
 pub mod dir_buffer;
 pub mod dirent;
 pub mod error;

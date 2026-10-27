@@ -372,6 +372,10 @@ mod platform {
 
             let device = wide(std::ffi::OsStr::new(super::DISK_DEVICE));
             let mut file_system: *mut c_void = std::ptr::null_mut();
+            // The log handle is process-wide, so it is set up **before** create or the first traces are lost.
+            let debug_log = std::env::var_os("LAYER_FS_DEBUG_LOG")
+                .map(std::path::PathBuf::from)
+                .and_then(|path: std::path::PathBuf| crate::debuglog::open(path.as_path()));
             let create_status = create(device.as_ptr(), &params, interface, &mut file_system);
             if create_status != 0 || file_system.is_null() {
                 return Ok(super::MountReport {
@@ -383,6 +387,10 @@ mod platform {
                     released_after_delete: true,
                     looked_like_a_mount: false,
                 });
+            }
+
+            if let Some(log) = debug_log {
+                crate::debuglog::attach(log, module, file_system);
             }
 
             let mount_path = wide(mount_point.as_os_str());
@@ -408,6 +416,10 @@ mod platform {
             let unmount_status = set_mount_point(file_system, std::ptr::null());
             stop(file_system);
             delete(file_system);
+            if let Some(log) = debug_log {
+                // Close **before** anyone reads the file, or the tail is still buffered.
+                crate::debuglog::close(log);
+            }
             // The hard evidence, read back from the OS: is the mount point gone? A status code alone does not say.
             let was_drive = {
                 let text = mount_point.to_string_lossy();
