@@ -170,3 +170,23 @@ Remaining candidates, in the order the log's neighbourhood suggests:
    filesystem-name string has a different length and shape).
 
 The same VirtualQuery guard can be applied to each of those in turn — one guard, one run, until one of them refuses.
+
+## Double-Close: the three numbers (L2 mounted run, release witness on)
+
+```
+our counters:  open_like entries 122, create_shell 4, contexts allocated 115, freed 97, double releases 18
+FSD log:       >>Create 244, >>Close 117, >>Open 0
+```
+
+Reading them together:
+
+- **115 = 97 + 18**: every context is freed once successfully, and 18 *extra* `Close` calls arrive for addresses that are already out of
+  the live set. The bookkeeping adds up exactly, so this is not a leak and not a lost free — it is **more closes than contexts**;
+- `>>Create` (244) versus `create_shell` (4) is a second anomaly worth the same treatment: the FSD logs far more creates than reach our
+  callback, which either means most are answered by the FSD itself (a class gate?) or that our `Create` is not the one being called for
+  most of them. **Not explained yet**;
+- `>>Open 0` with `open_like` entered 122 times says every open goes through **`Create`** in this FSD (`Open` is not used when `Create`
+  is registered) — that is consistent with the header's note that `Create` supersedes `Open`.
+
+So the next experiment is not "find the double close" but **"who calls Close twice"**: attach the FSD log and pair each `>>Close` line with the
+`FileContext` value printed by our side. A pairing (same pointer, two `>>Close` lines, one `>>Create`) settles it in one run.
