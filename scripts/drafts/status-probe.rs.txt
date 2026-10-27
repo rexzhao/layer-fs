@@ -1,0 +1,48 @@
+//! (512) Print the exact status the create/open door answers for a missing name, in the shape that fails.
+
+use std::path::PathBuf;
+
+use fs_winfsp::abi::VolumeInfo;
+use fs_winfsp::loader::{default_library, resolve_library, LoadError};
+use fs_winfsp::mock::MockBackend;
+use fs_winfsp::mounted::mount_read_only;
+use fs_winfsp::ops::DynOps;
+
+fn volume() -> VolumeInfo {
+    VolumeInfo {
+        total_size: 1 << 20,
+        free_size: 1 << 19,
+        volume_label_length: 4,
+        volume_label: {
+            let mut label = [0u16; 32];
+            label[..4].copy_from_slice(&[b'w' as u16, b'r' as u16, b'i' as u16, b't' as u16]);
+            label
+        },
+    }
+}
+
+#[test]
+fn status_for_a_missing_name() {
+    let library = default_library();
+    if let Err(LoadError::NotFound { path }) = resolve_library(&library) {
+        eprintln!("SKIP: no winfsp at {}", path.display());
+        return;
+    }
+    let mount_point = std::env::var_os("LAYER_FS_MNT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("V:"));
+    let backend: DynOps = Box::new(MockBackend::new());
+    let _ = mount_read_only(&library, &mount_point, backend, volume(), |path: &std::path::Path| {
+        let root = if path.to_string_lossy().ends_with(':') {
+            PathBuf::from(format!("{}\\", path.display()))
+        } else {
+            path.to_path_buf()
+        };
+        let joined = root.join("written.txt");
+        let formatted = PathBuf::from(format!("{}written.txt", root.display()));
+        let via_join = std::fs::write(&joined, b"hello layer-fs").map_err(|e| e.to_string());
+        let via_format = std::fs::write(&formatted, b"hello layer-fs").map_err(|e| e.to_string());
+        println!("STATUS via_join={via_join:?} via_format={via_format:?}");
+        Ok(())
+    });
+}

@@ -1048,3 +1048,21 @@ means the answer we gave is not `STATUS_OBJECT_NAME_NOT_FOUND`.
 Our handler for a missing file in `\written.txt` is the file door's `create_or_open(..., Open)`, whose `NotFound` maps to… that mapping is the next thing
 to read, and the criterion is precise: **the status returned for a missing name must be `0xC0000034`**, or Windows will not upgrade an `Open` into a
 `Create` and no file can be created through the mount in this shape.
+
+## **Both** gates answer `0xC0000034` — and Windows still will not create (512)
+
+```
+door-status create/open("\\", Open)            -> 0xC0000034
+door-status create/open("\written.txt", Open) -> 0xC0000034
+gsbn-status("\written.txt")                   -> 0xC0000034
+gsbn-status("\\")                              -> 0xC0000034
+STATUS via_join = os error 3 ; via_format = os error 3
+```
+
+So the status we return is the one the upgrade requires, **twice over**, and no `Create` is ever sent. That kills the "wrong status" explanation and moves the
+question one step: what does Windows actually ask for? `std::fs::write` opens with `CREATE_ALWAYS`, i.e. `FILE_OVERWRITE_IF`, and WinFsp routes that
+disposition to **`Overwrite` (slot 5)**, not to `Create`. Our call log shows no `Create`, no `Overwrite` line either (the mock only logs `WorkspaceOps`
+calls, and `Overwrite` reaches us as `create_shell` with disposition `Supersede`… or not at all).
+
+Next probe, one line: log the **slot** that arrived (`Create` vs `Overwrite`) with its `CreateOptions` and the status we answer. If `Overwrite` is being
+called for a file that does not exist, the answer must still let the create happen.
