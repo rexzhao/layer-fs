@@ -122,3 +122,17 @@ Three fixes got there, each found by a reading rather than by reasoning:
 The last fix is done **without** changing either backend: the shell asks the size first and clamps the request to what remains
 (`want = min(length, size - offset)`), so EOF is a genuine zero-byte read. Both backends zero-pad their answers, which is fine for
 them — the padding contract stays where the trait put it, and the adapter makes EOF visible.
+
+## L2 mounted side: a crash, and the interpreter trap
+
+Running the L2 script **against a live mount** (through a temporary harness that mounts `MockBackend` and shells out) found two things:
+
+1. **`bash` is not `bash` here.** `std::process::Command::new("bash")` resolves to `C:\Windows\System32\bash.exe` (WSL), which cannot
+   see `F:` at all — the script reports "No such file or directory" for a file that exists. The Git Bash
+   (`C:/Program Files/Git/bin/bash.exe`) is the one the script was written for; it must be named explicitly.
+2. With the Git Bash, the mounted run **aborted the test process**: `0xc0000374` (`STATUS_HEAP_CORRUPTION`). That is the first crash the
+   mounted side has produced, and it is a **memory-corruption** class finding, not a behaviour difference — it needs the same
+   trace-first treatment (which callback with which buffer) before anything else is claimed about L2 results.
+
+Neither the harness nor the crash diagnosis is committed yet: the harness was temporary, and a crash report is worth nothing until the
+failing callback is named.
