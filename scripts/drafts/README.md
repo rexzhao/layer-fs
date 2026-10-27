@@ -330,3 +330,25 @@ again with `FILE_OPEN + FILE_DIRECTORY_FILE`, which falls into the file door and
 
 The fix is a trait method — `open_dir(path) -> id` (or a `kind`-aware `create_or_open`) — implemented in both backends. That is a cut of its own,
 and it is the one that unblocks the four L2 classes.
+
+## The dispatch never selects `mkdir`/`open_dir`: `FILE_DIRECTORY_FILE` is not arriving
+
+A recording backend (every `WorkspaceOps` call printed with its raw path) run through `create_dir` + a write inside it:
+
+```
+CALL create_or_open "\"          Open
+CALL create_or_open "\l2-dir"    Open      ← the directory
+CALL create_or_open "\l2-dir\a"  Open
+CALL create_or_open "\l2-dir\a"  Open
+CALL create_or_open "\l2-dir"    Open
+```
+
+Three facts:
+
+1. **No `mkdir` and no `open_dir` call at all** — the 2×2 never leaves the `File` arm for these requests;
+2. every one of them is `Open`, not `Create`/`OpenIf` — so the creating dispositions never appear either;
+3. the paths carry the WinFsp form (`\l2-dir`, no leading slash translation here because this recorder sees the raw bytes).
+
+So the assumption behind the split — "a directory create arrives with `FILE_DIRECTORY_FILE` in the low bits and a creating disposition in the high
+byte" — is **not what this DLL sends for these calls**. The next run must print the raw `create_options` word for each of these, to see which of the
+two halves is missing (or whether both are, and the FSD is opening first and creating later).
