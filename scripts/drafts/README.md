@@ -936,3 +936,26 @@ So the variable is inside the probe **body** itself, and only two textual differ
    `trim_end_matches` on the path text.
 
 The next run changes exactly one of those two, in the working file, and reads the same two lines.
+
+## Bisect (506): the run configuration is not the variable either
+
+Same file, same crate, same filter style, three repeats each:
+
+```
+full file (2 tests, nextest runs them in parallel)   -> 2 passed, 2/2 runs
+my new test, filtered, alone                          -> write = os error 3, 3/3 runs
+the *original* test, filtered, alone                  -> PASS, 0.05 s
+```
+
+So it is not "two mounts warm something": the original test passes **alone**, mine fails **alone**, in the same file. The variable is inside the body after
+all — and both path constructions (`Path::join` and `format!`) fail in my body, so the difference is not how the path string is built.
+
+What is left between the two bodies:
+
+1. the original **checks the letter is free by a call I did not make** in that exact form (bisect step 2 used `Path::exists`, the original uses its own
+   helper) — the *kind* of pre-mount call may matter, not just "a call happened";
+2. my body has a `println!` of both `PathBuf`s **before** the write, and it writes twice (once per construction) where the original writes once;
+3. my body returns the write's `Result` while the original returns an outcome computed after four operations.
+
+The decisive next run is a copy of the original body **verbatim** under a new test name: if that passes alone, the delta is one of (2)/(3) and can be
+bisected line by line; if it fails, the name/filter is somehow involved and the whole comparison needs re-examining.
