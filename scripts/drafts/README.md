@@ -260,3 +260,16 @@ can distinguish "the context this close belongs to" from "whatever now lives at 
 
 That is the next cut — it replaces `LIVE_CONTEXTS: BTreeSet<usize>` (address-keyed) with `BTreeMap<u64, Box<EntryContext>>` (id-keyed) and
 makes `close_shell` look up by id.
+
+## id-table cut: started, verified compiling, **not landed** (stash: `id-table-wip`)
+
+The design is agreed and the library side works: `FileContext` becomes a **monotonic id** (never reused) kept in
+`BTreeMap<u64, Box<EntryContext>>`; `entry_of`/`release_context` never dereference the value, so a stale id is simply absent and a double
+release is impossible by construction.
+
+What stopped it: the **direct tests** build an `EntryContext` by hand and pass its address
+(`callbacks_direct`, `set_file_size_criterion`, `overwrite_shell_criterion`, `read_directory_core`, `cleanup_shell_criterion`). Under the new
+scheme those addresses are not ids, so every one of them must go through `register_context_for_test` — a mechanical but wide edit across five
+test files, plus a check that `mounted_write_chain` still passes.
+
+The work-in-progress is in `git stash` under `id-table-wip`; the branch itself is green (`170/170`, clippy 0) at `c50e3c7` + docs.
