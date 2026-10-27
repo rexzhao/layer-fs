@@ -994,3 +994,18 @@ Next single change: make `write_only_first_operation` return the write's `Result
 Note for the record: four bisect steps have now landed on "it still fails / it still passes" without moving, which is the shape of a variable that is not in
 the code being edited. The one thing all failing shapes had in common so far is that they were created **after** the working ones in the same file and
 run **filtered** — a property that has to be tested deliberately (not assumed away) before more body-level bisecting.
+
+## Experiment A (509): position in the file is not the variable either
+
+The failing body placed **first** in the file (before the working test's definition) still answers `os error 3` on its first write, 2/2 runs. So the
+test-harness ordering / link order is excluded.
+
+What is left, and it is now the honest shortlist:
+
+1. **session / machine state** — something left behind by earlier mounts on this machine (the QA blockers happened on this same box in the same period).
+   Test: a clean session (new shell, ideally a reboot or another machine), then run the failing body alone.
+2. **codegen-sensitive difference** — the failing body holds two `PathBuf`s across the write and returns `Err`; adding either alone did not flip it.
+   If a codegen difference really changes filesystem behaviour, something is unspecified (UB) somewhere, and the cheap probe is to run the same test
+   under `cargo test` instead of `cargo nextest` (different harness, same code).
+
+Until one of those is read, the mounting defect stays **unexplained**, and it is recorded as such rather than as a product defect.
