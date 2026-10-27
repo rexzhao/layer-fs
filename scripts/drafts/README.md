@@ -384,3 +384,24 @@ changes what the FSD sends (its blanket failures short-circuit the create path),
 
 The instrument for the remaining question has to be the **real backend plus a trace inside `SlashBackend`** (print the path it receives and the path it
 forwards), because that is where a nested name could be translated differently from a single-component one.
+
+## Real backend + SlashBackend trace: the conversion is uniform, the child arrives as `Open`
+
+```
+SLASH create_or_open "\"    -> "/"   Open
+SLASH mkdir           "\d"  -> "/d"          ← the directory is created
+SLASH create_or_open "\d"   -> "/d"   Open
+SLASH create_or_open "\d\a" -> "/d/a" Open    ← the child, asked for as **Open**
+SLASH create_or_open "\d\a" -> "/d/a" Open
+SLASH create_or_open "\d"   -> "/d"   Open
+```
+
+Two facts:
+
+1. **The translation is uniform**: `\d` → `/d`, `\d\a` → `/d/a`. So the nested-name hypothesis is dead — it is not the fixture translating
+   differently for nested names;
+2. The child creation reaches us as **`Disposition::Open`**, not `OpenIf`. `Open` on a missing leaf is - correctly - "not found", so nothing is
+   created and the whole downstream (`05`, `07`, `09`, `10`) fails.
+
+So the next question is narrow and answerable with one print: **what create options does Windows use for `write("d/a")` inside a directory it just
+created** — and why is the disposition `Open` there while the same operation in the root arrives as `OpenIf` (`raw=0x03000060`)?
