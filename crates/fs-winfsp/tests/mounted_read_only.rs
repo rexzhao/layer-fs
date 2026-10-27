@@ -54,6 +54,15 @@ fn lookup(file_id: u64) -> Option<NodeInfo> {
     (file_id == 0 || file_id == 1 || file_id == 2 || file_id == 7).then(|| node(file_id))
 }
 
+fn resolve_path(path: &str) -> Option<u64> {
+    // Verbatim from the closure it replaces (搬运不改形): the backslash trimmed, the root as `""`, one file by name.
+    match path.trim_start_matches(char::from(92)) {
+        "" => Some(0),
+        "alpha.txt" => Some(1),
+        _ => None,
+    }
+}
+
 #[test]
 fn the_file_system_can_be_mounted_read_only_and_unmounted() {
     let library = default_library();
@@ -65,37 +74,22 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
         return;
     }
 
-    // Paths: the root is `\`; one child for the listing probe.
-    // Paths: the root is a single backslash; the listing probe asks for its children.
-    assert!(
-        callbacks::configure_paths(|path| {
-            let trimmed = path.trim_start_matches(char::from(92));
-            match trimmed {
-                "" => Some(0),
-                "alpha.txt" => Some(1),
-                _ => None,
-            }
-        }),
-        "cell paths: the resolver is configured once"
-    );
-    let configured = callbacks::configure(
-        &VolumeInfo {
-            total_size: 1 << 20,
-            free_size: 1 << 19,
-            volume_label_length: 8,
-            volume_label: {
-                let mut label = [0u16; 32];
-                label[..4].copy_from_slice(&[b'w' as u16, b'c' as u16, b'a' as u16, b's' as u16]);
-                label
-            },
-        },
+    // The three fixture answers, handed to the mount **as a backend** — the mount path no longer reads process-wide closures.
+    let backend: fs_winfsp::ops::DynOps = Box::new(FixtureOps {
         lookup,
         list,
-    );
-    assert!(
-        configured,
-        "cell configure: this test configures the callbacks first; a second configuration in the same process fails by design"
-    );
+        resolve: resolve_path,
+    });
+    let volume = VolumeInfo {
+        total_size: 1 << 20,
+        free_size: 1 << 19,
+        volume_label_length: 8,
+        volume_label: {
+            let mut label = [0u16; 32];
+            label[..4].copy_from_slice(&[b'w' as u16, b'c' as u16, b'a' as u16, b's' as u16]);
+            label
+        },
+    };
 
     // An **explicitly created empty directory**: WinFsp refuses a mount point that does not exist, and `0xC0000035` is what
     // that refusal looks like from the caller's side (it reads as "name collision").
@@ -138,7 +132,7 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
     let before_contexts = callbacks::context_counts();
     // The mounted probe returns `Result<(), String>` to the library (which only cares whether it worked); the **names** are kept
     // here, because they are the evidence about semantics rather than about plumbing.
-    let report = mount_read_only(&library, &mount_point, |path| {
+    let report = mount_read_only(&library, &mount_point, backend, volume, |path: &std::path::Path| {
         // `Y:` alone means "the current directory on Y:", which a file system without directory state cannot answer; `Y:\`
         // is the volume root. This distinction is exactly the kind of thing that fails as ERROR_INVALID_FUNCTION rather than as
         // "not found".
@@ -289,4 +283,98 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
         );
     }
     let _ = std::fs::remove_dir_all(&mount_point);
+}
+/// The test backend for the real-mount test: the three fixture answers, wrapped as a `WorkspaceOps`.
+///
+/// This used to be a bridge **inside** `mounted` (deleted in the same batch): production passes `fs-api`'s real backend, so the
+/// mount path no longer has to synthesise one from process-wide closures. What remains is a fixture, which is what it always was —
+/// and moving it here is a **verbatim搬运**: the same answers, including the 376 fix (the listing's ids must resolve in `lookup`),
+/// because a migration is not an opportunity to redesign the fixture.
+use fs_semantics::disposition::Disposition;
+use fs_winfsp::ops::{DirEntry, OpenOutcome, OpsError, OpsResult, RenameOutcome, WorkspaceOps};
+
+pub struct FixtureOps {
+    pub lookup: fn(u64) -> Option<NodeInfo>,
+    pub list: fn(u64) -> Vec<(Vec<u16>, NodeInfo)>,
+    pub resolve: fn(&str) -> Option<u64>,
+}
+
+impl WorkspaceOps for FixtureOps {
+    fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
+        // Only `Open`: this mount is read-only, and a silent "created nothing" is the failure mode the write batch exists to avoid.
+        if disposition != Disposition::Open {
+            return Err(OpsError::ReadOnly);
+        }
+        let text = String::from_utf8_lossy(path);
+        let file_id = (self.resolve)(text.as_ref()).ok_or(OpsError::NotFound)?;
+        let info = (self.lookup)(file_id).ok_or(OpsError::NotFound)?;
+        Ok(OpenOutcome {
+            file_id,
+            kind: info.kind,
+            action: fs_semantics::disposition::Action::Open,
+            size: info.size,
+            times: info.times,
+            attributes: info.attributes,
+            binding: (file_id, Vec::new()),
+            replaced: None,
+        })
+    }
+
+    fn mkdir(&self, _path: &[u8]) -> OpsResult<u64> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn read(&self, _file_id: u64, _offset: u64, _len: usize) -> OpsResult<Vec<u8>> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn write(&self, _file_id: u64, _offset: u64, _bytes: &[u8]) -> OpsResult<usize> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn set_size(&self, _file_id: u64, _len: u64) -> OpsResult<()> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn read_dir(&self, dir_id: u64) -> OpsResult<Vec<DirEntry>> {
+        Ok((self.list)(dir_id)
+            .into_iter()
+            .map(|(name, info)| DirEntry {
+                name: String::from_utf16_lossy(&name).into_bytes(),
+                kind: info.kind,
+                file_id: info.file_id,
+            })
+            .collect())
+    }
+
+    fn get_info(&self, file_id: u64) -> OpsResult<NodeInfo> {
+        (self.lookup)(file_id).ok_or(OpsError::NotFound)
+    }
+
+    fn set_times(
+        &self,
+        _file_id: u64,
+        _accessed: Option<i64>,
+        _written: Option<i64>,
+        _changed: Option<i64>,
+        _created: Option<i64>,
+    ) -> OpsResult<()> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn set_attributes(&self, _file_id: u64, _attributes: Attributes) -> OpsResult<()> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn rename(&self, _from: &[u8], _to: &[u8], _replace: bool) -> OpsResult<RenameOutcome> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn remove_at(&self, _parent: u64, _name: &[u8], _expected_id: u64) -> OpsResult<()> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn flush(&self) -> OpsResult<()> {
+        Ok(())
+    }
 }

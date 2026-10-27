@@ -585,11 +585,7 @@ pub unsafe fn open_shell(
         fs_semantics::disposition::Disposition::Open,
     ) {
         Ok(outcome) => outcome,
-        Err(crate::ops::OpsError::NotFound) => {
-            OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return OURS_OBJECT_NAME_NOT_FOUND;
-        }
-        Err(_) => {
+        Err(_error) => {
             OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return OURS_OBJECT_NAME_NOT_FOUND;
         }
@@ -731,7 +727,61 @@ pub unsafe fn get_security_by_name(
     let Some(node) = LOOKUP.get().and_then(|lookup| lookup(file_id)) else {
         return OURS_OBJECT_NAME_NOT_FOUND;
     };
+    write_security_answer(attributes_out, descriptor_out, descriptor_size_out, &node)
+}
 
+/// The `GetSecurityByName` **shell**: the name is resolved by **this mount's backend**, like `open` (367's route).
+///
+/// Windows asks this **before** opening anything, so it is the first place a mount dies — and the first place a leftover
+/// process-wide resolver would show up as `ERROR_INVALID_FUNCTION` for every operation that follows.
+///
+/// # Safety
+///
+/// Same contract as [`get_security_by_name`].
+pub unsafe fn get_security_by_name_shell(
+    adapter: Option<&crate::DynAdapter>,
+    file_name: *const u16,
+    attributes_out: *mut u32,
+    descriptor_out: *mut c_void,
+    descriptor_size_out: *mut usize,
+) -> i32 {
+    SECURITY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if file_name.is_null() {
+        return OURS_INVALID_PARAMETER;
+    }
+    // SAFETY: `file_name` is NUL-terminated per WinFsp's contract.
+    let units = unsafe { crate::boundary::utf16_len(file_name) };
+    // SAFETY: same pointer, bounded by the terminator.
+    let slice = unsafe { std::slice::from_raw_parts(file_name, units) };
+    let path = String::from_utf16_lossy(slice);
+    let Some(adapter) = adapter else {
+        return NOT_IMPLEMENTED;
+    };
+    // `Open` is the read-only disposition that **does not create** — the right question for "does this name exist".
+    let Ok(outcome) = adapter.backend().create_or_open(
+        path.as_bytes(),
+        fs_semantics::disposition::Disposition::Open,
+    ) else {
+        return OURS_OBJECT_NAME_NOT_FOUND;
+    };
+    let Ok(node) = adapter.backend().get_info(outcome.file_id) else {
+        return OURS_OBJECT_NAME_NOT_FOUND;
+    };
+    // SAFETY: the caller's contract covers all three out-pointers.
+    unsafe { write_security_answer(attributes_out, descriptor_out, descriptor_size_out, &node) }
+}
+
+/// The answer both `GetSecurityByName` paths share: attributes out, a **zero-length** descriptor, nothing written into a buffer.
+///
+/// # Safety
+///
+/// `attributes_out` and `descriptor_size_out` may be null; `descriptor_out` is only read, never written.
+unsafe fn write_security_answer(
+    attributes_out: *mut u32,
+    descriptor_out: *mut c_void,
+    descriptor_size_out: *mut usize,
+    node: &NodeInfo,
+) -> i32 {
     if !attributes_out.is_null() {
         // SAFETY: the caller passes either a valid pointer or null (fsop.c:797 passes null when it only wants the size).
         unsafe { std::ptr::write(attributes_out, node.attributes.0) };

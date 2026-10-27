@@ -74,10 +74,12 @@ pub fn drive_present(path: &Path) -> Option<bool> {
 pub fn mount_read_only(
     library: &Path,
     mount_point: &Path,
+    backend: crate::ops::DynOps,
+    volume: crate::abi::VolumeInfo,
     probe: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<MountReport, LoadError> {
     resolve_library(library)?;
-    platform::mount_read_only(library, mount_point, probe)
+    platform::mount_read_only(library, mount_point, backend, volume, probe)
 }
 
 #[cfg(windows)]
@@ -298,15 +300,17 @@ mod platform {
     /// `GetSecurityByName`: `(FSP_FILE_SYSTEM*, PWSTR FileName, PUINT32 Attributes, PSECURITY_DESCRIPTOR,
     /// SIZE_T *Size)` — `winfsp.h:252`.
     unsafe extern "system" fn security_by_name_trampoline(
-        _file_system: *mut c_void,
+        file_system: *mut c_void,
         file_name: *const u16,
         attributes_out: *mut u32,
         descriptor_out: *mut c_void,
         descriptor_size_out: *mut usize,
     ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
         // SAFETY: WinFsp's contract for this callback.
         unsafe {
-            crate::callbacks::get_security_by_name(
+            crate::callbacks::get_security_by_name_shell(
+                adapter.as_deref(),
                 file_name,
                 attributes_out,
                 descriptor_out,
@@ -534,6 +538,8 @@ mod platform {
     pub(super) fn mount_read_only(
         library: &Path,
         mount_point: &Path,
+        backend: crate::ops::DynOps,
+        volume: crate::abi::VolumeInfo,
         probe: impl FnOnce(&Path) -> Result<(), String>,
     ) -> Result<super::MountReport, LoadError> {
         let module_path = wide(library.as_os_str());
@@ -635,17 +641,12 @@ mod platform {
             }
 
             // **Register right after `create`** — that is the first moment the pointer exists, and a callback can arrive as soon
-            // as the dispatcher starts. The adapter carries this mount's configuration; nothing below reads a process-wide one.
-            let (volume, lookup, list) = crate::callbacks::configured();
-            let resolve = crate::callbacks::configured_resolve();
+            // as the dispatcher starts. The backend comes from the caller (the real one in production, a fixture in tests): the
+            // bridge that used to synthesise one from process-wide closures is gone — that is what "the bridge dies here" meant.
             let mounted_adapter = std::sync::Arc::new(crate::DynAdapter::with_config(
-                Box::new(super::ConfiguredOps {
-                    lookup,
-                    list,
-                    resolve,
-                }) as crate::ops::DynOps,
+                backend,
                 crate::adapter::AdapterConfig {
-                    volume,
+                    volume: Some(volume),
                     ..crate::adapter::AdapterConfig::default()
                 },
             ));
@@ -660,8 +661,6 @@ mod platform {
 
             // Observe **while mounted**: this is the only window in which the OS can see the file system.
             let looked_like_a_mount = mount_status == 0 && probe(mount_point).is_ok();
-
-            // Unmount first, then stop, then delete.
             let dispatcher_result = if let Some(address) = dispatcher_result_address {
                 // SAFETY: the address came from this module's export table; the signature is the SDK's.
                 let read: DispatcherResultFn = unsafe { std::mem::transmute(address) };
@@ -729,138 +728,13 @@ mod platform {
     pub(super) fn mount_read_only(
         library: &Path,
         _mount_point: &Path,
+        _backend: crate::ops::DynOps,
+        _volume: crate::abi::VolumeInfo,
         _probe: impl FnOnce(&Path) -> Result<(), String>,
     ) -> Result<super::MountReport, LoadError> {
         Err(LoadError::LoadFailed {
             path: library.to_path_buf(),
             last_error: 0,
         })
-    }
-}
-
-/// The backend the mount path can build today: the three injected answers, wrapped into the trait the registry stores.
-///
-/// This is a **bridge, not a design**: once `fs-api`'s real backend is handed to the mount entry point, this type disappears. It
-/// exists so the callbacks can ask "this mount" instead of "the process" without changing where the configuration comes from
-/// (搬运不改形) — and so its limitations are visible rather than implied:
-///
-/// - `read_dir` answers from the listing hook, and each entry's metadata from the lookup hook;
-/// - every mutation is refused with [`crate::ops::OpsError::ReadOnly`], which is the truth for this read-only mount.
-struct ConfiguredOps {
-    lookup: Option<fn(u64) -> Option<crate::ops::NodeInfo>>,
-    list: Option<crate::callbacks::Lister>,
-    resolve: Option<fn(&str) -> Option<u64>>,
-}
-
-impl crate::ops::WorkspaceOps for ConfiguredOps {
-    fn create_or_open(
-        &self,
-        path: &[u8],
-        disposition: fs_semantics::disposition::Disposition,
-    ) -> crate::ops::OpsResult<crate::ops::OpenOutcome> {
-        // The bridge's job is to keep the **existing** semantics: the injected resolver answers, and a metadata lookup follows —
-        // exactly what `open` did against the two statics. Only `Open` is supported, because this mount is read-only and a
-        // silent "created nothing" would be the failure mode the setter batch exists to avoid.
-        if disposition != fs_semantics::disposition::Disposition::Open {
-            return Err(crate::ops::OpsError::ReadOnly);
-        }
-        let text = String::from_utf8_lossy(path);
-        let file_id = self
-            .resolve
-            .and_then(|resolve| resolve(text.as_ref()))
-            .ok_or(crate::ops::OpsError::NotFound)?;
-        let info = self
-            .lookup
-            .and_then(|lookup| lookup(file_id))
-            .ok_or(crate::ops::OpsError::NotFound)?;
-        Ok(crate::ops::OpenOutcome {
-            file_id,
-            kind: info.kind,
-            size: info.size,
-            times: info.times,
-            attributes: info.attributes,
-            action: fs_semantics::disposition::Action::Open,
-            binding: (file_id, Vec::new()),
-            replaced: None,
-        })
-    }
-
-    fn mkdir(&self, _path: &[u8]) -> crate::ops::OpsResult<u64> {
-        Err(crate::ops::OpsError::ReadOnly)
-    }
-
-    fn read(&self, _file_id: u64, _offset: u64, _len: usize) -> crate::ops::OpsResult<Vec<u8>> {
-        Err(crate::ops::OpsError::ReadOnly)
-    }
-
-    fn write(&self, _file_id: u64, _offset: u64, _bytes: &[u8]) -> crate::ops::OpsResult<usize> {
-        Err(crate::ops::OpsError::ReadOnly)
-    }
-
-    fn set_size(&self, _file_id: u64, _len: u64) -> crate::ops::OpsResult<()> {
-        Err(crate::ops::OpsError::ReadOnly)
-    }
-
-    fn read_dir(&self, dir_id: u64) -> crate::ops::OpsResult<Vec<crate::ops::DirEntry>> {
-        let Some(list) = self.list else {
-            return Err(crate::ops::OpsError::ReadOnly);
-        };
-        Ok(list(dir_id)
-            .into_iter()
-            .map(|(name, info)| crate::ops::DirEntry {
-                name: String::from_utf16_lossy(&name).into_bytes(),
-                kind: info.kind,
-                // The listing hook already carries the entry's own record, so its id is the one it reports.
-                file_id: info.file_id,
-            })
-            .collect())
-    }
-
-    fn get_info(&self, file_id: u64) -> crate::ops::OpsResult<crate::ops::NodeInfo> {
-        match self.lookup.and_then(|lookup| lookup(file_id)) {
-            Some(info) => Ok(info),
-            None => Err(crate::ops::OpsError::NotFound),
-        }
-    }
-
-    fn set_times(
-        &self,
-        _file_id: u64,
-        _accessed: Option<i64>,
-        _written: Option<i64>,
-        _changed: Option<i64>,
-        _created: Option<i64>,
-    ) -> crate::ops::OpsResult<()> {
-        Err(crate::ops::OpsError::ReadOnly)
-    }
-
-    fn set_attributes(
-        &self,
-        _file_id: u64,
-        _attributes: crate::ops::Attributes,
-    ) -> crate::ops::OpsResult<()> {
-        Err(crate::ops::OpsError::ReadOnly)
-    }
-
-    fn rename(
-        &self,
-        _from: &[u8],
-        _to: &[u8],
-        _replace: bool,
-    ) -> crate::ops::OpsResult<crate::ops::RenameOutcome> {
-        Err(crate::ops::OpsError::ReadOnly)
-    }
-
-    fn remove_at(
-        &self,
-        _parent: u64,
-        _name: &[u8],
-        _expected_id: u64,
-    ) -> crate::ops::OpsResult<()> {
-        Err(crate::ops::OpsError::ReadOnly)
-    }
-
-    fn flush(&self) -> crate::ops::OpsResult<()> {
-        Ok(())
     }
 }
