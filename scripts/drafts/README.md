@@ -563,3 +563,26 @@ Three observations:
 3. `01` now answers — the root fix holds.
 
 The next question is therefore narrow: **which path removes a directory when `remove_at` is never called with its name?**
+
+## L2 scoreboard after the directory-binding + CanDelete fix: **7 of 12**
+
+```
+01 root: series               ours: not a directory          ✗
+02 create+read: alpha         ours: <unreadable>             ✗
+03 truncate: ok               ✓
+04 missing: not found         ✓
+05a/05b listing: a,b,         ✓
+06 rmdir non-empty: refused   ✓   ← flipped by `9d5f56d`
+07 rename: old=gone new=present ✓ ← flipped by the fold
+08 case-only rename           ours: <missing>                ✗
+09 delete while open          ours: present                  ✗
+10 concurrent read: beta      ours: <unreadable>             ✗ (downstream of 02)
+11 long name: refused         ✓
+12a readonly=yes              ours: readonly=no              ✗
+```
+
+Remaining: `01` (root stat — the instrument says `is_dir` works in isolation, so the script's first call is what differs), `02` (a plain
+write-then-`cat` that works in the instrument but not inside the script), `08` (case-only rename), `09` (delete while open), `12a` (attributes).
+
+`02` is the most suspicious one *because* it works standalone: the difference is what `01` leaves behind when its `stat` fails. That suggests
+`01` should be fixed first — it may be the upstream cause of `02` and `10`.
