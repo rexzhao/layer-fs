@@ -825,3 +825,24 @@ Enable the hook once per clone:
 ```sh
 git config core.hooksPath .githooks
 ```
+
+## QA L2 blockers, first probe: even the **root** is unusable with the real backend (491)
+
+`scripts/drafts/subdir-probe.rs.txt` mounts the **real** backend (`ApiBackend` over `fs-workspace`) and asks bash the three questions:
+
+```
+MOUNT result = Ok(true)                       ← the mount call reports success
+BACKEND read_dir(root) = Ok([])               ← the workspace root lists, empty (correct: nothing created yet)
+MKDIR   mkdir Z:/l2-dir   -> No such file or directory   rc=1
+LSROOT  ls Z:/            -> No such file or directory
+WRITE   Z:/l2-dir/a       -> No such file or directory
+LSDIR   ls Z:/l2-dir      -> No such file or directory
+```
+
+No `create:`/`open:` line from the shells appeared at all, i.e. **the FSD never reached our callbacks**. That is a *stronger* failure than
+QA's ①/② — they had the root listing working, so their mount was live and the defect is on the subdirectory path. Here the drive is not usable at
+all, which points at the mount handshake (volume info / root open) as the first suspect, not at subdirectory resolution.
+
+**Difference to nail down with QA before diagnosing further:** with `MockBackend` the same shape works (`mounted_read_only`, `mounted_write_chain`),
+so the variable is the real backend, not the mount code path — but the first reader to check is the handshake sequence, printed from inside the
+callbacks, because "the mount returned Ok" and "the drive answers" are two different facts.

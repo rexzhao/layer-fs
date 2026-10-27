@@ -1,0 +1,100 @@
+//! Instrument: a mount over the **real** backend, asked the three questions QA's L2 run answered wrong.
+//!
+//! Rules 431/434: one mount, one test file, `--test` alone, every line names the call it reports.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use fs_api::winfsp_backend::ApiBackend;
+use fs_winfsp::abi::VolumeInfo;
+use fs_winfsp::loader::{default_library, resolve_library, LoadError};
+use fs_winfsp::mounted::mount_read_only;
+use fs_winfsp::ops::{DynOps, WorkspaceOps};
+use fs_workspace::Repo;
+
+struct Fixture {
+    dir: PathBuf,
+    _repo: Arc<Repo>,
+    workspace: fs_workspace::Workspace,
+}
+
+
+impl Fixture {
+    fn new(label: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("fs-api-subdir-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let repo = Arc::new(Repo::open(dir.join("store"), true).expect("repo"));
+        repo.init().expect("init");
+        let workspace = repo.workspace_create("w1", "main").expect("workspace");
+        Self {
+            dir,
+            _repo: repo,
+            workspace,
+        }
+    }
+}
+
+fn volume() -> VolumeInfo {
+    VolumeInfo {
+        total_size: 1 << 30,
+        free_size: 1 << 29,
+        volume_label_length: 4,
+        volume_label: {
+            let mut label = [0u16; 32];
+            label[..4].copy_from_slice(&[b'l' as u16, b'a' as u16, b'y' as u16, b'r' as u16]);
+            label
+        },
+    }
+}
+
+fn bash(script: &str) -> String {
+    let output = std::process::Command::new("C:/Program Files/Git/bin/bash.exe")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("bash");
+    format!(
+        "out={:?} err={:?}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+#[test]
+fn subdirectories_through_a_real_backend_mount() {
+    let library = default_library();
+    if let Err(LoadError::NotFound { path }) = resolve_library(&library) {
+        eprintln!("SKIP: no winfsp at {}", path.display());
+        return;
+    }
+    let fixture = Fixture::new("probe");
+    let mount_point = std::env::var_os("LAYER_FS_MNT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("Z:"));
+    // `DynOps` is `Box<dyn WorkspaceOps + Send + Sync>` (no lifetime parameter), so the backend must outlive the call: leak the workspace for the
+    // duration of this instrument — a probe, not production code.
+    let workspace: &'static fs_workspace::Workspace = Box::leak(Box::new(fixture.workspace));
+    let backend: DynOps = Box::new(ApiBackend::new(workspace));
+    let mounted = mount_read_only(&library, &mount_point, backend, volume(), |path: &std::path::Path| {
+        let root = path
+            .to_string_lossy()
+            .trim_end_matches(char::from(92))
+            .replace(char::from(92), "/");
+        println!("MKDIR   {}", bash(&format!("mkdir '{root}/l2-dir' 2>&1; echo rc=$?")));
+        println!("LSROOT  {}", bash(&format!("ls -1 '{root}/' 2>&1")));
+        println!("WRITE   {}", bash(&format!("printf x > '{root}/l2-dir/a' 2>&1; echo rc=$?")));
+        println!("LSDIR   {}", bash(&format!("ls -1 '{root}/l2-dir' 2>&1")));
+        println!("STATDIR {}", bash(&format!("stat -c '%n %F' '{root}/l2-dir' 2>&1")));
+        // The same three questions asked **of the backend directly**, in the same session: if these are right while the mount is wrong, the defect is
+        // above the backend.
+        let dir_id = workspace.read_dir_id(fs_namespace::FileId::ROOT, None, 64).map(|entries| {
+            entries
+                .into_iter()
+                .map(|(name, id)| (String::from_utf8_lossy(&name).into_owned(), id))
+                .collect::<Vec<_>>()
+        });
+        println!("BACKEND read_dir(root) = {dir_id:?}");
+        Ok(())
+    });
+    println!("MOUNT result = {:?}", mounted.is_ok());
+}
