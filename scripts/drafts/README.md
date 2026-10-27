@@ -190,3 +190,20 @@ Reading them together:
 
 So the next experiment is not "find the double close" but **"who calls Close twice"**: attach the FSD log and pair each `>>Close` line with the
 `FileContext` value printed by our side. A pairing (same pointer, two `>>Close` lines, one `>>Create`) settles it in one run.
+
+## Close pairing: the pointer repeats because the allocator reuses it
+
+Tracing every `close_shell` (`CLOSE-TRACE #n ctx=0x…`) shows the **same address** arriving many times:
+
+```
+#00001 ctx=0x…ebfb0     #00002 ctx=0x…ebfb0     #00006 ctx=0x…ebfb0     #00008 ctx=0x…ebfb0
+```
+
+Two readings are consistent with that, and the trace alone cannot separate them:
+
+1. **address reuse** — the context is freed, the allocator hands the same address to the next `Box::new`, and a *late* close of the old
+   handle lands on the new context (which would be worse than a double free: it frees the wrong object);
+2. **genuine repeated close** — WinFsp really calls `Close` more than once per context.
+
+The experiment that separates them is to **stop reuse**: in trace mode, keep every freed context in a `Vec` (leak them on purpose) so an
+address can never come back. Then a repeated pointer in `CLOSE-TRACE` is proof of (2), and its absence proves (1).

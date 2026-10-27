@@ -474,6 +474,9 @@ static LIVE_CONTEXTS: std::sync::Mutex<Option<std::collections::BTreeSet<usize>>
 /// How many times a context was released twice.
 static DOUBLE_RELEASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// When non-zero, `close_shell` prints the context pointer it is about to release (paired with the FSD log).
+pub static CLOSE_TRACE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// How many times a context was released twice.
 #[must_use]
 pub fn double_release_count() -> usize {
@@ -903,6 +906,12 @@ pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_v
         return;
     }
     // SAFETY: the caller guarantees this pointer came from `Box::into_raw` in `open_like`, and it was just claimed from the live set.
+    if CLOSE_TRACE.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        eprintln!(
+            "CLOSE-TRACE #{:05} ctx={context:p}",
+            CONTEXTS_FREED.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
     let entry = unsafe { Box::from_raw(context.cast::<EntryContext>()) };
     if let Some(adapter) = adapter {
         // The adapter performs the single `remove_at` (outside its table lock, see `Adapter::close`). A failure here is recorded by
