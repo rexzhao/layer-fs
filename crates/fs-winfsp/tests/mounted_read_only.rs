@@ -55,8 +55,10 @@ fn lookup(file_id: u64) -> Option<NodeInfo> {
 }
 
 fn resolve_path(path: &str) -> Option<u64> {
-    // Verbatim from the closure it replaces (搬运不改形): the backslash trimmed, the root as `""`, one file by name.
-    match path.trim_start_matches(char::from(92)) {
+    // The separator is trimmed, the root is `""`, one file by name. **It used to trim a backslash**, because the mount handed raw Windows paths;
+    // the entry now normalises the separator to `/` before any backend sees it (517/518), so the fixture trims the separator it actually receives.
+    // This is a fixture following the boundary, not a criterion being relaxed: the names and the expectations are unchanged.
+    match path.trim_start_matches('/') {
         "" => Some(0),
         "alpha.txt" => Some(1),
         _ => None,

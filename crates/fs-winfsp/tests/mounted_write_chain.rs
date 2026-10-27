@@ -310,3 +310,45 @@ fn windows_can_write_through_the_mount_and_read_the_bytes_back() {
         counts_after.2, counts_before.3, counts_after.3
     );
 }
+
+/// **The root is usable and a file can be created there** (515/517/518).
+///
+/// The defect this pins: WinFsp hands paths with backslashes, so `Create("\")` arrived as a single component named `\`, was answered
+/// `0xC0000034`, and the FSD synthesised `0xC000003A` for every child — `std::fs::write(root/f)` failed with `os error 3` although the backend
+/// answered the root perfectly well when asked directly. The fix is one normalisation at the entry; this test is what makes its absence fail again.
+#[test]
+fn a_file_can_be_created_at_the_root() {
+    let library = default_library();
+    if let Err(LoadError::NotFound { path }) = resolve_library(&library) {
+        eprintln!("SKIP: no winfsp at {}", path.display());
+        return;
+    }
+    let mount_point = mount_point();
+    let backend: DynOps = Box::new(MockBackend::new());
+    let _ = mount_read_only(
+        &library,
+        &mount_point,
+        backend,
+        volume(),
+        |path: &std::path::Path| {
+            let root = root_of(path);
+            let file = root.join("created.txt");
+            std::fs::write(&file, b"hello layer-fs").map_err(|error| format!("write: {error}"))?;
+            let back = std::fs::read(&file).map_err(|error| format!("read back: {error}"))?;
+            if back != b"hello layer-fs" {
+                return Err(format!("read back: {:?}", String::from_utf8_lossy(&back)));
+            }
+            // And the entry is listed, so the create is visible through the same door that refused the root before.
+            let names: Vec<String> = std::fs::read_dir(&root)
+                .map_err(|error| format!("read_dir: {error}"))?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            if !names.iter().any(|name| name == "created.txt") {
+                return Err(format!("created.txt not listed: {names:?}"));
+            }
+            Ok(())
+        },
+    )
+    .expect("the mount path is available");
+}

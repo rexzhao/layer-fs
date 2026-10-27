@@ -618,6 +618,20 @@ pub fn clear_contexts() {
 static CLOSED_CONTEXTS: std::sync::Mutex<Option<std::collections::BTreeSet<u64>>> =
     std::sync::Mutex::new(None);
 
+/// The **one** place WinFsp's path bytes are turned into the bytes the backends parse (517/518).
+///
+/// WinFsp hands Windows paths — `\\`, `\\dir\\file`. Every backend in this workspace parses `/`. Without this rewrite the root arrived as a
+/// single component named `\\`, was answered `0xC0000034`, and WinFsp synthesised `0xC000003A` for every child: no file could be created through the
+/// mount, and every subdirectory operation reported `os error 3`.
+///
+/// This must be the **only** conversion, applied at every door that takes a name from the file system (`open_like`, `get_security_by_name_shell`,
+/// `rename_shell`; `mkdir`/`open_dir`/`dir_binding` are reached through `open_like`). Doing it in some doors and not others is worse than doing it
+/// nowhere: the same entry would be addressed by two different keys (measured — a single-door version left the create chain broken *and* reddened a
+/// mount test that had been green).
+fn fsd_path(units: &[u16]) -> String {
+    String::from_utf16_lossy(units).replace('\\', "/")
+}
+
 /// Whether the EOF-on-closed fallback is enabled (`LAYER_FS_EOF_ON_CLOSED=1`).
 ///
 /// Default **off**: a fallback that cannot tell "the object is gone" from "we released too early" hides the lifecycle question rather than
@@ -822,7 +836,7 @@ unsafe fn open_like(
     let units = unsafe { crate::boundary::utf16_len(file_name) };
     // SAFETY: same pointer, bounded by the terminator.
     let slice = unsafe { std::slice::from_raw_parts(file_name, units) };
-    let path = String::from_utf16_lossy(slice);
+    let path = fsd_path(slice);
     let Some(adapter) = adapter else {
         OPEN_EXITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
@@ -1314,10 +1328,12 @@ pub unsafe fn rename_shell(
     let to_units = unsafe { crate::boundary::utf16_len(new_name) };
     let from_slice = unsafe { std::slice::from_raw_parts(file_name, from_units) };
     let to_slice = unsafe { std::slice::from_raw_parts(new_name, to_units) };
-    let Ok(from) = crate::boundary::utf16_to_utf8(from_slice) else {
+    let Ok(from) = crate::boundary::utf16_to_utf8(from_slice).map(|text| text.replace('\\', "/"))
+    else {
         return OURS_INVALID_PARAMETER;
     };
-    let Ok(to) = crate::boundary::utf16_to_utf8(to_slice) else {
+    let Ok(to) = crate::boundary::utf16_to_utf8(to_slice).map(|text| text.replace('\\', "/"))
+    else {
         return OURS_INVALID_PARAMETER;
     };
     // The context is only a consistency check here: a rename names its source by path, and the header passes the context so the file system
@@ -1790,7 +1806,7 @@ pub unsafe fn get_security_by_name_shell(
     let units = unsafe { crate::boundary::utf16_len(file_name) };
     // SAFETY: same pointer, bounded by the terminator.
     let slice = unsafe { std::slice::from_raw_parts(file_name, units) };
-    let path = String::from_utf16_lossy(slice);
+    let path = fsd_path(slice);
     let Some(adapter) = adapter else {
         return NOT_IMPLEMENTED;
     };
