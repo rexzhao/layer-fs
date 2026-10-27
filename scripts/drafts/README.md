@@ -450,3 +450,28 @@ KEY create_or_open raw="\d\a" key="/d/a" resolved=None    -> Err(NotFound)
 So the open question is exactly one: **why does the dispatcher not upgrade `Open` to `Create`** here, when its own source says it upgrades on
 `STATUS_OBJECT_NAME_NOT_FOUND` — which is the code we return. The instrument above did not print the disposition; the next one must, together with the
 exact status returned, for every call.
+
+## L2 after the GSBN fix: `05` flipped green, `06` became a real difference
+
+Mounted side (one mount, script driven through Git Bash):
+
+```
+01 root: not a directory or missing
+02 create+read: alpha                     ← matches NTFS
+03 truncate existing: ok                  ← matches
+04 missing file: not found                ← matches
+05a dir listing (sorted): a,b,            ← **matches NTFS now** (was empty before the GSBN fix)
+05b dir listing (raw order): a,b,         ← matches
+06 rmdir non-empty: removed (wrong)       ← NTFS refuses; **we delete a non-empty directory**
+07 rename: old=present new=gone
+08 case-only rename: <missing>
+09 delete while open: name=present
+10 concurrent read after write: <unreadable>
+11 long name: refused                     ← matches
+12a attributes (semantic): readonly=yes directory=no   ← matches
+```
+
+So the mapping prediction held for `05` (child creation was the single root cause there), and `06` is a **newly visible real defect**: removing a
+non-empty directory is refused by NTFS and allowed by us. `07`/`08`/`09`/`10` remain, and `01` is the separate root-metadata question.
+
+Next: `06` first (shortest, a real semantic rule: a directory with children cannot be removed), then `07` (rename) which likely also explains `10`.
