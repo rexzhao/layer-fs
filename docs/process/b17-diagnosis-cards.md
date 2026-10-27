@@ -10,13 +10,14 @@ SqliteFailure { code: SystemIoFailure, extended_code: 1546, Some("disk I/O error
 ```
 注：早期误判为 DELETE_NOENT（=5898）已更正（判据 372）。
 
-## 家族（2 crate / 8 测试名 / 全部同签名；2026-10-27 QA 241 抓捕窗口补第 8 名）
+## 家族（2 crate / 9 测试名 / 全部同签名；第 9 名 crash_before_the_index_commit 为写链批读数，症状面扩至 index commit 前的 staged 路径）
 | crate | 测试名 | 行 |
 |---|---|---|
 | fs-workspace::crash | every_commit_crash_point_recovers… | :187 |
 | fs-workspace::crash | a_crash_after_the_publication_completes_it_on_reopen | :187 |
 | fs-workspace::crash | a_crash_during_materialisation_publishes_nothing | — |
 | fs-workspace::crash | a_crash_during_discard_is_swept_on_reopen | :328 |
+| cas-store::crash | crash_before_the_index_commit… | — |
 | cas-store::crash | crash_while_the_object_is_staged | :177 |
 | cas-store::crash | a_crash_between_two_puts_keeps_the_first | — |
 | cas-store::crash | completing_the_put_after_a_crash_publishes_exactly_one_copy | — |
