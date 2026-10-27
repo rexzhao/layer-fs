@@ -149,7 +149,13 @@ mod platform {
         let adapter = crate::registry::mounts().get(file_system as usize);
         // SAFETY: WinFsp passes a buffer of `volume_info_length` bytes, which is what the callee validates against its own
         // structure size.
-        unsafe { crate::callbacks::get_volume_info_shell(adapter.as_deref(), volume_info, volume_info_length) }
+        unsafe {
+            crate::callbacks::get_volume_info_shell(
+                adapter.as_deref(),
+                volume_info,
+                volume_info_length,
+            )
+        }
     }
 
     /// `GetFileInfo`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PVOID FileInfo)` — `winfsp.h:507`.
@@ -618,7 +624,10 @@ mod platform {
             let (volume, lookup, list) = crate::callbacks::configured();
             let mounted_adapter = std::sync::Arc::new(crate::DynAdapter::with_config(
                 Box::new(super::ConfiguredOps { lookup, list }) as crate::ops::DynOps,
-                crate::adapter::AdapterConfig { volume, ..crate::adapter::AdapterConfig::default() },
+                crate::adapter::AdapterConfig {
+                    volume,
+                    ..crate::adapter::AdapterConfig::default()
+                },
             ));
             let key = file_system as usize;
             crate::registry::mounts().insert(key, mounted_adapter);
@@ -756,6 +765,8 @@ impl crate::ops::WorkspaceOps for ConfiguredOps {
             .map(|(name, info)| crate::ops::DirEntry {
                 name: String::from_utf16_lossy(&name).into_bytes(),
                 kind: info.kind,
+                // The listing hook already carries the entry's own record, so its id is the one it reports.
+                file_id: info.file_id,
             })
             .collect())
     }

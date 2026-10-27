@@ -179,6 +179,9 @@ impl WorkspaceOps for ApiBackend<'_> {
             out.push(DirEntry {
                 name,
                 kind: kind_of(view.kind),
+                // The child's own serial, which is what `view`/`get_info` answer by — the listing and the metadata now come from
+                // **one** translation instead of two.
+                file_id: child.serial(),
             });
         }
         Ok(out)

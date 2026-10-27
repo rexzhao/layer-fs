@@ -451,6 +451,8 @@ impl WorkspaceOps for MockBackend {
             entries.push(DirEntry {
                 name: name.clone(),
                 kind: child_node.kind,
+                // The id the backend would answer `get_info` with for this entry — the field's whole purpose (367).
+                file_id: *child,
             });
         }
         Ok(entries)

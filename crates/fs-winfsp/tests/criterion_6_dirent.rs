@@ -189,10 +189,12 @@ fn a_dot_from_the_backend_would_reach_the_caller_twice() {
         DirEntry {
             name: b".".to_vec(),
             kind: Kind::Directory,
+            file_id: 1,
         },
         DirEntry {
             name: b"real".to_vec(),
             kind: Kind::File,
+            file_id: 2,
         },
     ];
     cursor.fill(entries, |name| name.to_ascii_lowercase());
@@ -211,5 +213,65 @@ fn a_dot_from_the_backend_would_reach_the_caller_twice() {
         listed.len(),
         2,
         "cell count: two entries survive — no de-duplication is hiding a misbehaving backend"
+    );
+}
+
+/// The listing's `file_id` is the id `get_info` answers with (367's criterion): one translation, not two.
+///
+/// Without this, a listing could carry ids that agree with themselves but not with the backend — every record would still look
+/// right in isolation, which is exactly the kind of wrong that only a cross-check catches.
+#[test]
+fn a_listing_carries_the_ids_the_backend_uses() {
+    use fs_semantics::disposition::Disposition;
+    use fs_winfsp::mock::MockBackend;
+    use fs_winfsp::ops::WorkspaceOps;
+    use fs_winfsp::Kind as EntryKind;
+
+    let backend = MockBackend::new();
+    let file = backend
+        .create_or_open(b"/alpha.txt", Disposition::Create)
+        .expect("create the file");
+    let dir = backend.mkdir(b"/sub").expect("create the directory");
+
+    let entries = backend.read_dir(0).expect("list the root");
+    assert_eq!(entries.len(), 2, "cell count: the two entries just made");
+
+    for entry in &entries {
+        // Each listed id must answer metadata — that is what a dirent record needs.
+        let info = backend
+            .get_info(entry.file_id)
+            .expect("cell agreement: every listed id must be resolvable");
+        assert_eq!(
+            info.kind,
+            entry.kind,
+            "cell agreement: the id and the listing describe the same entry (name {:?})",
+            String::from_utf8_lossy(&entry.name)
+        );
+        // The by-name route must agree too: resolving the same name again gives the same id the listing reported.
+        // A file resolves by name to the same id the listing reported. A **directory** is checked against the id `mkdir`
+        // returned instead: `create_or_open` is the file door (`NotADirectory` on a directory is the correct refusal, and it is
+        // how this test found out that the two doors are not interchangeable).
+        if entry.kind == EntryKind::Directory {
+            assert_eq!(
+                entry.file_id, dir,
+                "cell agreement: the listed directory carries the id `mkdir` returned"
+            );
+        } else {
+            let by_name = backend
+                .create_or_open(b"/alpha.txt", Disposition::Open)
+                .expect("resolve the file by name");
+            assert_eq!(
+                by_name.file_id,
+                entry.file_id,
+                "cell agreement: the listing's id is the id the name resolves to (name {:?})",
+                String::from_utf8_lossy(&entry.name)
+            );
+        }
+    }
+
+    let ids: Vec<u64> = entries.iter().map(|entry| entry.file_id).collect();
+    assert!(
+        ids.contains(&file.file_id) && ids.contains(&dir),
+        "cell ids: the listing names the file and the directory by the ids `create_or_open`/`mkdir` returned"
     );
 }

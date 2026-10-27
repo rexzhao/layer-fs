@@ -123,6 +123,11 @@ pub struct DirEntry {
     pub name: Vec<u8>,
     /// File or directory, so the adapter can fill `FileAttributes` without a second call.
     pub kind: Kind,
+    /// The entry's identity — the same number `get_info` answers with.
+    ///
+    /// Added in P3-4 batch (i): a directory listing needs each entry's **metadata**, and the backend answers metadata *by id*. Without
+    /// it a listing could only be built by looking the name up again, i.e. by a second, subtly different translation (367).
+    pub file_id: u64,
 }
 
 /// A typed operation failure.

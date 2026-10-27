@@ -102,8 +102,8 @@ fn the_shell_reads_the_volume_from_the_mount_it_was_given() {
     use fs_winfsp::adapter::AdapterConfig;
     use fs_winfsp::callbacks::get_volume_info_shell;
     use fs_winfsp::mock::MockBackend;
-    use fs_winfsp::DynAdapter;
     use fs_winfsp::ops::DynOps;
+    use fs_winfsp::DynAdapter;
 
     let capacity = u32::try_from(std::mem::size_of::<VolumeInfo>()).expect("fits");
     let configured: DynAdapter = DynAdapter::with_config(
