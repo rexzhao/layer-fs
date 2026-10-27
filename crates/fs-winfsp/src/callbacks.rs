@@ -66,9 +66,9 @@ static LIST: OnceLock<Lister> = OnceLock::new();
 pub unsafe fn read_directory(
     context: *const c_void,
     buffer: *mut c_void,
-    offset: u64,
     marker: *const u16,
     length: u32,
+    bytes_transferred: *mut u32,
 ) -> i32 {
     READ_DIR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if context.is_null() || buffer.is_null() {
@@ -106,7 +106,6 @@ pub unsafe fn read_directory(
             .position(|(candidate, _)| candidate.as_slice() == name)
             .map_or(0, |index| index + 1)
     };
-    let _ = offset;
 
     // SAFETY: `buffer` is valid for `length` bytes per the caller's contract.
     let bytes = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), length as usize) };
@@ -122,6 +121,17 @@ pub unsafe fn read_directory(
             // A record that cannot be built (a timestamp outside FILETIME) is skipped rather than truncating the listing.
             Err(_) => continue,
         }
+    }
+    // The count is the **only** way the OS learns that entries were produced: without it a perfectly filled buffer reads as an
+    // empty directory (which is exactly what `dir Z:` showed while the chain itself was green).
+    if !bytes_transferred.is_null() {
+        // SAFETY: writable out-pointer per WinFsp's contract.
+        unsafe {
+            std::ptr::write(
+                bytes_transferred,
+                u32::try_from(out.written()).unwrap_or(u32::MAX),
+            )
+        };
     }
     0
 }

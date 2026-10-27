@@ -164,18 +164,23 @@ mod platform {
     unsafe extern "system" fn read_directory_trampoline(
         _file_system: *mut c_void,
         file_context: *mut c_void,
-        buffer: *mut c_void,
-        offset: u64,
         _pattern: *const u16,
         marker: *const u16,
+        buffer: *mut c_void,
         length: u32,
+        bytes_transferred: *mut u32,
     ) -> i32 {
-        eprintln!(
-            "read_directory raw: fs={:p} ctx={:p} buffer={:p} offset={:#x} pattern={:p} marker={:p} length={:#x}",
-            _file_system, file_context, buffer, offset, _pattern, marker, length
-        );
-        // SAFETY: WinFsp's contract — `file_context` is ours, `buffer` is valid for `length` bytes, `marker` is NUL-terminated.
-        unsafe { crate::callbacks::read_directory(file_context, buffer, offset, marker, length) }
+        // SAFETY: WinFsp's contract — `file_context` is ours, `buffer` is valid for `length` bytes, `marker` is NUL-terminated
+        // and `bytes_transferred` is writable.
+        unsafe {
+            crate::callbacks::read_directory(
+                file_context,
+                buffer,
+                marker,
+                length,
+                bytes_transferred,
+            )
+        }
     }
 
     /// `Open`: `(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess, PVOID *PFileContext,
@@ -321,11 +326,11 @@ mod platform {
             let listing: unsafe extern "system" fn(
                 *mut c_void,
                 *mut c_void,
+                *const u16,
+                *const u16,
                 *mut c_void,
-                u64,
-                *const u16,
-                *const u16,
                 u32,
+                *mut u32,
             ) -> i32 = read_directory_trampoline;
             interface.slots[slot::GET_VOLUME_INFO] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> i32,
@@ -437,11 +442,11 @@ mod platform {
                 unsafe extern "system" fn(
                     *mut c_void,
                     *mut c_void,
+                    *const u16,
+                    *const u16,
                     *mut c_void,
-                    u64,
-                    *const u16,
-                    *const u16,
                     u32,
+                    *mut u32,
                 ) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(listing));
