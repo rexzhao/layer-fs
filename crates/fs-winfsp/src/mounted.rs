@@ -173,6 +173,25 @@ mod platform {
         }
     }
 
+    /// `SetFileSize`: `(FSP_FILE_SYSTEM*, PVOID FileContext, UINT64 NewSize, FSP_FSCTL_FILE_INFO*)` — `winfsp.h:576`.
+    unsafe extern "system" fn set_file_size_trampoline(
+        file_system: *mut c_void,
+        file_context: *mut c_void,
+        new_size: u64,
+        info_out: *mut crate::abi::FileInfo,
+    ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
+        // SAFETY: WinFsp's contract — `file_context` is ours and `info_out` is its output buffer.
+        unsafe {
+            crate::callbacks::set_file_size_shell(
+                adapter.as_deref(),
+                file_context,
+                new_size,
+                info_out,
+            )
+        }
+    }
+
     /// `ReadDirectory`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PVOID Buffer, UINT64 Offset, PWSTR Pattern, PWSTR Marker,
     /// ULONG Length)` — `winfsp.h:703`.
     unsafe extern "system" fn read_directory_trampoline(
@@ -525,6 +544,17 @@ mod platform {
                 unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(file));
+            // `SetFileSize`: `(FSP_FILE_SYSTEM*, PVOID FileContext, UINT64 NewSize, FSP_FSCTL_FILE_INFO*)` — `winfsp.h:576`,
+            // slot **13**. Registered together with `GetFileInfo` because the answer to "make it this big" is the same record.
+            interface.slots[slot::SET_FILE_SIZE] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    u64,
+                    *mut crate::abi::FileInfo,
+                ) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(set_file_size_trampoline));
         }
         interface
     }

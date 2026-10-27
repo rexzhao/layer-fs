@@ -213,6 +213,76 @@ pub unsafe fn get_volume_info_for(
     0
 }
 
+/// The `SetFileSize` **shell**: ask the mount's backend to resize, then answer with the entry's **current** record.
+///
+/// The two steps are deliberately separate: "the backend accepted a length" and "the entry now has that length" are different
+/// facts, and the record handed back is built from a fresh `get_info`, so a backend that silently ignores the request cannot make
+/// the caller believe it worked (382 — the write-side mirror of "zero records read as an empty file").
+///
+/// # Safety
+///
+/// `context` must point to an `EntryContext` owned by this frontend; `out` must be valid for writes of `size_of::<FileInfo>()`.
+pub unsafe fn set_file_size_shell(
+    adapter: Option<&crate::DynAdapter>,
+    context: *const c_void,
+    new_size: u64,
+    out: *mut FileInfo,
+) -> i32 {
+    SET_SIZE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if context.is_null() || out.is_null() {
+        return OURS_INVALID_PARAMETER;
+    }
+    // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
+    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(adapter) = adapter else {
+        return NOT_IMPLEMENTED;
+    };
+    if adapter.backend().set_size(entry.file_id, new_size).is_err() {
+        // Nothing is written into the caller's buffer on failure: a half-updated record is worse than none.
+        return NOT_IMPLEMENTED;
+    }
+    // Read back through the **same** backend: this is where "accepted" becomes "is".
+    let Some(node) = adapter.backend().get_info(entry.file_id).ok() else {
+        return NOT_IMPLEMENTED;
+    };
+    if node.size != new_size {
+        // The backend said yes and the store says otherwise. Refusing is the only honest answer, and it is counted so the two
+        // facts cannot be confused later.
+        SET_SIZE_DISAGREEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return NOT_IMPLEMENTED;
+    }
+    match crate::file_info::file_info(&node) {
+        Ok(record) => {
+            // SAFETY: `out` is non-null; the caller guarantees room for `FileInfo`.
+            unsafe { std::ptr::write(out.cast::<FileInfo>(), record) };
+            0
+        }
+        Err(_) => NOT_IMPLEMENTED,
+    }
+}
+
+/// How many times `SetFileSize` was entered.
+static SET_SIZE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times a backend accepted a size and then reported a different one.
+///
+/// Zero is the invariant: a non-zero value means the store disagrees with the last successful call, which is a defect in one of the
+/// two, not a transient.
+static SET_SIZE_DISAGREEMENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times `SetFileSize` was entered.
+#[must_use]
+pub fn set_size_call_count() -> usize {
+    SET_SIZE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many times a backend accepted a length and then answered with a different one.
+#[must_use]
+pub fn set_size_disagreement_count() -> usize {
+    SET_SIZE_DISAGREEMENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The `GetFileInfo` **shell**: the metadata comes from **this mount's backend**, not from a process-wide lookup hook.
 ///
 /// # Safety
