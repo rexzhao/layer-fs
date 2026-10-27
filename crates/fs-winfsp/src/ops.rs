@@ -214,6 +214,19 @@ pub trait WorkspaceOps {
         Err(OpsError::NotFound)
     }
 
+    /// Where the directory at `path` **lives**: `(parent id, name bytes)`.
+    ///
+    /// The directory doors answer an id, and a handle needs more than that: `remove_at` guards with `(parent, name, expected id)`, so a
+    /// directory handle without a binding cannot take part in the two-phase deletion — its `set_delete` and `close` have no name to remove,
+    /// and the failure is invisible (measured: `rmdir` on a **non-empty** directory succeeded, because the deletion went around the rule that
+    /// refuses it).
+    ///
+    /// The information is not new work for a backend: resolving the path already **walked the parent segment**. The default answers `None`,
+    /// which means "this backend cannot tell", and a directory then behaves as it did before — an explicit gap rather than a guessed name.
+    fn dir_binding(&self, _path: &[u8]) -> Option<(u64, Vec<u8>)> {
+        None
+    }
+
     /// Reads up to `len` bytes at `offset`; a short read at EOF is zero-padded by the caller's contract, not here.
     ///
     /// # Errors

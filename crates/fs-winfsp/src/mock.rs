@@ -351,6 +351,15 @@ impl WorkspaceOps for MockBackend {
         Ok(id)
     }
 
+    fn dir_binding(&self, path: &[u8]) -> Option<(u64, Vec<u8>)> {
+        // The parent segment is already walked by `parent_and_name` — this is the same resolution the doors do, so the binding cannot disagree
+        // with the id they answered.
+        let inner = self.inner.lock().expect("mock lock");
+        let components = split(path).ok()?;
+        let (parent, name) = parent_and_name(&inner, &components).ok()?;
+        Some((parent, name.raw))
+    }
+
     fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
         MockBackend::mkdir(self, path)
     }

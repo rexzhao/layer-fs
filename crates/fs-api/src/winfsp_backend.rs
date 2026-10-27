@@ -108,6 +108,20 @@ impl WorkspaceOps for ApiBackend<'_> {
         Ok(resolved.serial())
     }
 
+    fn dir_binding(&self, path: &[u8]) -> Option<(u64, Vec<u8>)> {
+        // Split the path once: the parent is resolved through the same rules layer, the name is the last segment bytes.
+        let text = String::from_utf8_lossy(path).replace('\\', "/");
+        let (parent_text, name) = text.rsplit_once('/')?;
+        let parent_path = if parent_text.is_empty() {
+            "/"
+        } else {
+            parent_text
+        };
+        let rules = self.rules();
+        let parent = rules.resolve(&path_of(parent_path.as_bytes()).ok()?).ok()?;
+        Some((parent.serial(), name.as_bytes().to_vec()))
+    }
+
     fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
         let rules = self.rules();
         rules.mkdir(&path_of(path)?).map_err(to_ops)?;

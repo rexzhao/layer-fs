@@ -728,12 +728,13 @@ unsafe fn open_like(
     }
     let outcome = match make_verb(disposition, wants_directory) {
         MakeVerb::Directory => match adapter.backend().mkdir(path.as_bytes()) {
-            // A directory made by `mkdir` has **no binding from the backend** (the trait answers only an id), so a pending deletion of
-            // a directory would have no name to remove. Recorded as a gap: opening a directory by path is the missing trait capability.
+            // **The directory handle gets a binding too.** `dir_binding` is the parent segment the doors already walked, so the two-phase
+            // deletion covers directories exactly as it covers files — without it a directory's `set_delete`/`close` have no name to remove and
+            // the failure is invisible (measured: `rmdir` on a non-empty directory succeeded).
             Ok(file_id) => adapter
                 .backend()
                 .get_info(file_id)
-                .map(|_| (file_id, None))
+                .map(|_| (file_id, adapter.backend().dir_binding(path.as_bytes())))
                 .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
             // The name is taken: `FILE_CREATE` means **fail if it exists**, and that is a collision, not a silent open.
             Err(crate::ops::OpsError::NameCollision) => Err(OURS_OBJECT_NAME_COLLISION),
@@ -743,7 +744,7 @@ unsafe fn open_like(
             Ok(file_id) => adapter
                 .backend()
                 .get_info(file_id)
-                .map(|_| (file_id, None))
+                .map(|_| (file_id, adapter.backend().dir_binding(path.as_bytes())))
                 .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
             // Windows opens a directory with `FILE_OPEN_IF`, which means "open it, or make it": the make half is `mkdir`, and doing it here is
             // what keeps the 2x2 from needing a fifth verb.
@@ -1000,7 +1001,20 @@ pub unsafe fn can_delete_shell(adapter: Option<&crate::DynAdapter>, context: *co
         return NOT_IMPLEMENTED;
     };
     match adapter.backend().get_info(entry.file_id) {
-        Ok(_) => 0,
+        Ok(info) => {
+            // **This is the only place a refused deletion can still be reported.** `Cleanup` and `Close` are `VOID`, so marking and removing a
+            // directory happen where nobody can return an error — measured: `rmdir` on a non-empty directory answered success while `remove_at`
+            // refused inside the close, and Windows had already told the caller it worked. `CanDelete` is the question the FSD asks **before** the
+            // disposition is set, so the emptiness rule belongs here as well as at the removal.
+            if info.kind == crate::Kind::Directory {
+                if let Ok(entries) = adapter.backend().read_dir(entry.file_id) {
+                    if !entries.is_empty() {
+                        return OURS_DIRECTORY_NOT_EMPTY;
+                    }
+                }
+            }
+            0
+        }
         Err(_) => OURS_OBJECT_NAME_NOT_FOUND,
     }
 }
