@@ -707,3 +707,15 @@ operations answerable instead of refused.
 
 `09` and `10` flipped with the reference count, as predicted — they were the same lifecycle defect seen from two sides. What is left is
 `01` (the script's own first `stat`), `08` (case-only rename) and `12a` (attributes), and each has a distinct question already written down.
+
+## L2 after `SetBasicInfo`: **11 of 12**
+
+```
+01 root: not a directory        ✗  (the script's own first stat)
+02 … 07, 09, 10, 11             ✓
+08 case-only rename: <missing>  ✗
+12a attributes: readonly=yes    ✓   ← flipped by `SetBasicInfo@12` (raw shows `R`)
+```
+
+Only two classes left, and both have a written next step: `01` is to be moved to the end of the script (cheapest discriminator between
+"script order" and "backend"), and `08` is the case-only rename path.
