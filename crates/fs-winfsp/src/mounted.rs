@@ -140,13 +140,16 @@ mod platform {
 
     /// `GetVolumeInfo`: `(FSP_FILE_SYSTEM*, PVOID VolumeInfo, ULONG Length)` — `winfsp.h:206`.
     unsafe extern "system" fn volume_info_trampoline(
-        _file_system: *mut c_void,
+        file_system: *mut c_void,
         volume_info: *mut c_void,
         volume_info_length: u32,
     ) -> i32 {
+        // The **mount this callback belongs to**, not the process's last configuration: the pointer WinFsp hands back is the key
+        // it was registered under. `None` means the pointer is not a live mount; the shell refuses rather than inventing an answer.
+        let adapter = crate::registry::mounts().get(file_system as usize);
         // SAFETY: WinFsp passes a buffer of `volume_info_length` bytes, which is what the callee validates against its own
         // structure size.
-        unsafe { crate::callbacks::get_volume_info(volume_info, volume_info_length) }
+        unsafe { crate::callbacks::get_volume_info_shell(adapter.as_deref(), volume_info, volume_info_length) }
     }
 
     /// `GetFileInfo`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PVOID FileInfo)` — `winfsp.h:507`.
@@ -162,7 +165,7 @@ mod platform {
     /// `ReadDirectory`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PVOID Buffer, UINT64 Offset, PWSTR Pattern, PWSTR Marker,
     /// ULONG Length)` — `winfsp.h:703`.
     unsafe extern "system" fn read_directory_trampoline(
-        _file_system: *mut c_void,
+        file_system: *mut c_void,
         file_context: *mut c_void,
         _pattern: *const u16,
         marker: *const u16,
@@ -170,10 +173,12 @@ mod platform {
         length: u32,
         bytes_transferred: *mut u32,
     ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
         // SAFETY: WinFsp's contract — `file_context` is ours, `buffer` is valid for `length` bytes, `marker` is NUL-terminated
         // and `bytes_transferred` is writable.
         unsafe {
-            crate::callbacks::read_directory(
+            crate::callbacks::read_directory_shell(
+                adapter.as_deref(),
                 file_context,
                 buffer,
                 marker,

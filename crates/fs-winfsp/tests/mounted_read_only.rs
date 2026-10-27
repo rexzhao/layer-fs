@@ -160,6 +160,29 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
                 names
             })
             .map_err(|error| error.to_string());
+
+        // **The scenario's own ordering, not a retry** (369): the handle above is dropped, and our `Close` callback for it is an
+        // IRP that the dispatcher delivers *asynchronously* — `FspFileSystemStopDispatcher` returning does not mean the queue is
+        // empty, and once the dispatcher is stopped a pending `Close` is never delivered at all. So the wait belongs **here**,
+        // while the dispatcher is alive, and the assertion afterwards keeps its zero tolerance.
+        //
+        // What is being tested is thus explicit: *a handle close produces an `IRP_MJ_CLOSE` delivered while the dispatcher runs*.
+        // A timeout is a failure (the dispatcher did not deliver, or our `Close` is broken), never a reason to proceed.
+        let started = std::time::Instant::now();
+        loop {
+            let now = callbacks::context_counts();
+            if now.0 - before_contexts.0 == now.1 - before_contexts.1 {
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(2) {
+                return Err(format!(
+                    "in-flight Close did not arrive within 2s: before {before_contexts:?}, after {now:?} — \
+                     the dispatcher is alive, so this is a real gap, not a slow machine"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
         probe_result = Some(outcome.clone());
         outcome.map(|_names| ())
     })
@@ -186,6 +209,11 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
     eprintln!(
         "dispatcher result = {} (0x{:08X}) — 0 means the dispatcher threads survived",
         report.dispatcher_result, report.dispatcher_result as u32
+    );
+    // A registry miss is the one现场 a dangling callback leaves; reported on every mount run so it cannot hide behind "some refusal".
+    eprintln!(
+        "registry misses = {} (a miss means a callback reached a pointer that was no longer a live mount)",
+        fs_winfsp::registry::miss_count()
     );
     eprintln!("probe hits = {}", report.probe_hits);
     eprintln!("open entries = {}", callbacks::open_entry_count());
