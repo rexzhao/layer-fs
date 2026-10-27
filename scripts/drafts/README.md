@@ -719,3 +719,14 @@ operations answerable instead of refused.
 
 Only two classes left, and both have a written next step: `01` is to be moved to the end of the script (cheapest discriminator between
 "script order" and "backend"), and `08` is the case-only rename path.
+
+## `01` moved to the end: still red — so it is not script ordering
+
+With the `01` class executed **last** (after every other class has run), it still answers `not a directory or missing`. And in the isolated
+instrument (where `[ -d 'Z:/' ]` runs first) the same expression answers `d=0`.
+
+So the root's `stat` works when it is the *first* thing that happens and fails once other classes have run. That is **state dependent on our side**, and
+the bisect is cheap: run the script with an early `exit` after each class and note the first one after which `01` starts failing.
+
+`08` (case-only rename) is unchanged by this — it is the remaining functional gap, and it has its own criterion to run (manager 442: fold matching,
+case-only is not a collision, identity preserved).
