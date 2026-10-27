@@ -752,3 +752,23 @@ for the class that asks "is the root a directory", with the measurement written 
 07 old=gone new=present ✓   09 name=gone ✓   10 beta ✓   11 refused ✓   12a readonly=yes ✓ (raw `R`)   12b ✓
 08 case-only rename: <missing> ✗
 ```
+
+## `08`: the `Rename` never reaches the backend at all
+
+One mount, `printf x > Z:/l2-renamed`, then `mv Z:/l2-renamed Z:/L2-RENAMED`:
+
+```
+PRE  ls -1 Z:/          -> l2-renamed
+MV   mv … ; echo rc=$?  -> rc=0
+POST ls -1a Z:/         -> . .. l2-renamed        ← still the old spelling
+STAT Z:/l2-renamed      -> ino 8948360027621016923
+CALL …                  -> no `Rename` in the backend call log
+```
+
+So the FSD (or the client above it) decides the request is a **no-op** and answers success: our side is never asked, the display spelling stays, and
+the class is red. That is a different question from "our rename is wrong" — the rename path was never exercised here.
+
+Prime suspect, and the reason NTFS behaves differently: we answer the *destination* spelling (`L2-RENAMED`) as an existing name (the fold), and a
+case-insensitive client that compares "same file → nothing to do" therefore returns early. The next experiment is to ask whether the request reaches
+`SetInformation`/`Rename` when the FSD's own volume parameters are compared against `memfs` (`CasePreservedNames` **and** `CaseSensitiveSearch`),
+which is the one place memfs declares both.
