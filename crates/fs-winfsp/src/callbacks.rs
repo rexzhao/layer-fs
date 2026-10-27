@@ -443,21 +443,49 @@ pub unsafe fn create_shell(
     info_out: *mut FileInfo,
 ) -> i32 {
     CREATE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let disposition = match create_options
-        & (FILE_SUPERSEDE
-            | FILE_OPEN
-            | FILE_CREATE
-            | FILE_OPEN_IF
-            | FILE_OVERWRITE
-            | FILE_OVERWRITE_IF)
-    {
-        FILE_OPEN => fs_semantics::disposition::Disposition::Open,
-        FILE_CREATE => fs_semantics::disposition::Disposition::Create,
-        // Every other member of the create-disposition class: not implemented yet, and said so.
-        _ => return NOT_IMPLEMENTED,
+    let parts = split_create_options(create_options);
+    let Some(disposition) = parts.disposition else {
+        // A disposition value NT does not define: refuse, and do not ask the backend anything.
+        return NOT_IMPLEMENTED;
     };
+    // `FILE_DIRECTORY_FILE` is the **option**, not the disposition — it says *what kind* to make, and it is the flag the SDK tells
+    // user-mode file systems to look at (`winfsp.h:262-266`).
+    let _wants_directory = parts.options & FILE_DIRECTORY_FILE != 0;
     // SAFETY: the caller's contract for both pointers is the same as `open_shell`'s.
     unsafe { open_like(adapter, file_name, disposition, context_out, info_out) }
+}
+
+/// The two halves of a packed `create_options` word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateParts {
+    /// The disposition (`FILE_OPEN`, `FILE_CREATE`, …), or `None` when the value is not one NT defines.
+    pub disposition: Option<fs_semantics::disposition::Disposition>,
+    /// The low 24 bits: `FILE_DIRECTORY_FILE`, `FILE_NON_DIRECTORY_FILE`, `FILE_WRITE_THROUGH`, …
+    pub options: u32,
+}
+
+/// Splits the packed `CreateOptions` word — **`Disposition: high 8 bits; Options: low 24 bits`** (`fsctl.h:351`).
+///
+/// The packing is documented in one comment line in the transact structure, and the dispatcher itself does exactly this
+/// (`fsop.c:915`: `switch ((CreateOptions >> 24) & 0xff)`), passing the **packed** value through to the interface (`fsop.c:455`).
+/// Reading the low bits as the disposition is the mistake this function exists to make impossible: the FSD's own trace prints the
+/// two halves separately, so a bare `0x21` in a log is `FILE_DIRECTORY_FILE` and says nothing about the disposition.
+#[must_use]
+pub fn split_create_options(create_options: u32) -> CreateParts {
+    use fs_semantics::disposition::Disposition;
+    let disposition = match (create_options >> 24) & 0xff {
+        FILE_SUPERSEDE => Some(Disposition::Supersede),
+        FILE_OPEN => Some(Disposition::Open),
+        FILE_CREATE => Some(Disposition::Create),
+        FILE_OPEN_IF => Some(Disposition::OpenIf),
+        FILE_OVERWRITE => Some(Disposition::Overwrite),
+        FILE_OVERWRITE_IF => Some(Disposition::OverwriteIf),
+        _ => None,
+    };
+    CreateParts {
+        disposition,
+        options: create_options & 0x00FF_FFFF,
+    }
 }
 
 /// `FILE_SUPERSEDE` — `winfsp.h` (`CreateOptions`), the first member of the create-disposition class.
@@ -472,6 +500,12 @@ pub const FILE_OPEN_IF: u32 = 0x03;
 pub const FILE_OVERWRITE: u32 = 0x04;
 /// `FILE_OVERWRITE_IF` — "open and truncate, creating if needed".
 pub const FILE_OVERWRITE_IF: u32 = 0x05;
+
+/// `FILE_DIRECTORY_FILE` — an **option** bit (`0x00000001`), not a disposition: "create a directory rather than a file".
+///
+/// The collision with `FILE_OPEN`'s value is exactly what made the low-bit reading look plausible and be wrong: the two live in
+/// different halves of the same word.
+pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 
 /// The `Close` body: frees the `FileContext` **once**.
 ///

@@ -6,7 +6,7 @@
 //! - `FILE_CREATE` ⇒ **exactly one** `create_or_open` with `Disposition::Create`;
 //! - `FILE_OPEN` ⇒ `Disposition::Open` (the translation must not have moved the other member);
 //! - a backend that cannot create ⇒ **refusal**, never a `FileContext` that pretends the entry exists;
-//! - an unimplemented member (`FILE_OVERWRITE`) ⇒ refused, and **nothing is called**.
+//! - an undefined disposition value (0x07) ⇒ refused, and **nothing is called**.
 
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 use fs_semantics::disposition::Disposition;
 use fs_winfsp::abi::FileInfo;
 use fs_winfsp::callbacks::{
-    create_shell, EntryContext, FILE_CREATE, FILE_OPEN, FILE_OVERWRITE, NOT_IMPLEMENTED,
+    create_shell, split_create_options, EntryContext, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN,
+    NOT_IMPLEMENTED,
 };
 use fs_winfsp::ops::DynOps;
 use fs_winfsp::ops::{
@@ -212,7 +213,7 @@ fn create(adapter: &DynAdapter, options: u32) -> (i32, bool) {
 fn file_create_asks_the_backend_to_create_exactly_once() {
     let recorder = Recorder::writable();
     let adapter = fixture(&recorder);
-    let (status, gave_context) = create(&adapter, FILE_CREATE);
+    let (status, gave_context) = create(&adapter, pack(FILE_CREATE, 0));
 
     assert_eq!(
         status, 0,
@@ -230,7 +231,7 @@ fn file_create_asks_the_backend_to_create_exactly_once() {
 fn file_open_still_means_open() {
     let recorder = Recorder::writable();
     let adapter = fixture(&recorder);
-    let (status, _) = create(&adapter, FILE_OPEN);
+    let (status, _) = create(&adapter, pack(FILE_OPEN, 0));
 
     assert_eq!(status, 0, "cell open: FILE_OPEN succeeds on the fixture");
     assert_eq!(
@@ -244,7 +245,7 @@ fn file_open_still_means_open() {
 fn a_backend_that_cannot_create_refuses_instead_of_pretending() {
     let recorder = Recorder::read_only();
     let adapter = fixture(&recorder);
-    let (status, gave_context) = create(&adapter, FILE_CREATE);
+    let (status, gave_context) = create(&adapter, pack(FILE_CREATE, 0));
 
     assert_ne!(status, 0, "cell read-only: the create is refused");
     assert!(
@@ -259,18 +260,58 @@ fn a_backend_that_cannot_create_refuses_instead_of_pretending() {
 }
 
 #[test]
-fn an_unimplemented_member_is_refused_before_anything_is_called() {
+fn an_undefined_disposition_value_is_refused_before_anything_is_called() {
+    // `0x07` is not a disposition NT defines. The refusal must happen **before** the backend, so "not implemented" and "tried and
+    // failed" stay distinguishable — a refusal that still asks once leaves a phantom attempt in every future diagnosis.
     let recorder = Recorder::writable();
     let adapter = fixture(&recorder);
-    let (status, gave_context) = create(&adapter, FILE_OVERWRITE);
+    let (status, gave_context) = create(&adapter, pack(0x07, 0));
 
-    assert_eq!(
-        status, NOT_IMPLEMENTED,
-        "cell overwrite: refused, because \"open and truncate\" is not implemented yet"
-    );
-    assert!(!gave_context, "cell overwrite: and no handle is handed out");
+    assert_eq!(status, NOT_IMPLEMENTED, "cell undefined: refused");
+    assert!(!gave_context, "cell undefined: and no handle is handed out");
     assert!(
         recorder.seen().is_empty(),
-        "cell overwrite: **the backend was not asked at all** — a refusal must not be a failed attempt"
+        "cell undefined: **the backend was not asked at all**"
     );
+}
+
+#[test]
+fn the_disposition_lives_in_the_high_byte_and_the_flags_in_the_low_24_bits() {
+    // The packing is `fsctl.h:351`'s one-line comment, and this is it as an assertion: a bare `0x21` from the FSD log is
+    // `FILE_DIRECTORY_FILE` with **no** disposition, which is why reading the low bits never could have worked.
+    let parts = split_create_options(pack(FILE_OPEN, FILE_DIRECTORY_FILE));
+    assert_eq!(
+        parts.disposition,
+        Some(Disposition::Open),
+        "cell split: the disposition comes from the high byte"
+    );
+    assert_eq!(
+        parts.options, FILE_DIRECTORY_FILE,
+        "cell split: and the flags from the low 24 bits"
+    );
+
+    // The bare value from the real log: flags only, disposition zero (= `FILE_SUPERSEDE`, which is why the old reading "worked" for
+    // a directory open and would have been wrong for anything else).
+    let bare = split_create_options(FILE_DIRECTORY_FILE | 0x20);
+    assert_eq!(
+        bare.options,
+        FILE_DIRECTORY_FILE | 0x20,
+        "cell bare: flags survive"
+    );
+    assert_eq!(
+        bare.disposition,
+        Some(Disposition::Supersede),
+        "cell bare: with nothing in the high byte, the disposition is whatever zero means — **not** FILE_OPEN"
+    );
+
+    assert_eq!(
+        split_create_options(pack(0x07, 0)).disposition,
+        None,
+        "cell undefined: an out-of-range disposition has no mapping"
+    );
+}
+
+/// Packs a disposition and options the way the FSD does (`fsctl.h:351`).
+fn pack(disposition: u32, options: u32) -> u32 {
+    ((disposition & 0xff) << 24) | (options & 0x00FF_FFFF)
 }
