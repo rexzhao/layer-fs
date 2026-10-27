@@ -41,6 +41,9 @@ P3-3a/3b 把"所有能用普通 Rust 测的语义"做完了；本卡只做**转�
 | U12 | **运行时版本/ABI 匹配**（FFI 面 §5.7–5.8） | 冒烟：`FspVersion` 返回 0（只证明 DLL 可加载） | L1：结构大小/字段偏移 static assert；启动时主/次版本比对 | 拒绝启动 |
 | U13 | **有打开句柄时卸载被拒；强制卸载的数据语义**（ADR-009 W12、§8） | 无 | L3：打开句柄 → 正常卸载被拒；`--force` → 记录未刷数据丢失范围 | 修订 §8 |
 | U14 | **8.3 短名不支持、大小写折叠行为**（ADR-009 W8、§4.1） | 文档（WinFsp NTFS-Compatibility：不支持短名） | L2：`dir /x` 无短名；折叠歧义 → `STATUS_OBJECT_NAME_COLLISION` | 修订 §4.1 |
+| U15 | **多页目录列举（marker 续读）从未验证**（2026-10-27 新增：夹具仅 2 条目永远单页；NextOffset 定性见下） | 无——真机仅单页列举通过 | L2：造 >单页容量目录（约 200 条）真机列举，断言条数与内容；marker 续读路径（"大于 marker 的名字继续返回"）首验 | 多页失败 ⇒ 补续读实现 |
+
+  > **U15 附注（NextOffset 定性，2026-10-27 ddca7bd 源码核实）**：`dir_buffer::push` 从未写 `NextOffset`（恒 0）。当前配置无害——`DirectoryMarkerAsNextOffset` 未设（零位域）⇒ FSD 用最后一条的**文件名**做续读 marker，NextOffset 全程不被读（fsctl.h:232 / winfsp.h:687）。风险仅为：将来若设该 flag 则静默坏。写链批后单列一项：写全 NextOffset（解除耦合）或断言 flag 恒 0。 |
 
 > 维护规则：本表每消一行，提交说明的判据影响行写"U<n>：通过/失败（红值）/空转"，并在 ADR 对应处把"未验证"改成结论 + 证据 ref；**不得只改表不改 ADR**。
 
