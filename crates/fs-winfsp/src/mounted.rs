@@ -123,6 +123,21 @@ mod platform {
         unsafe { crate::callbacks::get_file_info(file_context, file_info) }
     }
 
+    /// `ReadDirectory`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PVOID Buffer, UINT64 Offset, PWSTR Pattern, PWSTR Marker,
+    /// ULONG Length)` — `winfsp.h:703`.
+    unsafe extern "system" fn read_directory_trampoline(
+        _file_system: *mut c_void,
+        file_context: *mut c_void,
+        buffer: *mut c_void,
+        offset: u64,
+        _pattern: *const u16,
+        marker: *const u16,
+        length: u32,
+    ) -> i32 {
+        // SAFETY: WinFsp's contract — `file_context` is ours, `buffer` is valid for `length` bytes, `marker` is NUL-terminated.
+        unsafe { crate::callbacks::read_directory(file_context, buffer, offset, marker, length) }
+    }
+
     fn interface_with_callbacks() -> FileSystemInterface {
         let mut interface = FileSystemInterface::empty();
         // SAFETY: the slot type carries **no signature** (the SDK's slots differ in arity), so registering a callback is a
@@ -132,10 +147,31 @@ mod platform {
                 volume_info_trampoline;
             let file: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 =
                 file_info_trampoline;
+            let listing: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                u64,
+                *const u16,
+                *const u16,
+                u32,
+            ) -> i32 = read_directory_trampoline;
             interface.slots[slot::GET_VOLUME_INFO] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(volume));
+            interface.slots[slot::READ_DIRECTORY] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    u64,
+                    *const u16,
+                    *const u16,
+                    u32,
+                ) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(listing));
             interface.slots[slot::GET_FILE_INFO] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32,
                 unsafe extern "C" fn() -> i32,

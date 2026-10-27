@@ -54,3 +54,17 @@ where
         Err(_) => default,
     }
 }
+
+/// The number of UTF-16 units before the terminator.
+///
+/// # Safety
+///
+///  must point to a NUL-terminated UTF-16 string.
+pub unsafe fn utf16_len(units: *const u16) -> usize {
+    let mut len = 0usize;
+    // SAFETY: the caller guarantees a terminator, so this walk stops inside the string.
+    while unsafe { *units.add(len) } != 0 {
+        len += 1;
+    }
+    len
+}

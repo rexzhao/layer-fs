@@ -25,6 +25,14 @@ fn node(file_id: u64) -> NodeInfo {
     }
 }
 
+/// The listing the directory callback answers from: the root holds one entry.
+fn list(dir_id: u64) -> Vec<fs_winfsp::callbacks::ListEntry> {
+    if dir_id != 0 {
+        return Vec::new();
+    }
+    vec![("a.txt".encode_utf16().collect(), node(7))]
+}
+
 fn lookup(file_id: u64) -> Option<NodeInfo> {
     (file_id == 7).then(|| node(file_id))
 }
@@ -46,7 +54,7 @@ fn the_two_callbacks_answer_from_configuration_and_from_the_entry_context() {
         },
     };
     assert!(
-        configure(&volume, lookup),
+        configure(&volume, lookup, list),
         "cell configure: the first configuration in this process succeeds"
     );
 

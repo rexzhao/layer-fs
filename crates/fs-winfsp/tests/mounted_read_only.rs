@@ -27,6 +27,17 @@ fn node(file_id: u64) -> NodeInfo {
     }
 }
 
+/// The directory listing the callbacks answer from: the root has two entries.
+fn list(dir_id: u64) -> Vec<(Vec<u16>, NodeInfo)> {
+    if dir_id != 0 {
+        return Vec::new();
+    }
+    vec![
+        ("alpha.txt".encode_utf16().collect(), node(1)),
+        ("beta".encode_utf16().collect(), node(2)),
+    ]
+}
+
 fn lookup(file_id: u64) -> Option<NodeInfo> {
     (file_id == 7).then(|| node(file_id))
 }
@@ -54,6 +65,7 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
             },
         },
         lookup,
+        list,
     );
     assert!(
         configured,

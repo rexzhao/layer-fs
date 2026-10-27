@@ -145,6 +145,8 @@ pub mod slot {
     pub const CAN_DELETE: usize = 14;
     /// `Rename` — `winfsp.h:632`.
     pub const RENAME: usize = 15;
+    /// `ReadDirectory` — `winfsp.h:703` (index 18; `GetSecurity`/`SetSecurity` occupy 16/17).
+    pub const READ_DIRECTORY: usize = 18;
 
     /// How many named (non-reserved) entries the SDK declares; the rest are `Reserved[31]` plus padding to 64.
     pub const NAMED: usize = 33;
