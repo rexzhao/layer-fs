@@ -639,3 +639,23 @@ exiting 0.
 So the defect is in **how the answered bytes reach the caller's buffer**, not in the offset arithmetic. The next probe writes the first bytes of
 `Buffer` *before* and *after* our copy (and prints `*PBytesTransferred`), which separates "we copied the wrong bytes" from "we copied to the wrong
 place". (`wc -c` read 5 bytes correctly through the same shell, so the buffer plumbing works on that path — the difference is the length-3 read.)
+
+## The last centimetre: two reads, two buffers, and our EOF answer swallows the live one
+
+Working buffer printed at the trampoline, one `printf > f1; cat f1` under bash:
+
+```
+TRAMP read buffer=0x2c273f50000 offset=0 length=3        -> BACKEND read(len=3) -> "alp"
+TRAMP read buffer=0x2c273f60000 offset=0 length=131072   -> (no backend call)
+```
+
+Two facts:
+
+1. the buffers **differ**, so these are two different requests (a small read and the cached read-ahead);
+2. the second one **never reaches the backend** — the shell takes the `is_closed` branch and answers EOF. So a read that belongs to a *live* caller
+   is being answered as if the handle were closed: the graveyard test fires for a context that is still in use, which means the id in that request
+   was already released by an earlier `Close` of the *same* id.
+
+That points at the lifecycle again, from a new side: **the FSD is still issuing reads for a handle whose context we released**, and my EOF shortcut hides
+it (it made `cat` fail quietly instead of loudly). The next instrument must print the *context id* per read on both sides — the buffer addresses already
+show the pairing is not 1:1.
