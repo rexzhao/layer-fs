@@ -125,11 +125,15 @@ fn volume() -> VolumeInfo {
     }
 }
 
-/// Where the mount will be attached: `Z:` by default (owner ruling), a directory when the environment says so.
+/// Where the mount will be attached: **`X:`**, deliberately *not* `Z:`.
+///
+/// Two mount tests running in parallel would otherwise fight over one drive letter (process 434): each test process is its own mount, and a
+/// shared letter means the second one mounts into the first one's volume — or fails with "the probe never ran". A distinct letter is a
+/// **structural** fix; serialising the suite would only hide the collision. The letter is asserted free before mounting.
 fn mount_point() -> PathBuf {
     std::env::var_os("LAYER_FS_MNT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("Z:"))
+        .unwrap_or_else(|| PathBuf::from("X:"))
 }
 
 fn root_of(mount_point: &std::path::Path) -> PathBuf {
