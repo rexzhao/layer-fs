@@ -127,9 +127,9 @@ fn split(path: &[u8]) -> OpsResult<Vec<Component>> {
             return Err(OpsError::InvalidParameter);
         }
         out.push(Component {
-            // **ASCII lowercase only** — the fold range is part of the contract, not an implementation detail (manager 442: the L2 names are
-            // ASCII; full Unicode folding is a known limit and stays out of scope).
-            folded: component.to_ascii_lowercase(),
+            // **The one implementation** (`fs_semantics::name::fold_bytes`), not a local copy: this used to be `to_ascii_lowercase`, which is a
+            // second definition of the matching key and would have let the mock and the real backend disagree without any test noticing (472).
+            folded: fs_semantics::name::fold_bytes(component),
             raw: component.to_vec(),
         });
     }
@@ -708,7 +708,7 @@ impl WorkspaceOps for MockBackend {
         //      identity no longer names anything.
         match inner
             .children
-            .get(&(parent, name.to_ascii_lowercase()))
+            .get(&(parent, fs_semantics::name::fold_bytes(name)))
             .map(|binding| binding.id)
         {
             // The name now belongs to a **different** entry. That is not "not found" — the caller's handle is stale, and
@@ -726,7 +726,9 @@ impl WorkspaceOps for MockBackend {
                 if has_children {
                     return Err(OpsError::NotEmpty);
                 }
-                inner.children.remove(&(parent, name.to_ascii_lowercase()));
+                inner
+                    .children
+                    .remove(&(parent, fs_semantics::name::fold_bytes(name)));
                 inner.retire(bound);
                 Ok(())
             }
