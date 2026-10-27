@@ -82,6 +82,8 @@ pub unsafe fn read_directory(
     }
     // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
     let entry = unsafe { &*context.cast::<EntryContext>() };
+    // The **only** two things the shell does: count (done above) and fetch the entries. Everything about framing, resuming and
+    // counting lies in `read_directory_from`, which a test can call with entries it chose (361).
     let entries = match LIST.get() {
         Some(list) => list(entry.file_id),
         None => Vec::new(),
@@ -92,7 +94,23 @@ pub unsafe fn read_directory(
         entries.len(),
         length
     );
+    // SAFETY: the caller's contract covers every pointer handed through.
+    unsafe { read_directory_from(&entries, buffer, marker, length, bytes_transferred) }
+}
 
+/// The `ReadDirectory` body with the entries handed in — the resume, the framing and the count are all here.
+///
+/// # Safety
+///
+/// `buffer` must be valid for writes of `length` bytes, `marker` (when not null) must point to a NUL-terminated UTF-16 string,
+/// and `bytes_transferred` (when not null) must be writable.
+pub unsafe fn read_directory_from(
+    entries: &[ListEntry],
+    buffer: *mut c_void,
+    marker: *const u16,
+    length: u32,
+    bytes_transferred: *mut u32,
+) -> i32 {
     // A non-null marker means the caller wants to resume after that name; we index by position, so translate it.
     let start = if marker.is_null() {
         0usize
