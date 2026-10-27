@@ -74,6 +74,10 @@ pub unsafe fn read_directory(
     if context.is_null() || buffer.is_null() {
         // A null `FileContext`/buffer is a caller contract violation; answering `INVALID_DEVICE_REQUEST` here would be
         // indistinguishable from the slot being absent, so it is counted and answered with an empty listing instead.
+        eprintln!(
+            "read_directory: null argument (context={:?} buffer={:?} length={})",
+            context, buffer, length
+        );
         return 0;
     }
     // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
@@ -82,6 +86,12 @@ pub unsafe fn read_directory(
         Some(list) => list(entry.file_id),
         None => Vec::new(),
     };
+    eprintln!(
+        "read_directory: file_id={} entries={} length={}",
+        entry.file_id,
+        entries.len(),
+        length
+    );
 
     // A non-null marker means the caller wants to resume after that name; we index by position, so translate it.
     let start = if marker.is_null() {

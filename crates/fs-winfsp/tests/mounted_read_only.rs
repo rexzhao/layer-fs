@@ -126,8 +126,10 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
     }
 
     // The probe runs **while mounted**; its error is captured for the report.
-    let mut probe_result: Option<Result<(), String>> = None;
+    let mut probe_result: Option<Result<Vec<String>, String>> = None;
     let before_contexts = callbacks::context_counts();
+    // The mounted probe returns `Result<(), String>` to the library (which only cares whether it worked); the **names** are kept
+    // here, because they are the evidence about semantics rather than about plumbing.
     let report = mount_read_only(&library, &mount_point, |path| {
         // `Y:` alone means "the current directory on Y:", which a file system without directory state cannot answer; `Y:\`
         // is the volume root. This distinction is exactly the kind of thing that fails as ERROR_INVALID_FUNCTION rather than as
@@ -141,15 +143,20 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
             "during mount: drive present = {:?}",
             fs_winfsp::mounted::drive_present(path)
         );
+        // **Names, not just success**: "no error" only proves the chain is connected; the names prove the *semantics*. The
+        // listing callback answers with exactly the two entries the fixture declares, so the OS should hand back the same two.
         let outcome = std::fs::read_dir(&root)
-            .map(|mut entries| {
-                // Reading one entry is enough to prove the OS served the directory from us; the callback table has no
-                // ReadDirectory yet, so a `None` here is expected and recorded as such.
-                let _ = entries.next();
+            .map(|entries| {
+                let mut names: Vec<String> = entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                names
             })
             .map_err(|error| error.to_string());
         probe_result = Some(outcome.clone());
-        outcome
+        outcome.map(|_names| ())
     })
     .expect("the mount path is available");
 

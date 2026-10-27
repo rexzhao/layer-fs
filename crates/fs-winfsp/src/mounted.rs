@@ -170,6 +170,10 @@ mod platform {
         marker: *const u16,
         length: u32,
     ) -> i32 {
+        eprintln!(
+            "read_directory raw: fs={:p} ctx={:p} buffer={:p} offset={:#x} pattern={:p} marker={:p} length={:#x}",
+            _file_system, file_context, buffer, offset, _pattern, marker, length
+        );
         // SAFETY: WinFsp's contract — `file_context` is ours, `buffer` is valid for `length` bytes, `marker` is NUL-terminated.
         unsafe { crate::callbacks::read_directory(file_context, buffer, offset, marker, length) }
     }
