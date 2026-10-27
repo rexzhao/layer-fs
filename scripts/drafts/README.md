@@ -975,3 +975,22 @@ path in a row**.
 The next single change is therefore: take the verbatim copy and delete its `read`/`set_len`/`remove`, leaving only the write. If that fails, "a mount whose
 first and only operation is a create+write" is the shape, and the defect is in how the very first operation after mount is served — which is exactly the
 half-alive mount QA saw, with the extra detail that the *content* of the first operation decides it.
+
+## Bisect (508): replay is deterministic — and the delta is not what it looks like
+
+```
+bisect6_replay (the body that failed before, re-created verbatim)   -> BOTH writes os error 3, 2/2 runs
+write_only_first_operation (same file, same mount call, one write)  -> PASS, 2/2 runs
+write_only + an unused second PathBuf built with format!            -> PASS
+write_only + a second write to the same path                        -> PASS
+```
+
+So the same file, same mount call, same letter, same backend serves one body and not the other, deterministically. The remaining differences of the
+failing body are: it **returns the write's `Result`** (instead of `Ok(())`), and it holds **two `PathBuf`s alive across the write**. Everything else has
+been changed one at a time and kept passing.
+
+Next single change: make `write_only_first_operation` return the write's `Result` unchanged — the last structural difference.
+
+Note for the record: four bisect steps have now landed on "it still fails / it still passes" without moving, which is the shape of a variable that is not in
+the code being edited. The one thing all failing shapes had in common so far is that they were created **after** the working ones in the same file and
+run **filtered** — a property that has to be tested deliberately (not assumed away) before more body-level bisecting.
