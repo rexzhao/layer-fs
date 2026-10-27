@@ -261,20 +261,30 @@ mod platform {
         }
     }
 
-    /// `Overwrite` — `winfsp.h:345`, slot **5**. Required for the whole create class (`fsop.c:907`: the dispatcher refuses the
-    /// class outright, **without calling any member**, when `Create`/`Open`/`Overwrite` are not all present).
+    /// `Overwrite` — `winfsp.h:326-346`, slot **5**.
     ///
-    /// A read-only volume: refuse with `STATUS_MEDIA_WRITE_PROTECTED` (`0xC00000EA`). That is not "unimplemented" — WinFsp relays
-    /// it as a write-protected volume, which is the truth about this stage.
+    /// `(FSP_FILE_SYSTEM*, PVOID FileContext, UINT32 FileAttributes, BOOLEAN ReplaceFileAttributes, UINT64 AllocationSize,
+    /// FSP_FSCTL_FILE_INFO*)` — the shape the header gives, and the one the interface table registers.
     unsafe extern "system" fn overwrite_trampoline(
-        _file_system: *mut c_void,
-        _file_context: *mut c_void,
-        _file_attributes: u32,
-        _replace_attributes: u32,
-        _allocation_size: u64,
-        _file_info: *mut crate::abi::FileInfo,
+        file_system: *mut c_void,
+        file_context: *mut c_void,
+        file_attributes: u32,
+        replace_attributes: u32,
+        allocation_size: u64,
+        file_info: *mut crate::abi::FileInfo,
     ) -> i32 {
-        0xC000_00EAu32 as i32
+        let adapter = crate::registry::mounts().get(file_system as usize);
+        // SAFETY: WinFsp's contract for this callback.
+        unsafe {
+            crate::callbacks::overwrite_shell(
+                adapter.as_deref(),
+                file_context,
+                file_attributes,
+                replace_attributes != 0,
+                allocation_size,
+                file_info,
+            )
+        }
     }
 
     /// `GetSecurity` — `winfsp.h:652`, slot **16**.

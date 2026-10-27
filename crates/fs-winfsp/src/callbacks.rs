@@ -718,6 +718,102 @@ pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_v
     CONTEXTS_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The `Overwrite` **shell**: truncate in place, apply the attribute policy, then **read both back**.
+///
+/// The two header facts this is built on (`winfsp.h:326-346`):
+///
+/// - the entry keeps its **identity** — this is a truncation of the same file, not a new one (the same decision ruling (a) made for
+///   `SUPERSEDE` in the core, now at the mount layer);
+/// - `ReplaceFileAttributes` decides between **replace** and **merge (or)**: `TRUE` stores the caller's bits, `FALSE` ors them into what
+///   is stored. Both directions are asserted, because a shell that always replaced would pass a replace-only test.
+///
+/// `AllocationSize` is accepted and **ignored**: this backend has no allocation concept, and pretending to honour it would be a
+/// promise nobody keeps.
+///
+/// # Safety
+///
+/// `context` must point to an `EntryContext` owned by this frontend; `out` (when not null) must be writable.
+pub unsafe fn overwrite_shell(
+    adapter: Option<&crate::DynAdapter>,
+    context: *const c_void,
+    file_attributes: u32,
+    replace_attributes: bool,
+    allocation_size: u64,
+    out: *mut FileInfo,
+) -> i32 {
+    OVERWRITE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if context.is_null() {
+        return OURS_INVALID_PARAMETER;
+    }
+    // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
+    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(adapter) = adapter else {
+        return NOT_IMPLEMENTED;
+    };
+    let before = match adapter.backend().get_info(entry.file_id) {
+        Ok(info) => info,
+        Err(_) => return OURS_OBJECT_NAME_NOT_FOUND,
+    };
+    // Truncation first: it is the operation the caller actually asked for, and a failed attribute write must not leave a file that is
+    // neither old nor new.
+    if adapter.backend().set_size(entry.file_id, 0).is_err() {
+        return NOT_IMPLEMENTED;
+    }
+    // `FILE_ATTRIBUTE_NORMAL` (0x80) and `DIRECTORY` (0x10) are **derived**, never stored: masking them off here is what keeps a caller
+    // that passes the ordinary "normal file" value from being refused by the attribute validator.
+    let requested = file_attributes & fs_semantics::attributes::WRITABLE;
+    let stored = if replace_attributes {
+        requested
+    } else {
+        before.attributes.0 & fs_semantics::attributes::WRITABLE | requested
+    };
+    if adapter
+        .backend()
+        .set_attributes(entry.file_id, crate::ops::Attributes(stored))
+        .is_err()
+    {
+        return NOT_IMPLEMENTED;
+    }
+    let after = match adapter.backend().get_info(entry.file_id) {
+        Ok(info) => info,
+        Err(_) => return NOT_IMPLEMENTED,
+    };
+    // Read both back: the size **and** the attribute bits, since "replace vs merge" is the whole question this callback asks.
+    if after.size != 0 || after.attributes.0 & fs_semantics::attributes::WRITABLE != stored {
+        OVERWRITE_DISAGREEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return NOT_IMPLEMENTED;
+    }
+    let _ = allocation_size;
+    if !out.is_null() {
+        match crate::file_info::file_info(&after) {
+            Ok(record) => {
+                // SAFETY: `out` is non-null and the caller guarantees room for `FileInfo`.
+                unsafe { std::ptr::write(out.cast::<FileInfo>(), record) };
+            }
+            Err(_) => return NOT_IMPLEMENTED,
+        }
+    }
+    0
+}
+
+/// How many times `Overwrite` was entered.
+static OVERWRITE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times an overwrite was accepted and then contradicted by the store (size or attributes).
+static OVERWRITE_DISAGREEMENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times `Overwrite` was entered.
+#[must_use]
+pub fn overwrite_call_count() -> usize {
+    OVERWRITE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many times an overwrite left the store in a state that does not match what was asked.
+#[must_use]
+pub fn overwrite_disagreement_count() -> usize {
+    OVERWRITE_DISAGREEMENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// The `Write` **shell**: write, then **read back** — "the backend accepted it" is not "the bytes are there" (021ed97's rule, applied
 /// to the operation where it matters most).
 ///
