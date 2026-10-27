@@ -718,6 +718,114 @@ pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_v
     CONTEXTS_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The `Write` **shell**: write, then **read back** — "the backend accepted it" is not "the bytes are there" (021ed97's rule, applied
+/// to the operation where it matters most).
+///
+/// Three details come straight from the header (`winfsp.h:452-466`) and each is a way to be silently wrong:
+///
+/// - `WriteToEndOfFile` ⇒ `Offset` is **-1** and the write goes to the current end of file;
+/// - `ConstrainedIo` ⇒ the file **must not grow**: a write past the end is truncated, not extended;
+/// - `*PBytesTransferred` is the caller's only evidence that anything happened.
+///
+/// # Safety
+///
+/// `context` must point to an `EntryContext` owned by this frontend; `buffer` must be valid for reads of `length` bytes;
+/// `bytes_written` (when not null) and `out` (when not null) must be writable.
+/// The argument count is the callback's own shape (`winfsp.h:471-475`): flattening it into a struct here would only move the same
+/// nine things somewhere else, and the FFI adapter would have to unpack them again.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn write_shell(
+    adapter: Option<&crate::DynAdapter>,
+    context: *const c_void,
+    buffer: *const c_void,
+    offset: u64,
+    length: u32,
+    write_to_end_of_file: bool,
+    constrained_io: bool,
+    bytes_written: *mut u32,
+    out: *mut FileInfo,
+) -> i32 {
+    WRITE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if context.is_null() || (buffer.is_null() && length > 0) {
+        return OURS_INVALID_PARAMETER;
+    }
+    // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
+    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(adapter) = adapter else {
+        return NOT_IMPLEMENTED;
+    };
+    let before = match adapter.backend().get_info(entry.file_id) {
+        Ok(info) => info,
+        Err(_) => return OURS_OBJECT_NAME_NOT_FOUND,
+    };
+    // `WriteToEndOfFile` is signalled by `Offset == u64::MAX`; the header says so explicitly.
+    let mut at = if write_to_end_of_file {
+        before.size
+    } else {
+        offset
+    };
+    let mut len = length as usize;
+    if constrained_io {
+        // "Must not extend the file": keep whatever fits and report how much was taken. Reporting success while growing the file
+        // would break the one promise this flag makes.
+        let room = before.size.saturating_sub(at);
+        len = len.min(usize::try_from(room).unwrap_or(usize::MAX));
+    }
+    // SAFETY: `buffer` is valid for `length >= len` bytes per the caller's contract.
+    let bytes = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), len) };
+    let written = match adapter.backend().write(entry.file_id, at, bytes) {
+        Ok(written) => written.min(len),
+        Err(_) => return NOT_IMPLEMENTED,
+    };
+    // Read the bytes **back** and compare: the size alone cannot catch a dropped write that stayed inside the file, and that is
+    // exactly the silent case this check exists for (`before.size` and `after.size` are equal whether the bytes landed or not).
+    let echo = match adapter.backend().read(entry.file_id, at, written) {
+        Ok(bytes) => bytes,
+        Err(_) => return NOT_IMPLEMENTED,
+    };
+    let after = match adapter.backend().get_info(entry.file_id) {
+        Ok(info) => info,
+        Err(_) => return NOT_IMPLEMENTED,
+    };
+    let expected = before.size.max(at.saturating_add(written as u64));
+    if echo.as_slice() != &bytes[..written.min(bytes.len())] || after.size != expected {
+        WRITE_DISAGREEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return NOT_IMPLEMENTED;
+    }
+    if !bytes_written.is_null() {
+        // SAFETY: writable out-pointer per WinFsp's contract.
+        unsafe { std::ptr::write(bytes_written, u32::try_from(written).unwrap_or(u32::MAX)) };
+    }
+    if !out.is_null() {
+        match crate::file_info::file_info(&after) {
+            Ok(record) => {
+                // SAFETY: `out` is non-null and the caller guarantees room for `FileInfo`.
+                unsafe { std::ptr::write(out.cast::<FileInfo>(), record) };
+            }
+            Err(_) => return NOT_IMPLEMENTED,
+        }
+    }
+    let _ = &mut at;
+    0
+}
+
+/// How many times `Write` was entered.
+static WRITE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times a backend accepted bytes and then reported a size that does not follow from them.
+static WRITE_DISAGREEMENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times `Write` was entered.
+#[must_use]
+pub fn write_call_count() -> usize {
+    WRITE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many times a write was accepted and then contradicted by the store.
+#[must_use]
+pub fn write_disagreement_count() -> usize {
+    WRITE_DISAGREEMENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// The `Close` body **without** an adapter: frees the `FileContext` and nothing else.
 ///
 /// Kept for the paths that have no mount to ask (and for the direct tests that exercise the allocation contract alone); production
