@@ -1352,3 +1352,8 @@
      改动面积与事故概率单调相关（本轮两次注入事故都在"一次动太多"）。
      B 步的删干净证据：grep -c OnceLock 期望 0。
      在上下文边界不硬上（交接说明形态）本身是好交付。
+
+> **379 范围修订（2026-10-27，QA 结构批复算发现）**：grep 范围限定为 `crates/fs-winfsp`——
+> 工作区全局 `static .*OnceLock<` 共 4 处（cas-store probe.rs ×2 测试支撑、fs-snapshot cdc.rs GEAR 表、
+> fs-winfsp registry.rs MOUNTS）。判据原意是"挂载表留一个 OnceLock"（fs-winfsp 内恰好 1 且为 MOUNTS），
+> 无范围限定则别的 crate 加 OnceLock 会误红。复算发现判据自身缺陷 = 验收独立复算存在的理由。
