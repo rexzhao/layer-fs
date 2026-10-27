@@ -425,7 +425,8 @@ impl<S: TreeStore> Rules<S> {
             });
         }
         self.store.write(OpLabel::Rename, |tree| {
-            let (source_parent, source_name, source) = resolve_existing(tree, from)?;
+            // The requested name is **not** used to unbind: the stored spelling is looked up below (521).
+            let (source_parent, _source_name, source) = resolve_existing(tree, from)?;
             let source_kind = tree
                 .inode(source)?
                 .ok_or_else(|| NamespaceError::NotFound {
@@ -496,7 +497,39 @@ impl<S: TreeStore> Rules<S> {
                 }
             }
 
-            tree.unbind(source_parent, source_name.as_bytes())?;
+            // **The stored spelling, not the one the caller asked with.** A case-insensitive frontend asks to rename `\L2-FILE` while the entry is
+            // stored as `l2-file`; an exact `unbind` with the requested spelling removes nothing, and the rename answers success with **both** names
+            // still bound (measured through a mounted volume: `SetInformation [Rename] "\L2-FILE"` -> 0, then both names listed).
+            //
+            // Found by walking the parent: the source was resolved a moment ago, so its name is there, and a miss is a real inconsistency rather than
+            // a spelling to guess at.
+            let stored_source_name = {
+                let mut after: Option<Vec<u8>> = None;
+                let mut found: Option<Vec<u8>> = None;
+                loop {
+                    let page = tree.read_dir(source_parent, after.as_deref(), 256)?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    for (name, id) in &page {
+                        if *id == source {
+                            found = Some(name.clone());
+                            break;
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                    after = page.last().map(|(name, _)| name.clone());
+                }
+                found
+            };
+            let Some(stored_source_name) = stored_source_name else {
+                return Err(NamespaceError::NotFound {
+                    path: from.display(),
+                });
+            };
+            tree.unbind(source_parent, &stored_source_name)?;
             tree.bind(target_parent, target_name.as_bytes(), source)?;
             Ok(RenameOutcome {
                 binding,
