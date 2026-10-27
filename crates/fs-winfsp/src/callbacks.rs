@@ -145,6 +145,7 @@ pub fn reset_for_tests() {
 ///
 /// `out` must be valid for writes of `capacity` bytes for the duration of the call.
 pub unsafe fn get_volume_info(out: *mut c_void, capacity: u32) -> i32 {
+    VOLUME_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if out.is_null() || (capacity as usize) < std::mem::size_of::<VolumeInfo>() {
         return NOT_IMPLEMENTED;
     }
@@ -272,6 +273,15 @@ pub unsafe fn close(context: *mut c_void) {
 const OURS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 /// `STATUS_INVALID_PARAMETER`.
 const OURS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+
+/// How many times `GetVolumeInfo` was called — the cheapest "did the OS talk to us at all" probe.
+static VOLUME_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times the volume question has been answered.
+#[must_use]
+pub fn volume_call_count() -> usize {
+    VOLUME_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// How many times `GetSecurityByName` was called — the counter that makes "we were never asked" visible.
 static SECURITY_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

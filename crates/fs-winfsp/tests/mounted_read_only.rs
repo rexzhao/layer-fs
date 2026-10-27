@@ -138,7 +138,8 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
 
     let after_contexts = callbacks::context_counts();
     eprintln!(
-        "security queries answered: {}",
+        "callbacks reached: volume_info={} security={}",
+        callbacks::volume_call_count(),
         callbacks::security_call_count()
     );
     eprintln!(

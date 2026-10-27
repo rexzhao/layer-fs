@@ -350,11 +350,19 @@ mod platform {
             params.set_max_component_length(255);
             // No caching: the workspace is the only source of truth, and a cached FileInfo would hide another handle's write.
             params.set_file_info_timeout(0);
-            let interface = interface_with_callbacks();
+            // **The table must outlive the file system.** `FspFileSystemCreate` takes a pointer to the interface and — like
+            // most C libraries — keeps it rather than copying it; a table owned by this stack frame would be dangling the
+            // moment `create` returns, and a dangling table reads as "every slot is None", which WinFsp reports as
+            // `ERROR_INVALID_FUNCTION` with **no callback ever invoked**.
+            //
+            // Leaked deliberately: this mount's lifetime is the process's (one adapter per process, see `callbacks`), and a
+            // `Box::leak` is the honest way to say "this table is not owned by a scope".
+            let interface: &'static FileSystemInterface =
+                Box::leak(Box::new(interface_with_callbacks()));
 
             let device = wide(std::ffi::OsStr::new(super::DISK_DEVICE));
             let mut file_system: *mut c_void = std::ptr::null_mut();
-            let create_status = create(device.as_ptr(), &params, &interface, &mut file_system);
+            let create_status = create(device.as_ptr(), &params, interface, &mut file_system);
             if create_status != 0 || file_system.is_null() {
                 return Ok(super::MountReport {
                     create: create_status,
@@ -368,7 +376,9 @@ mod platform {
 
             let mount_path = wide(mount_point.as_os_str());
             let mount_status = set_mount_point(file_system, mount_path.as_ptr());
-            let start_status = start(file_system, 0);
+            // Explicit thread count: memfs passes 0, but if 0 means "no threads" the dispatcher would exist and serve
+            // nothing — which is indistinguishable from a dangling table from the outside. 2 is enough to tell the difference.
+            let start_status = start(file_system, 2);
 
             // Observe **while mounted**: this is the only window in which the OS can see the file system.
             let looked_like_a_mount = mount_status == 0 && probe(mount_point).is_ok();
