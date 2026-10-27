@@ -482,7 +482,22 @@ pub unsafe fn get_file_info_shell(
 ///
 /// So the `FileContext` this frontend hands out is an **id**. We never dereference it; a stale id is simply not in the map; and the map owns
 /// every context, which makes a double release impossible by construction rather than by vigilance.
-static CONTEXTS: std::sync::Mutex<Option<std::collections::BTreeMap<u64, Box<EntryContext>>>> =
+/// One context and **how many file objects still refer to it**.
+///
+/// WinFsp's contract is the reference-counted one its own sample uses (`memfs`: `MemfsFileNodeReference` on open,
+/// `MemfsFileNodeDereference` on close, the node dying at zero): several file objects for the same entry **share** one context, and every object's
+/// `Close` arrives. Our first model handed out a fresh id per open and freed it at the first close, which is why the same id was closed twice and a
+/// read could arrive between those closes — measured: `CLOSE 8 … READ STALE id=8 … CLOSE 8`.
+struct Shared {
+    entry: EntryContext,
+    refs: usize,
+}
+
+static CONTEXTS: std::sync::Mutex<Option<std::collections::BTreeMap<u64, Shared>>> =
+    std::sync::Mutex::new(None);
+
+/// `file_id -> context id`, so a second open of the **same entry** shares the context instead of minting a new one.
+static CONTEXT_BY_FILE: std::sync::Mutex<Option<std::collections::BTreeMap<u64, u64>>> =
     std::sync::Mutex::new(None);
 
 /// The next id to hand out. Never reused, so a stale id can never be mistaken for a fresh one.
@@ -507,8 +522,42 @@ fn register_context(entry: EntryContext) -> u64 {
         .lock()
         .expect("contexts")
         .get_or_insert_with(std::collections::BTreeMap::new)
-        .insert(id, Box::new(entry));
+        .insert(id, Shared { entry, refs: 1 });
+    CONTEXT_BY_FILE
+        .lock()
+        .expect("context index")
+        .get_or_insert_with(std::collections::BTreeMap::new)
+        .insert(entry.file_id, id);
     id
+}
+
+/// The id for `entry`, **reusing the one already handed out for that entry** and bumping its reference count.
+///
+/// This is the shape the FSD expects (one context per entry, one close per file object); the key is the entry's `file_id`, which is already the
+/// fold-insensitive identity the rest of this layer uses.
+fn acquire_context(entry: EntryContext) -> u64 {
+    let existing = CONTEXT_BY_FILE
+        .lock()
+        .expect("context index")
+        .get_or_insert_with(std::collections::BTreeMap::new)
+        .get(&entry.file_id)
+        .copied();
+    let Some(id) = existing else {
+        return register_context(entry);
+    };
+    let mut guard = CONTEXTS.lock().expect("contexts");
+    let table = guard.get_or_insert_with(std::collections::BTreeMap::new);
+    match table.get_mut(&id) {
+        Some(shared) => {
+            shared.refs += 1;
+            id
+        }
+        // The index pointed at a context that is gone: fall back to a fresh one rather than inventing a live entry.
+        None => {
+            drop(guard);
+            register_context(entry)
+        }
+    }
 }
 
 /// The context behind `context`, if the id was really handed out.
@@ -524,7 +573,7 @@ fn entry_of(context: *const c_void) -> Option<EntryContext> {
         .expect("contexts")
         .get_or_insert_with(std::collections::BTreeMap::new)
         .get(&id)
-        .map(|entry| **entry)
+        .map(|shared| shared.entry)
 }
 
 /// Releases a context from the direct tests, through the same table `close_shell` uses.
@@ -589,24 +638,44 @@ fn is_closed(context: *const c_void) -> bool {
 }
 
 /// Removes the context behind `context`, or `None` when the id was never handed out (a stale close).
-fn release_context(context: *const c_void) -> Option<Box<EntryContext>> {
+/// Drops the reference `context` held, freeing the entry only when the **last** file object lets go.
+///
+/// Returns the entry when this was the final release (the adapter then performs the single `remove_at`), and `None` when other file objects still
+/// refer to it — which is the ordinary case the FSD's contract produces, not an error.
+fn release_context(context: *const c_void) -> Option<EntryContext> {
     let id = context as usize as u64;
     if id == 0 {
         return None;
     }
-    let released = CONTEXTS
-        .lock()
-        .expect("contexts")
-        .get_or_insert_with(std::collections::BTreeMap::new)
-        .remove(&id);
-    if released.is_some() {
+    let mut guard = CONTEXTS.lock().expect("contexts");
+    let table = guard.get_or_insert_with(std::collections::BTreeMap::new);
+    let remaining = match table.get_mut(&id) {
+        Some(shared) => {
+            shared.refs -= 1;
+            shared.refs
+        }
+        None => return None,
+    };
+    if remaining > 0 {
+        // Another file object still refers to this context: nothing dies yet, and a read arriving now is legitimate.
+        return None;
+    }
+    let entry = table.remove(&id).map(|shared| shared.entry);
+    drop(guard);
+    if let Some(entry) = entry {
+        CONTEXT_BY_FILE
+            .lock()
+            .expect("context index")
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .remove(&entry.file_id);
         CLOSED_CONTEXTS
             .lock()
             .expect("closed contexts")
             .get_or_insert_with(std::collections::BTreeSet::new)
             .insert(id);
+        return Some(entry);
     }
-    released
+    None
 }
 
 ///
@@ -862,7 +931,7 @@ unsafe fn open_like(
         return NOT_IMPLEMENTED;
     };
     // The value the OS carries is an **id**, not an address (see `CONTEXTS`).
-    let context = register_context(EntryContext { file_id, handle }) as usize as *mut c_void;
+    let context = acquire_context(EntryContext { file_id, handle }) as usize as *mut c_void;
     CONTEXTS_ALLOCATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: both out-pointers were checked non-null and are valid for their writes per the caller's contract.
     unsafe {
@@ -1183,10 +1252,11 @@ pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_v
     // is counted as a refusal instead of freed. There is no double release to detect, because the map is the only owner and the entry leaves
     // it exactly once.
     let Some(entry) = release_context(context) else {
-        STALE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!(
-            "close: {context:p} is not a context this mount handed out — refusing (stale id)"
-        );
+        // Either another file object still refers to this context (the ordinary case under the FSD's reference-counted contract — a read arriving
+        // now is legitimate), or the id was never ours. `release_context` returns `None` for the first; the second is what the counter is for.
+        if !is_closed(context) {
+            STALE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return;
     };
     if let Some(adapter) = adapter {
