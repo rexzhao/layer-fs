@@ -301,7 +301,6 @@ pub unsafe fn get_security(
     0
 }
 
-
 /// How many times `ReadDirectory` was entered — the counter that separates "our callback ran and answered empty" from "the
 /// slot was never called".
 static READ_DIR_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -344,6 +343,34 @@ pub unsafe fn open_shell(
     context_out: *mut *mut c_void,
     info_out: *mut FileInfo,
 ) -> i32 {
+    // SAFETY: the caller's contract is `open_like`'s.
+    unsafe {
+        open_like(
+            adapter,
+            file_name,
+            fs_semantics::disposition::Disposition::Open,
+            context_out,
+            info_out,
+        )
+    }
+}
+
+/// The one body behind `Open` and `Create`: resolve the name **with a disposition**, then hand back a `FileContext`.
+///
+/// The disposition is the whole difference between the two callbacks: `Open` says "must exist", `Create` says what the create
+/// options asked for. Writing it once is what keeps them from drifting apart — the read-only stage answered `Create` by calling
+/// `open`, so any disposition other than `Open` was silently ignored rather than refused.
+///
+/// # Safety
+///
+/// `file_name` must be NUL-terminated; `context_out` and `info_out` must be valid for writes of a pointer and a `FileInfo`.
+unsafe fn open_like(
+    adapter: Option<&crate::DynAdapter>,
+    file_name: *const u16,
+    disposition: fs_semantics::disposition::Disposition,
+    context_out: *mut *mut c_void,
+    info_out: *mut FileInfo,
+) -> i32 {
     OPEN_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if file_name.is_null() || context_out.is_null() || info_out.is_null() {
         eprintln!(
@@ -361,11 +388,12 @@ pub unsafe fn open_shell(
         OPEN_EXITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
     };
-    // `Open` **must not create** — the disposition says so, and the backend is where that promise is kept.
-    let outcome = match adapter.backend().create_or_open(
-        path.as_bytes(),
-        fs_semantics::disposition::Disposition::Open,
-    ) {
+    // The disposition is passed through **unchanged**: whether it creates or opens is the backend's decision, and the promise
+    // that `Open` does not create lives there (asserted in `open_shell_criterion`).
+    let outcome = match adapter
+        .backend()
+        .create_or_open(path.as_bytes(), disposition)
+    {
         Ok(outcome) => outcome,
         Err(_error) => {
             OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -393,7 +421,16 @@ pub unsafe fn open_shell(
     0
 }
 
-/// The `Create` **shell** for the read-only stage: only `FILE_OPEN` is answered, and it goes through [`open_shell`].
+/// The `Create` **shell**: WinFsp's create options decide the disposition, and the backend does the rest.
+///
+/// Only the two options the read-only stage can honour are translated:
+///
+/// - `FILE_OPEN` ("must exist") → `Disposition::Open`;
+/// - `FILE_CREATE` ("create, fail if it exists") → `Disposition::Create`.
+///
+/// Anything else is **refused**, not approximated. Answering `FILE_OVERWRITE` by opening would be the "looks successful, did
+/// nothing" failure the write batch exists to avoid — and a mount that silently ignores a truncation request is worse than one
+/// that reports it cannot.
 ///
 /// # Safety
 ///
@@ -406,12 +443,35 @@ pub unsafe fn create_shell(
     info_out: *mut FileInfo,
 ) -> i32 {
     CREATE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // FILE_OPEN is the "must exist" disposition; WinFsp passes it as a create option when the caller opened an existing name.
-    let _ = create_options;
+    let disposition = match create_options
+        & (FILE_SUPERSEDE
+            | FILE_OPEN
+            | FILE_CREATE
+            | FILE_OPEN_IF
+            | FILE_OVERWRITE
+            | FILE_OVERWRITE_IF)
+    {
+        FILE_OPEN => fs_semantics::disposition::Disposition::Open,
+        FILE_CREATE => fs_semantics::disposition::Disposition::Create,
+        // Every other member of the create-disposition class: not implemented yet, and said so.
+        _ => return NOT_IMPLEMENTED,
+    };
     // SAFETY: the caller's contract for both pointers is the same as `open_shell`'s.
-    unsafe { open_shell(adapter, file_name, context_out, info_out) }
+    unsafe { open_like(adapter, file_name, disposition, context_out, info_out) }
 }
 
+/// `FILE_SUPERSEDE` — `winfsp.h` (`CreateOptions`), the first member of the create-disposition class.
+pub const FILE_SUPERSEDE: u32 = 0x00;
+/// `FILE_OPEN` — "must exist".
+pub const FILE_OPEN: u32 = 0x01;
+/// `FILE_CREATE` — "create; fail if it exists".
+pub const FILE_CREATE: u32 = 0x02;
+/// `FILE_OPEN_IF` — "open if it exists, otherwise create".
+pub const FILE_OPEN_IF: u32 = 0x03;
+/// `FILE_OVERWRITE` — "open and truncate; fail if it does not exist".
+pub const FILE_OVERWRITE: u32 = 0x04;
+/// `FILE_OVERWRITE_IF` — "open and truncate, creating if needed".
+pub const FILE_OVERWRITE_IF: u32 = 0x05;
 
 /// The `Close` body: frees the `FileContext` **once**.
 ///

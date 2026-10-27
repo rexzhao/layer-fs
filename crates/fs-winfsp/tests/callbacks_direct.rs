@@ -9,16 +9,16 @@ use std::mem::size_of;
 
 use fs_semantics::disposition::Disposition;
 use fs_winfsp::abi::{FileInfo, VolumeInfo};
+use fs_winfsp::callbacks::NOT_IMPLEMENTED;
 use fs_winfsp::callbacks::{
     get_file_info_shell, get_volume_info_shell, EntryContext, OURS_BUFFER_TOO_SMALL,
     OURS_INVALID_PARAMETER,
 };
-use fs_winfsp::callbacks::NOT_IMPLEMENTED;
+use fs_winfsp::ops::DynOps;
 use fs_winfsp::ops::{
-    Attributes, DirEntry, Kind, NodeInfo, OpsError, OpsResult, OpenOutcome, RenameOutcome,
+    Attributes, DirEntry, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, RenameOutcome,
     WorkspaceOps,
 };
-use fs_winfsp::ops::DynOps;
 use fs_winfsp::DynAdapter;
 
 /// The metadata the fixture knows: one file, id 7, 1234 bytes.
@@ -193,9 +193,8 @@ fn the_volume_record_is_copied_verbatim() {
 fn a_short_buffer_is_refused_rather_than_half_filled() {
     let adapter = adapter();
     let mut small = [0u8; 8];
-    let status = unsafe {
-        get_volume_info_shell(Some(&adapter), small.as_mut_ptr().cast::<c_void>(), 8)
-    };
+    let status =
+        unsafe { get_volume_info_shell(Some(&adapter), small.as_mut_ptr().cast::<c_void>(), 8) };
     assert_eq!(
         status, OURS_BUFFER_TOO_SMALL,
         "cell short: \"too small\", not \"unsupported\""
