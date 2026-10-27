@@ -786,3 +786,19 @@ the next step is to read its source for the case-only branch rather than to keep
 
 Our own `rename_shell` was checked and does **not** short-circuit: it converts both names and calls the backend. The absence of a `Rename` in the
 call log is genuine.
+
+## `08` disposition (U16): recorded as a platform difference, and the script now says so
+
+`fsop.c` dispatches `FileRenameInformation` straight to `Interface->Rename`, and flipping `CaseSensitiveSearch` changes no reading, so the
+short-circuit is above user mode. The class therefore has three possible answers and the script now names all three:
+
+```
+08 case-only rename: renamed                              (NTFS-like behaviour — not what a mounted volume does)
+08 case-only rename: request-not-delivered (…unchanged)   (the true reading here)
+08 case-only rename: <missing>
+```
+
+`request-not-delivered` is not a pass — it is the measurement. Whether case-only rename is a promised feature belongs to spec/ADR-009; if it is, it
+becomes P3-4b work through a mechanism that does not depend on this request reaching us.
+
+**Mounted-side scoreboard: 11 of 11 reachable classes green** (`08` carries a documented platform difference).

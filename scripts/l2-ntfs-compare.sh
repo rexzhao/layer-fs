@@ -58,8 +58,20 @@ mv "$ROOT/l2-file" "$ROOT/l2-renamed" 2>/dev/null
 note "07 rename: old=$([ -e "$ROOT/l2-file" ] && echo present || echo gone) new=$([ -e "$ROOT/l2-renamed" ] && echo present || echo gone)"
 
 # 08 — case-only rename on a case-preserving volume: the bytes change, the entry does not.
+#
+# **Disposition (U16):** on a *mounted* volume this request does not reach the file system at all — measured, with the backend call log open, from two
+# independent routes (`mv` and `cmd /c ren`): both answer `rc=0`, both leave the spelling untouched, and **no `Rename` call arrives**. `fsop.c`
+# dispatches `FileRenameInformation` straight through, and flipping `CaseSensitiveSearch` changes nothing, so the short-circuit sits in the kernel /
+# FSD layer above us and cannot be fixed from user mode.
+#
+# The class therefore records **what was observed** rather than pretending the rename either succeeded or failed: `request-not-delivered` is a third
+# answer, and it is the true one. On NTFS the same two commands change the spelling, so this is a documented platform difference, not a pass.
 mv "$ROOT/l2-renamed" "$ROOT/L2-RENAMED" 2>/dev/null
-note "08 case-only rename: $(ls -1 "$ROOT" 2>/dev/null | grep -i '^l2-renamed$' || echo '<missing>')"
+case "$(ls -1 "$ROOT" 2>/dev/null | grep -i '^l2-renamed$' || echo '<missing>')" in
+  L2-RENAMED) note "08 case-only rename: renamed" ;;
+  l2-renamed) note "08 case-only rename: request-not-delivered (spelling unchanged)" ;;
+  *) note "08 case-only rename: <missing>" ;;
+esac
 
 # 09 — delete an open file (NTFS: allowed if the handle allows delete sharing; the name goes away at close).
 exec 9>"$ROOT/l2-delete"
