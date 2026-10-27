@@ -11,7 +11,6 @@
 //! Paths: WinFsp hands the callbacks `\name`; the backend's paths are `/name`. That single translation lives in `SlashBackend` and
 //! nowhere else.
 
-use std::ffi::c_void;
 use std::path::PathBuf;
 
 use fs_semantics::disposition::Disposition;
@@ -22,9 +21,9 @@ use fs_winfsp::mock::MockBackend;
 use fs_winfsp::mounted::mount_read_only;
 use fs_winfsp::ops::DynOps;
 use fs_winfsp::ops::{
-    Attributes, DirEntry, NodeInfo, OpsError, OpsResult, OpenOutcome, RenameOutcome, WorkspaceOps,
+    Attributes, DirEntry, NodeInfo, OpenOutcome, OpsResult, RenameOutcome, WorkspaceOps,
 };
-use fs_winfsp::{DynAdapter, Kind};
+use fs_winfsp::Kind;
 
 /// Forwards to a `MockBackend` while translating WinFsp's `\name` into the backend's `/name`.
 struct SlashBackend {
@@ -41,7 +40,11 @@ impl SlashBackend {
 
 fn to_backend_path(path: &[u8]) -> Vec<u8> {
     let text = String::from_utf8_lossy(path).replace('\\', "/");
-    let text = if text.is_empty() { "/".to_string() } else { text };
+    let text = if text.is_empty() {
+        "/".to_string()
+    } else {
+        text
+    };
     text.into_bytes()
 }
 
@@ -177,51 +180,57 @@ fn windows_can_write_through_the_mount_and_read_the_bytes_back() {
         callbacks::cleanup_call_count(),
     );
 
-    let report = mount_read_only(&library, &mount_point, backend, volume(), |path: &std::path::Path| {
-        // The outcome is recorded **whatever happens**, so a failure inside the probe is reported as itself instead of appearing as
-        // "the probe never ran" (the two are different facts, and one of them is the one worth reading).
-        let outcome = (|| -> Result<(), String> {
-        let root = root_of(path);
-        let file = root.join("written.txt");
+    let report = mount_read_only(
+        &library,
+        &mount_point,
+        backend,
+        volume(),
+        |path: &std::path::Path| {
+            // The outcome is recorded **whatever happens**, so a failure inside the probe is reported as itself instead of appearing as
+            // "the probe never ran" (the two are different facts, and one of them is the one worth reading).
+            let outcome = (|| -> Result<(), String> {
+                let root = root_of(path);
+                let file = root.join("written.txt");
 
-        // 1. create + write.
-        std::fs::write(&file, b"hello layer-fs").map_err(|error| error.to_string())?;
+                // 1. create + write.
+                std::fs::write(&file, b"hello layer-fs").map_err(|error| error.to_string())?;
 
-        // 2. read back **the bytes**, not the size (392).
-        let read_back = std::fs::read(&file).map_err(|error| error.to_string())?;
-        if read_back != b"hello layer-fs" {
-            return Err(format!(
-                "the file came back as {:?}, not the bytes that were written",
-                String::from_utf8_lossy(&read_back)
-            ));
-        }
+                // 2. read back **the bytes**, not the size (392).
+                let read_back = std::fs::read(&file).map_err(|error| error.to_string())?;
+                if read_back != b"hello layer-fs" {
+                    return Err(format!(
+                        "the file came back as {:?}, not the bytes that were written",
+                        String::from_utf8_lossy(&read_back)
+                    ));
+                }
 
-        // 3. set size: truncate to 5 bytes.
-        let handle = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&file)
-            .map_err(|error| error.to_string())?;
-        handle.set_len(5).map_err(|error| error.to_string())?;
-        drop(handle);
-        let truncated = std::fs::read(&file).map_err(|error| error.to_string())?;
-        if truncated != b"hello" {
-            return Err(format!(
-                "after set_len(5) the file is {:?}, not the first five bytes",
-                String::from_utf8_lossy(&truncated)
-            ));
-        }
+                // 3. set size: truncate to 5 bytes.
+                let handle = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&file)
+                    .map_err(|error| error.to_string())?;
+                handle.set_len(5).map_err(|error| error.to_string())?;
+                drop(handle);
+                let truncated = std::fs::read(&file).map_err(|error| error.to_string())?;
+                if truncated != b"hello" {
+                    return Err(format!(
+                        "after set_len(5) the file is {:?}, not the first five bytes",
+                        String::from_utf8_lossy(&truncated)
+                    ));
+                }
 
-        // 4. delete, and observe the **OS**, not the status.
-        std::fs::remove_file(&file).map_err(|error| error.to_string())?;
-        if file.exists() {
-            return Err("the file is still there after remove_file".to_string());
-        }
+                // 4. delete, and observe the **OS**, not the status.
+                std::fs::remove_file(&file).map_err(|error| error.to_string())?;
+                if file.exists() {
+                    return Err("the file is still there after remove_file".to_string());
+                }
 
-        Ok(())
-        })();
-        report_outcome = Some(outcome.clone());
-        outcome
-    })
+                Ok(())
+            })();
+            report_outcome = Some(outcome.clone());
+            outcome
+        },
+    )
     .expect("the mount path is available");
 
     let after_contexts = callbacks::context_counts();

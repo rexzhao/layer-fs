@@ -95,3 +95,30 @@ It is not fatal for the chain (Windows tolerates the retry), but it explains why
 
    `set_file_size_shell` returns that code when the `FileContext` is null, so the first question is whether WinFsp passes a null context
    for `SetInformation` (it does for some operations) or whether the slot's argument order is off. Same trace-first rule as before.
+
+## Resolved (fourth session)
+
+The write chain **passes on the real machine**, and the draft is gone: the test now lives at
+`crates/fs-winfsp/tests/mounted_write_chain.rs` and runs on every full run (skipping itself only when WinFsp is absent).
+
+Readings from the passing run:
+
+```
+write chain counters: create 0 -> 1, write 0 -> 1, set_size 0 -> 1, cleanup 0 -> 7
+```
+
+plus the assertions in the test: bytes read back **equal to what was written**, `set_len(5)` leaves the first five bytes,
+`remove_file` leaves nothing, `contexts` balanced `1 -> 1`, `registry misses = 0`, `released_after_delete = true`.
+
+Three fixes got there, each found by a reading rather than by reasoning:
+
+1. `Create` must accept **all six dispositions** — `std::fs::write` sends `FILE_OPEN_IF` (raw `0x03000060`), which the
+   "no approximation" whitelist refused, so no file was ever created (`a5f1d80`).
+2. `SetFileSize` has **five** parameters — `(fs, FileContext, NewSize, BOOLEAN SetAllocationSize, FileInfo*)`; the missing
+   `BOOLEAN` put the output pointer one slot early (`c000000d`).
+3. `Read` was never registered at all (slot 8), and once it was, the count had to be the **bytes actually read** — reporting the
+   padded length made Windows ask again at the next offset until the process ran out of memory.
+
+The last fix is done **without** changing either backend: the shell asks the size first and clamps the request to what remains
+(`want = min(length, size - offset)`), so EOF is a genuine zero-byte read. Both backends zero-pad their answers, which is fine for
+them — the padding contract stays where the trait put it, and the adapter makes EOF visible.

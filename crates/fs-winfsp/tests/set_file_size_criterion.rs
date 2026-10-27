@@ -173,6 +173,7 @@ fn run(adapter: &DynAdapter, new_size: u64) -> (i32, FileInfo) {
             Some(adapter),
             (&context as *const EntryContext).cast::<c_void>(),
             new_size,
+            false,
             &mut out as *mut FileInfo,
         )
     };
@@ -244,6 +245,7 @@ fn a_null_context_or_buffer_is_refused_before_anything_else() {
                 Some(&adapter),
                 std::ptr::null(),
                 10,
+                false,
                 &mut out as *mut FileInfo,
             )
         },
@@ -269,6 +271,7 @@ fn no_mount_is_refused_and_nothing_is_written() {
             None,
             (&context as *const EntryContext).cast::<c_void>(),
             10,
+            false,
             &mut out as *mut FileInfo,
         )
     };

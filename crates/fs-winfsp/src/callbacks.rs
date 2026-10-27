@@ -229,6 +229,7 @@ pub unsafe fn set_file_size_shell(
     adapter: Option<&crate::DynAdapter>,
     context: *const c_void,
     new_size: u64,
+    set_allocation_size: bool,
     out: *mut FileInfo,
 ) -> i32 {
     SET_SIZE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -240,6 +241,27 @@ pub unsafe fn set_file_size_shell(
     let Some(adapter) = adapter else {
         return NOT_IMPLEMENTED;
     };
+    if set_allocation_size {
+        // `SetAllocationSize = TRUE` asks for **reserved space**, not for a length: this store grows on demand, so the truthful answer
+        // is success with the file unchanged. Truncating here would be the lie — it would drop data the caller did not ask to drop.
+        return match adapter.backend().get_info(entry.file_id) {
+            Ok(node) => {
+                if !out.is_null() {
+                    match crate::file_info::file_info(&node) {
+                        Ok(record) => {
+                            // SAFETY: `out` is non-null and the caller guarantees room for `FileInfo`.
+                            unsafe { std::ptr::write(out.cast::<FileInfo>(), record) };
+                            0
+                        }
+                        Err(_) => NOT_IMPLEMENTED,
+                    }
+                } else {
+                    0
+                }
+            }
+            Err(_) => OURS_OBJECT_NAME_NOT_FOUND,
+        };
+    }
     if adapter.backend().set_size(entry.file_id, new_size).is_err() {
         // Nothing is written into the caller's buffer on failure: a half-updated record is worse than none.
         return NOT_IMPLEMENTED;
@@ -745,7 +767,16 @@ pub unsafe fn read_shell(
     let Some(adapter) = adapter else {
         return NOT_IMPLEMENTED;
     };
-    let len = length as usize;
+    // **Clamp to what the entry actually holds.** Both backends answer a read with a full-length buffer (they zero-pad), so a request
+    // past EOF would come back "full" and Windows would ask again at the next offset — forever, which is how the first version of this
+    // shell ended in an out-of-memory panic. Asking the size first makes EOF visible **without** changing the backends' documented
+    // "padding is the caller's job" contract: at EOF `want` becomes 0 and the answer is a genuine zero-byte read.
+    let size = match adapter.backend().get_info(entry.file_id) {
+        Ok(info) => info.size,
+        Err(_) => return OURS_OBJECT_NAME_NOT_FOUND,
+    };
+    let remaining = size.saturating_sub(offset);
+    let len = (length as u64).min(remaining) as usize;
     let bytes = match adapter.backend().read(entry.file_id, offset, len) {
         Ok(bytes) => bytes,
         // A directory cannot be read through a file handle: that is a typed refusal, not an empty read.
@@ -761,7 +792,8 @@ pub unsafe fn read_shell(
     // this function did exactly that and ended in an out-of-memory panic).
     if taken < len {
         // SAFETY: the same buffer, the remaining range.
-        let tail = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>().add(taken), len - taken) };
+        let tail =
+            unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>().add(taken), len - taken) };
         tail.fill(0);
     }
     if !bytes_transferred.is_null() {

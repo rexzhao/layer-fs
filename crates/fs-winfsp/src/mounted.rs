@@ -174,10 +174,16 @@ mod platform {
     }
 
     /// `SetFileSize`: `(FSP_FILE_SYSTEM*, PVOID FileContext, UINT64 NewSize, FSP_FSCTL_FILE_INFO*)` — `winfsp.h:576`.
+    /// `SetFileSize` — `winfsp.h:576-577`, slot **13**.
+    ///
+    /// `(FSP_FILE_SYSTEM*, PVOID FileContext, UINT64 NewSize, BOOLEAN SetAllocationSize, FSP_FSCTL_FILE_INFO*)` — **five** parameters.
+    /// The fourth one was missing from this declaration until the real chain failed: without it `info_out` sat one slot early and the
+    /// shell read a `BOOLEAN` as its output pointer. Signature again settled by reading the header, not by compiling.
     unsafe extern "system" fn set_file_size_trampoline(
         file_system: *mut c_void,
         file_context: *mut c_void,
         new_size: u64,
+        set_allocation_size: u8,
         info_out: *mut crate::abi::FileInfo,
     ) -> i32 {
         let adapter = crate::registry::mounts().get(file_system as usize);
@@ -187,6 +193,7 @@ mod platform {
                 adapter.as_deref(),
                 file_context,
                 new_size,
+                set_allocation_size != 0,
                 info_out,
             )
         }
@@ -663,6 +670,7 @@ mod platform {
                     *mut c_void,
                     *mut c_void,
                     u64,
+                    u8,
                     *mut crate::abi::FileInfo,
                 ) -> i32,
                 unsafe extern "C" fn() -> i32,
