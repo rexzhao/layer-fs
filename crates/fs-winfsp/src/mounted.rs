@@ -45,6 +45,22 @@ pub struct MountReport {
 /// # Errors
 ///
 /// [`LoadError`] from the loader or a missing export.
+/// Whether the OS currently lists `path` as a drive letter.
+///
+/// Exposed so a caller can ask **during** the mount, which is the one moment that distinguishes "the mount point was recorded"
+/// from "the volume is there".
+#[must_use]
+pub fn drive_present(path: &Path) -> Option<bool> {
+    platform::drive_present(path)
+}
+
+/// Mounts read-only at `mount_point`, observes it through the OS, unmounts, and tears everything down.
+///
+/// `probe` is called **while the mount is up**; its result is reported, never swallowed.
+///
+/// # Errors
+///
+/// [`LoadError`] from the loader or a missing export.
 pub fn mount_read_only(
     library: &Path,
     mount_point: &Path,
@@ -81,6 +97,15 @@ mod platform {
         fn FreeLibrary(module: *mut c_void) -> i32;
         fn GetLastError() -> u32;
         fn GetLogicalDrives() -> u32;
+    }
+
+    pub(super) fn drive_present(path: &Path) -> Option<bool> {
+        let text = path.to_string_lossy();
+        let bytes = text.as_bytes();
+        if bytes.len() != 2 || bytes[1] != b':' {
+            return None;
+        }
+        Some(drive_letter_present(path))
     }
 
     /// Whether `path` still looks like a live drive letter (`Y:`), as the OS reports it.
@@ -385,6 +410,10 @@ mod platform {
     use std::path::Path;
 
     use crate::loader::LoadError;
+
+    pub(super) fn drive_present(_path: &Path) -> Option<bool> {
+        None
+    }
 
     pub(super) fn mount_read_only(
         library: &Path,

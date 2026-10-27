@@ -120,6 +120,10 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
         } else {
             path.to_path_buf()
         };
+        eprintln!(
+            "during mount: drive present = {:?}",
+            fs_winfsp::mounted::drive_present(path)
+        );
         let outcome = std::fs::read_dir(&root)
             .map(|mut entries| {
                 // Reading one entry is enough to prove the OS served the directory from us; the callback table has no
