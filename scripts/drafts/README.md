@@ -586,3 +586,22 @@ write-then-`cat` that works in the instrument but not inside the script), `08` (
 
 `02` is the most suspicious one *because* it works standalone: the difference is what `01` leaves behind when its `stat` fails. That suggests
 `01` should be fixed first — it may be the upstream cause of `02` and `10`.
+
+## bash probes: `[ -d ]` works here; `cat` fails with **"Invalid request code"**, before and after it
+
+```
+BASH printf alpha > 'Z:/f1' && cat 'Z:/f1'   -> exit=1  stderr: cat: 'Z:/f1': Invalid request code
+BASH [ -d 'Z:/' ]                            -> d=0            ← the root **is** a directory here
+BASH printf alpha > 'Z:/f2' && cat 'Z:/f2'   -> exit=1  stderr: cat: 'Z:/f2': Invalid request code
+```
+
+Two conclusions, and they kill both hypotheses as stated:
+
+1. **`01` is not a backend failure**: `[ -d 'Z:/' ]` answers `d=0` in this instrument. Whatever the L2 script hits is specific to its own earlier state,
+   not to `stat`;
+2. **`02`/`10` are not "downstream of 01"** (assumption A): `cat` fails **before** any `-d` ran, so the shared cause is the *opening form* bash uses
+   (assumption B). The message is `Invalid request code` — `STATUS_INVALID_DEVICE_REQUEST` — i.e. **a callback we do not implement is being asked**,
+   and the `>>Create` trace shows the file was never even created (`create_or_open "/f1" Open -> NotFound` over and over).
+
+So the next question is a *slot* question, not a resolution question: **which operation does MSYS's read/write path request that `std::fs` does not** —
+a candidate list from the unimplemented members (`GetEa`/`SetEa`, `Control`, `SetSecurity`, `GetStreamInfo`).
