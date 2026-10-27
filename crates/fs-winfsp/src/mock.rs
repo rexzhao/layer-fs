@@ -90,6 +90,12 @@ fn split(path: &[u8]) -> OpsResult<Vec<Vec<u8>>> {
     if path.first() != Some(&b'/') {
         return Err(OpsError::InvalidParameter);
     }
+    // **The root is a legal path with no components.** Refusing `/` here forced every caller that can name a directory to carry its own root
+    // special case: `create_or_open` had one, `open_dir` did not — which is why `stat` on the volume root failed while every other operation on the
+    // same path worked. One answer at the entry point instead of N special cases downstream.
+    if path == b"/" {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     for component in path[1..].split(|byte| *byte == b'/') {
         if component.is_empty() {

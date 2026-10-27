@@ -326,3 +326,35 @@ fn supersede_replaces_attributes_while_overwrite_keeps_them() {
         }
     }
 }
+
+/// **The root is a path, not an exception**: `"/"` resolves, opens as a directory, and lists.
+///
+/// This is the entry-point fix for a smell the mounted L2 run exposed: `create_or_open` carried a root special case and `open_dir` did not, so
+/// `stat` on the volume root failed while every other operation on the same path worked. Two special cases were the symptom; refusing `"/"` in the
+/// path splitter was the cause.
+#[test]
+fn the_root_resolves_like_any_other_directory() {
+    let backend = MockBackend::new();
+    assert_eq!(
+        backend.resolve(b"/"),
+        Some(ROOT),
+        "cell resolve: the root has an id like every other entry"
+    );
+    assert_eq!(
+        backend.open_dir(b"/"),
+        Ok(ROOT),
+        "cell open_dir: and it opens as a directory — no special case needed now"
+    );
+    assert_eq!(
+        backend
+            .get_info(ROOT)
+            .map(|info| info.kind)
+            .expect("root info"),
+        fs_winfsp::Kind::Directory,
+        "cell kind: it reports the kind a `stat` needs"
+    );
+    assert!(
+        backend.read_dir(ROOT).is_ok(),
+        "cell list: and it lists (empty, since nothing was created)"
+    );
+}
