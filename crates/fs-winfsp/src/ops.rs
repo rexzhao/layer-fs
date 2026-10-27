@@ -289,7 +289,13 @@ pub trait WorkspaceOps {
 /// The forwarding is deliberate and mechanical — eleven `(**self)` calls, no logic. `Deref` would have been shorter but would
 /// also make a boxed backend *auto-deref* into other traits; an explicit impl keeps "this is a backend" a statement rather than
 /// a side effect.
-impl WorkspaceOps for Box<dyn WorkspaceOps> {
+/// A boxed backend is a backend: the mount entry point does not know which concrete type it was given, and saying so once here
+/// is what lets the registry hold `dyn WorkspaceOps` without the adapter layer ever naming a backend.
+///
+/// The forwarding is deliberate and mechanical — twelve `(**self)` calls, no logic. `Deref` would have been shorter but would
+/// also make a boxed backend *auto-deref* into other traits; an explicit impl keeps "this is a backend" a statement rather than
+/// a side effect.
+impl WorkspaceOps for Box<dyn WorkspaceOps + Send + Sync> {
     fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
         (**self).create_or_open(path, disposition)
     }
@@ -347,4 +353,7 @@ impl WorkspaceOps for Box<dyn WorkspaceOps> {
 }
 
 /// The backend type a mount entry point hands over: the registry (and therefore the callbacks) never names a concrete one.
-pub type DynOps = Box<dyn WorkspaceOps>;
+///
+/// `Send + Sync` is not decoration: the dispatcher serves callbacks from **several threads** (`start(fs, 2)`), and the mount table
+/// is process-wide. A backend that could not be shared across threads could not be mounted.
+pub type DynOps = Box<dyn WorkspaceOps + Send + Sync>;

@@ -608,6 +608,16 @@ mod platform {
                 crate::debuglog::attach(log, module, file_system);
             }
 
+            // **Register right after `create`** — that is the first moment the pointer exists, and a callback can arrive as soon
+            // as the dispatcher starts. The adapter carries this mount's configuration; nothing below reads a process-wide one.
+            let (volume, lookup, list) = crate::callbacks::configured();
+            let mounted_adapter = std::sync::Arc::new(crate::DynAdapter::with_config(
+                Box::new(super::ConfiguredOps { lookup, list }) as crate::ops::DynOps,
+                crate::adapter::AdapterConfig { volume, ..crate::adapter::AdapterConfig::default() },
+            ));
+            let key = file_system as usize;
+            crate::registry::mounts().insert(key, mounted_adapter);
+
             let mount_path = wide(mount_point.as_os_str());
             let mount_status = set_mount_point(file_system, mount_path.as_ptr());
             // Explicit thread count: memfs passes 0, but if 0 means "no threads" the dispatcher would exist and serve
@@ -630,7 +640,14 @@ mod platform {
 
             let unmount_status = set_mount_point(file_system, std::ptr::null());
             stop(file_system);
+            // Unregister **after `stop` and before `delete`**: a callback arriving after the stop must find no mount, and the
+            // assertion below is what makes "cannot dangle" checkable rather than a comment (351).
+            crate::registry::mounts().remove(key);
             delete(file_system);
+            assert!(
+                !crate::registry::mounts().contains(key),
+                "after `delete` the registry must not answer for that pointer"
+            );
             if let Some(log) = debug_log {
                 // Close **before** anyone reads the file, or the tail is still buffered.
                 crate::debuglog::close(log);
@@ -684,5 +701,105 @@ mod platform {
             path: library.to_path_buf(),
             last_error: 0,
         })
+    }
+}
+
+/// The backend the mount path can build today: the three injected answers, wrapped into the trait the registry stores.
+///
+/// This is a **bridge, not a design**: once `fs-api`'s real backend is handed to the mount entry point, this type disappears. It
+/// exists so the callbacks can ask "this mount" instead of "the process" without changing where the configuration comes from
+/// (搬运不改形) — and so its limitations are visible rather than implied:
+///
+/// - `read_dir` answers from the listing hook, and each entry's metadata from the lookup hook;
+/// - every mutation is refused with [`crate::ops::OpsError::ReadOnly`], which is the truth for this read-only mount.
+struct ConfiguredOps {
+    lookup: Option<fn(u64) -> Option<crate::ops::NodeInfo>>,
+    list: Option<crate::callbacks::Lister>,
+}
+
+impl crate::ops::WorkspaceOps for ConfiguredOps {
+    fn create_or_open(
+        &self,
+        _path: &[u8],
+        _disposition: fs_semantics::disposition::Disposition,
+    ) -> crate::ops::OpsResult<crate::ops::OpenOutcome> {
+        Err(crate::ops::OpsError::ReadOnly)
+    }
+
+    fn mkdir(&self, _path: &[u8]) -> crate::ops::OpsResult<u64> {
+        Err(crate::ops::OpsError::ReadOnly)
+    }
+
+    fn read(&self, _file_id: u64, _offset: u64, _len: usize) -> crate::ops::OpsResult<Vec<u8>> {
+        Err(crate::ops::OpsError::ReadOnly)
+    }
+
+    fn write(&self, _file_id: u64, _offset: u64, _bytes: &[u8]) -> crate::ops::OpsResult<usize> {
+        Err(crate::ops::OpsError::ReadOnly)
+    }
+
+    fn set_size(&self, _file_id: u64, _len: u64) -> crate::ops::OpsResult<()> {
+        Err(crate::ops::OpsError::ReadOnly)
+    }
+
+    fn read_dir(&self, dir_id: u64) -> crate::ops::OpsResult<Vec<crate::ops::DirEntry>> {
+        let Some(list) = self.list else {
+            return Err(crate::ops::OpsError::ReadOnly);
+        };
+        Ok(list(dir_id)
+            .into_iter()
+            .map(|(name, info)| crate::ops::DirEntry {
+                name: String::from_utf16_lossy(&name).into_bytes(),
+                kind: info.kind,
+            })
+            .collect())
+    }
+
+    fn get_info(&self, file_id: u64) -> crate::ops::OpsResult<crate::ops::NodeInfo> {
+        match self.lookup.and_then(|lookup| lookup(file_id)) {
+            Some(info) => Ok(info),
+            None => Err(crate::ops::OpsError::NotFound),
+        }
+    }
+
+    fn set_times(
+        &self,
+        _file_id: u64,
+        _accessed: Option<i64>,
+        _written: Option<i64>,
+        _changed: Option<i64>,
+        _created: Option<i64>,
+    ) -> crate::ops::OpsResult<()> {
+        Err(crate::ops::OpsError::ReadOnly)
+    }
+
+    fn set_attributes(
+        &self,
+        _file_id: u64,
+        _attributes: crate::ops::Attributes,
+    ) -> crate::ops::OpsResult<()> {
+        Err(crate::ops::OpsError::ReadOnly)
+    }
+
+    fn rename(
+        &self,
+        _from: &[u8],
+        _to: &[u8],
+        _replace: bool,
+    ) -> crate::ops::OpsResult<crate::ops::RenameOutcome> {
+        Err(crate::ops::OpsError::ReadOnly)
+    }
+
+    fn remove_at(
+        &self,
+        _parent: u64,
+        _name: &[u8],
+        _expected_id: u64,
+    ) -> crate::ops::OpsResult<()> {
+        Err(crate::ops::OpsError::ReadOnly)
+    }
+
+    fn flush(&self) -> crate::ops::OpsResult<()> {
+        Ok(())
     }
 }

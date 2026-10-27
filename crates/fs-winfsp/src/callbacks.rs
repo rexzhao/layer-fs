@@ -202,6 +202,32 @@ pub unsafe fn read_directory_from(
 
 /// Configures the callbacks for this process. Returns `false` if they were already set (a second mount is not supported at
 /// this stage, and silently overwriting would make two mounts share one answer).
+/// The configuration currently in force: the volume answer, the metadata source and the directory source.
+///
+/// A named tuple type rather than a three-field struct because the caller destructures it once and passes the parts on; a struct
+/// would only rename the same three things.
+pub type Configured = (
+    Option<VolumeInfo>,
+    Option<fn(u64) -> Option<NodeInfo>>,
+    Option<Lister>,
+);
+
+/// The configuration currently in force, for the mount path to hand to the registry.
+///
+/// This is the **bridge** the A step needs: the closures are still injected the old way, but the mount now wraps them into one
+/// `Adapter` and registers it, so the callbacks can ask "this mount" instead of "the process". No shape changed — the same three
+/// answers, moved one layer (搬运不改形).
+#[must_use]
+pub fn configured() -> Configured {
+    (
+        VOLUME.get().copied(),
+        LOOKUP.get().copied(),
+        LIST.get().copied(),
+    )
+}
+
+/// Configures the callbacks for this process. Returns `false` if they were already set (a second mount is not supported at
+/// this stage, and silently overwriting would make two mounts share one answer).
 pub fn configure(volume: &VolumeInfo, lookup: fn(u64) -> Option<NodeInfo>, list: Lister) -> bool {
     if VOLUME.set(*volume).is_err() {
         return false;

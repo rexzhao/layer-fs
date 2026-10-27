@@ -27,6 +27,20 @@ use crate::ops::WorkspaceOps;
 /// occur", a counter says "if it did, here it is" — a refusal that shares a status code with every other refusal would hide it.
 static REGISTRY_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The process's mount table.
+///
+/// **This one `OnceLock` stays** (the four configuration ones do not): what is being made global is *the list of mounts*, which is
+/// a property of the process — `FSP_FILE_SYSTEM*` is a process-local pointer, so "which mounts exist here" has no other home. A
+/// configuration static answered "how should this mount behave", which belongs to the mount; that is the distinction, not the
+/// keyword (352).
+static MOUNTS: std::sync::OnceLock<Registry<crate::ops::DynOps>> = std::sync::OnceLock::new();
+
+/// The process's mount table, created on first use.
+#[must_use]
+pub fn mounts() -> &'static Registry<crate::ops::DynOps> {
+    MOUNTS.get_or_init(Registry::new)
+}
+
 /// How many lookups have missed since process start.
 #[must_use]
 pub fn miss_count() -> usize {
