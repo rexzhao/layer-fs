@@ -208,16 +208,16 @@ fn write(
     write_to_end_of_file: bool,
     constrained: bool,
 ) -> (i32, u32, u64) {
-    let context = EntryContext {
+    let context = fs_winfsp::callbacks::register_context_for_test(EntryContext {
         file_id: 4,
         handle: HandleId::from_raw(1),
-    };
+    });
     let mut record = FileInfo::zeroed();
     let mut transferred = u32::MAX;
     let status = unsafe {
         write_shell(
             Some(&request.adapter),
-            (&context as *const EntryContext).cast::<c_void>(),
+            context,
             data.as_ptr().cast::<c_void>(),
             offset,
             u32::try_from(data.len()).expect("small"),
@@ -311,10 +311,10 @@ fn a_backend_that_accepts_and_drops_the_bytes_is_caught() {
 #[test]
 fn null_pointers_are_refused_before_the_backend_is_asked() {
     let request = fixture(b"abc", true);
-    let context = EntryContext {
+    let context = fs_winfsp::callbacks::register_context_for_test(EntryContext {
         file_id: 4,
         handle: HandleId::from_raw(1),
-    };
+    });
     let mut record = FileInfo::zeroed();
     let mut transferred = 0u32;
 
@@ -342,7 +342,7 @@ fn null_pointers_are_refused_before_the_backend_is_asked() {
     let status = unsafe {
         write_shell(
             Some(&request.adapter),
-            (&context as *const EntryContext).cast::<c_void>(),
+            context,
             std::ptr::null(),
             0,
             4,

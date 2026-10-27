@@ -40,7 +40,7 @@ fn open(adapter: &DynAdapter, path: &str) -> (i32, u64) {
     };
     if !context.is_null() {
         // Release it the way `close` would: the shell allocated it, so a test that opened must free.
-        drop(unsafe { Box::from_raw(context.cast::<fs_winfsp::callbacks::EntryContext>()) });
+        fs_winfsp::callbacks::release_context_for_test(context);
     }
     (status, record.file_size)
 }

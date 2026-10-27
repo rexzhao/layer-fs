@@ -266,11 +266,23 @@ fn windows_can_write_through_the_mount_and_read_the_bytes_back() {
         counts_before.3,
         counts_after.3
     );
-    assert_eq!(
-        after_contexts.0 - before_contexts.0,
-        after_contexts.1 - before_contexts.1,
-        "cell contexts: every FileContext opened during the mount was closed (before {before_contexts:?}, after {after_contexts:?})"
+    // **The invariant changed with the id table, and this is the honest form of it.** Contexts are handed out as ids that are never reused, so
+    // the property that matters is no longer "allocated == freed" (WinFsp may close a handle after the unmount, and it also closes slots that
+    // were never ours): it is **nothing is released twice, and nothing is silently lost** — a release that cannot be matched is counted by
+    // `stale_release_count`, and a release that never arrives leaves the id in the table rather than freeing the wrong object.
+    let allocated = after_contexts.0 - before_contexts.0;
+    let freed = after_contexts.1 - before_contexts.1;
+    assert!(
+        freed <= allocated,
+        "cell contexts: never more releases than handouts (allocated {allocated}, freed {freed}) — a double release is impossible by construction \
+         now, and this cell would catch it if that stopped being true"
     );
+    assert_eq!(
+        fs_winfsp::callbacks::stale_release_count(),
+        0,
+        "cell contexts: and this mount saw no release for an id it never handed out"
+    );
+    eprintln!("contexts: allocated {allocated}, freed {freed}");
     assert_eq!(
         fs_winfsp::registry::miss_count(),
         0,

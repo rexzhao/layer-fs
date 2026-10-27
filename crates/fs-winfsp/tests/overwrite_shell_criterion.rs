@@ -10,7 +10,6 @@
 //! `AllocationSize` is accepted and ignored, because this backend has no allocation concept; a test asserting otherwise would be
 //! asserting a promise nobody keeps.
 
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -192,15 +191,15 @@ fn adapter(file: &Arc<File>) -> DynAdapter {
 }
 
 fn overwrite(adapter: &DynAdapter, attributes: u32, replace: bool) -> (i32, u64) {
-    let context = EntryContext {
+    let context = fs_winfsp::callbacks::register_context_for_test(EntryContext {
         file_id: 6,
         handle: HandleId::from_raw(1),
-    };
+    });
     let mut record = FileInfo::zeroed();
     let status = unsafe {
         overwrite_shell(
             Some(adapter),
-            (&context as *const EntryContext).cast::<c_void>(),
+            context,
             attributes,
             replace,
             1 << 20,

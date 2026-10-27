@@ -232,15 +232,15 @@ fn a_null_buffer_is_refused_for_the_volume() {
 #[test]
 fn the_file_record_is_answered_from_the_entry_context() {
     let adapter = adapter();
-    let context = EntryContext {
+    let context = fs_winfsp::callbacks::register_context_for_test(EntryContext {
         file_id: 7,
         handle: fs_winfsp::handles::HandleId::from_raw(1),
-    };
+    });
     let mut out = FileInfo::zeroed();
     let status = unsafe {
         get_file_info_shell(
             Some(&adapter),
-            (&context as *const EntryContext).cast::<c_void>(),
+            context,
             (&mut out as *mut FileInfo).cast::<c_void>(),
         )
     };
@@ -258,15 +258,15 @@ fn the_file_record_is_answered_from_the_entry_context() {
 #[test]
 fn an_unknown_id_is_refused_and_leaves_the_buffer_untouched() {
     let adapter = adapter();
-    let unknown = EntryContext {
+    let unknown = fs_winfsp::callbacks::register_context_for_test(EntryContext {
         file_id: 99,
         handle: fs_winfsp::handles::HandleId::from_raw(2),
-    };
+    });
     let mut out = FileInfo::zeroed();
     let status = unsafe {
         get_file_info_shell(
             Some(&adapter),
-            (&unknown as *const EntryContext).cast::<c_void>(),
+            unknown,
             (&mut out as *mut FileInfo).cast::<c_void>(),
         )
     };

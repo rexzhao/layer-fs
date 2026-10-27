@@ -166,12 +166,9 @@ fn context(file_id: u64, handle: HandleId) -> EntryContext {
     EntryContext { file_id, handle }
 }
 
-/// Allocates the context the way the frontend does: `close_shell` takes ownership back, so a stack pointer would be freed.
+/// Registers a hand-built context the way the frontend does — the value that crosses the FFI boundary is an **id**, not an address.
 fn alloc(context: EntryContext) -> *mut c_void {
-    let ptr = Box::into_raw(Box::new(context)).cast::<c_void>();
-    // The release-side witness only frees contexts it knows about; a hand-built one must register, exactly as `open_like` does.
-    fs_winfsp::callbacks::note_context_live(ptr as usize);
-    ptr
+    fs_winfsp::callbacks::register_context_for_test(context)
 }
 
 #[test]

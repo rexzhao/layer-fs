@@ -67,7 +67,10 @@ pub unsafe fn read_directory_shell(
         return 0;
     }
     // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
-    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(entry) = entry_of(context) else {
+        return NOT_IMPLEMENTED;
+    };
+    let entry = &entry;
     // The listing comes from **this mount's backend**, not from an injected hook: `DirEntry` now carries the entry's id, so its
     // metadata is one `get_info` away (367 — the field exists exactly so this derivation stops being impossible).
     let entries = match adapter {
@@ -357,7 +360,10 @@ pub unsafe fn set_file_size_shell(
         return OURS_INVALID_PARAMETER;
     }
     // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
-    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(entry) = entry_of(context) else {
+        return NOT_IMPLEMENTED;
+    };
+    let entry = &entry;
     let Some(adapter) = adapter else {
         return NOT_IMPLEMENTED;
     };
@@ -446,7 +452,10 @@ pub unsafe fn get_file_info_shell(
         return NOT_IMPLEMENTED;
     }
     // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
-    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(entry) = entry_of(context) else {
+        return NOT_IMPLEMENTED;
+    };
+    let entry = &entry;
     // No mount ⇒ no metadata. `None` in the type is the refusal, not a reason to ask somebody else's configuration (352).
     let info = adapter.and_then(|adapter| adapter.backend().get_info(entry.file_id).ok());
     let Some(info) = info else {
@@ -464,58 +473,87 @@ pub unsafe fn get_file_info_shell(
 }
 /// Live `FileContext` allocations, and how many have been released.
 /// Every `FileContext` currently handed out, **by address**.
+/// Handed-out contexts, keyed by a **monotonic id** — never by address.
 ///
-/// The release side had never been checked: heap corruption can be a double free just as easily as an out-of-bounds write, and both look
-/// alike from the outside. This set is the witness — an address that is closed twice is caught here, by name, instead of being left to the
-/// allocator to notice much later. (Reuse after free is fine and invisible: the entry is removed on the first close.)
-static LIVE_CONTEXTS: std::sync::Mutex<Option<std::collections::BTreeSet<usize>>> =
+/// The address-keyed version that lived here before was a net, not a design. It caught double releases, but under allocator reuse a *stale*
+/// close could land on a live context and free the wrong object **silently** — and a serial stored *inside* the context could not help,
+/// because under reuse that memory is the new context's and the serial read back is the new one too. The lesson generalises: **identity has to
+/// travel in the value that crosses the boundary**, not be proven afterwards from the memory the value points at.
+///
+/// So the `FileContext` this frontend hands out is an **id**. We never dereference it; a stale id is simply not in the map; and the map owns
+/// every context, which makes a double release impossible by construction rather than by vigilance.
+static CONTEXTS: std::sync::Mutex<Option<std::collections::BTreeMap<u64, Box<EntryContext>>>> =
     std::sync::Mutex::new(None);
 
-/// How many times a context was released twice.
-static DOUBLE_RELEASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The next id to hand out. Never reused, so a stale id can never be mistaken for a fresh one.
+static NEXT_CONTEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// When non-zero, `close_shell` prints the context pointer it is about to release (paired with the FSD log).
-pub static CLOSE_TRACE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// How many releases arrived for an address that was never handed out (the "stale value" class).
+/// How many releases arrived for an id that was never handed out.
+///
+/// This is the class the old witness could not name: the FSD does close context slots that were never ours (17 of them in one mounted run),
+/// and the only safe answer is to refuse them. **Refusing is not a bug to be explained away** — it is the design being robust to garbage.
 pub static STALE_RELEASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// How many releases arrived for an address that was never handed out — the class that says the value came from somewhere other than a
-/// successful open of ours.
+/// How many releases arrived for an id that was never handed out.
 #[must_use]
 pub fn stale_release_count() -> usize {
     STALE_RELEASES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// How many times a context was released twice.
-#[must_use]
-pub fn double_release_count() -> usize {
-    DOUBLE_RELEASES.load(std::sync::atomic::Ordering::Relaxed)
+/// Stores a context and returns the id the OS will carry for it.
+fn register_context(entry: EntryContext) -> u64 {
+    let id = NEXT_CONTEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    CONTEXTS
+        .lock()
+        .expect("contexts")
+        .get_or_insert_with(std::collections::BTreeMap::new)
+        .insert(id, Box::new(entry));
+    id
 }
 
-/// Registers a context as live.
+/// The context behind `context`, if the id was really handed out.
 ///
-/// Production registers inside `open_like`; the direct tests build an `EntryContext` by hand and must register it too, otherwise the
-/// release-side witness refuses their `close_shell` — which is the behaviour working as intended.
-pub fn note_context_live(address: usize) {
-    let mut guard = LIVE_CONTEXTS.lock().expect("live contexts");
-    guard
-        .get_or_insert_with(std::collections::BTreeSet::new)
-        .insert(address);
+/// **No pointer is dereferenced.** That is the whole point: a value the OS invented cannot make us read memory.
+fn entry_of(context: *const c_void) -> Option<EntryContext> {
+    let id = context as usize as u64;
+    if id == 0 {
+        return None;
+    }
+    CONTEXTS
+        .lock()
+        .expect("contexts")
+        .get_or_insert_with(std::collections::BTreeMap::new)
+        .get(&id)
+        .map(|entry| **entry)
 }
 
-/// Returns `false` when the address was **not** live, which means this is a second release (or a pointer we never handed out).
-/// When non-zero, released contexts are **deliberately leaked** so the allocator can never hand the same address out again.
-///
-/// This is an **instrument, not a fix**: it separates "the same address came back because memory was reused" from "WinFsp really closed the
-/// same context twice". It must never be on in production — every open would leak 24 bytes.
-pub static PIN_ADDRESSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Releases a context from the direct tests, through the same table `close_shell` uses.
+#[doc(hidden)]
+pub fn release_context_for_test(context: *mut c_void) {
+    if release_context(context.cast_const()).is_none() {
+        STALE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
-fn take_context_live(address: usize) -> bool {
-    let mut guard = LIVE_CONTEXTS.lock().expect("live contexts");
-    guard
-        .get_or_insert_with(std::collections::BTreeSet::new)
-        .remove(&address)
+/// Registers a context for the direct tests, which build one by hand instead of going through `open_like`.
+///
+/// Returns the same **id-as-pointer** value the OS would carry, so the test exercises the production table rather than a copy of it.
+#[doc(hidden)]
+pub fn register_context_for_test(entry: EntryContext) -> *mut c_void {
+    register_context(entry) as usize as *mut c_void
+}
+
+/// Removes the context behind `context`, or `None` when the id was never handed out (a stale close).
+fn release_context(context: *const c_void) -> Option<Box<EntryContext>> {
+    let id = context as usize as u64;
+    if id == 0 {
+        return None;
+    }
+    CONTEXTS
+        .lock()
+        .expect("contexts")
+        .get_or_insert_with(std::collections::BTreeMap::new)
+        .remove(&id)
 }
 
 ///
@@ -711,8 +749,8 @@ unsafe fn open_like(
         OPEN_EXITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
     };
-    let context = Box::into_raw(Box::new(EntryContext { file_id, handle }));
-    note_context_live(context as usize);
+    // The value the OS carries is an **id**, not an address (see `CONTEXTS`).
+    let context = register_context(EntryContext { file_id, handle }) as usize as *mut c_void;
     CONTEXTS_ALLOCATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: both out-pointers were checked non-null and are valid for their writes per the caller's contract.
     unsafe {
@@ -877,7 +915,10 @@ pub unsafe fn cleanup_shell(
         return 0;
     }
     // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
-    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(entry) = entry_of(context) else {
+        return NOT_IMPLEMENTED;
+    };
+    let entry = &entry;
     let Some(adapter) = adapter else {
         return NOT_IMPLEMENTED;
     };
@@ -900,52 +941,33 @@ pub fn cleanup_call_count() -> usize {
 
 /// The `Close` **shell**: releases the handle, and performs the entry's removal **once** if it was marked.
 ///
-/// The `Box<EntryContext>` is freed in every path — a `Close` that fails must still not leak the context, because the caller has no
-/// way to retry it.
+/// The context leaves the table in every path — a `Close` that fails must still not leave it there, because the caller has no way to retry.
+/// A value that is not a live id is **refused**, never dereferenced: WinFsp closes slots that were never ours.
 ///
 /// # Safety
 ///
-/// Same contract as [`close`]: `context` came from `Box::into_raw` in `open_like`, and `Close` happens once per open.
+/// `context` is treated as an opaque token; it is looked up in the table and never dereferenced as a pointer.
 pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_void) {
     if context.is_null() {
         return;
     }
-    // **Release-side witness.** A second `Close` of the same address used to go straight into `Box::from_raw` — a double free, which is
-    // the other way `0xc0000374` is produced (the hunt had only looked at writes until now). The address is claimed out of the live set
-    // first: if it is not there, this is a second release of something already freed, so it is **counted and refused** instead of freed
-    // again.
-    if !take_context_live(context as usize) {
-        DOUBLE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // **Look the id up; never dereference the value.** A stale id — the FSD really does close slots that were never ours — finds nothing and
+    // is counted as a refusal instead of freed. There is no double release to detect, because the map is the only owner and the entry leaves
+    // it exactly once.
+    let Some(entry) = release_context(context) else {
         STALE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "close: {context:p} is not a live context — refusing to free it (null={} never-handed-out)"
-        ,
-            (context as usize) == 0
+            "close: {context:p} is not a context this mount handed out — refusing (stale id)"
         );
         return;
-    }
-    // SAFETY: the caller guarantees this pointer came from `Box::into_raw` in `open_like`, and it was just claimed from the live set.
-    if CLOSE_TRACE.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-        eprintln!(
-            "CLOSE-TRACE #{:05} ctx={context:p}",
-            CONTEXTS_FREED.load(std::sync::atomic::Ordering::Relaxed)
-        );
-    }
-    let entry = unsafe { Box::from_raw(context.cast::<EntryContext>()) };
+    };
     if let Some(adapter) = adapter {
         // The adapter performs the single `remove_at` (outside its table lock, see `Adapter::close`). A failure here is recorded by
-        // the backend's own error, and the context is freed either way.
+        // the backend's own error, and the context is released either way.
         let _ = adapter.close(entry.handle);
-    }
-    if PIN_ADDRESSES.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-        // **Instrument only**: keep the block alive so the allocator cannot hand this address out again. If the same pointer then shows
-        // up in `CLOSE-TRACE` a second time, the repeated close is real rather than memory reuse.
-        std::mem::forget(entry);
     }
     CONTEXTS_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
-
-/// The `Read` **shell**: fill the caller's buffer from the entry at `offset`, **zero-padding at EOF**.
 ///
 /// The padding is this layer's job, not the backend's: `WorkspaceOps::read` documents "a short read at EOF is zero-padded by the
 /// caller's contract, not here", so a backend that returns three bytes for a ten-byte request is correct, and returning those three
@@ -968,7 +990,10 @@ pub unsafe fn read_shell(
         return OURS_INVALID_PARAMETER;
     }
     // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
-    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(entry) = entry_of(context) else {
+        return NOT_IMPLEMENTED;
+    };
+    let entry = &entry;
     let Some(adapter) = adapter else {
         return NOT_IMPLEMENTED;
     };
@@ -1044,7 +1069,10 @@ pub unsafe fn overwrite_shell(
         return OURS_INVALID_PARAMETER;
     }
     // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
-    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(entry) = entry_of(context) else {
+        return NOT_IMPLEMENTED;
+    };
+    let entry = &entry;
     let Some(adapter) = adapter else {
         return NOT_IMPLEMENTED;
     };
@@ -1146,7 +1174,10 @@ pub unsafe fn write_shell(
         return OURS_INVALID_PARAMETER;
     }
     // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
-    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(entry) = entry_of(context) else {
+        return NOT_IMPLEMENTED;
+    };
+    let entry = &entry;
     let Some(adapter) = adapter else {
         return NOT_IMPLEMENTED;
     };
@@ -1232,12 +1263,14 @@ pub fn write_disagreement_count() -> usize {
 /// # Safety
 ///
 /// `context` must have come from `open_like` and must not be used afterwards.
+/// The adapter-free `Close`: drops the context if the id is ours, and counts a stale id like every other release path.
 pub unsafe fn close(context: *mut c_void) {
     if context.is_null() {
         return;
     }
-    // SAFETY: the caller guarantees this pointer came from `Box::into_raw` in `open`, and that `Close` happens once per open.
-    drop(unsafe { Box::from_raw(context.cast::<EntryContext>()) });
+    if release_context(context).is_none() {
+        STALE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     CONTEXTS_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 

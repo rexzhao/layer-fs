@@ -7,7 +7,6 @@
 //! 1. ask the backend to resize, **exactly once**, with the exact value;
 //! 2. read the entry back and answer only if the size really is the requested one — otherwise refuse.
 
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -163,15 +162,15 @@ impl WorkspaceOps for Shared {
 }
 
 fn run(adapter: &DynAdapter, new_size: u64) -> (i32, FileInfo) {
-    let context = EntryContext {
+    let context = fs_winfsp::callbacks::register_context_for_test(EntryContext {
         file_id: 9,
         handle: fs_winfsp::handles::HandleId::from_raw(1),
-    };
+    });
     let mut out = FileInfo::zeroed();
     let status = unsafe {
         set_file_size_shell(
             Some(adapter),
-            (&context as *const EntryContext).cast::<c_void>(),
+            context,
             new_size,
             false,
             &mut out as *mut FileInfo,
@@ -262,19 +261,12 @@ fn a_null_context_or_buffer_is_refused_before_anything_else() {
 #[test]
 fn no_mount_is_refused_and_nothing_is_written() {
     let mut out = FileInfo::zeroed();
-    let context = EntryContext {
+    let context = fs_winfsp::callbacks::register_context_for_test(EntryContext {
         file_id: 9,
         handle: fs_winfsp::handles::HandleId::from_raw(1),
-    };
-    let status = unsafe {
-        set_file_size_shell(
-            None,
-            (&context as *const EntryContext).cast::<c_void>(),
-            10,
-            false,
-            &mut out as *mut FileInfo,
-        )
-    };
+    });
+    let status =
+        unsafe { set_file_size_shell(None, context, 10, false, &mut out as *mut FileInfo) };
     assert_eq!(status, NOT_IMPLEMENTED, "cell no mount: refused");
     assert_eq!(out, FileInfo::zeroed(), "cell no mount: buffer untouched");
 }

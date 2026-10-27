@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use fs_semantics::disposition::Disposition;
 use fs_winfsp::abi::FileInfo;
 use fs_winfsp::callbacks::{
-    create_shell, split_create_options, EntryContext, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN,
+    create_shell, split_create_options, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN,
     NOT_IMPLEMENTED,
 };
 use fs_winfsp::ops::DynOps;
@@ -203,8 +203,8 @@ fn create(adapter: &DynAdapter, options: u32) -> (i32, bool) {
     };
     let gave_context = !context.is_null();
     if gave_context {
-        // Release it the way `close` would: the shell allocated it.
-        drop(unsafe { Box::from_raw(context.cast::<EntryContext>()) });
+        // Release it the way `close` does: the value is an **id**, so it goes back through the table rather than to `Box::from_raw`.
+        fs_winfsp::callbacks::release_context_for_test(context);
     }
     (status, gave_context)
 }
