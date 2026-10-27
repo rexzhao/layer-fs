@@ -421,3 +421,13 @@ it — a callback that is not `Create`, and that we are not printing.
 
 Next instrument: log **every** callback that answers non-zero (a one-line hook in the shells' single exit path), not just `Create`. The failure is now
 known to be downstream of a successful create, which is a much smaller place to look than "the directory is broken".
+
+## Methodology hazard found: two mounts in one test process
+
+The step test above was appended to a copy of `mounted_write_chain.rs`, so **two tests mounted `Z:` in the same process**. The FSD log for that run
+contains only the *other* test's calls (`\written.txt`) — the directory operations are absent, which means they did not go through the mount whose
+trace I was reading.
+
+Consequence: **every reading produced by a copy-paste test that also mounts must be re-taken with exactly one mounting test per process** (or with a
+distinct mount point). The earlier "child `Create` returns 0 while the OS says path not found" reading may be sound, but it was taken under this
+hazard and should be re-confirmed the same way before anything is built on it.
