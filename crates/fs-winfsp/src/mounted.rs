@@ -188,39 +188,54 @@ mod platform {
         unsafe { crate::callbacks::open(file_name, context_out, info_out) }
     }
 
-    /// `Create`: `(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess, UINT32 FileAttributes,
-    /// PSECURITY_DESCRIPTOR, UINT64 AllocationSize, PVOID *PFileContext, FSP_FSCTL_FILE_INFO*)` — `winfsp.h:291`.
+    /// `Create` — declared **generically** for one measurement round: nine word-sized parameters, printed raw, with a bounded
+    /// UTF-16 peek at any that look like pointers.
+    ///
+    /// The DLL's own trace line is the ground truth for what the values mean
+    /// (`>>Create "\\", FILE_OPEN, CreateOptions=21, FileAttributes=10, Security=NULL, AllocationSize=0:0`), so the job here is
+    /// to find those known values in the raw sequence — not to argue about the header.
     unsafe extern "system" fn create_trampoline(
-        _file_system: *mut c_void,
-        file_name: *const u16,
-        create_options: u32,
-        _granted_access: u32,
-        _file_attributes: u32,
-        _security: *mut c_void,
-        _allocation_size: u64,
-        context_out: *mut *mut c_void,
-        info_out: *mut crate::abi::FileInfo,
+        _a: usize,
+        _b: usize,
+        _c: usize,
+        _d: usize,
+        _e: usize,
+        _f: usize,
+        _g: usize,
+        _h: usize,
+        _i: usize,
     ) -> i32 {
-        // Raw values first, interpretation second: if the parameter order or the `Create`/`CreateEx` variant is not what we
-        // assume, the raw line still says what the driver actually passed.
+        let args = [_a, _b, _c, _d, _e, _f, _g, _h, _i];
         eprintln!(
-            "create raw: fs={:p} p1={:p} p2={:#x} p3={:#x} p4={:#x} p5={:p} p6={:#x} p7={:p} p8={:p}",
-            _file_system,
-            file_name,
-            create_options,
-            _granted_access,
-            _file_attributes,
-            _security,
-            _allocation_size,
-            context_out,
-            info_out
+            "create raw: {}",
+            args.iter()
+                .map(|v| format!("{v:#x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
-        eprintln!(
-            "create as decoded: FileName={:p} CreateOptions={:#x} GrantedAccess={:#x} FileAttributes={:#x} Security={:p} AllocationSize={:#x} ContextOut={:p} InfoOut={:p}",
-            file_name, create_options, _granted_access, _file_attributes, _security, _allocation_size, context_out, info_out
-        );
-        // SAFETY: WinFsp's contract for this callback.
-        unsafe { crate::callbacks::create(file_name, create_options, context_out, info_out) }
+        for (index, value) in args.iter().enumerate() {
+            // Only peek at values that plausibly point into a mapped region, and never past a terminator: an untrusted pointer
+            // dereference is how the earlier attempt crashed with 0xC0000005.
+            if *value > 0x1000 {
+                // SAFETY: the bound below is a heuristic, not a guarantee — this is a diagnostic build, and the read is capped.
+                let text = unsafe {
+                    let pointer = *value as *const u16;
+                    let mut units = Vec::new();
+                    for offset in 0..64 {
+                        let unit = std::ptr::read_volatile(pointer.add(offset));
+                        if unit == 0 {
+                            break;
+                        }
+                        units.push(unit);
+                    }
+                    String::from_utf16_lossy(&units)
+                };
+                if text.chars().all(|c| !c.is_control()) {
+                    eprintln!("  p{index} = {value:#x} as utf16: {text:?}");
+                }
+            }
+        }
+        0xC000_0010u32 as i32
     }
 
     /// `Close`: `(FSP_FILE_SYSTEM*, PVOID FileContext)` — `winfsp.h:420`.
@@ -344,27 +359,27 @@ mod platform {
                 unsafe extern "C" fn() -> i32,
             >(security));
             let creating: unsafe extern "system" fn(
-                *mut c_void,
-                *const u16,
-                u32,
-                u32,
-                u32,
-                *mut c_void,
-                u64,
-                *mut *mut c_void,
-                *mut crate::abi::FileInfo,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
             ) -> i32 = create_trampoline;
             interface.slots[crate::abi::measured::CREATE] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(
-                    *mut c_void,
-                    *const u16,
-                    u32,
-                    u32,
-                    u32,
-                    *mut c_void,
-                    u64,
-                    *mut *mut c_void,
-                    *mut crate::abi::FileInfo,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
                 ) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(creating));
