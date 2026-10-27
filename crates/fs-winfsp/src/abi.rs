@@ -116,13 +116,23 @@ impl std::fmt::Debug for FileSystemInterface {
 ///
 /// Every index here must be measured this way; the ones that have not been measured yet are marked.
 pub mod measured {
-    /// `Create` — **measured** (slot 32 fires on a create; the header order says 3).
-    pub const CREATE: usize = 32;
+    /// `Create` — **3**, the header index. This module briefly said 32, and the story is worth keeping:
+    ///
+    /// * slot 32 is `DispatcherStopped(FSP_FILE_SYSTEM*, BOOLEAN)`, a **`VOID`-returning** member;
+    /// * the index extraction only matched `NTSTATUS (*…)` members, so every `VOID` member (Cleanup, Close,
+    ///   DispatcherStopped) was skipped and the numbering silently shifted;
+    /// * the slot probe then "confirmed" 32, because `DispatcherStopped` fires on **every** teardown, while `Create` could not
+    ///   fire at all: `GetSecurityByName` (slot 2) was still `None`, and the create IRP dies there before reaching `Create`.
+    ///
+    /// Two lessons, both about measurement rather than about WinFsp: enumerate function-pointer members by **shape**, not by
+    /// return type; and a single-slot probe is fooled by call-order dependencies — the slot that lights up may be a teardown
+    /// hook, and the slot that stays dark may simply be unreachable.
+    pub const CREATE: usize = 3;
 
-    /// Which DLL build the measurements above were taken against.
+    /// Which DLL build these indices were confirmed against.
     pub const DLL_BUILD: &str = "2.1.25156.ddca7bd";
 
-    /// The date the probe was run, so a future reader knows how old the measurement is.
+    /// When they were confirmed.
     pub const MEASURED_ON: &str = "2026-10-26";
 }
 
