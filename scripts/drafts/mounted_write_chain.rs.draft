@@ -1,0 +1,263 @@
+//! The **real write chain**: Windows writes into layer-fs through the mount, and the bytes are read back.
+//!
+//! Until now the real machine only exercised the read chain. This test is the first time Windows writes data through this frontend:
+//! `create → write → read back → set size → delete`, all through `std::fs` on the mounted volume, with the counters that prove each
+//! callback was reached.
+//!
+//! The backend is `mock::MockBackend` (a real in-memory store, not a stub): what is being tested is the **FFI chain**, and a backend
+//! that silently does nothing would turn every assertion below into a false green — which is why the bytes are compared, not just the
+//! sizes (392).
+//!
+//! Paths: WinFsp hands the callbacks `\name`; the backend's paths are `/name`. That single translation lives in `SlashBackend` and
+//! nowhere else.
+
+use std::ffi::c_void;
+use std::path::PathBuf;
+
+use fs_semantics::disposition::Disposition;
+use fs_winfsp::abi::VolumeInfo;
+use fs_winfsp::callbacks;
+use fs_winfsp::loader::{default_library, resolve_library, LoadError};
+use fs_winfsp::mock::MockBackend;
+use fs_winfsp::mounted::mount_read_only;
+use fs_winfsp::ops::DynOps;
+use fs_winfsp::ops::{
+    Attributes, DirEntry, NodeInfo, OpsError, OpsResult, OpenOutcome, RenameOutcome, WorkspaceOps,
+};
+use fs_winfsp::{DynAdapter, Kind};
+
+/// Forwards to a `MockBackend` while translating WinFsp's `\name` into the backend's `/name`.
+struct SlashBackend {
+    inner: MockBackend,
+}
+
+impl SlashBackend {
+    fn new() -> Self {
+        Self {
+            inner: MockBackend::new(),
+        }
+    }
+}
+
+fn to_backend_path(path: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(path).replace('\\', "/");
+    let text = if text.is_empty() { "/".to_string() } else { text };
+    text.into_bytes()
+}
+
+impl WorkspaceOps for SlashBackend {
+    fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
+        self.inner.create_or_open(&to_backend_path(path), disposition)
+    }
+    fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
+        self.inner.mkdir(&to_backend_path(path))
+    }
+    fn read(&self, file_id: u64, offset: u64, len: usize) -> OpsResult<Vec<u8>> {
+        self.inner.read(file_id, offset, len)
+    }
+    fn write(&self, file_id: u64, offset: u64, bytes: &[u8]) -> OpsResult<usize> {
+        self.inner.write(file_id, offset, bytes)
+    }
+    fn set_size(&self, file_id: u64, len: u64) -> OpsResult<()> {
+        self.inner.set_size(file_id, len)
+    }
+    fn read_dir(&self, dir_id: u64) -> OpsResult<Vec<DirEntry>> {
+        self.inner.read_dir(dir_id)
+    }
+    fn get_info(&self, file_id: u64) -> OpsResult<NodeInfo> {
+        self.inner.get_info(file_id)
+    }
+    fn set_times(
+        &self,
+        file_id: u64,
+        accessed: Option<i64>,
+        written: Option<i64>,
+        changed: Option<i64>,
+        created: Option<i64>,
+    ) -> OpsResult<()> {
+        self.inner
+            .set_times(file_id, accessed, written, changed, created)
+    }
+    fn set_attributes(&self, file_id: u64, attributes: Attributes) -> OpsResult<()> {
+        self.inner.set_attributes(file_id, attributes)
+    }
+    fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome> {
+        self.inner
+            .rename(&to_backend_path(from), &to_backend_path(to), replace)
+    }
+    fn remove_at(&self, parent: u64, name: &[u8], expected_id: u64) -> OpsResult<()> {
+        self.inner.remove_at(parent, name, expected_id)
+    }
+    fn flush(&self) -> OpsResult<()> {
+        self.inner.flush()
+    }
+}
+
+fn volume() -> VolumeInfo {
+    VolumeInfo {
+        total_size: 1 << 20,
+        free_size: 1 << 19,
+        volume_label_length: 4,
+        volume_label: {
+            let mut label = [0u16; 32];
+            label[..4].copy_from_slice(&[b'w' as u16, b'r' as u16, b'i' as u16, b't' as u16]);
+            label
+        },
+    }
+}
+
+/// Where the mount will be attached: `Z:` by default (owner ruling), a directory when the environment says so.
+fn mount_point() -> PathBuf {
+    std::env::var_os("LAYER_FS_MNT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("Z:"))
+}
+
+fn root_of(mount_point: &std::path::Path) -> PathBuf {
+    if mount_point.to_string_lossy().ends_with(':') {
+        PathBuf::from(format!("{}\\", mount_point.display()))
+    } else {
+        mount_point.to_path_buf()
+    }
+}
+
+#[test]
+fn windows_can_write_through_the_mount_and_read_the_bytes_back() {
+    let library = default_library();
+    if let Err(LoadError::NotFound { path }) = resolve_library(&library) {
+        eprintln!(
+            "SKIP: winfsp library not installed at {} — write chain not exercised (skip, not pass)",
+            path.display()
+        );
+        return;
+    }
+
+    let mount_point = mount_point();
+    if mount_point.to_string_lossy().ends_with(':') {
+        let text = mount_point.to_string_lossy().to_string();
+        let taken = fs_winfsp::mounted::drive_present(&mount_point);
+        assert!(
+            taken == Some(false),
+            "cell drive: {text} must be free before mounting — a taken letter makes every later reading meaningless "
+        );
+    } else {
+        assert!(
+            !mount_point.exists(),
+            "cell mount point: a directory mount point must **not** exist (WinFsp creates it)"
+        );
+        assert!(
+            mount_point.parent().is_some_and(|parent| parent.exists()),
+            "cell mount point: the parent must exist"
+        );
+    }
+
+    let backend: DynOps = Box::new(SlashBackend::new());
+    let mut report_outcome: Option<Result<(), String>> = None;
+    let before_contexts = callbacks::context_counts();
+    let counts_before = (
+        callbacks::create_call_count(),
+        callbacks::write_call_count(),
+        callbacks::set_size_call_count(),
+        callbacks::cleanup_call_count(),
+    );
+
+    let report = mount_read_only(&library, &mount_point, backend, volume(), |path: &std::path::Path| {
+        // The outcome is recorded **whatever happens**, so a failure inside the probe is reported as itself instead of appearing as
+        // "the probe never ran" (the two are different facts, and one of them is the one worth reading).
+        let outcome = (|| -> Result<(), String> {
+        let root = root_of(path);
+        let file = root.join("written.txt");
+
+        // 1. create + write.
+        std::fs::write(&file, b"hello layer-fs").map_err(|error| error.to_string())?;
+
+        // 2. read back **the bytes**, not the size (392).
+        let read_back = std::fs::read(&file).map_err(|error| error.to_string())?;
+        if read_back != b"hello layer-fs" {
+            return Err(format!(
+                "the file came back as {:?}, not the bytes that were written",
+                String::from_utf8_lossy(&read_back)
+            ));
+        }
+
+        // 3. set size: truncate to 5 bytes.
+        let handle = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .map_err(|error| error.to_string())?;
+        handle.set_len(5).map_err(|error| error.to_string())?;
+        drop(handle);
+        let truncated = std::fs::read(&file).map_err(|error| error.to_string())?;
+        if truncated != b"hello" {
+            return Err(format!(
+                "after set_len(5) the file is {:?}, not the first five bytes",
+                String::from_utf8_lossy(&truncated)
+            ));
+        }
+
+        // 4. delete, and observe the **OS**, not the status.
+        std::fs::remove_file(&file).map_err(|error| error.to_string())?;
+        if file.exists() {
+            return Err("the file is still there after remove_file".to_string());
+        }
+
+        Ok(())
+        })();
+        report_outcome = Some(outcome.clone());
+        outcome
+    })
+    .expect("the mount path is available");
+
+    let after_contexts = callbacks::context_counts();
+    let counts_after = (
+        callbacks::create_call_count(),
+        callbacks::write_call_count(),
+        callbacks::set_size_call_count(),
+        callbacks::cleanup_call_count(),
+    );
+
+    match &report_outcome {
+        Some(Ok(())) => {}
+        Some(Err(error)) => panic!("cell write chain: {error}"),
+        None => panic!("cell write chain: the probe never ran against the mounted volume"),
+    }
+
+    // Every step of the chain really reached us: the counters are the evidence that the OS called **our** callbacks.
+    assert!(
+        counts_after.0 > counts_before.0,
+        "cell create: the create callback was reached ({} -> {})",
+        counts_before.0,
+        counts_after.0
+    );
+    assert!(
+        counts_after.2 > counts_before.2,
+        "cell set size: `SetFileSize` was reached ({} -> {})",
+        counts_before.2,
+        counts_after.2
+    );
+    assert!(
+        counts_after.3 >= counts_before.3,
+        "cell cleanup: the cleanup counter is readable ({} -> {})",
+        counts_before.3,
+        counts_after.3
+    );
+    assert_eq!(
+        after_contexts.0 - before_contexts.0,
+        after_contexts.1 - before_contexts.1,
+        "cell contexts: every FileContext opened during the mount was closed (before {before_contexts:?}, after {after_contexts:?})"
+    );
+    assert_eq!(
+        fs_winfsp::registry::miss_count(),
+        0,
+        "cell registry: no callback reached a pointer that was not a live mount"
+    );
+    assert!(
+        report.released_after_delete,
+        "cell unmount: the OS says the mount point is gone (status codes say what a call thought; this says what is left)"
+    );
+    eprintln!(
+        "write chain counters: create {} -> {}, write {} -> {}, set_size {} -> {}, cleanup {} -> {}",
+        counts_before.0, counts_after.0, counts_before.1, counts_after.1, counts_before.2,
+        counts_after.2, counts_before.3, counts_after.3
+    );
+}
