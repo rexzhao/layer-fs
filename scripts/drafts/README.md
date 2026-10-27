@@ -136,3 +136,23 @@ Running the L2 script **against a live mount** (through a temporary harness that
 
 Neither the harness nor the crash diagnosis is committed yet: the harness was temporary, and a crash report is worth nothing until the
 failing callback is named.
+
+### Logged re-run of the L2 mounted side
+
+With `LAYER_FS_DEBUG_LOG` on, the run still aborts (`0xc0000374`) and the log's tail is:
+
+```
+>>Create [UT----] "\", FILE_OPEN, CreateOptions=200000, ...
+>>QueryInformation 000001FC272B68A0
+>>QueryInformation 000001FC272B68A0
+>>Cleanup 000001FC272B68A0
+>>Close   000001FC272B68A0
+```
+
+So the corruption happens around a **root open + two `QueryInformation` (GetFileInfo) calls**, with no `>>Read`/`>>QueryDirectory`
+afterwards — i.e. the crash is near `GetFileInfo`/`GetSecurity` on a freshly created directory handle, not in the listing or the
+read path. Candidate order (unchanged, but now narrower): an out-pointer write in `get_file_info_shell`/`get_security*`, not
+`DirBuffer` arithmetic.
+
+The log gives the neighbourhood, not the first fault: the next step is **PageHeap** (`gflags /p /enable <exe> /full`), which breaks at the
+offending write instead of at the abort.
