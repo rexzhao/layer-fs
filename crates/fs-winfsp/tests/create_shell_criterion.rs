@@ -315,3 +315,144 @@ fn the_disposition_lives_in_the_high_byte_and_the_flags_in_the_low_24_bits() {
 fn pack(disposition: u32, options: u32) -> u32 {
     ((disposition & 0xff) << 24) | (options & 0x00FF_FFFF)
 }
+
+/// `FILE_CREATE | FILE_DIRECTORY_FILE` ⇒ **`mkdir`**, and the file door is never used.
+///
+/// The two halves of the packed word have to be read to get this right: the disposition (high byte) says "create", the option
+/// (low bits) says "a directory". Reading either one alone gives the wrong verb — which is what the previous cut did.
+#[test]
+fn creating_a_directory_goes_through_mkdir_and_not_the_file_door() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts which door was used: `mkdir` or `create_or_open`.
+    struct Doors {
+        made_dirs: AtomicUsize,
+        opened: AtomicUsize,
+    }
+
+    impl WorkspaceOps for Doors {
+        fn create_or_open(
+            &self,
+            _path: &[u8],
+            _disposition: Disposition,
+        ) -> OpsResult<OpenOutcome> {
+            self.opened.fetch_add(1, Ordering::Relaxed);
+            Err(OpsError::NotFound)
+        }
+        fn mkdir(&self, _path: &[u8]) -> OpsResult<u64> {
+            let made = self.made_dirs.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(100 + made as u64)
+        }
+        fn read(&self, _id: u64, _o: u64, _l: usize) -> OpsResult<Vec<u8>> {
+            Err(OpsError::ReadOnly)
+        }
+        fn write(&self, _id: u64, _o: u64, _b: &[u8]) -> OpsResult<usize> {
+            Err(OpsError::ReadOnly)
+        }
+        fn set_size(&self, _id: u64, _l: u64) -> OpsResult<()> {
+            Err(OpsError::ReadOnly)
+        }
+        fn read_dir(&self, _id: u64) -> OpsResult<Vec<DirEntry>> {
+            Ok(Vec::new())
+        }
+        fn get_info(&self, id: u64) -> OpsResult<NodeInfo> {
+            Ok(NodeInfo {
+                file_id: id,
+                kind: Kind::Directory,
+                size: 0,
+                times: fs_winfsp::file_info::times(1, 1, 1, 1),
+                attributes: Attributes(0x10),
+            })
+        }
+        fn set_times(
+            &self,
+            _id: u64,
+            _a: Option<i64>,
+            _w: Option<i64>,
+            _c: Option<i64>,
+            _cr: Option<i64>,
+        ) -> OpsResult<()> {
+            Err(OpsError::ReadOnly)
+        }
+        fn set_attributes(&self, _id: u64, _a: Attributes) -> OpsResult<()> {
+            Err(OpsError::ReadOnly)
+        }
+        fn rename(&self, _f: &[u8], _t: &[u8], _r: bool) -> OpsResult<RenameOutcome> {
+            Err(OpsError::ReadOnly)
+        }
+        fn remove_at(&self, _p: u64, _n: &[u8], _e: u64) -> OpsResult<()> {
+            Err(OpsError::ReadOnly)
+        }
+        fn flush(&self) -> OpsResult<()> {
+            Ok(())
+        }
+    }
+
+    let doors = Arc::new(Doors {
+        made_dirs: AtomicUsize::new(0),
+        opened: AtomicUsize::new(0),
+    });
+
+    struct SharedDoors(Arc<Doors>);
+    impl WorkspaceOps for SharedDoors {
+        fn create_or_open(&self, p: &[u8], d: Disposition) -> OpsResult<OpenOutcome> {
+            self.0.create_or_open(p, d)
+        }
+        fn mkdir(&self, p: &[u8]) -> OpsResult<u64> {
+            self.0.mkdir(p)
+        }
+        fn read(&self, i: u64, o: u64, l: usize) -> OpsResult<Vec<u8>> {
+            self.0.read(i, o, l)
+        }
+        fn write(&self, i: u64, o: u64, b: &[u8]) -> OpsResult<usize> {
+            self.0.write(i, o, b)
+        }
+        fn set_size(&self, i: u64, l: u64) -> OpsResult<()> {
+            self.0.set_size(i, l)
+        }
+        fn read_dir(&self, i: u64) -> OpsResult<Vec<DirEntry>> {
+            self.0.read_dir(i)
+        }
+        fn get_info(&self, i: u64) -> OpsResult<NodeInfo> {
+            self.0.get_info(i)
+        }
+        fn set_times(
+            &self,
+            i: u64,
+            a: Option<i64>,
+            w: Option<i64>,
+            c: Option<i64>,
+            cr: Option<i64>,
+        ) -> OpsResult<()> {
+            self.0.set_times(i, a, w, c, cr)
+        }
+        fn set_attributes(&self, i: u64, a: Attributes) -> OpsResult<()> {
+            self.0.set_attributes(i, a)
+        }
+        fn rename(&self, f: &[u8], t: &[u8], r: bool) -> OpsResult<RenameOutcome> {
+            self.0.rename(f, t, r)
+        }
+        fn remove_at(&self, p: u64, n: &[u8], e: u64) -> OpsResult<()> {
+            self.0.remove_at(p, n, e)
+        }
+        fn flush(&self) -> OpsResult<()> {
+            self.0.flush()
+        }
+    }
+
+    let adapter = DynAdapter::new(Box::new(SharedDoors(Arc::clone(&doors))) as DynOps);
+    let (status, gave_context) = create(&adapter, pack(FILE_CREATE, FILE_DIRECTORY_FILE));
+
+    assert_eq!(status, 0, "cell dir: the directory was made");
+    assert!(gave_context, "cell dir: and the caller gets a handle");
+    assert_eq!(
+        doors.made_dirs.load(Ordering::Relaxed),
+        1,
+        "cell dir: **mkdir was the door** — exactly once"
+    );
+    assert_eq!(
+        doors.opened.load(Ordering::Relaxed),
+        0,
+        "cell dir: and the file door was never used (it has no kind argument, so it cannot make a directory)"
+    );
+}

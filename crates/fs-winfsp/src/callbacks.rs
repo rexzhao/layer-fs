@@ -349,6 +349,8 @@ pub unsafe fn open_shell(
             adapter,
             file_name,
             fs_semantics::disposition::Disposition::Open,
+            // `Open` has no create options at all: a plain open never asks for a directory to be made.
+            false,
             context_out,
             info_out,
         )
@@ -368,6 +370,7 @@ unsafe fn open_like(
     adapter: Option<&crate::DynAdapter>,
     file_name: *const u16,
     disposition: fs_semantics::disposition::Disposition,
+    wants_directory: bool,
     context_out: *mut *mut c_void,
     info_out: *mut FileInfo,
 ) -> i32 {
@@ -388,20 +391,36 @@ unsafe fn open_like(
         OPEN_EXITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
     };
-    // The disposition is passed through **unchanged**: whether it creates or opens is the backend's decision, and the promise
-    // that `Open` does not create lives there (asserted in `open_shell_criterion`).
-    let outcome = match adapter
-        .backend()
-        .create_or_open(path.as_bytes(), disposition)
-    {
-        Ok(outcome) => outcome,
-        Err(_error) => {
+    // The disposition is passed through **unchanged** for a file: whether it creates or opens is the backend's decision, and the
+    // promise that `Open` does not create lives there (asserted in `open_shell_criterion`).
+    // A **directory** is different: `mkdir` is the only verb that can make one, so the decision is taken here and said out loud.
+    let outcome = match make_verb(disposition, wants_directory) {
+        MakeVerb::Directory => match adapter.backend().mkdir(path.as_bytes()) {
+            Ok(file_id) => adapter
+                .backend()
+                .get_info(file_id)
+                .map(|_| file_id)
+                .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
+            // The name is taken: `FILE_CREATE` means **fail if it exists**, and that is a collision, not a silent open.
+            Err(crate::ops::OpsError::NameCollision) => Err(OURS_OBJECT_NAME_COLLISION),
+            Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
+        },
+        MakeVerb::File => adapter
+            .backend()
+            .create_or_open(path.as_bytes(), disposition)
+            .map(|outcome| outcome.file_id)
+            .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
+    };
+    let file_id = match outcome {
+        Ok(file_id) => file_id,
+        Err(status) => {
             OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return OURS_OBJECT_NAME_NOT_FOUND;
+            return status;
         }
     };
+    let _ = disposition;
     // The record is built from **current** metadata, read at return time — not from whatever the outcome remembered.
-    let Some(node) = adapter.backend().get_info(outcome.file_id).ok() else {
+    let Some(node) = adapter.backend().get_info(file_id).ok() else {
         OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return OURS_OBJECT_NAME_NOT_FOUND;
     };
@@ -409,9 +428,7 @@ unsafe fn open_like(
         OPEN_EXITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
     };
-    let context = Box::into_raw(Box::new(EntryContext {
-        file_id: outcome.file_id,
-    }));
+    let context = Box::into_raw(Box::new(EntryContext { file_id }));
     CONTEXTS_ALLOCATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: both out-pointers were checked non-null and are valid for their writes per the caller's contract.
     unsafe {
@@ -450,9 +467,47 @@ pub unsafe fn create_shell(
     };
     // `FILE_DIRECTORY_FILE` is the **option**, not the disposition — it says *what kind* to make, and it is the flag the SDK tells
     // user-mode file systems to look at (`winfsp.h:262-266`).
-    let _wants_directory = parts.options & FILE_DIRECTORY_FILE != 0;
+    let wants_directory = parts.options & FILE_DIRECTORY_FILE != 0;
     // SAFETY: the caller's contract for both pointers is the same as `open_shell`'s.
-    unsafe { open_like(adapter, file_name, disposition, context_out, info_out) }
+    unsafe {
+        open_like(
+            adapter,
+            file_name,
+            disposition,
+            wants_directory,
+            context_out,
+            info_out,
+        )
+    }
+}
+
+/// Which verb to use for a create request.
+///
+/// A directory is made with `mkdir` and nothing else — `create_or_open` has **no kind argument**, because the file door is the only
+/// place a name becomes an id. That split is the reason `FILE_DIRECTORY_FILE` had to be extracted from the low 24 bits at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MakeVerb {
+    /// `create_or_open(path, disposition)` — a file, opened or created by the disposition.
+    File,
+    /// `mkdir(path)` — a **new** directory (the disposition asked for creation).
+    Directory,
+}
+
+/// The decision, as a function: `FILE_DIRECTORY_FILE` + a creating disposition ⇒ `mkdir`.
+///
+/// Opening an existing directory keeps going through `create_or_open(Open)`, because that is the only path→id door the trait has;
+///
+/// **a directory's id is not reachable any other way** (finding recorded when this was written).
+#[must_use]
+fn make_verb(
+    disposition: fs_semantics::disposition::Disposition,
+    wants_directory: bool,
+) -> MakeVerb {
+    use fs_semantics::disposition::Disposition;
+    match (wants_directory, disposition) {
+        (true, Disposition::Create) => MakeVerb::Directory,
+        _ => MakeVerb::File,
+    }
 }
 
 /// The two halves of a packed `create_options` word.
@@ -523,6 +578,8 @@ pub unsafe fn close(context: *mut c_void) {
 
 /// `STATUS_OBJECT_NAME_NOT_FOUND`.
 pub const OURS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+/// `STATUS_OBJECT_NAME_COLLISION` — "that name is already taken" (`FILE_CREATE` on an existing entry).
+pub const OURS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 /// `STATUS_BUFFER_TOO_SMALL`.
 pub const OURS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 /// `STATUS_INVALID_PARAMETER`.
