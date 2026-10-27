@@ -49,3 +49,26 @@ signature is not what the loaded DLL passes (the header says `Buffer, UINT64 Off
 header is a newer mainline build — the same divergence that process 326/393 describes), or Windows really issues a zero-length
 write first. **Next step is a probe, not a guess**: register a `Write` trampoline that prints every raw argument once, drive one
 `std::fs::write`, and compare with the FSD trace line.
+
+## The log named it (second session)
+
+`LAYER_FS_DEBUG_LOG` was on during a full chain run. The first non-success `>>Op` line is the answer:
+
+```
+>>Create [UT----] "\written.txt", FILE_OPEN_IF, CreateOptions=60 ...
+<<Create IoStatus=c0000034            <- the earlier bug (Create refused OPEN_IF), now fixed
+>>QueryVolumeInformation
+<<QueryVolumeInformation IoStatus=c0000023   <- STATUS_BUFFER_TOO_SMALL, unexplained; see below
+>>Write ..., Offset=0:0, Length=14
+<<Write IoStatus=0                     <- the write itself SUCCEEDS
+>>Create [UT----] "\written.txt", FILE_OPEN ...
+>>Read ..., Address=..., Offset=0:0, Length=32
+<<Read IoStatus=c0000010               <- **Read is not registered at all** (slot 8)
+```
+
+So the chain fails at the **read-back** step, because `Read` (slot 8) has never been wired: `read_shell` does not exist yet.
+That is the whole remaining gap for the chain — plus one open question:
+
+`QueryVolumeInformation IoStatus=c0000023` (`STATUS_BUFFER_TOO_SMALL`) — our volume shell answers that when the caller's buffer is
+smaller than `size_of::<VolumeInfo>()`, but the FSD's query does not print a length, so this needs one probe to see what size it passes.
+It is not fatal for the chain (Windows tolerates the retry), but it explains why the volume shows no size.
