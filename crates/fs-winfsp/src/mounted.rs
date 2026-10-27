@@ -372,6 +372,43 @@ mod platform {
     /// Registered because **its absence is visible**: a `WriteFile` followed by a close makes WinFsp flush, and an unset slot answers
     /// `STATUS_INVALID_DEVICE_REQUEST`, which surfaces as `ERROR_INVALID_FUNCTION` on the very operation that had just succeeded.
     /// The backend's own `flush` is the answer; a null `FileContext` means "the whole volume", which this layer has nothing to add to.
+    /// `CanDelete` — `winfsp.h:606-607`, slot **14**.
+    ///
+    /// `(FSP_FILE_SYSTEM*, PVOID FileContext, PWSTR FileName)`.
+    unsafe extern "system" fn can_delete_trampoline(
+        file_system: *mut c_void,
+        file_context: *mut c_void,
+        _file_name: *const u16,
+    ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
+        // SAFETY: WinFsp's contract for this callback.
+        unsafe { crate::callbacks::can_delete_shell(adapter.as_deref(), file_context) }
+    }
+
+    /// `Rename` — `winfsp.h:631-632`, slot **15**.
+    ///
+    /// `(FSP_FILE_SYSTEM*, PVOID FileContext, PWSTR FileName, PWSTR NewFileName, BOOLEAN ReplaceIfExists)` — the boolean is `u8`, per the
+    /// sub-register rule this layer keeps re-learning.
+    unsafe extern "system" fn rename_trampoline(
+        file_system: *mut c_void,
+        file_context: *mut c_void,
+        file_name: *const u16,
+        new_name: *const u16,
+        replace_if_exists: u8,
+    ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
+        // SAFETY: WinFsp's contract for this callback.
+        unsafe {
+            crate::callbacks::rename_shell(
+                adapter.as_deref(),
+                file_context,
+                file_name,
+                new_name,
+                replace_if_exists,
+            )
+        }
+    }
+
     unsafe extern "system" fn flush_trampoline(
         file_system: *mut c_void,
         _file_context: *mut c_void,
@@ -670,6 +707,22 @@ mod platform {
                 ) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(set_file_size_trampoline));
+            // `CanDelete` — slot **14**: `(fs, FileContext, FileName)`.
+            interface.slots[slot::CAN_DELETE] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *const u16) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(can_delete_trampoline));
+            // `Rename` — slot **15**: `(fs, FileContext, FileName, NewFileName, BOOLEAN)`.
+            interface.slots[slot::RENAME] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *const u16,
+                    *const u16,
+                    u8,
+                ) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(rename_trampoline));
         }
         interface
     }

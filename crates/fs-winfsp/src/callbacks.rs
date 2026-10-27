@@ -911,8 +911,88 @@ pub const FSP_CLEANUP_DELETE: u32 = 0x0000_0001;
 /// "delete on the last close" true for the OS rather than for us.
 ///
 /// # Safety
+/// The `CanDelete` **shell**: is this entry deletable at all?
 ///
-/// `context` must point to an `EntryContext` owned by this frontend.
+/// The header's wording is "tests whether a file or directory can be safely deleted" (`winfsp.h:600-607`), and the honest answer for this
+/// backend is: if the id is live and the store still has it, yes. The **sharing** part of "safely" is the adapter's own rule and is applied
+/// when the delete is actually requested — answering it here as well would be a second, drift-prone copy.
+///
+/// # Safety
+///
+/// `context` is an opaque token; it is looked up in the table and never dereferenced.
+pub unsafe fn can_delete_shell(adapter: Option<&crate::DynAdapter>, context: *const c_void) -> i32 {
+    let Some(entry) = entry_of(context) else {
+        return OURS_INVALID_PARAMETER;
+    };
+    let Some(adapter) = adapter else {
+        return NOT_IMPLEMENTED;
+    };
+    match adapter.backend().get_info(entry.file_id) {
+        Ok(_) => 0,
+        Err(_) => OURS_OBJECT_NAME_NOT_FOUND,
+    }
+}
+
+/// The `Rename` **shell**: two names in, one `rename` on the mount's backend.
+///
+/// `ReplaceIfExists` is a **BOOLEAN** — the fourth sub-register argument in this layer, so it is declared `u8` (process 400: only the low
+/// byte is defined for arguments smaller than a machine word).
+///
+/// The pair of UTF-16 names is converted here and nowhere else: the backend's contract is bytes, and doing the conversion twice is how the
+/// two ends drift apart.
+///
+/// # Safety
+///
+/// `file_name` and `new_name` must be NUL-terminated UTF-16 strings; `context` is an opaque token.
+pub unsafe fn rename_shell(
+    adapter: Option<&crate::DynAdapter>,
+    context: *const c_void,
+    file_name: *const u16,
+    new_name: *const u16,
+    replace_if_exists: u8,
+) -> i32 {
+    if file_name.is_null() || new_name.is_null() {
+        return OURS_INVALID_PARAMETER;
+    }
+    let Some(adapter) = adapter else {
+        return NOT_IMPLEMENTED;
+    };
+    // Both names are NUL-terminated per WinFsp's contract; the slice is bounded by the terminator measured first.
+    let from_units = unsafe { crate::boundary::utf16_len(file_name) };
+    let to_units = unsafe { crate::boundary::utf16_len(new_name) };
+    let from_slice = unsafe { std::slice::from_raw_parts(file_name, from_units) };
+    let to_slice = unsafe { std::slice::from_raw_parts(new_name, to_units) };
+    let Ok(from) = crate::boundary::utf16_to_utf8(from_slice) else {
+        return OURS_INVALID_PARAMETER;
+    };
+    let Ok(to) = crate::boundary::utf16_to_utf8(to_slice) else {
+        return OURS_INVALID_PARAMETER;
+    };
+    // The context is only a consistency check here: a rename names its source by path, and the header passes the context so the file system
+    // can refuse when the two disagree. Refusing is right — renaming "something else" would be a silent wrong-object operation.
+    if !context.is_null() {
+        let Some(entry) = entry_of(context) else {
+            return OURS_INVALID_PARAMETER;
+        };
+        let _ = entry;
+    }
+    match adapter.rename(from.as_bytes(), to.as_bytes(), replace_if_exists != 0) {
+        Ok(_) => 0,
+        Err(crate::ops::OpsError::NameCollision) => OURS_OBJECT_NAME_COLLISION,
+        Err(crate::ops::OpsError::NotEmpty) => OURS_DIRECTORY_NOT_EMPTY,
+        Err(crate::ops::OpsError::NotFound) => OURS_OBJECT_NAME_NOT_FOUND,
+        Err(_) => NOT_IMPLEMENTED,
+    }
+}
+
+/// `STATUS_DIRECTORY_NOT_EMPTY`.
+pub const OURS_DIRECTORY_NOT_EMPTY: i32 = 0xC000_0101u32 as i32;
+
+/// The `Cleanup` **shell**: mark the entry delete-pending; never delete here.
+///
+/// # Safety
+///
+/// `context` is an opaque token; it is looked up in the table and never dereferenced.
 pub unsafe fn cleanup_shell(
     adapter: Option<&crate::DynAdapter>,
     context: *const c_void,
