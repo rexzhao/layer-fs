@@ -431,3 +431,22 @@ trace I was reading.
 Consequence: **every reading produced by a copy-paste test that also mounts must be re-taken with exactly one mounting test per process** (or with a
 distinct mount point). The earlier "child `Create` returns 0 while the OS says path not found" reading may be sound, but it was taken under this
 hazard and should be re-confirmed the same way before anything is built on it.
+
+## Key-shape hypothesis: dead. The child create still arrives as `Open`
+
+Clean instrument (one mount, keys printed):
+
+```
+KEY create_or_open raw="\d"   key="/d"   resolved=Some(1) -> Err(NotADirectory)
+KEY open_dir       raw="\d"   key="/d"   resolved=Some(1) -> Ok(1)      ← the new fallback works
+KEY read_dir(1) -> 0
+KEY create_or_open raw="\D\a" key="/D/a" resolved=None    -> Err(NotFound)
+KEY create_or_open raw="\d\a" key="/d/a" resolved=None    -> Err(NotFound)
+```
+
+- **the two routes use the same key** (`/d`) and the same resolved id (1) — so the "different key shapes" suspicion (426, third appearance) is **dead**;
+- the child never appears with a *creating* disposition: both attempts are `Open`, which correctly cannot create, so `/d/a` is never made.
+
+So the open question is exactly one: **why does the dispatcher not upgrade `Open` to `Create`** here, when its own source says it upgrades on
+`STATUS_OBJECT_NAME_NOT_FOUND` — which is the code we return. The instrument above did not print the disposition; the next one must, together with the
+exact status returned, for every call.
