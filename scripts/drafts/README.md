@@ -605,3 +605,23 @@ Two conclusions, and they kill both hypotheses as stated:
 
 So the next question is a *slot* question, not a resolution question: **which operation does MSYS's read/write path request that `std::fs` does not** —
 a candidate list from the unimplemented members (`GetEa`/`SetEa`, `Control`, `SetSecurity`, `GetStreamInfo`).
+
+## The refused operation is named: a `Read` that arrives **after** `Close`
+
+From the FSD log of one `printf alpha > f1 && cat f1` under bash:
+
+```
+>>Read 0000…0008, Offset=0:0, Length=3        <<Read IoStatus=0[3]
+>>Cleanup 0000…0008                          <<Cleanup IoStatus=0
+>>Close   0000…0008                          <<Close IoStatus=0
+>>Read 0000…0008, Offset=0:0, Length=131072  <<Read IoStatus=c0000010   ← refused
+```
+
+So the read that fails is a **second, large read of the same FileContext after that context was closed** — our `close_shell`
+released the id from the table (correctly: `Close` means the context is gone), and the later `Read` finds no id and refuses with
+`STATUS_INVALID_DEVICE_REQUEST`, which MSYS reports as "Invalid request code".
+
+The question is therefore not "which slot is missing" (324/455's plan is answered: it *is* `Read`) but **why Windows reads after closing the
+handle** — a lifecycle question, and the same family as the double-close finding: our `Close` may be freeing the context while the FSD still holds
+the file object. The next instrument should print the `FileContext` id at `open`/`read`/`cleanup`/`close` for one bash `cat`, so the pairing is
+visible on our side too.
