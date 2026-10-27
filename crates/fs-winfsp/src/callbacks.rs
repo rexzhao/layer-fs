@@ -569,6 +569,14 @@ pub fn clear_contexts() {
 static CLOSED_CONTEXTS: std::sync::Mutex<Option<std::collections::BTreeSet<u64>>> =
     std::sync::Mutex::new(None);
 
+/// Whether the EOF-on-closed fallback is enabled (`LAYER_FS_EOF_ON_CLOSED=1`).
+///
+/// Default **off**: a fallback that cannot tell "the object is gone" from "we released too early" hides the lifecycle question rather than
+/// answering it (459). The environment variable exists so the A/B can be re-run on demand without rebuilding the arm in.
+fn eof_on_closed() -> bool {
+    std::env::var_os("LAYER_FS_EOF_ON_CLOSED").is_some_and(|value| value != "0")
+}
+
 /// Whether `context` names a handle that was handed out and has since been closed.
 fn is_closed(context: *const c_void) -> bool {
     let id = context as usize as u64;
@@ -1213,7 +1221,10 @@ pub unsafe fn read_shell(
         // **A read of an already-closed handle is answered as EOF, not as an error.** The measured shape is the cache manager's 128 KiB read-ahead
         // arriving after `Close`: the file object is dead, nobody consumes those bytes, and refusing it turned a successful `cat` into
         // "Invalid request code". Zero bytes is both true (there is no data to give) and harmless (nothing is written into the caller's buffer).
-        if is_closed(context) {
+        // **Off by default, and it is a last resort rather than a fix** (process 459). The EOF answer cannot tell "the file object is really gone" from
+        // "we released the context too early", so when it fires it *hides* the lifecycle question instead of answering it — measured: it swallowed a
+        // read that belonged to a live caller, and `cat` went quiet instead of failing. `LAYER_FS_EOF_ON_CLOSED=1` turns it back on for the A/B.
+        if eof_on_closed() && is_closed(context) {
             if !bytes_transferred.is_null() {
                 // SAFETY: writable out-pointer per WinFsp's contract.
                 unsafe { std::ptr::write(bytes_transferred, 0) };
