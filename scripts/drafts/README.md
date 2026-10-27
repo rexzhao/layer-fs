@@ -1080,3 +1080,25 @@ carrying disposition `Open`, and we answer `0xC0000034` every time and never get
 That contradicts the documented `FileOpenIf` / `FileOverwriteIf` sequences, which means the request is being handled **before** those paths, or the sequence
 differs for a mounted volume in this state. The instrument this file has not used yet is our own **debug log**, which records the calls WinFsp actually makes
 and their statuses — that is the next reading, and it must come before another guess about which door is wrong.
+
+## Debug log (514): the FSD is right — **our root open answers `0xC0000034`**, and everything downstream follows
+
+One failing write, the whole IRP sequence:
+
+```
+>>Create "\"            FILE_OPEN    CreateOptions=4021  <<c0000034   ← the root, refused as missing
+>>Create "\written.txt" FILE_OPEN    CreateOptions=200020 <<c0000034
+>>Create "\written.txt" FILE_OPEN_IF CreateOptions=60     <<c000003a   ← computed by the FSD, never reaches us
+```
+
+That is the whole chain, and it is not the status we return for the file: the **parent** (`\`) was answered `0xC0000034`, so WinFsp's `FileOpenIf` upgrade path
+concludes the *path* is missing and synthesises `0xC000003A` — which the caller sees as `os error 3`. Our own code cannot produce `0xC000003A`; there is not a
+single such constant in the crate. The log line proves it is the FSD's own answer.
+
+Why the root is refused: `create_or_open("/")` reaches the backend, the mock's `split` refuses a bare `/`, the door sees `NotFound`, and `open_like` only falls
+back to `open_dir` on **`NotADirectory`** (that fallback was added for 8fe5b81). `NotFound` is not in that list, so a root open that should succeed answers
+"no such name".
+
+**Fix sketch (next round):** in `open_like`, when the file door answers `NotFound` and the same path opens as a directory, answer the directory — the same
+asymmetry rule as 435 (`a no-flag open landing on a directory = open it`), applied to the one case where the door cannot even say "that is a directory".
+That is a product defect, reproducible with the stock `MockBackend` (no `SlashBackend` involved).
