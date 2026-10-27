@@ -13,6 +13,68 @@
 
 use fs_semantics::disposition::Disposition;
 
+/// A path crossing the ops boundary: **the key to match by** and **the bytes to hand back** (443/470/473).
+///
+/// The two are not interchangeable and neither can be derived from the other at the far side of the boundary:
+///
+/// - `key` is folded with the one implementation ([`fs_semantics::name::fold_bytes`]), and it is what a lookup must match on, or `README` and
+///   `readme` would be two entries;
+/// - `display` is exactly what the caller wrote, and it is what must be **stored** and handed back, or an entry created as `ReadMe.txt` would come
+///   back as `readme.txt` (measured once already: folding inside a split made the display name folded too).
+///
+/// Carrying them as one value is the whole point. A backend that received only the raw bytes would have to fold for itself — a second definition of
+/// the matching key — and a backend that received only the folded key could not preserve spelling. `Path` is how the boundary says "both, decided
+/// once, upstream".
+///
+/// The separator is not folded specially: `/` has no case, so folding the whole path is the same as folding each component.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Path<'a> {
+    key: Vec<u8>,
+    display: &'a [u8],
+}
+
+impl<'a> Path<'a> {
+    /// Builds both fields from the bytes a frontend handed us.
+    #[must_use]
+    pub fn new(raw: &'a [u8]) -> Self {
+        Self {
+            key: fs_semantics::name::fold_bytes(raw),
+            display: raw,
+        }
+    }
+
+    /// The folded key: what a lookup matches on.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// The bytes the caller wrote: what gets stored and handed back.
+    #[must_use]
+    pub fn display(&self) -> &[u8] {
+        self.display
+    }
+
+    /// The display bytes the last component contributes, i.e. the name a `bind` records.
+    ///
+    /// `None` when the path ends in the separator or has no components at all (the root) — a caller that needs a name has asked the wrong
+    /// question of the wrong path, and answering `b""` would turn that into an empty name in the store.
+    #[must_use]
+    pub fn display_name(&self) -> Option<&'a [u8]> {
+        let start = self
+            .display
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .map_or(0, |at| at + 1);
+        let name = &self.display[start..];
+        if name.is_empty() || name == b"\\" {
+            None
+        } else {
+            Some(name)
+        }
+    }
+}
+
 /// The kind of a namespace entry, as the adapter needs to report it.
 ///
 /// # Why this is not the core's `Kind`
