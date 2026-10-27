@@ -39,7 +39,8 @@ fn list(dir_id: u64) -> Vec<(Vec<u16>, NodeInfo)> {
 }
 
 fn lookup(file_id: u64) -> Option<NodeInfo> {
-    (file_id == 7).then(|| node(file_id))
+    // The root (**id 0**) must resolve too: `Create` is called for `\` first, and without it the volume has no root to open.
+    (file_id == 0 || file_id == 7).then(|| node(file_id))
 }
 
 #[test]

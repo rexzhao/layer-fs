@@ -107,6 +107,25 @@ impl std::fmt::Debug for FileSystemInterface {
     }
 }
 
+/// Slot indices **measured against the installed DLL**, not read from the header.
+///
+/// The header lists the operations; it does not say where they sit in a given binary. Measured on 2026-10-26 against
+/// WinFsp `2.1.25156.ddca7bd` (the `Program Files (x86)` install), with `LAYER_FS_PROBE_SLOT=n`: filling slot 32 and issuing a
+/// create is the only slot that fired. The SDK header on this machine is a newer mainline build whose order differs — both
+/// report `FspVersion` 2.1, so the version number alone does not identify a layout.
+///
+/// Every index here must be measured this way; the ones that have not been measured yet are marked.
+pub mod measured {
+    /// `Create` — **measured** (slot 32 fires on a create; the header order says 3).
+    pub const CREATE: usize = 32;
+
+    /// Which DLL build the measurements above were taken against.
+    pub const DLL_BUILD: &str = "2.1.25156.ddca7bd";
+
+    /// The date the probe was run, so a future reader knows how old the measurement is.
+    pub const MEASURED_ON: &str = "2026-10-26";
+}
+
 /// Slot indices of the operations this frontend implements, in the SDK's table order.
 ///
 /// Extracted mechanically from `winfsp.h:193-1093` (33 named entries followed by `Reserved`), and every index below cites

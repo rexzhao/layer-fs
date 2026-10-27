@@ -336,7 +336,7 @@ mod platform {
                 *mut *mut c_void,
                 *mut crate::abi::FileInfo,
             ) -> i32 = create_trampoline;
-            interface.slots[slot::CREATE] = Some(std::mem::transmute::<
+            interface.slots[crate::abi::measured::CREATE] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(
                     *mut c_void,
                     *const u16,
