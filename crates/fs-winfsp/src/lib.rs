@@ -38,5 +38,6 @@ pub use ops::{
 ///
 /// They are `include!`d rather than copied: one definition, two instantiations (mock here, real backend in `fs-api`). A
 /// copy would let the two drift, and the drift would look like "the backend has its own contract".
+pub mod registry;
 pub mod scenarios;
 pub mod volume;
