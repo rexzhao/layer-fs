@@ -400,31 +400,16 @@ pub unsafe fn get_security_by_name(
     };
 
     if !attributes_out.is_null() {
-        // SAFETY: the caller says this is writable (it asked us to fill it).
+        // SAFETY: the caller passes either a valid pointer or null (fsop.c:797 passes null when it only wants the size).
         unsafe { std::ptr::write(attributes_out, node.attributes.0) };
     }
     if !descriptor_size_out.is_null() {
-        let capacity = unsafe { std::ptr::read(descriptor_size_out) };
-        if !descriptor_out.is_null() && capacity >= 4 {
-            // A minimal self-relative descriptor: revision 1, control 0, no owner/group/sacl/dacl. Four bytes is the documented
-            // minimum, and "no explicit security" is exactly what an empty one means.
-            // SAFETY: `descriptor_out` is non-null and at least 4 bytes per the capacity check.
-            unsafe {
-                let bytes = descriptor_out.cast::<u8>();
-                // SECURITY_DESCRIPTOR_RELATIVE: revision 1, then `Control` as a little-endian u16 at offset 2. The
-                // `SE_SELF_RELATIVE` bit (0x8000) is **required** for a descriptor with no pointers — without it Windows
-                // rejects the whole thing with STATUS_INVALID_SECURITY_DESCR (0xC0000078), which is exactly what it did.
-                std::ptr::write(bytes, 1);
-                std::ptr::write(bytes.add(1), 0);
-                std::ptr::write(bytes.add(2), 0x00);
-                std::ptr::write(bytes.add(3), 0x80);
-            }
-            // SAFETY: writable out-parameter.
-            unsafe { std::ptr::write(descriptor_size_out, 4) };
-        } else {
-            // SAFETY: writable out-parameter.
-            unsafe { std::ptr::write(descriptor_size_out, 4) };
-        }
+        // **Two-phase contract**: on a size query the caller wants only the required size and must not get a byte written into
+        // its buffer. `0` means "no explicit security information", which is the truth for a workspace-backed volume and the
+        // one answer that needs no buffer at all.
+        // SAFETY: writable out-parameter, checked non-null above.
+        unsafe { std::ptr::write(descriptor_size_out, 0) };
     }
+    let _ = descriptor_out;
     0
 }
