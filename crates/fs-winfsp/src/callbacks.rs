@@ -125,24 +125,38 @@ pub unsafe fn read_directory_shell(
     }
     // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
     let entry = unsafe { &*context.cast::<EntryContext>() };
-    let entries = match (adapter, LIST.get()) {
-        // A live mount with a configured lister.
-        (Some(_), Some(list)) => list(entry.file_id),
-        // No mount, or nothing configured: an empty page. A miss must never fall back to another mount's lister (352).
-        _ => Vec::new(),
+    // The listing comes from **this mount's backend**, not from an injected hook: `DirEntry` now carries the entry's id, so its
+    // metadata is one `get_info` away (367 — the field exists exactly so this derivation stops being impossible).
+    let entries = match adapter {
+        Some(adapter) => list_entries(adapter, entry.file_id),
+        // No mount: an empty page. A miss must never fall back to another mount's listing (352).
+        None => Vec::new(),
     };
     // SAFETY: the caller's contract covers every pointer handed through.
     unsafe { read_directory_from(&entries, buffer, marker, length, bytes_transferred) }
 }
 
-/// Why the entries are still taken from the injected `LIST` hook and **not** derived from the adapter:
+/// One directory as `ListEntry`s, taken from the mount's own backend.
 ///
-/// `ops::DirEntry` carries `{ name, kind }` — **no `file_id`** — while a dirent record needs the entry's metadata, which the backend
-/// answers by id. So deriving needs `DirEntry::file_id` added at the trait level (and in both backends) — a backend change, not a
-/// shell change. Recorded as a finding rather than worked around: inventing an id here would put a wrong number into every
-/// listing.
-#[allow(dead_code)]
-fn directory_entries_cannot_yet_be_derived_from_the_mount() {}
+/// A name that the backend cannot answer metadata for is **left out** rather than listed with invented numbers: a dirent record
+/// with a made-up size/timestamp is worse than a missing row, because nothing downstream can tell the difference.
+fn list_entries(adapter: &crate::DynAdapter, dir_id: u64) -> Vec<ListEntry> {
+    let Ok(items) = adapter.backend().read_dir(dir_id) else {
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let info = adapter.backend().get_info(item.file_id).ok()?;
+            Some((
+                String::from_utf8_lossy(&item.name)
+                    .encode_utf16()
+                    .collect::<Vec<u16>>(),
+                info,
+            ))
+        })
+        .collect()
+}
 
 /// The `ReadDirectory` body with the entries handed in — the resume, the framing and the count are all here.
 ///
@@ -314,6 +328,37 @@ pub unsafe fn get_volume_info_for(
     // SAFETY: `out` is non-null and large enough for `VolumeInfo`, per the check above.
     unsafe { std::ptr::write(out.cast::<VolumeInfo>(), volume) };
     0
+}
+
+/// The `GetFileInfo` **shell**: the metadata comes from **this mount's backend**, not from a process-wide lookup hook.
+///
+/// # Safety
+///
+/// `context` must point to an `EntryContext` owned by this frontend, and `out` must be valid for writes of
+/// `size_of::<FileInfo>()` bytes.
+pub unsafe fn get_file_info_shell(
+    adapter: Option<&crate::DynAdapter>,
+    context: *const c_void,
+    out: *mut c_void,
+) -> i32 {
+    if context.is_null() || out.is_null() {
+        return NOT_IMPLEMENTED;
+    }
+    // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
+    let entry = unsafe { &*context.cast::<EntryContext>() };
+    // No mount ⇒ no metadata. `None` in the type is the refusal, not a reason to ask somebody else's configuration (352).
+    let info = adapter.and_then(|adapter| adapter.backend().get_info(entry.file_id).ok());
+    let Some(info) = info else {
+        return NOT_IMPLEMENTED;
+    };
+    match crate::file_info::file_info(&info) {
+        Ok(record) => {
+            // SAFETY: `out` is non-null; the caller guarantees room for `FileInfo`.
+            unsafe { std::ptr::write(out.cast::<FileInfo>(), record) };
+            0
+        }
+        Err(_) => NOT_IMPLEMENTED,
+    }
 }
 
 /// The `GetFileInfo` body: looks the entry up and writes its record.

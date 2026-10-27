@@ -160,12 +160,13 @@ mod platform {
 
     /// `GetFileInfo`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PVOID FileInfo)` — `winfsp.h:507`.
     unsafe extern "system" fn file_info_trampoline(
-        _file_system: *mut c_void,
+        file_system: *mut c_void,
         file_context: *mut c_void,
         file_info: *mut c_void,
     ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
         // SAFETY: `file_context` is the `EntryContext` this frontend allocated, and `file_info` is WinFsp's output buffer.
-        unsafe { crate::callbacks::get_file_info(file_context, file_info) }
+        unsafe { crate::callbacks::get_file_info_shell(adapter.as_deref(), file_context, file_info) }
     }
 
     /// `ReadDirectory`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PVOID Buffer, UINT64 Offset, PWSTR Pattern, PWSTR Marker,

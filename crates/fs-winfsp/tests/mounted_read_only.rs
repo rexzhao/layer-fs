@@ -47,8 +47,11 @@ fn list(dir_id: u64) -> Vec<(Vec<u16>, NodeInfo)> {
 }
 
 fn lookup(file_id: u64) -> Option<NodeInfo> {
+    // The ids the listing declares **must** resolve here, because the shell now asks the backend for each entry's metadata by id
+    // (the listing no longer carries the record inline). Before this, the fixture could declare entries whose metadata its own
+    // lookup did not know, and nothing noticed — a listing that carries its own `NodeInfo` hides that inconsistency.
     // The root (**id 0**) must resolve too: `Create` is called for `\` first, and without it the volume has no root to open.
-    (file_id == 0 || file_id == 7).then(|| node(file_id))
+    (file_id == 0 || file_id == 1 || file_id == 2 || file_id == 7).then(|| node(file_id))
 }
 
 #[test]
