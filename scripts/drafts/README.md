@@ -959,3 +959,19 @@ What is left between the two bodies:
 
 The decisive next run is a copy of the original body **verbatim** under a new test name: if that passes alone, the delta is one of (2)/(3) and can be
 bisected line by line; if it fails, the name/filter is somehow involved and the whole comparison needs re-examining.
+
+## Bisect (507): the body is fine — what my probe *omitted* is not
+
+```
+verbatim copy of the working body, new name, run alone   -> PASS  (X: and V:)
+same copy + a print of both PathBufs *before* the write  -> PASS
+same copy renamed to the name that used to fail          -> PASS
+```
+
+So the failing shape is not "a print before the write", not the test name, not the letter, not the path construction. What the failing body did **not** do is the
+rest of the working body: **read the bytes back, `set_len`, remove the file**. And it did one thing the working body does not: **two writes to the same
+path in a row**.
+
+The next single change is therefore: take the verbatim copy and delete its `read`/`set_len`/`remove`, leaving only the write. If that fails, "a mount whose
+first and only operation is a create+write" is the shape, and the defect is in how the very first operation after mount is served — which is exactly the
+half-alive mount QA saw, with the extra detail that the *content* of the first operation decides it.
