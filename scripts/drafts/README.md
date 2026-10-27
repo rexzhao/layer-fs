@@ -1146,3 +1146,27 @@ with normalisation AND the `NotFound` fallback removed : still FAIL
 So the fallback is not the cause; the normalisation is. Reverted to keep the tree green — the direction is right, the **scope** is wrong: `Path::new` is used by
 tests and by production alike, and normalising there changes what every consumer sees at once. The next attempt should normalise where the FSD's bytes enter
 (the shells in `callbacks.rs`, one place per door) and leave `Path` a plain value, so the blast radius is the mount and not the whole crate.
+
+## 06/07 through a real-backend mount (521): 06 is fine, 07 has **no rename IRP at all**
+
+```
+06 rmdir non-empty = Err(os 145 DirectoryNotEmpty) ; directory still there   ← correct, does not reproduce
+07 old exists = true ; new exists = true                                     ← my probe's own reading
+```
+
+The debug log for the same run says something different from my probe about 07:
+
+```
+>>Create "\l2-renamed" FILE_OPEN   <<c0000034        ← Rust's rename checks the destination first
+>>Create "\l2-file"    FILE_OPEN   <<0  FileInfo{FileAttributes=80, FileSize=0:1}
+>>QueryInformation / Cleanup / Close
+>>Create "\l2-renamed" FILE_OPEN   <<c0000034        ← and after the "rename", still missing
+>>SetInformation ...   (only two, both `[Disposition] Delete`, from class 06)
+```
+
+So the FSD dispatched **no rename at all**, the destination is still absent for the file system, and yet the probe printed `new exists = true`. Those two
+cannot both be right, and the probe is the less trustworthy of the two: the next step is to print the **result of `std::fs::rename`** and re-ask with
+`symlink_metadata` instead of `Path::exists`, rather than to treat "07 leaves the old name" as established.
+
+Backend-level rename is clean (checked directly, no mount): `old = NotFound`, `new = Ok(1)`, listing `["l2-renamed"]` — so whatever 07 is, it is in the
+mount layer or in the probe.
