@@ -309,11 +309,24 @@ mod platform {
 
     /// `Close`: `(FSP_FILE_SYSTEM*, PVOID FileContext)` — `winfsp.h:420`.
     unsafe extern "system" fn close_trampoline(
-        _file_system: *mut c_void,
+        file_system: *mut c_void,
         file_context: *mut c_void,
     ) {
-        // SAFETY: the context came from `open`, and WinFsp calls `Close` once per open.
-        unsafe { crate::callbacks::close(file_context) }
+        let adapter = crate::registry::mounts().get(file_system as usize);
+        // SAFETY: the context came from `open_like`, and WinFsp calls `Close` once per open.
+        unsafe { crate::callbacks::close_shell(adapter.as_deref(), file_context) }
+    }
+
+    /// `Cleanup`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PWSTR FileName, ULONG Flags)` — `winfsp.h:410`, slot **6**.
+    unsafe extern "system" fn cleanup_trampoline(
+        file_system: *mut c_void,
+        file_context: *mut c_void,
+        _file_name: *const u16,
+        flags: u32,
+    ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
+        // SAFETY: WinFsp's contract for this callback.
+        unsafe { crate::callbacks::cleanup_shell(adapter.as_deref(), file_context, flags) }
     }
 
     /// `GetSecurityByName`: `(FSP_FILE_SYSTEM*, PWSTR FileName, PUINT32 Attributes, PSECURITY_DESCRIPTOR,
@@ -528,6 +541,11 @@ mod platform {
                 unsafe extern "system" fn(*mut c_void, *mut c_void),
                 unsafe extern "C" fn() -> i32,
             >(closing));
+            // `Cleanup` — slot **6**, before `Close`: phase one of the two-phase deletion.
+            interface.slots[slot::CLEANUP] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *const u16, u32) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(cleanup_trampoline));
             interface.slots[slot::READ_DIRECTORY] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(
                     *mut c_void,

@@ -29,6 +29,9 @@ pub const NOT_IMPLEMENTED: i32 = 0xC000_0010u32 as i32;
 pub struct EntryContext {
     /// The entry the handle names.
     pub file_id: u64,
+    /// The adapter-side handle: `Cleanup`/`Close` act on the **entry that was opened**, not on whatever the name points at when
+    /// they arrive (a rename between open and close is the case that makes the difference visible).
+    pub handle: crate::handles::HandleId,
 }
 
 /// Where the volume answer comes from: configuration set before the mount starts.
@@ -466,10 +469,12 @@ unsafe fn open_like(
     // A **directory** is different: `mkdir` is the only verb that can make one, so the decision is taken here and said out loud.
     let outcome = match make_verb(disposition, wants_directory) {
         MakeVerb::Directory => match adapter.backend().mkdir(path.as_bytes()) {
+            // A directory made by `mkdir` has **no binding from the backend** (the trait answers only an id), so a pending deletion of
+            // a directory would have no name to remove. Recorded as a gap: opening a directory by path is the missing trait capability.
             Ok(file_id) => adapter
                 .backend()
                 .get_info(file_id)
-                .map(|_| file_id)
+                .map(|_| (file_id, None))
                 .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
             // The name is taken: `FILE_CREATE` means **fail if it exists**, and that is a collision, not a silent open.
             Err(crate::ops::OpsError::NameCollision) => Err(OURS_OBJECT_NAME_COLLISION),
@@ -478,11 +483,12 @@ unsafe fn open_like(
         MakeVerb::File => adapter
             .backend()
             .create_or_open(path.as_bytes(), disposition)
-            .map(|outcome| outcome.file_id)
+            // The backend's own answer carries where the name lives — that is the binding `remove_at` will guard with.
+            .map(|outcome| (outcome.file_id, Some(outcome.binding)))
             .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
     };
-    let file_id = match outcome {
-        Ok(file_id) => file_id,
+    let (file_id, binding) = match outcome {
+        Ok(pair) => pair,
         Err(status) => {
             OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return status;
@@ -498,7 +504,13 @@ unsafe fn open_like(
         OPEN_EXITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
     };
-    let context = Box::into_raw(Box::new(EntryContext { file_id }));
+    // Register the handle **after** the record is built: a refused open must not leave a handle behind, and the table is the thing
+    // `Cleanup`/`Close` will act on. Coming last also means the earlier refusal paths need no undo.
+    let Ok(handle) = adapter.open_handle(file_id, binding) else {
+        OPEN_EXITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return NOT_IMPLEMENTED;
+    };
+    let context = Box::into_raw(Box::new(EntryContext { file_id, handle }));
     CONTEXTS_ALLOCATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: both out-pointers were checked non-null and are valid for their writes per the caller's contract.
     unsafe {
@@ -637,6 +649,83 @@ pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 /// # Safety
 ///
 /// `context` must have come from [`open`] and must not be used afterwards.
+/// `FSP_CLEANUP_DELETE` — `winfsp.h` (`Cleanup` flags): "delete the file when the last handle is closed".
+pub const FSP_CLEANUP_DELETE: u32 = 0x0000_0001;
+
+/// The `Cleanup` **shell** — phase one of two-phase deletion: **mark**, do not delete.
+///
+/// Windows calls `Cleanup` when the **last user handle** to the entry goes away, and calls `Close` afterwards. The deletion itself
+/// therefore belongs to `Close`, because only then is the adapter's own handle count the last word — and that ordering is what makes
+/// "delete on the last close" true for the OS rather than for us.
+///
+/// # Safety
+///
+/// `context` must point to an `EntryContext` owned by this frontend.
+pub unsafe fn cleanup_shell(
+    adapter: Option<&crate::DynAdapter>,
+    context: *const c_void,
+    flags: u32,
+) -> i32 {
+    CLEANUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if context.is_null() {
+        return OURS_INVALID_PARAMETER;
+    }
+    if flags & FSP_CLEANUP_DELETE == 0 {
+        // A cleanup for any other reason (a handle simply closing) has nothing to mark.
+        return 0;
+    }
+    // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
+    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(adapter) = adapter else {
+        return NOT_IMPLEMENTED;
+    };
+    match adapter.set_delete(entry.handle) {
+        Ok(()) => 0,
+        // No `DELETE` access on this handle, or the handle is unknown: a typed refusal, not a silent success that would leave the
+        // caller believing the entry is going away.
+        Err(_) => NOT_IMPLEMENTED,
+    }
+}
+
+/// How many times `Cleanup` was entered.
+static CLEANUP_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times `Cleanup` was entered.
+#[must_use]
+pub fn cleanup_call_count() -> usize {
+    CLEANUP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The `Close` **shell**: releases the handle, and performs the entry's removal **once** if it was marked.
+///
+/// The `Box<EntryContext>` is freed in every path — a `Close` that fails must still not leak the context, because the caller has no
+/// way to retry it.
+///
+/// # Safety
+///
+/// Same contract as [`close`]: `context` came from `Box::into_raw` in `open_like`, and `Close` happens once per open.
+pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_void) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: the caller guarantees this pointer came from `Box::into_raw` in `open_like`.
+    let entry = unsafe { Box::from_raw(context.cast::<EntryContext>()) };
+    if let Some(adapter) = adapter {
+        // The adapter performs the single `remove_at` (outside its table lock, see `Adapter::close`). A failure here is recorded by
+        // the backend's own error, and the context is freed either way.
+        let _ = adapter.close(entry.handle);
+    }
+    CONTEXTS_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `Close` body **without** an adapter: frees the `FileContext` and nothing else.
+///
+/// Kept for the paths that have no mount to ask (and for the direct tests that exercise the allocation contract alone); production
+/// goes through [`close_shell`], which also releases the handle and performs the removal.
+///
+/// # Safety
+///
+/// `context` must have come from `open_like` and must not be used afterwards.
 pub unsafe fn close(context: *mut c_void) {
     if context.is_null() {
         return;

@@ -27,6 +27,15 @@ impl HandleId {
     pub fn get(self) -> u64 {
         self.0
     }
+
+    /// Rebuilds a handle token from its raw value.
+    ///
+    /// Needed by the callbacks' direct tests, which build an `EntryContext` by hand. **A forged token cannot do any harm**: it names
+    /// no open handle, so every table lookup refuses it — the token is an index, not an authority.
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 /// One open handle.

@@ -163,7 +163,10 @@ impl WorkspaceOps for Shared {
 }
 
 fn run(adapter: &DynAdapter, new_size: u64) -> (i32, FileInfo) {
-    let context = EntryContext { file_id: 9 };
+    let context = EntryContext {
+        file_id: 9,
+        handle: fs_winfsp::handles::HandleId::from_raw(1),
+    };
     let mut out = FileInfo::zeroed();
     let status = unsafe {
         set_file_size_shell(
@@ -257,7 +260,10 @@ fn a_null_context_or_buffer_is_refused_before_anything_else() {
 #[test]
 fn no_mount_is_refused_and_nothing_is_written() {
     let mut out = FileInfo::zeroed();
-    let context = EntryContext { file_id: 9 };
+    let context = EntryContext {
+        file_id: 9,
+        handle: fs_winfsp::handles::HandleId::from_raw(1),
+    };
     let status = unsafe {
         set_file_size_shell(
             None,

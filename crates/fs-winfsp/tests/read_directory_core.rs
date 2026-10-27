@@ -17,7 +17,10 @@ use fs_winfsp::Kind;
 /// `contains == false` assertion argues cannot happen at teardown, and the counter is what makes it visible if it does.
 #[test]
 fn the_shell_lists_nothing_when_there_is_no_mount() {
-    let entry = fs_winfsp::callbacks::EntryContext { file_id: 0 };
+    let entry = fs_winfsp::callbacks::EntryContext {
+        file_id: 0,
+        handle: fs_winfsp::handles::HandleId::from_raw(0),
+    };
     let context = std::ptr::addr_of!(entry).cast::<c_void>();
     let mut buffer = vec![0u8; 4096];
     let mut transferred = u32::MAX;

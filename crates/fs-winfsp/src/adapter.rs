@@ -70,7 +70,15 @@ pub struct Adapter<B: WorkspaceOps> {
 impl<B: WorkspaceOps> std::fmt::Debug for Adapter<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Adapter")
-            .field("handles", &self.handles.lock().expect("handle table").handles_of(0).len())
+            .field(
+                "handles",
+                &self
+                    .handles
+                    .lock()
+                    .expect("handle table")
+                    .handles_of(0)
+                    .len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -183,12 +191,47 @@ impl<B: WorkspaceOps> Adapter<B> {
             outcome.binding.0,
             outcome.binding.1.clone(),
         );
-        let handle = self
-            .handles
-            .lock()
-            .expect("handle table")
-            .open(outcome.file_id, desired, share, delete_on_close)?;
+        let handle = self.handles.lock().expect("handle table").open(
+            outcome.file_id,
+            desired,
+            share,
+            delete_on_close,
+        )?;
         Ok((handle, outcome.file_id, outcome.kind))
+    }
+
+    /// Registers a handle on an entry **without touching the backend**.
+    ///
+    /// `open` cannot be used for this: it resolves the path again (`create_or_open`), and a second resolution is a second answer to a
+    /// question already answered. The callbacks therefore ask the backend once and register the result here.
+    ///
+    /// **Sharing is not enforced yet** (`ALL_BITS` on both sides): the table has the entry, so `Cleanup`/`Close` can act on an
+    /// **identity**, but the 9-cell share rule belongs to its own delivery (card U3) and arrives with its own criterion. Saying so here
+    /// is what keeps "the table is wired" from being read as "sharing is implemented".
+    ///
+    /// # Errors
+    ///
+    /// [`OpsError::DeletePending`] when the entry is already delete-pending.
+    pub fn open_handle(
+        &self,
+        file_id: u64,
+        binding: Option<(u64, Vec<u8>)>,
+    ) -> OpsResult<HandleId> {
+        let mut table = self.handles.lock().expect("handle table");
+        if table.is_pending(file_id) {
+            return Err(OpsError::DeletePending);
+        }
+        // The binding is what `remove_at` will need at the last close. Without one the entry can still be opened and closed, but a
+        // pending deletion would have no name to remove — so it is recorded here, from the backend's own answer, never guessed.
+        if let Some((parent, name)) = binding {
+            table.remember_binding(file_id, parent, name);
+        }
+        table.open(
+            file_id,
+            fs_windows::share::Mask::ALL_BITS,
+            fs_windows::share::Mask::ALL_BITS,
+            false,
+        )
     }
 
     /// Reads through a handle.
@@ -251,7 +294,10 @@ impl<B: WorkspaceOps> Adapter<B> {
     ///
     /// [`OpsError::AccessDenied`] without `DELETE` access, [`OpsError::NotFound`] for an unknown handle.
     pub fn set_delete(&self, handle: HandleId) -> OpsResult<()> {
-        self.handles.lock().expect("handle table").set_delete(handle)
+        self.handles
+            .lock()
+            .expect("handle table")
+            .set_delete(handle)
     }
 
     /// Closes a handle; on the last one of a pending entry the entry is removed **once**, here.
@@ -272,9 +318,9 @@ impl<B: WorkspaceOps> Adapter<B> {
             match table.close(handle)? {
                 CloseEffect::Nothing => None,
                 CloseEffect::Remove(file_id) => {
-                    let (parent, name) = table
-                        .binding_of(file_id)
-                        .ok_or_else(|| OpsError::InvalidRecord(format!("no binding for {file_id}")))?;
+                    let (parent, name) = table.binding_of(file_id).ok_or_else(|| {
+                        OpsError::InvalidRecord(format!("no binding for {file_id}"))
+                    })?;
                     Some((parent, name, file_id))
                 }
             }
@@ -284,10 +330,7 @@ impl<B: WorkspaceOps> Adapter<B> {
             Some((parent, name, file_id)) => {
                 // Outside the lock, deliberately.
                 self.ops.remove_at(parent, &name, file_id)?;
-                self.handles
-                    .lock()
-                    .expect("handle table")
-                    .removed(file_id);
+                self.handles.lock().expect("handle table").removed(file_id);
                 Ok(())
             }
         }
