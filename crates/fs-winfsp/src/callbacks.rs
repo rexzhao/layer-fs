@@ -1502,13 +1502,24 @@ pub unsafe fn get_security_by_name_shell(
         return NOT_IMPLEMENTED;
     };
     // `Open` is the read-only disposition that **does not create** — the right question for "does this name exist".
-    let Ok(outcome) = adapter.backend().create_or_open(
+    //
+    // **A directory answers `NotADirectory` to the file door**, and reporting that as "name not found" is how a *parent segment* came to look
+    // missing: Windows then mapped the whole operation to `ERROR_PATH_NOT_FOUND` (`os error 3`), and every child under a perfectly good directory
+    // failed. So the directory door gets the second attempt here too — the same fallback `open_like` uses, for the same reason.
+    let resolved = match adapter.backend().create_or_open(
         path.as_bytes(),
         fs_semantics::disposition::Disposition::Open,
-    ) else {
+    ) {
+        Ok(outcome) => Some(outcome.file_id),
+        Err(crate::ops::OpsError::NotADirectory) => {
+            adapter.backend().open_dir(path.as_bytes()).ok()
+        }
+        Err(_) => None,
+    };
+    let Some(file_id) = resolved else {
         return OURS_OBJECT_NAME_NOT_FOUND;
     };
-    let Ok(node) = adapter.backend().get_info(outcome.file_id) else {
+    let Ok(node) = adapter.backend().get_info(file_id) else {
         return OURS_OBJECT_NAME_NOT_FOUND;
     };
     // SAFETY: the caller's contract covers all three out-pointers.
