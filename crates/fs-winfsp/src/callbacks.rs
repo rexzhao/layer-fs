@@ -210,6 +210,26 @@ pub fn configure_paths(resolve: fn(&str) -> Option<u64>) -> bool {
     RESOLVE.set(resolve).is_ok()
 }
 
+/// Which early exit `open` took, counted per branch.
+///
+/// The three exits all return the same status code, so a status cannot say which one fired — the counters can. Order:
+/// `(no_resolver, no_entry, bad_record)`.
+static OPEN_EXITS: [std::sync::atomic::AtomicUsize; 3] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// How many times each early exit of `open` was taken.
+#[must_use]
+pub fn open_exit_counts() -> (usize, usize, usize) {
+    (
+        OPEN_EXITS[0].load(std::sync::atomic::Ordering::Relaxed),
+        OPEN_EXITS[1].load(std::sync::atomic::Ordering::Relaxed),
+        OPEN_EXITS[2].load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// The `Open` body: resolve the path, hand WinFsp a `Box<EntryContext>`, and fill its `FileInfo`.
 ///
 /// Deliberately shallow: the path is resolved once by the configured resolver, and **no recursion or caching** happens here.
@@ -233,16 +253,20 @@ pub unsafe fn open(
     let slice = unsafe { std::slice::from_raw_parts(file_name, units) };
     let path = String::from_utf16_lossy(slice);
     let Some(resolve) = RESOLVE.get() else {
+        OPEN_EXITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
     };
     let Some(file_id) = resolve(&path) else {
+        OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The code WinFsp itself uses for "that name is not here" — not one of our own inventions.
         return OURS_OBJECT_NAME_NOT_FOUND;
     };
     let Some(node) = LOOKUP.get().and_then(|lookup| lookup(file_id)) else {
+        OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return OURS_OBJECT_NAME_NOT_FOUND;
     };
     let Ok(record) = crate::file_info::file_info(&node) else {
+        OPEN_EXITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
     };
     let context = Box::into_raw(Box::new(EntryContext { file_id }));

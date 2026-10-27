@@ -152,6 +152,12 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
     );
     eprintln!("probe hits = {}", report.probe_hits);
     eprintln!(
+        "open exits: no_resolver={} no_entry={} bad_record={}",
+        callbacks::open_exit_counts().0,
+        callbacks::open_exit_counts().1,
+        callbacks::open_exit_counts().2
+    );
+    eprintln!(
         "callbacks reached: volume_info={} security={} create={}",
         callbacks::volume_call_count(),
         callbacks::security_call_count(),
