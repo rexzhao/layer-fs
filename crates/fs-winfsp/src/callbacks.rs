@@ -229,6 +229,123 @@ pub unsafe fn get_volume_info_for(
 /// the caller believe it worked (382 — the write-side mirror of "zero records read as an empty file").
 ///
 /// # Safety
+/// Whether `ptr` is writable for `len` bytes according to the OS, not according to our hopes.
+///
+/// **Why this exists**: a heap-corruption abort (`0xc0000374`) names the *abort* point, not the *fault* point — the two can be dozens of
+/// calls apart, so a debug trace only narrows the neighbourhood. This check asks the operating system directly, right before the write,
+/// and turns "somebody later noticed the heap was broken" into "this callback, this pointer, this length".
+///
+/// It is cheap enough to keep on: `VirtualQuery` is a single syscall, the callbacks that use it write at most a few dozen bytes, and a
+/// write that fails this check is a **bug in the caller or in our own argument reading**, never a normal runtime event.
+#[cfg(windows)]
+fn write_is_safe(ptr: *const c_void, len: usize) -> bool {
+    use std::ffi::c_void as Cvoid;
+    #[repr(C)]
+    struct MemoryBasicInformation {
+        base_address: *mut Cvoid,
+        allocation_base: *mut Cvoid,
+        allocation_protect: u32,
+        partition_id: u16,
+        _pad: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn VirtualQuery(
+            address: *const Cvoid,
+            buffer: *mut MemoryBasicInformation,
+            length: usize,
+        ) -> usize;
+    }
+    const MEM_COMMIT: u32 = 0x1000;
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_WRITECOPY: u32 = 0x08;
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+    const PAGE_GUARD: u32 = 0x100;
+
+    if ptr.is_null() || len == 0 {
+        return false;
+    }
+    let mut info = MemoryBasicInformation {
+        base_address: std::ptr::null_mut(),
+        allocation_base: std::ptr::null_mut(),
+        allocation_protect: 0,
+        partition_id: 0,
+        _pad: 0,
+        region_size: 0,
+        state: 0,
+        protect: 0,
+        kind: 0,
+    };
+    // SAFETY: the pointer is only inspected; the structure is ours and fully initialised.
+    let asked = unsafe {
+        VirtualQuery(
+            ptr,
+            &mut info,
+            std::mem::size_of::<MemoryBasicInformation>(),
+        )
+    };
+    if asked == 0 || info.state != MEM_COMMIT || info.protect & PAGE_GUARD != 0 {
+        return false;
+    }
+    let writable = matches!(
+        info.protect & 0xFF,
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    );
+    if !writable {
+        return false;
+    }
+    let start = info.base_address as usize;
+    let end = start.saturating_add(info.region_size);
+    let at = ptr as usize;
+    at >= start && at.saturating_add(len) <= end
+}
+
+/// Writes a `FileInfo` **only after asking the OS whether the pointer can take it**.
+///
+/// Returns `false` when the pointer is not writable for the whole structure; the caller refuses the call and counts it, so a bad output
+/// pointer becomes a named refusal instead of a heap that is discovered to be broken much later.
+///
+/// # Safety
+///
+/// `out` is treated as opaque: it is validated before any write, and never dereferenced otherwise.
+unsafe fn write_file_info(out: *mut FileInfo, record: FileInfo) -> bool {
+    if !write_is_safe(out.cast::<c_void>(), std::mem::size_of::<FileInfo>()) {
+        BAD_OUTPUT_POINTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "file info: refusing to write {} bytes to {out:p} — not a writable region the OS knows about",
+            std::mem::size_of::<FileInfo>()
+        );
+        return false;
+    }
+    // SAFETY: the pointer was just checked to be writable for exactly this many bytes.
+    unsafe { std::ptr::write(out, record) };
+    true
+}
+
+/// How many output pointers failed the OS-level check.
+static BAD_OUTPUT_POINTERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times an output pointer was refused because the OS said it was not writable.
+#[must_use]
+pub fn bad_output_pointer_count() -> usize {
+    BAD_OUTPUT_POINTERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// On non-Windows there is no `VirtualQuery`: the check is a no-op so the shells stay compilable and the criterion does not silently
+/// disappear on the platform that never had the crash.
+#[cfg(not(windows))]
+fn write_is_safe(_ptr: *const c_void, _len: usize) -> bool {
+    true
+}
+
+/// The `SetFileSize` **shell**: ask the mount's backend to resize, then answer with the entry's **current** record.
+///
+/// # Safety
 ///
 /// `context` must point to an `EntryContext` owned by this frontend; `out` must be valid for writes of `size_of::<FileInfo>()`.
 pub unsafe fn set_file_size_shell(
@@ -256,7 +373,9 @@ pub unsafe fn set_file_size_shell(
                     match crate::file_info::file_info(&node) {
                         Ok(record) => {
                             // SAFETY: `out` is non-null and the caller guarantees room for `FileInfo`.
-                            unsafe { std::ptr::write(out.cast::<FileInfo>(), record) };
+                            if !unsafe { write_file_info(out, record) } {
+                                return OURS_INVALID_PARAMETER;
+                            }
                             0
                         }
                         Err(_) => NOT_IMPLEMENTED,
@@ -284,8 +403,9 @@ pub unsafe fn set_file_size_shell(
     }
     match crate::file_info::file_info(&node) {
         Ok(record) => {
-            // SAFETY: `out` is non-null; the caller guarantees room for `FileInfo`.
-            unsafe { std::ptr::write(out.cast::<FileInfo>(), record) };
+            if !unsafe { write_file_info(out, record) } {
+                return OURS_INVALID_PARAMETER;
+            }
             0
         }
         Err(_) => NOT_IMPLEMENTED,
@@ -337,8 +457,9 @@ pub unsafe fn get_file_info_shell(
     };
     match crate::file_info::file_info(&info) {
         Ok(record) => {
-            // SAFETY: `out` is non-null; the caller guarantees room for `FileInfo`.
-            unsafe { std::ptr::write(out.cast::<FileInfo>(), record) };
+            if !unsafe { write_file_info(out.cast::<FileInfo>(), record) } {
+                return OURS_INVALID_PARAMETER;
+            }
             0
         }
         Err(_) => NOT_IMPLEMENTED,
@@ -886,8 +1007,10 @@ pub unsafe fn overwrite_shell(
     if !out.is_null() {
         match crate::file_info::file_info(&after) {
             Ok(record) => {
-                // SAFETY: `out` is non-null and the caller guarantees room for `FileInfo`.
-                unsafe { std::ptr::write(out.cast::<FileInfo>(), record) };
+                // Guarded: a bad pointer is refused **here**, not discovered by the heap allocator much later.
+                if !unsafe { write_file_info(out, record) } {
+                    return OURS_INVALID_PARAMETER;
+                }
             }
             Err(_) => return NOT_IMPLEMENTED,
         }
@@ -994,8 +1117,10 @@ pub unsafe fn write_shell(
     if !out.is_null() {
         match crate::file_info::file_info(&after) {
             Ok(record) => {
-                // SAFETY: `out` is non-null and the caller guarantees room for `FileInfo`.
-                unsafe { std::ptr::write(out.cast::<FileInfo>(), record) };
+                // Guarded: a bad pointer is refused **here**, not discovered by the heap allocator much later.
+                if !unsafe { write_file_info(out, record) } {
+                    return OURS_INVALID_PARAMETER;
+                }
             }
             Err(_) => return NOT_IMPLEMENTED,
         }
