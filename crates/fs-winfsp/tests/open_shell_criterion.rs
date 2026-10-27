@@ -14,6 +14,7 @@ use fs_semantics::disposition::Disposition;
 use fs_winfsp::abi::FileInfo;
 use fs_winfsp::callbacks::{open_shell, OURS_OBJECT_NAME_NOT_FOUND};
 use fs_winfsp::mock::MockBackend;
+use fs_winfsp::ops::Path;
 use fs_winfsp::ops::{DynOps, WorkspaceOps};
 use fs_winfsp::DynAdapter;
 
@@ -66,7 +67,7 @@ fn adapter_with_file() -> DynAdapter {
     let adapter: DynAdapter = DynAdapter::new(Box::new(MockBackend::new()) as DynOps);
     adapter
         .backend()
-        .create_or_open(b"/alpha.txt", Disposition::Create)
+        .create_or_open(&Path::new(b"/alpha.txt"), Disposition::Create)
         .expect("create the file through the same backend the shell will use");
     adapter
         .backend()

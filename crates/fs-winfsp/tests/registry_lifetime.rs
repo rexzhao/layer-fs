@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use fs_winfsp::ops::Path;
 use fs_winfsp::registry::Registry;
 use fs_winfsp::{Adapter, MockBackend};
 
@@ -258,9 +259,9 @@ fn dir_outcome_pairs_the_identity_with_the_binding() {
     use fs_winfsp::ops::WorkspaceOps;
 
     let backend = MockBackend::new();
-    let dir = backend.mkdir(b"/d").expect("mkdir");
+    let dir = backend.mkdir(&Path::new(b"/d")).expect("mkdir");
     let outcome = backend
-        .dir_binding(b"/d")
+        .dir_binding(&Path::new(b"/d"))
         .expect("a directory that exists has a binding");
     assert_eq!(
         outcome.id, dir,
@@ -270,7 +271,7 @@ fn dir_outcome_pairs_the_identity_with_the_binding() {
     assert_eq!(outcome.binding.1, b"d".to_vec(), "the raw name bytes");
 
     assert!(
-        backend.dir_binding(b"/nope").is_none(),
+        backend.dir_binding(&Path::new(b"/nope")).is_none(),
         "a path that names nothing has no binding — not a name that would fail later"
     );
 }

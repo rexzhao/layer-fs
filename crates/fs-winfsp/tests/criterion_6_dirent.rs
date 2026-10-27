@@ -10,11 +10,12 @@
 //! tests below show `A` and `a` both survive.
 
 use fs_semantics::disposition::Disposition;
+use fs_winfsp::ops::Path;
 use fs_winfsp::{DirEntry, DirentCursor, Kind, MockBackend, WorkspaceOps};
 
 fn create(backend: &MockBackend, path: &[u8]) {
     backend
-        .create_or_open(path, Disposition::Create)
+        .create_or_open(&Path::new(path), Disposition::Create)
         .expect("create");
 }
 
@@ -22,7 +23,7 @@ fn create(backend: &MockBackend, path: &[u8]) {
 #[test]
 fn a_new_entry_created_after_the_first_read_does_not_appear() {
     let backend = MockBackend::new();
-    let dir = backend.mkdir(b"/d").expect("mkdir");
+    let dir = backend.mkdir(&Path::new(b"/d")).expect("mkdir");
     create(&backend, b"/d/one");
     create(&backend, b"/d/two");
 
@@ -61,7 +62,7 @@ fn a_new_entry_created_after_the_first_read_does_not_appear() {
 #[test]
 fn later_pages_are_cut_from_the_same_snapshot() {
     let backend = MockBackend::new();
-    let dir = backend.mkdir(b"/d").expect("mkdir");
+    let dir = backend.mkdir(&Path::new(b"/d")).expect("mkdir");
     for name in [&b"/d/a"[..], b"/d/b", b"/d/c"] {
         create(&backend, name);
     }
@@ -100,7 +101,7 @@ fn later_pages_are_cut_from_the_same_snapshot() {
 #[test]
 fn an_unknown_marker_yields_an_empty_page_rather_than_restarting() {
     let backend = MockBackend::new();
-    let dir = backend.mkdir(b"/d").expect("mkdir");
+    let dir = backend.mkdir(&Path::new(b"/d")).expect("mkdir");
     create(&backend, b"/d/a");
     create(&backend, b"/d/b");
     let mut cursor = DirentCursor::new();
@@ -166,7 +167,7 @@ fn folding_orders_entries_without_merging_them() {
 #[test]
 fn the_cursor_does_not_synthesise_dot_entries() {
     let backend = MockBackend::new();
-    let dir = backend.mkdir(b"/d").expect("mkdir");
+    let dir = backend.mkdir(&Path::new(b"/d")).expect("mkdir");
     create(&backend, b"/d/only");
     let mut cursor = DirentCursor::new();
     let list = cursor.fill(backend.read_dir(dir).expect("read_dir"), |name| {
@@ -239,9 +240,11 @@ fn a_listing_carries_the_ids_the_backend_uses() {
 
     let backend = MockBackend::new();
     let file = backend
-        .create_or_open(b"/alpha.txt", Disposition::Create)
+        .create_or_open(&Path::new(b"/alpha.txt"), Disposition::Create)
         .expect("create the file");
-    let dir = backend.mkdir(b"/sub").expect("create the directory");
+    let dir = backend
+        .mkdir(&Path::new(b"/sub"))
+        .expect("create the directory");
 
     let entries = backend.read_dir(0).expect("list the root");
     assert_eq!(entries.len(), 2, "cell count: the two entries just made");
@@ -268,7 +271,7 @@ fn a_listing_carries_the_ids_the_backend_uses() {
             );
         } else {
             let by_name = backend
-                .create_or_open(b"/alpha.txt", Disposition::Open)
+                .create_or_open(&Path::new(b"/alpha.txt"), Disposition::Open)
                 .expect("resolve the file by name");
             assert_eq!(
                 by_name.file_id,

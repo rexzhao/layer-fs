@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use fs_semantics::disposition::Disposition;
 
 use crate::ops::{
-    Attributes, DirEntry, DirOutcome, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult,
+    Attributes, DirEntry, DirOutcome, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, Path,
     RenameOutcome, Times, WorkspaceOps,
 };
 
@@ -191,10 +191,10 @@ impl MockBackend {
     /// # Errors
     ///
     /// [`OpsError::NameCollision`] when the name is taken, [`OpsError::NotFound`] for a missing parent.
-    pub fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
+    pub fn mkdir(&self, path: &Path<'_>) -> OpsResult<u64> {
         let mut inner = self.inner.lock().expect("mock lock");
         let clock = inner.clock;
-        let components = split(path)?;
+        let components = split(path.display())?;
         let (parent, name) = parent_and_name(&inner, &components)?;
         if inner.children.contains_key(&(parent, name.folded.clone())) {
             return Err(OpsError::NameCollision);
@@ -339,10 +339,10 @@ impl Inner {
 }
 
 impl WorkspaceOps for MockBackend {
-    fn open_dir(&self, path: &[u8]) -> OpsResult<u64> {
+    fn open_dir(&self, path: &Path<'_>) -> OpsResult<u64> {
         // Resolve first, then check the kind: a file at that name is `NotADirectory`, not "not found" — the two must stay distinguishable, and
         // both backends answer the same way (the shared contract asserts it).
-        let id = MockBackend::resolve(self, path).ok_or(OpsError::NotFound)?;
+        let id = MockBackend::resolve(self, path.display()).ok_or(OpsError::NotFound)?;
         let inner = self.inner.lock().expect("mock lock");
         let kind = inner.live_node(id)?.kind;
         if kind != Kind::Directory {
@@ -351,11 +351,11 @@ impl WorkspaceOps for MockBackend {
         Ok(id)
     }
 
-    fn dir_binding(&self, path: &[u8]) -> Option<DirOutcome> {
+    fn dir_binding(&self, path: &Path<'_>) -> Option<DirOutcome> {
         // The parent segment is already walked by `parent_and_name` — this is the same resolution the doors do, so the binding cannot disagree
         // with the id they answered.
         let inner = self.inner.lock().expect("mock lock");
-        let components = split(path).ok()?;
+        let components = split(path.display()).ok()?;
         let (parent, name) = parent_and_name(&inner, &components).ok()?;
         // Walk the same components the binding used, so the identity cannot come from a different resolution than the name.
         let mut entry = ROOT;
@@ -368,17 +368,17 @@ impl WorkspaceOps for MockBackend {
         })
     }
 
-    fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
+    fn mkdir(&self, path: &Path<'_>) -> OpsResult<u64> {
         MockBackend::mkdir(self, path)
     }
 
-    fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
+    fn create_or_open(&self, path: &Path<'_>, disposition: Disposition) -> OpsResult<OpenOutcome> {
         let mut inner = self.inner.lock().expect("mock lock");
         inner
             .calls
-            .push(Call::CreateOrOpen(path.to_vec(), disposition));
+            .push(Call::CreateOrOpen(path.display().to_vec(), disposition));
         let clock = inner.clock;
-        let components = split(path)?;
+        let components = split(path.display())?;
         // **The root is answered here, once.** It has no parent segment, so `parent_and_name` cannot place it — and a caller that merely opens
         // the volume (`FILE_OPEN` on `\`) must succeed, or every later operation on that path dies with "path not found". A creating disposition
         // on the root is a collision: the root always exists.
@@ -618,14 +618,16 @@ impl WorkspaceOps for MockBackend {
         Ok(())
     }
 
-    fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome> {
+    fn rename(&self, from: &Path<'_>, to: &Path<'_>, replace: bool) -> OpsResult<RenameOutcome> {
         let mut inner = self.inner.lock().expect("mock lock");
-        inner
-            .calls
-            .push(Call::Rename(from.to_vec(), to.to_vec(), replace));
+        inner.calls.push(Call::Rename(
+            from.display().to_vec(),
+            to.display().to_vec(),
+            replace,
+        ));
         let clock = inner.clock;
-        let from_components = split(from)?;
-        let to_components = split(to)?;
+        let from_components = split(from.display())?;
+        let to_components = split(to.display())?;
         let (from_parent, from_name) = parent_and_name(&inner, &from_components)?;
         let (to_parent, to_name) = parent_and_name(&inner, &to_components)?;
         let source = inner

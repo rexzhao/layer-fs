@@ -264,7 +264,7 @@ pub trait WorkspaceOps {
     ///
     /// [`OpsError::NameCollision`] for `Create` on an existing name, [`OpsError::TypeMismatch`] where the disposition
     /// and the existing kind disagree.
-    fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome>;
+    fn create_or_open(&self, path: &Path<'_>, disposition: Disposition) -> OpsResult<OpenOutcome>;
 
     /// Creates a directory (and only a directory — `create_or_open` has no kind argument in this trait, because the
     /// adapter only ever needs "make a directory" or "make/open a file").
@@ -272,7 +272,7 @@ pub trait WorkspaceOps {
     /// # Errors
     ///
     /// [`OpsError::NameCollision`] when the name is taken, [`OpsError::NotFound`] for a missing parent.
-    fn mkdir(&self, path: &[u8]) -> OpsResult<u64>;
+    fn mkdir(&self, path: &Path<'_>) -> OpsResult<u64>;
 
     /// Opens an **existing** directory by path, answering its id.
     ///
@@ -288,7 +288,7 @@ pub trait WorkspaceOps {
     ///
     /// The default **refuses** rather than fabricating an answer: a fixture that never opens a directory by path says "I cannot", which is
     /// falsifiable the moment a caller tries it, and both real backends override this.
-    fn open_dir(&self, _path: &[u8]) -> OpsResult<u64> {
+    fn open_dir(&self, _path: &Path<'_>) -> OpsResult<u64> {
         Err(OpsError::NotFound)
     }
 
@@ -301,7 +301,7 @@ pub trait WorkspaceOps {
     ///
     /// The information is not new work for a backend: resolving the path already **walked the parent segment**. The default answers `None`,
     /// which means "this backend cannot tell", and a directory then behaves as it did before — an explicit gap rather than a guessed name.
-    fn dir_binding(&self, _path: &[u8]) -> Option<DirOutcome> {
+    fn dir_binding(&self, _path: &Path<'_>) -> Option<DirOutcome> {
         None
     }
 
@@ -375,7 +375,7 @@ pub trait WorkspaceOps {
     ///
     /// [`OpsError::NameCollision`] when `replace` is false and the name is taken, [`OpsError::NotEmpty`] for a
     /// non-empty destination directory, [`OpsError::TypeMismatch`] for a cross-type move.
-    fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome>;
+    fn rename(&self, from: &Path<'_>, to: &Path<'_>, replace: bool) -> OpsResult<RenameOutcome>;
 
     /// Removes one entry, guarded by the identity the caller believes is there.
     ///
@@ -410,15 +410,15 @@ pub trait WorkspaceOps {
 /// also make a boxed backend *auto-deref* into other traits; an explicit impl keeps "this is a backend" a statement rather than
 /// a side effect.
 impl WorkspaceOps for Box<dyn WorkspaceOps + Send + Sync> {
-    fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
+    fn create_or_open(&self, path: &Path<'_>, disposition: Disposition) -> OpsResult<OpenOutcome> {
         (**self).create_or_open(path, disposition)
     }
 
-    fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
+    fn mkdir(&self, path: &Path<'_>) -> OpsResult<u64> {
         (**self).mkdir(path)
     }
 
-    fn open_dir(&self, path: &[u8]) -> OpsResult<u64> {
+    fn open_dir(&self, path: &Path<'_>) -> OpsResult<u64> {
         (**self).open_dir(path)
     }
 
@@ -457,7 +457,7 @@ impl WorkspaceOps for Box<dyn WorkspaceOps + Send + Sync> {
         (**self).set_attributes(file_id, attributes)
     }
 
-    fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome> {
+    fn rename(&self, from: &Path<'_>, to: &Path<'_>, replace: bool) -> OpsResult<RenameOutcome> {
         (**self).rename(from, to, replace)
     }
 

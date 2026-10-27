@@ -21,6 +21,7 @@ use fs_winfsp::callbacks::{
 };
 use fs_winfsp::handles::HandleId;
 use fs_winfsp::ops::DynOps;
+use fs_winfsp::ops::Path;
 use fs_winfsp::ops::{
     Attributes, DirEntry, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, RenameOutcome,
     WorkspaceOps,
@@ -75,10 +76,10 @@ fn node(size: u64, attributes: u32) -> NodeInfo {
 }
 
 impl WorkspaceOps for File {
-    fn create_or_open(&self, _p: &[u8], _d: Disposition) -> OpsResult<OpenOutcome> {
+    fn create_or_open(&self, _p: &Path<'_>, _d: Disposition) -> OpsResult<OpenOutcome> {
         Err(OpsError::ReadOnly)
     }
-    fn mkdir(&self, _p: &[u8]) -> OpsResult<u64> {
+    fn mkdir(&self, _p: &Path<'_>) -> OpsResult<u64> {
         Err(OpsError::ReadOnly)
     }
     fn read(&self, _id: u64, offset: u64, len: usize) -> OpsResult<Vec<u8>> {
@@ -126,7 +127,7 @@ impl WorkspaceOps for File {
         *self.attributes.lock().expect("attributes") = attributes.0;
         Ok(())
     }
-    fn rename(&self, _f: &[u8], _t: &[u8], _r: bool) -> OpsResult<RenameOutcome> {
+    fn rename(&self, _f: &Path<'_>, _t: &Path<'_>, _r: bool) -> OpsResult<RenameOutcome> {
         Err(OpsError::ReadOnly)
     }
     fn remove_at(&self, _p: u64, _n: &[u8], _e: u64) -> OpsResult<()> {
@@ -141,10 +142,10 @@ impl WorkspaceOps for File {
 struct Shared(Arc<File>);
 
 impl WorkspaceOps for Shared {
-    fn create_or_open(&self, p: &[u8], d: Disposition) -> OpsResult<OpenOutcome> {
+    fn create_or_open(&self, p: &Path<'_>, d: Disposition) -> OpsResult<OpenOutcome> {
         self.0.create_or_open(p, d)
     }
-    fn mkdir(&self, p: &[u8]) -> OpsResult<u64> {
+    fn mkdir(&self, p: &Path<'_>) -> OpsResult<u64> {
         self.0.mkdir(p)
     }
     fn read(&self, i: u64, o: u64, l: usize) -> OpsResult<Vec<u8>> {
@@ -175,7 +176,7 @@ impl WorkspaceOps for Shared {
     fn set_attributes(&self, i: u64, a: Attributes) -> OpsResult<()> {
         self.0.set_attributes(i, a)
     }
-    fn rename(&self, f: &[u8], t: &[u8], r: bool) -> OpsResult<RenameOutcome> {
+    fn rename(&self, f: &Path<'_>, t: &Path<'_>, r: bool) -> OpsResult<RenameOutcome> {
         self.0.rename(f, t, r)
     }
     fn remove_at(&self, p: u64, n: &[u8], e: u64) -> OpsResult<()> {

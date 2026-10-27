@@ -96,11 +96,11 @@ impl std::fmt::Debug for ApiBackend<'_> {
 }
 
 impl WorkspaceOps for ApiBackend<'_> {
-    fn open_dir(&self, path: &[u8]) -> OpsResult<u64> {
+    fn open_dir(&self, path: &fs_winfsp::ops::Path<'_>) -> OpsResult<u64> {
         let rules = self.rules();
         // The rules layer already resolves a path to an entry; the **kind** is what this method adds, and saying "that is a file" is the whole
         // reason the method exists (a directory open must not silently answer a file's id).
-        let resolved = rules.resolve(&path_of(path)?).map_err(to_ops)?;
+        let resolved = rules.resolve(&path_of(path.display())?).map_err(to_ops)?;
         let view = self.view(resolved.serial())?;
         if view.kind != fs_namespace::Kind::Directory {
             return Err(OpsError::NotADirectory);
@@ -108,9 +108,9 @@ impl WorkspaceOps for ApiBackend<'_> {
         Ok(resolved.serial())
     }
 
-    fn dir_binding(&self, path: &[u8]) -> Option<fs_winfsp::ops::DirOutcome> {
+    fn dir_binding(&self, path: &fs_winfsp::ops::Path<'_>) -> Option<fs_winfsp::ops::DirOutcome> {
         // Split the path once: the parent is resolved through the same rules layer, the name is the last segment bytes.
-        let text = String::from_utf8_lossy(path).replace('\\', "/");
+        let text = String::from_utf8_lossy(path.display()).replace('\\', "/");
         let (parent_text, name) = text.rsplit_once('/')?;
         let parent_path = if parent_text.is_empty() {
             "/"
@@ -121,26 +121,29 @@ impl WorkspaceOps for ApiBackend<'_> {
         let parent = rules.resolve(&path_of(parent_path.as_bytes()).ok()?).ok()?;
         // The entry itself, resolved through the **same** rules layer: asking both here is what keeps an identity and a binding from disagreeing, and a
         // path that names nothing gets `None` rather than a name that would only fail later, at `remove_at`.
-        let entry = rules.resolve(&path_of(path).ok()?).ok()?;
+        let entry = rules.resolve(&path_of(path.display()).ok()?).ok()?;
         Some(fs_winfsp::ops::DirOutcome {
             id: entry.serial(),
             binding: (parent.serial(), name.as_bytes().to_vec()),
         })
     }
 
-    fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
+    fn mkdir(&self, path: &fs_winfsp::ops::Path<'_>) -> OpsResult<u64> {
         let rules = self.rules();
-        rules.mkdir(&path_of(path)?).map_err(to_ops)?;
-        Ok(rules.resolve(&path_of(path)?).map_err(to_ops)?.serial())
+        rules.mkdir(&path_of(path.display())?).map_err(to_ops)?;
+        Ok(rules
+            .resolve(&path_of(path.display())?)
+            .map_err(to_ops)?
+            .serial())
     }
 
     fn create_or_open(
         &self,
-        path: &[u8],
+        path: &fs_winfsp::ops::Path<'_>,
         disposition: fs_semantics::disposition::Disposition,
     ) -> OpsResult<OpenOutcome> {
         let rules = self.rules();
-        let parsed = path_of(path)?;
+        let parsed = path_of(path.display())?;
         let outcome = rules.create_or_open(&parsed, disposition).map_err(to_ops)?;
         // Metadata is read **after** the call, not taken from it: `size`/`times`/`attributes` must be the current values,
         // and a cached copy is exactly what would make "a new handle after SUPERSEDE sees size 0" pass for the wrong
@@ -258,10 +261,15 @@ impl WorkspaceOps for ApiBackend<'_> {
             .map_err(to_ops)
     }
 
-    fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome> {
+    fn rename(
+        &self,
+        from: &fs_winfsp::ops::Path<'_>,
+        to: &fs_winfsp::ops::Path<'_>,
+        replace: bool,
+    ) -> OpsResult<RenameOutcome> {
         let rules = self.rules();
         let outcome = rules
-            .rename_with(&path_of(from)?, &path_of(to)?, replace)
+            .rename_with(&path_of(from.display())?, &path_of(to.display())?, replace)
             .map_err(to_ops)?;
         Ok(RenameOutcome {
             file_id: outcome.file_id.serial(),

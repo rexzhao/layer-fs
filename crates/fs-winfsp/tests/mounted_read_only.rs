@@ -291,6 +291,7 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
 /// and moving it here is a **verbatim搬运**: the same answers, including the 376 fix (the listing's ids must resolve in `lookup`),
 /// because a migration is not an opportunity to redesign the fixture.
 use fs_semantics::disposition::Disposition;
+use fs_winfsp::ops::Path;
 use fs_winfsp::ops::{DirEntry, OpenOutcome, OpsError, OpsResult, RenameOutcome, WorkspaceOps};
 
 pub struct FixtureOps {
@@ -300,12 +301,12 @@ pub struct FixtureOps {
 }
 
 impl WorkspaceOps for FixtureOps {
-    fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
+    fn create_or_open(&self, path: &Path<'_>, disposition: Disposition) -> OpsResult<OpenOutcome> {
         // Only `Open`: this mount is read-only, and a silent "created nothing" is the failure mode the write batch exists to avoid.
         if disposition != Disposition::Open {
             return Err(OpsError::ReadOnly);
         }
-        let text = String::from_utf8_lossy(path);
+        let text = String::from_utf8_lossy(path.display());
         let file_id = (self.resolve)(text.as_ref()).ok_or(OpsError::NotFound)?;
         let info = (self.lookup)(file_id).ok_or(OpsError::NotFound)?;
         Ok(OpenOutcome {
@@ -320,7 +321,7 @@ impl WorkspaceOps for FixtureOps {
         })
     }
 
-    fn mkdir(&self, _path: &[u8]) -> OpsResult<u64> {
+    fn mkdir(&self, _path: &Path<'_>) -> OpsResult<u64> {
         Err(OpsError::ReadOnly)
     }
 
@@ -366,7 +367,7 @@ impl WorkspaceOps for FixtureOps {
         Err(OpsError::ReadOnly)
     }
 
-    fn rename(&self, _from: &[u8], _to: &[u8], _replace: bool) -> OpsResult<RenameOutcome> {
+    fn rename(&self, _from: &Path<'_>, _to: &Path<'_>, _replace: bool) -> OpsResult<RenameOutcome> {
         Err(OpsError::ReadOnly)
     }
 

@@ -18,12 +18,18 @@
 //! `tests/` file made that impossible across crates. Nothing about them changed in the move — the instantiation for the
 //! mock still lives in `tests/contract.rs`, and the real backend instantiates them from `fs-api`.
 
+use crate::ops::Path;
 use crate::{OpsError, WorkspaceOps, ROOT};
+
+/// Wraps literal bytes for calls that now take a [`Path`].
+fn p(bytes: &[u8]) -> Path<'_> {
+    Path::new(bytes)
+}
 use fs_semantics::disposition::Disposition;
 
 fn create<B: WorkspaceOps>(backend: &B, path: &[u8]) -> u64 {
     backend
-        .create_or_open(path, Disposition::Create)
+        .create_or_open(&p(path), Disposition::Create)
         .expect("create")
         .file_id
 }
@@ -32,7 +38,7 @@ fn create<B: WorkspaceOps>(backend: &B, path: &[u8]) -> u64 {
 pub fn scenario_identity_across_rename<B: WorkspaceOps>(backend: &B) {
     let id = create(backend, b"/f");
     backend.write(id, 0, b"body").expect("write");
-    backend.rename(b"/f", b"/g", false).expect("rename");
+    backend.rename(&p(b"/f"), &p(b"/g"), false).expect("rename");
     assert_eq!(
         backend.read(id, 0, 4).expect("read by id"),
         b"body",
@@ -56,7 +62,7 @@ pub fn scenario_supersede_truncates_in_place<B: WorkspaceOps>(backend: &B) {
     let id = create(backend, b"/f");
     backend.write(id, 0, b"original").expect("write");
     let outcome = backend
-        .create_or_open(b"/f", Disposition::Supersede)
+        .create_or_open(&p(b"/f"), Disposition::Supersede)
         .expect("supersede");
     assert_eq!(
         outcome.replaced, None,
@@ -96,7 +102,7 @@ pub fn scenario_removal_cases<B: WorkspaceOps>(backend: &B) {
         "cell 2b: a repeated removal is idempotent"
     );
     let moved = create(backend, b"/c");
-    backend.rename(b"/c", b"/d", false).expect("rename");
+    backend.rename(&p(b"/c"), &p(b"/d"), false).expect("rename");
     assert_eq!(
         backend.remove_at(ROOT, b"c", moved),
         Err(OpsError::NotFound),
@@ -106,15 +112,17 @@ pub fn scenario_removal_cases<B: WorkspaceOps>(backend: &B) {
 
 /// Enumeration by id survives another directory taking over the old path.
 pub fn scenario_read_dir_by_id<B: WorkspaceOps>(backend: &B) {
-    let d1 = backend.mkdir(b"/d1").expect("mkdir");
-    backend.mkdir(b"/d2").expect("mkdir");
+    let d1 = backend.mkdir(&p(b"/d1")).expect("mkdir");
+    backend.mkdir(&p(b"/d2")).expect("mkdir");
     create(backend, b"/d1/x");
     create(backend, b"/d1/y");
     create(backend, b"/d2/p");
     backend
-        .rename(b"/d1", b"/d1-moved", false)
+        .rename(&p(b"/d1"), &p(b"/d1-moved"), false)
         .expect("rename d1");
-    backend.rename(b"/d2", b"/d1", false).expect("rename d2");
+    backend
+        .rename(&p(b"/d2"), &p(b"/d1"), false)
+        .expect("rename d2");
     let entries = backend.read_dir(d1).expect("read_dir by id");
     let names: Vec<Vec<u8>> = entries.into_iter().map(|entry| entry.name).collect();
     assert_eq!(
@@ -129,9 +137,9 @@ pub fn scenario_read_dir_by_id<B: WorkspaceOps>(backend: &B) {
 /// Measured defect (L2 class 06): `rmdir` on a non-empty directory **succeeded** on the mounted volume. That is not a wrong status code, it is
 /// **data loss**, so the criterion asserts more than the error: the children are still there afterwards, and still listable.
 pub fn scenario_remove_non_empty_directory<B: WorkspaceOps>(backend: &B) {
-    let dir = backend.mkdir(b"/d").expect("mkdir d");
+    let dir = backend.mkdir(&p(b"/d")).expect("mkdir d");
     let child = backend
-        .create_or_open(b"/d/a", fs_semantics::disposition::Disposition::Create)
+        .create_or_open(&p(b"/d/a"), fs_semantics::disposition::Disposition::Create)
         .expect("create /d/a");
 
     let refused = backend.remove_at(0, b"d", dir);
@@ -188,12 +196,12 @@ pub fn scenario_case_insensitive_names<B: WorkspaceOps>(backend: &B) {
 
     // 1. Folding is for matching, not for inventing.
     let folded = backend
-        .create_or_open(b"/readme.txt", Disposition::Open)
+        .create_or_open(&p(b"/readme.txt"), Disposition::Open)
         .expect("the other spelling resolves to the existing entry");
     assert_eq!(folded.file_id, id, "cell 1: same entry under another case");
     assert!(
         matches!(
-            backend.create_or_open(b"/other.txt", Disposition::Open),
+            backend.create_or_open(&p(b"/other.txt"), Disposition::Open),
             Err(OpsError::NotFound)
         ),
         "cell 1 negative: a different name is still missing"
@@ -201,7 +209,7 @@ pub fn scenario_case_insensitive_names<B: WorkspaceOps>(backend: &B) {
 
     // 2. Case-only rename: same object, nothing replaced.
     let outcome = backend
-        .rename(b"/ReadMe.txt", b"/readme.txt", true)
+        .rename(&p(b"/ReadMe.txt"), &p(b"/readme.txt"), true)
         .expect("case-only rename");
     assert_eq!(outcome.file_id, id, "cell 2: identity kept");
     assert_eq!(outcome.replaced, None, "cell 2: nothing lost the name");
@@ -217,7 +225,7 @@ pub fn scenario_case_insensitive_names<B: WorkspaceOps>(backend: &B) {
     // 4. The two spellings cannot both exist.
     assert!(
         matches!(
-            backend.create_or_open(b"/README.TXT", Disposition::Create),
+            backend.create_or_open(&p(b"/README.TXT"), Disposition::Create),
             Err(OpsError::NameCollision)
         ),
         "cell 4: creating the other spelling is a collision"

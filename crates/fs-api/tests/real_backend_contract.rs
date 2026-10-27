@@ -7,7 +7,7 @@
 //! The real backend is exercised through the same calls the adapter makes, which is what makes "the mock honours the
 //! contract" and "the backend honours the contract" two facts rather than one assumption.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use fs_api::winfsp_backend::ApiBackend;
@@ -36,7 +36,8 @@ impl Fixture {
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let repo = Arc::new(Repo::open(Path::new(&dir).join("store"), true).expect("repo"));
+        let repo =
+            Arc::new(Repo::open(std::path::Path::new(&dir).join("store"), true).expect("repo"));
         repo.init().expect("init");
         let workspace = repo.workspace_create("w1", "main").expect("workspace");
         Self {
@@ -96,11 +97,11 @@ fn criterion_3_core_half_holds_on_the_real_backend() {
     let fixture = Fixture::new("criterion3");
     let backend = fixture.backend();
     let left = backend
-        .create_or_open(b"/left", Disposition::Create)
+        .create_or_open(&fs_winfsp::ops::Path::new(b"/left"), Disposition::Create)
         .expect("create left")
         .file_id;
     let right = backend
-        .create_or_open(b"/right", Disposition::Create)
+        .create_or_open(&fs_winfsp::ops::Path::new(b"/right"), Disposition::Create)
         .expect("create right")
         .file_id;
 
@@ -118,7 +119,11 @@ fn criterion_3_core_half_holds_on_the_real_backend() {
         .expect("cell 2: a repeated removal of a retired id is an idempotent success");
     // (3) the name is free but the id is still live (it was renamed away) ⇒ `NotFound`.
     backend
-        .rename(b"/right", b"/moved", false)
+        .rename(
+            &fs_winfsp::ops::Path::new(b"/right"),
+            &fs_winfsp::ops::Path::new(b"/moved"),
+            false,
+        )
         .expect("rename right");
     match backend.remove_at(ROOT, b"right", right) {
         Err(OpsError::NotFound) => {}
@@ -150,14 +155,21 @@ fn the_real_backend_answers_a_case_only_rename() {
     let fixture = Fixture::new("case-only");
     let backend = fixture.backend();
     let created = backend
-        .create_or_open(b"/ReadMe.txt", Disposition::Create)
+        .create_or_open(
+            &fs_winfsp::ops::Path::new(b"/ReadMe.txt"),
+            Disposition::Create,
+        )
         .expect("create");
     backend
         .write(created.file_id, 0, b"body")
         .expect("write the body");
 
     let outcome = backend
-        .rename(b"/ReadMe.txt", b"/readme.txt", true)
+        .rename(
+            &fs_winfsp::ops::Path::new(b"/ReadMe.txt"),
+            &fs_winfsp::ops::Path::new(b"/readme.txt"),
+            true,
+        )
         .expect("a case-only rename is a legal request");
     assert_eq!(
         outcome.file_id, created.file_id,
@@ -173,7 +185,10 @@ fn the_real_backend_answers_a_case_only_rename() {
         "the id is unchanged"
     );
     let again = backend
-        .create_or_open(b"/ReadMe.txt", Disposition::Open)
+        .create_or_open(
+            &fs_winfsp::ops::Path::new(b"/ReadMe.txt"),
+            Disposition::Open,
+        )
         .expect("the fold makes the old spelling resolve");
     assert_eq!(again.file_id, created.file_id);
 

@@ -20,6 +20,7 @@ use fs_winfsp::loader::{default_library, resolve_library, LoadError};
 use fs_winfsp::mock::MockBackend;
 use fs_winfsp::mounted::mount_read_only;
 use fs_winfsp::ops::DynOps;
+use fs_winfsp::ops::Path;
 use fs_winfsp::ops::{
     Attributes, DirEntry, NodeInfo, OpenOutcome, OpsResult, RenameOutcome, WorkspaceOps,
 };
@@ -39,7 +40,7 @@ impl SlashBackend {
 }
 
 fn to_backend_path(path: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(path).replace('\\', "/");
+    let text = String::from_utf8_lossy(path).replace(char::from(92), "/");
     let text = if text.is_empty() {
         "/".to_string()
     } else {
@@ -49,8 +50,8 @@ fn to_backend_path(path: &[u8]) -> Vec<u8> {
 }
 
 impl WorkspaceOps for SlashBackend {
-    fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
-        let normalized = to_backend_path(path);
+    fn create_or_open(&self, path: &Path<'_>, disposition: Disposition) -> OpsResult<OpenOutcome> {
+        let normalized = to_backend_path(path.display());
         // **The root is not a path the backend can parse**: `MockBackend::split` refuses `/` (an empty component after the leading
         // slash). That is the fixture's limitation, and it is the same gap already recorded in the trait (a directory id is not
         // reachable by path). Answered here, in the fixture, rather than papered over in the shell.
@@ -66,10 +67,12 @@ impl WorkspaceOps for SlashBackend {
                 replaced: None,
             });
         }
-        self.inner.create_or_open(&normalized, disposition)
+        self.inner
+            .create_or_open(&Path::new(&normalized), disposition)
     }
-    fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
-        self.inner.mkdir(&to_backend_path(path))
+    fn mkdir(&self, path: &Path<'_>) -> OpsResult<u64> {
+        self.inner
+            .mkdir(&Path::new(&to_backend_path(path.display())))
     }
     fn read(&self, file_id: u64, offset: u64, len: usize) -> OpsResult<Vec<u8>> {
         self.inner.read(file_id, offset, len)
@@ -100,9 +103,12 @@ impl WorkspaceOps for SlashBackend {
     fn set_attributes(&self, file_id: u64, attributes: Attributes) -> OpsResult<()> {
         self.inner.set_attributes(file_id, attributes)
     }
-    fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome> {
-        self.inner
-            .rename(&to_backend_path(from), &to_backend_path(to), replace)
+    fn rename(&self, from: &Path<'_>, to: &Path<'_>, replace: bool) -> OpsResult<RenameOutcome> {
+        self.inner.rename(
+            &Path::new(&to_backend_path(from.display())),
+            &Path::new(&to_backend_path(to.display())),
+            replace,
+        )
     }
     fn remove_at(&self, parent: u64, name: &[u8], expected_id: u64) -> OpsResult<()> {
         self.inner.remove_at(parent, name, expected_id)

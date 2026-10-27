@@ -18,6 +18,7 @@ use fs_winfsp::callbacks::{
     NOT_IMPLEMENTED,
 };
 use fs_winfsp::ops::DynOps;
+use fs_winfsp::ops::Path;
 use fs_winfsp::ops::{
     Attributes, DirEntry, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, RenameOutcome,
     WorkspaceOps,
@@ -61,7 +62,7 @@ fn node() -> NodeInfo {
 }
 
 impl WorkspaceOps for Recorder {
-    fn create_or_open(&self, _path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
+    fn create_or_open(&self, _path: &Path<'_>, disposition: Disposition) -> OpsResult<OpenOutcome> {
         self.seen.lock().expect("recorder lock").push(disposition);
         if disposition != Disposition::Open && !self.can_create {
             return Err(OpsError::ReadOnly);
@@ -79,7 +80,7 @@ impl WorkspaceOps for Recorder {
         })
     }
 
-    fn mkdir(&self, _path: &[u8]) -> OpsResult<u64> {
+    fn mkdir(&self, _path: &Path<'_>) -> OpsResult<u64> {
         Err(OpsError::ReadOnly)
     }
     fn read(&self, _file_id: u64, _offset: u64, _len: usize) -> OpsResult<Vec<u8>> {
@@ -114,7 +115,7 @@ impl WorkspaceOps for Recorder {
     fn set_attributes(&self, _file_id: u64, _attributes: Attributes) -> OpsResult<()> {
         Err(OpsError::ReadOnly)
     }
-    fn rename(&self, _from: &[u8], _to: &[u8], _replace: bool) -> OpsResult<RenameOutcome> {
+    fn rename(&self, _from: &Path<'_>, _to: &Path<'_>, _replace: bool) -> OpsResult<RenameOutcome> {
         Err(OpsError::ReadOnly)
     }
     fn remove_at(&self, _parent: u64, _name: &[u8], _expected_id: u64) -> OpsResult<()> {
@@ -137,10 +138,10 @@ fn fixture(recorder: &Arc<Recorder>) -> DynAdapter {
 struct Shared(Arc<Recorder>);
 
 impl WorkspaceOps for Shared {
-    fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
+    fn create_or_open(&self, path: &Path<'_>, disposition: Disposition) -> OpsResult<OpenOutcome> {
         self.0.create_or_open(path, disposition)
     }
-    fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
+    fn mkdir(&self, path: &Path<'_>) -> OpsResult<u64> {
         self.0.mkdir(path)
     }
     fn read(&self, file_id: u64, offset: u64, len: usize) -> OpsResult<Vec<u8>> {
@@ -172,7 +173,7 @@ impl WorkspaceOps for Shared {
     fn set_attributes(&self, file_id: u64, attributes: Attributes) -> OpsResult<()> {
         self.0.set_attributes(file_id, attributes)
     }
-    fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome> {
+    fn rename(&self, from: &Path<'_>, to: &Path<'_>, replace: bool) -> OpsResult<RenameOutcome> {
         self.0.rename(from, to, replace)
     }
     fn remove_at(&self, parent: u64, name: &[u8], expected_id: u64) -> OpsResult<()> {
@@ -333,13 +334,13 @@ fn creating_a_directory_goes_through_mkdir_and_not_the_file_door() {
     impl WorkspaceOps for Doors {
         fn create_or_open(
             &self,
-            _path: &[u8],
+            _path: &Path<'_>,
             _disposition: Disposition,
         ) -> OpsResult<OpenOutcome> {
             self.opened.fetch_add(1, Ordering::Relaxed);
             Err(OpsError::NotFound)
         }
-        fn mkdir(&self, _path: &[u8]) -> OpsResult<u64> {
+        fn mkdir(&self, _path: &Path<'_>) -> OpsResult<u64> {
             let made = self.made_dirs.fetch_add(1, Ordering::Relaxed) + 1;
             Ok(100 + made as u64)
         }
@@ -377,7 +378,7 @@ fn creating_a_directory_goes_through_mkdir_and_not_the_file_door() {
         fn set_attributes(&self, _id: u64, _a: Attributes) -> OpsResult<()> {
             Err(OpsError::ReadOnly)
         }
-        fn rename(&self, _f: &[u8], _t: &[u8], _r: bool) -> OpsResult<RenameOutcome> {
+        fn rename(&self, _f: &Path<'_>, _t: &Path<'_>, _r: bool) -> OpsResult<RenameOutcome> {
             Err(OpsError::ReadOnly)
         }
         fn remove_at(&self, _p: u64, _n: &[u8], _e: u64) -> OpsResult<()> {
@@ -395,10 +396,10 @@ fn creating_a_directory_goes_through_mkdir_and_not_the_file_door() {
 
     struct SharedDoors(Arc<Doors>);
     impl WorkspaceOps for SharedDoors {
-        fn create_or_open(&self, p: &[u8], d: Disposition) -> OpsResult<OpenOutcome> {
+        fn create_or_open(&self, p: &Path<'_>, d: Disposition) -> OpsResult<OpenOutcome> {
             self.0.create_or_open(p, d)
         }
-        fn mkdir(&self, p: &[u8]) -> OpsResult<u64> {
+        fn mkdir(&self, p: &Path<'_>) -> OpsResult<u64> {
             self.0.mkdir(p)
         }
         fn read(&self, i: u64, o: u64, l: usize) -> OpsResult<Vec<u8>> {
@@ -429,7 +430,7 @@ fn creating_a_directory_goes_through_mkdir_and_not_the_file_door() {
         fn set_attributes(&self, i: u64, a: Attributes) -> OpsResult<()> {
             self.0.set_attributes(i, a)
         }
-        fn rename(&self, f: &[u8], t: &[u8], r: bool) -> OpsResult<RenameOutcome> {
+        fn rename(&self, f: &Path<'_>, t: &Path<'_>, r: bool) -> OpsResult<RenameOutcome> {
             self.0.rename(f, t, r)
         }
         fn remove_at(&self, p: u64, n: &[u8], e: u64) -> OpsResult<()> {

@@ -16,6 +16,7 @@ use fs_winfsp::callbacks::{
     OURS_IS_A_DIRECTORY,
 };
 use fs_winfsp::mock::MockBackend;
+use fs_winfsp::ops::Path;
 use fs_winfsp::ops::{DynOps, WorkspaceOps};
 use fs_winfsp::DynAdapter;
 
@@ -51,7 +52,7 @@ fn open_with(adapter: &DynAdapter, path: &str, options: u32) -> i32 {
 fn a_file_style_open_of_a_directory_is_refused_and_creates_nothing() {
     let adapter: DynAdapter = DynAdapter::new(Box::new(MockBackend::new()) as DynOps);
     // The directory the accident clobbered.
-    let dir = adapter.backend().mkdir(b"/d").expect("mkdir");
+    let dir = adapter.backend().mkdir(&Path::new(b"/d")).expect("mkdir");
     let before: Vec<Vec<u8>> = adapter
         .backend()
         .read_dir(0)
@@ -94,7 +95,7 @@ fn a_directory_style_open_of_a_file_is_refused() {
     let adapter: DynAdapter = DynAdapter::new(Box::new(MockBackend::new()) as DynOps);
     adapter
         .backend()
-        .create_or_open(b"/f.txt", Disposition::Create)
+        .create_or_open(&Path::new(b"/f.txt"), Disposition::Create)
         .expect("create the file");
 
     let status = open_with(&adapter, "/f.txt", pack(1, FILE_DIRECTORY_FILE));

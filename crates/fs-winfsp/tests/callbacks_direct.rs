@@ -13,6 +13,7 @@ use fs_winfsp::callbacks::{
     get_file_info_shell, get_volume_info_shell, EntryContext, OURS_INVALID_PARAMETER,
 };
 use fs_winfsp::ops::DynOps;
+use fs_winfsp::ops::Path;
 use fs_winfsp::ops::{
     Attributes, DirEntry, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, RenameOutcome,
     WorkspaceOps,
@@ -39,11 +40,11 @@ fn node() -> NodeInfo {
 struct OneFile;
 
 impl WorkspaceOps for OneFile {
-    fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
+    fn create_or_open(&self, path: &Path<'_>, disposition: Disposition) -> OpsResult<OpenOutcome> {
         if disposition != Disposition::Open {
             return Err(OpsError::ReadOnly);
         }
-        if path != b"/a.txt" {
+        if path.display() != b"/a.txt" {
             return Err(OpsError::NotFound);
         }
         let info = node();
@@ -59,7 +60,7 @@ impl WorkspaceOps for OneFile {
         })
     }
 
-    fn mkdir(&self, _path: &[u8]) -> OpsResult<u64> {
+    fn mkdir(&self, _path: &Path<'_>) -> OpsResult<u64> {
         Err(OpsError::ReadOnly)
     }
 
@@ -109,7 +110,7 @@ impl WorkspaceOps for OneFile {
         Err(OpsError::ReadOnly)
     }
 
-    fn rename(&self, _from: &[u8], _to: &[u8], _replace: bool) -> OpsResult<RenameOutcome> {
+    fn rename(&self, _from: &Path<'_>, _to: &Path<'_>, _replace: bool) -> OpsResult<RenameOutcome> {
         Err(OpsError::ReadOnly)
     }
 

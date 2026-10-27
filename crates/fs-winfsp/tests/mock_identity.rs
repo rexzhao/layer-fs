@@ -6,11 +6,12 @@
 //! the core it stands in for.
 
 use fs_semantics::disposition::Disposition;
+use fs_winfsp::ops::Path;
 use fs_winfsp::{MockBackend, OpsError, WorkspaceOps, ROOT};
 
 fn create(backend: &MockBackend, path: &[u8]) -> u64 {
     backend
-        .create_or_open(path, Disposition::Create)
+        .create_or_open(&Path::new(path), Disposition::Create)
         .expect("create")
         .file_id
 }
@@ -25,7 +26,9 @@ fn identity_is_stable_across_rename_and_never_reused() {
     let original = create(&backend, b"/a");
     backend.write(original, 0, b"body").expect("write");
 
-    let outcome = backend.rename(b"/a", b"/b", false).expect("rename");
+    let outcome = backend
+        .rename(&Path::new(b"/a"), &Path::new(b"/b"), false)
+        .expect("rename");
     assert_eq!(outcome.binding, (ROOT, b"b".to_vec()));
     assert_eq!(outcome.replaced, None);
     assert_eq!(
@@ -61,7 +64,7 @@ fn the_fold_makes_a_and_upper_a_one_entry_that_keeps_its_display_bytes() {
     let backend = MockBackend::new();
     let upper = create(&backend, b"/A");
     // Creating the other spelling is a **collision**: after folding it is the same name.
-    let collision = backend.create_or_open(b"/a", Disposition::Create);
+    let collision = backend.create_or_open(&Path::new(b"/a"), Disposition::Create);
     assert!(
         matches!(collision, Err(OpsError::NameCollision)),
         "cell collision: `/a` and `/A` are one name after folding (got {collision:?})"
@@ -81,7 +84,7 @@ fn the_fold_makes_a_and_upper_a_one_entry_that_keeps_its_display_bytes() {
     // A case-only rename changes the **display bytes** and keeps the **id** — three semantics in one assertion (manager 442): the fold matches,
     // a case-only rename is not a collision, and the identity survives.
     backend
-        .rename(b"/A", b"/a", true)
+        .rename(&Path::new(b"/A"), &Path::new(b"/a"), true)
         .expect("case-only rename");
     assert_eq!(backend.resolve(b"/a"), Some(upper), "cell rename: same id");
     assert_eq!(
@@ -103,7 +106,7 @@ fn supersede_truncates_in_place_and_keeps_the_id() {
     backend.write(id, 0, b"old").expect("write");
 
     let outcome = backend
-        .create_or_open(b"/f", Disposition::Supersede)
+        .create_or_open(&Path::new(b"/f"), Disposition::Supersede)
         .expect("supersede");
     assert_eq!(
         outcome.file_id, id,
@@ -135,7 +138,9 @@ fn supersede_truncates_in_place_and_keeps_the_id() {
 fn the_old_id_cannot_delete_the_object_that_reused_its_path() {
     let backend = MockBackend::new();
     let old = create(&backend, b"/a");
-    backend.rename(b"/a", b"/b", false).expect("rename");
+    backend
+        .rename(&Path::new(b"/a"), &Path::new(b"/b"), false)
+        .expect("rename");
     let new = create(&backend, b"/a");
     assert_ne!(
         old, new,
@@ -225,7 +230,7 @@ fn remove_at_classifies_three_ways() {
         .expect_err("a retired id is not writable");
     let live = create(&backend, b"/live");
     backend
-        .rename(b"/live", b"/elsewhere", false)
+        .rename(&Path::new(b"/live"), &Path::new(b"/elsewhere"), false)
         .expect("rename");
     assert_eq!(
         backend.remove_at(ROOT, b"live", live),
@@ -243,8 +248,8 @@ fn remove_at_classifies_three_ways() {
 #[test]
 fn read_dir_by_id_survives_another_directory_taking_the_old_path() {
     let backend = MockBackend::new();
-    let d1 = backend.mkdir(b"/d1").expect("mkdir d1");
-    backend.mkdir(b"/d2").expect("mkdir d2");
+    let d1 = backend.mkdir(&Path::new(b"/d1")).expect("mkdir d1");
+    backend.mkdir(&Path::new(b"/d2")).expect("mkdir d2");
     create(&backend, b"/d1/one");
     create(&backend, b"/d1/two");
     create(&backend, b"/d2/a");
@@ -257,10 +262,10 @@ fn read_dir_by_id_survives_another_directory_taking_the_old_path() {
     );
 
     backend
-        .rename(b"/d1", b"/d1-renamed", false)
+        .rename(&Path::new(b"/d1"), &Path::new(b"/d1-renamed"), false)
         .expect("rename d1");
     backend
-        .rename(b"/d2", b"/d1", false)
+        .rename(&Path::new(b"/d2"), &Path::new(b"/d1"), false)
         .expect("rename d2 onto d1's old path");
     assert_eq!(
         backend.read_dir(d1).expect("read_dir by id").len(),
@@ -328,7 +333,7 @@ fn supersede_replaces_attributes_while_overwrite_keeps_them() {
             .expect("set attributes");
 
         let outcome = backend
-            .create_or_open(b"/f", disposition)
+            .create_or_open(&Path::new(b"/f"), disposition)
             .expect("truncating disposition");
         assert_eq!(outcome.file_id, id, "cell {disposition:?}: identity kept");
         assert_eq!(outcome.size, 0, "cell {disposition:?}: content dropped");
@@ -363,7 +368,7 @@ fn the_root_resolves_like_any_other_directory() {
         "cell resolve: the root has an id like every other entry"
     );
     assert_eq!(
-        backend.open_dir(b"/"),
+        backend.open_dir(&Path::new(b"/")),
         Ok(ROOT),
         "cell open_dir: and it opens as a directory — no special case needed now"
     );

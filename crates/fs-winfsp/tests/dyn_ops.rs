@@ -6,6 +6,7 @@
 
 use fs_semantics::disposition::Disposition;
 use fs_winfsp::mock::MockBackend;
+use fs_winfsp::ops::Path;
 use fs_winfsp::ops::{DynOps, OpsError, WorkspaceOps};
 
 #[test]
@@ -16,10 +17,10 @@ fn a_boxed_backend_behaves_like_the_concrete_one() {
     // Same creation answer.
     let path = b"/alpha.txt";
     let a = concrete
-        .create_or_open(path, Disposition::Create)
+        .create_or_open(&Path::new(path), Disposition::Create)
         .expect("concrete: create");
     let b = boxed
-        .create_or_open(path, Disposition::Create)
+        .create_or_open(&Path::new(path), Disposition::Create)
         .expect("boxed: create — the forwarding reached the real implementation");
     assert_eq!(a.kind, b.kind, "cell kind: same answer through the box");
     assert_eq!(a.size, b.size, "cell size: same answer through the box");

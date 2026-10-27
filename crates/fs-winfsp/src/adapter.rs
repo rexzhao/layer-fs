@@ -171,10 +171,10 @@ impl<B: WorkspaceOps> Adapter<B> {
         share: Mask,
         delete_on_close: bool,
     ) -> OpsResult<(HandleId, u64, Kind)> {
-        if let Ok(existing) = self
-            .ops
-            .create_or_open(path, fs_semantics::disposition::Disposition::Open)
-        {
+        if let Ok(existing) = self.ops.create_or_open(
+            &crate::ops::Path::new(path),
+            fs_semantics::disposition::Disposition::Open,
+        ) {
             if self
                 .handles
                 .lock()
@@ -185,7 +185,9 @@ impl<B: WorkspaceOps> Adapter<B> {
             }
         }
 
-        let outcome = self.ops.create_or_open(path, disposition)?;
+        let outcome = self
+            .ops
+            .create_or_open(&crate::ops::Path::new(path), disposition)?;
         self.handles.lock().expect("handle table").remember_binding(
             outcome.file_id,
             outcome.binding.0,
@@ -343,7 +345,11 @@ impl<B: WorkspaceOps> Adapter<B> {
     ///
     /// Whatever the backend reports.
     pub fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> OpsResult<RenameOutcome> {
-        let outcome = self.ops.rename(from, to, replace)?;
+        let outcome = self.ops.rename(
+            &crate::ops::Path::new(from),
+            &crate::ops::Path::new(to),
+            replace,
+        )?;
         // The backend reports which id moved (P3-4 added that field): deriving it from the path would be guessing, and a wrong guess
         // means the binding keeps the old name, so the eventual deletion is refused by the guard.
         self.handles.lock().expect("handle table").rebind(

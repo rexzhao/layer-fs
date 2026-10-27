@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use fs_api::winfsp_backend::ApiBackend;
 use fs_semantics::disposition::Disposition;
+use fs_winfsp::ops::Path;
 use fs_winfsp::{Attributes, WorkspaceOps};
 use fs_workspace::Repo;
 
@@ -60,7 +61,7 @@ fn attributes_after_reopen(label: &str, disposition: Disposition, set: u32) -> u
             .expect("workspace");
         let backend = ApiBackend::new(&workspace);
         let id = backend
-            .create_or_open(b"/f", Disposition::Create)
+            .create_or_open(&Path::new(b"/f"), Disposition::Create)
             .expect("create")
             .file_id;
         backend
@@ -73,7 +74,7 @@ fn attributes_after_reopen(label: &str, disposition: Disposition, set: u32) -> u
         );
 
         backend
-            .create_or_open(b"/f", disposition)
+            .create_or_open(&Path::new(b"/f"), disposition)
             .expect("truncating disposition");
         workspace.close().expect("close");
         id

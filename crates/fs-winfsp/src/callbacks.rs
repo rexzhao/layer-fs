@@ -833,11 +833,19 @@ unsafe fn open_like(
     // The caller said "a file" (`FILE_NON_DIRECTORY_FILE`): if the name is a **directory**, that is `FILE_IS_A_DIRECTORY` before anything else is
     // attempted. Checking it here (rather than only after the file door answers) is what makes the refusal independent of what the backend does with
     // a directory name — and it is the check whose absence let a file replace a directory in the real trace.
-    if expects_file && adapter.backend().open_dir(path.as_bytes()).is_ok() {
+    if expects_file
+        && adapter
+            .backend()
+            .open_dir(&crate::ops::Path::new(path.as_bytes()))
+            .is_ok()
+    {
         return OURS_IS_A_DIRECTORY;
     }
     let outcome = match make_verb(disposition, wants_directory) {
-        MakeVerb::Directory => match adapter.backend().mkdir(path.as_bytes()) {
+        MakeVerb::Directory => match adapter
+            .backend()
+            .mkdir(&crate::ops::Path::new(path.as_bytes()))
+        {
             // **The directory handle gets a binding too.** `dir_binding` is the parent segment the doors already walked, so the two-phase
             // deletion covers directories exactly as it covers files — without it a directory's `set_delete`/`close` have no name to remove and
             // the failure is invisible (measured: `rmdir` on a non-empty directory succeeded).
@@ -845,7 +853,9 @@ unsafe fn open_like(
                 .backend()
                 .get_info(file_id)
                 .map(|_| {
-                    let found = adapter.backend().dir_binding(path.as_bytes());
+                    let found = adapter
+                        .backend()
+                        .dir_binding(&crate::ops::Path::new(path.as_bytes()));
                     // The id the door answered and the id the binding resolves to are the **same question twice**; answering them in one value is
                     // what makes a disagreement observable. The door's id wins (it is the one already handed out), so a mismatch is reported, not
                     // silently preferred.
@@ -864,12 +874,17 @@ unsafe fn open_like(
             Err(crate::ops::OpsError::NameCollision) => Err(OURS_OBJECT_NAME_COLLISION),
             Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
         },
-        MakeVerb::OpenDirectory => match adapter.backend().open_dir(path.as_bytes()) {
+        MakeVerb::OpenDirectory => match adapter
+            .backend()
+            .open_dir(&crate::ops::Path::new(path.as_bytes()))
+        {
             Ok(file_id) => adapter
                 .backend()
                 .get_info(file_id)
                 .map(|_| {
-                    let found = adapter.backend().dir_binding(path.as_bytes());
+                    let found = adapter
+                        .backend()
+                        .dir_binding(&crate::ops::Path::new(path.as_bytes()));
                     if let Some(ref outcome) = found {
                         if outcome.id != file_id {
                             eprintln!(
@@ -886,7 +901,10 @@ unsafe fn open_like(
             Err(crate::ops::OpsError::NotFound)
                 if disposition == fs_semantics::disposition::Disposition::OpenIf =>
             {
-                match adapter.backend().mkdir(path.as_bytes()) {
+                match adapter
+                    .backend()
+                    .mkdir(&crate::ops::Path::new(path.as_bytes()))
+                {
                     Ok(file_id) => adapter
                         .backend()
                         .get_info(file_id)
@@ -901,7 +919,7 @@ unsafe fn open_like(
         },
         MakeVerb::File => match adapter
             .backend()
-            .create_or_open(path.as_bytes(), disposition)
+            .create_or_open(&crate::ops::Path::new(path.as_bytes()), disposition)
         {
             // The backend's own answer carries where the name lives — that is the binding `remove_at` will guard with.
             Ok(outcome) => Ok((
@@ -916,11 +934,16 @@ unsafe fn open_like(
             // fallback the open of a perfectly good directory answers NotADirectory, and every child operation under it fails with
             // "path not found" (measured: `/d` Open -> NotADirectory, then `/d/a` -> NotFound, four calls in a row).
             Err(crate::ops::OpsError::NotADirectory) => {
-                match adapter.backend().open_dir(path.as_bytes()) {
+                match adapter
+                    .backend()
+                    .open_dir(&crate::ops::Path::new(path.as_bytes()))
+                {
                     Ok(file_id) => {
                         // The binding comes with an identity, and the identity must agree with the id the door just answered: same question twice,
                         // answered together so a disagreement is visible.
-                        let found = adapter.backend().dir_binding(path.as_bytes());
+                        let found = adapter
+                            .backend()
+                            .dir_binding(&crate::ops::Path::new(path.as_bytes()));
                         if let Some(ref outcome) = found {
                             if outcome.id != file_id {
                                 eprintln!(
@@ -1772,13 +1795,14 @@ pub unsafe fn get_security_by_name_shell(
     // missing: Windows then mapped the whole operation to `ERROR_PATH_NOT_FOUND` (`os error 3`), and every child under a perfectly good directory
     // failed. So the directory door gets the second attempt here too — the same fallback `open_like` uses, for the same reason.
     let resolved = match adapter.backend().create_or_open(
-        path.as_bytes(),
+        &crate::ops::Path::new(path.as_bytes()),
         fs_semantics::disposition::Disposition::Open,
     ) {
         Ok(outcome) => Some(outcome.file_id),
-        Err(crate::ops::OpsError::NotADirectory) => {
-            adapter.backend().open_dir(path.as_bytes()).ok()
-        }
+        Err(crate::ops::OpsError::NotADirectory) => adapter
+            .backend()
+            .open_dir(&crate::ops::Path::new(path.as_bytes()))
+            .ok(),
         Err(_) => None,
     };
     let Some(file_id) = resolved else {

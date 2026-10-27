@@ -13,6 +13,7 @@
 
 use fs_semantics::disposition::Disposition;
 use fs_windows::share::{Mask, Term};
+use fs_winfsp::ops::Path;
 use fs_winfsp::{HandleTable, MockBackend, WorkspaceOps, ROOT};
 
 fn mask(terms: &[Term]) -> Mask {
@@ -38,7 +39,7 @@ fn term_mask(term: Term) -> u8 {
 fn a_handle_survives_a_rename_of_its_own_entry() {
     let backend = MockBackend::new();
     let id = backend
-        .create_or_open(b"/f", Disposition::Create)
+        .create_or_open(&Path::new(b"/f"), Disposition::Create)
         .expect("create")
         .file_id;
     backend.write(id, 0, b"payload").expect("write");
@@ -47,7 +48,9 @@ fn a_handle_survives_a_rename_of_its_own_entry() {
         .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false)
         .expect("open");
 
-    let outcome = backend.rename(b"/f", b"/renamed", false).expect("rename");
+    let outcome = backend
+        .rename(&Path::new(b"/f"), &Path::new(b"/renamed"), false)
+        .expect("rename");
     assert_eq!(outcome.replaced, None, "cell rename: nothing was replaced");
 
     let bound = table.get(handle).expect("the handle is still open");
@@ -85,16 +88,16 @@ fn a_handle_survives_a_rename_of_its_own_entry() {
 #[test]
 fn a_directory_handle_survives_a_rename_and_a_reused_path() {
     let backend = MockBackend::new();
-    let d1 = backend.mkdir(b"/d1").expect("mkdir d1");
-    backend.mkdir(b"/d2").expect("mkdir d2");
+    let d1 = backend.mkdir(&Path::new(b"/d1")).expect("mkdir d1");
+    backend.mkdir(&Path::new(b"/d2")).expect("mkdir d2");
     for name in [&b"/d1/one"[..], b"/d1/two"] {
         backend
-            .create_or_open(name, Disposition::Create)
+            .create_or_open(&Path::new(name), Disposition::Create)
             .expect("create");
     }
     for name in [&b"/d2/a"[..], b"/d2/b", b"/d2/c"] {
         backend
-            .create_or_open(name, Disposition::Create)
+            .create_or_open(&Path::new(name), Disposition::Create)
             .expect("create");
     }
     let mut table = HandleTable::new();
@@ -103,10 +106,10 @@ fn a_directory_handle_survives_a_rename_and_a_reused_path() {
         .expect("open d1");
 
     backend
-        .rename(b"/d1", b"/d1-moved", false)
+        .rename(&Path::new(b"/d1"), &Path::new(b"/d1-moved"), false)
         .expect("rename d1");
     backend
-        .rename(b"/d2", b"/d1", false)
+        .rename(&Path::new(b"/d2"), &Path::new(b"/d1"), false)
         .expect("rename d2 onto d1's old path");
 
     let bound = table.get(handle).expect("still open").file_id;
@@ -138,7 +141,7 @@ fn a_directory_handle_survives_a_rename_and_a_reused_path() {
 fn a_supersede_is_visible_through_every_handle() {
     let backend = MockBackend::new();
     let id = backend
-        .create_or_open(b"/f", Disposition::Create)
+        .create_or_open(&Path::new(b"/f"), Disposition::Create)
         .expect("create")
         .file_id;
     backend.write(id, 0, b"original").expect("write");
@@ -148,7 +151,7 @@ fn a_supersede_is_visible_through_every_handle() {
         .expect("handle opened before the supersede");
 
     let outcome = backend
-        .create_or_open(b"/f", Disposition::Supersede)
+        .create_or_open(&Path::new(b"/f"), Disposition::Supersede)
         .expect("supersede");
     assert_eq!(outcome.file_id, id, "cell identity: unchanged");
     assert_eq!(outcome.replaced, None, "cell replaced: nothing lost a name");
@@ -180,11 +183,11 @@ fn a_supersede_is_visible_through_every_handle() {
 fn the_superseded_id_is_still_the_deletable_one() {
     let backend = MockBackend::new();
     let id = backend
-        .create_or_open(b"/f", Disposition::Create)
+        .create_or_open(&Path::new(b"/f"), Disposition::Create)
         .expect("create")
         .file_id;
     let outcome = backend
-        .create_or_open(b"/f", Disposition::Supersede)
+        .create_or_open(&Path::new(b"/f"), Disposition::Supersede)
         .expect("supersede");
     assert_eq!(outcome.file_id, id, "cell setup: same entry");
 

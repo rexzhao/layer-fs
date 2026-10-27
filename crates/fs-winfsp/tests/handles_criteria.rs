@@ -6,6 +6,7 @@
 //! while getting the *other* half wrong.
 
 use fs_windows::share::{Mask, Term};
+use fs_winfsp::ops::Path;
 use fs_winfsp::{CloseEffect, HandleTable, MockBackend, OpsError, WorkspaceOps, ROOT};
 
 fn mask(terms: &[Term]) -> Mask {
@@ -24,7 +25,10 @@ fn term_mask(term: Term) -> u8 {
 
 fn file(backend: &MockBackend, path: &[u8], content: &[u8]) -> u64 {
     let id = backend
-        .create_or_open(path, fs_semantics::disposition::Disposition::Create)
+        .create_or_open(
+            &Path::new(path),
+            fs_semantics::disposition::Disposition::Create,
+        )
         .expect("create")
         .file_id;
     backend.write(id, 0, content).expect("write");
@@ -151,7 +155,9 @@ fn delete_on_close_follows_the_file_id_across_a_rename() {
         "cell state: DELETE_ON_CLOSE is pending from the moment of open"
     );
 
-    backend.rename(b"/f", b"/moved", false).expect("rename");
+    backend
+        .rename(&Path::new(b"/f"), &Path::new(b"/moved"), false)
+        .expect("rename");
     assert_eq!(
         (backend.resolve(b"/f"), backend.resolve(b"/moved")),
         (None, Some(id)),
@@ -212,7 +218,9 @@ fn the_close_rule_disagrees_with_both_plausible_wrong_policies() {
 fn deleting_by_path_after_a_rename_is_observably_wrong() {
     let backend = MockBackend::new();
     let id = file(&backend, b"/f", b"body");
-    backend.rename(b"/f", b"/moved", false).expect("rename");
+    backend
+        .rename(&Path::new(b"/f"), &Path::new(b"/moved"), false)
+        .expect("rename");
 
     // Wrong policy: remember the path, delete by it. It must fail — and it must fail *before* touching anything.
     assert_eq!(
