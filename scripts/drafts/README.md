@@ -919,3 +919,20 @@ fs-winfsp::instrument_ready_timing    (Mock, V: X:) write at t=4 ms -> os error 
 So: same backend, same letter, same operation, same crate — and one shape serves while the other never does. The wait experiments are reverted; nothing in `src/` was changed by this round.
 
 Next experiment is a bisect, not a hypothesis: copy `mounted_write_chain.rs` and change **one** thing per run (probe body → my body; assertions → removed; letter → V:), until the copy stops working. The first single change that flips PASS→FAIL is the variable.
+
+## Bisect (504): steps 4 and 2 both excluded — the difference is inside the probe body
+
+```
+step 4  the never-working body appended to the *working* file (same binary, same crate, same call)
+        -> BISECT4 write = os error 3      ⇒ the compile unit is NOT the variable
+step 2  add the "is the letter free?" lookup *before* mounting (a failed lookup on a not-yet-existing drive)
+        -> BISECT2 pre_mount_exists=false ; write still os error 3   ⇒ the pre-mount probe is NOT the variable
+```
+
+So the variable is inside the probe **body** itself, and only two textual differences remain between the working body and mine:
+
+1. `root_of(path).join("written.txt")` versus `format!("{root}probe.txt")` — same string on Windows, so this is the least likely;
+2. **what the body does before writing**: the working body writes `hello layer-fs` (13 bytes) where mine writes `x` (1 byte), and mine has an extra
+   `trim_end_matches` on the path text.
+
+The next run changes exactly one of those two, in the working file, and reads the same two lines.
