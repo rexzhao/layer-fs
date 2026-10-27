@@ -543,6 +543,18 @@ pub fn register_context_for_test(entry: EntryContext) -> *mut c_void {
     register_context(entry) as usize as *mut c_void
 }
 
+/// Drops every context still in the table — called at unmount.
+///
+/// The table is process-wide (the callbacks have no place to keep a per-mount one), so without this a mount that leaves contexts behind would
+/// make the next mount start with them. Clearing at teardown is what keeps the residue **bounded by one mount** instead of accumulating.
+pub fn clear_contexts() {
+    CONTEXTS
+        .lock()
+        .expect("contexts")
+        .get_or_insert_with(std::collections::BTreeMap::new)
+        .clear();
+}
+
 /// Removes the context behind `context`, or `None` when the id was never handed out (a stale close).
 fn release_context(context: *const c_void) -> Option<Box<EntryContext>> {
     let id = context as usize as u64;

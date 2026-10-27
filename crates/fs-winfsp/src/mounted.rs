@@ -826,6 +826,9 @@ mod platform {
                 !crate::registry::mounts().contains(key),
                 "after `delete` the registry must not answer for that pointer"
             );
+            // The context table is process-wide, so teardown is where its residue is bounded: whatever this mount left behind is dropped here,
+            // instead of being inherited by the next mount.
+            crate::callbacks::clear_contexts();
             if let Some(log) = debug_log {
                 // Close **before** anyone reads the file, or the tail is still buffered.
                 crate::debuglog::close(log);
