@@ -307,3 +307,26 @@ as "the most valuable clue" was a false lead, and the trace settles it in four l
 So the open lead is back to the one place the L2 script differs from the minimal sequence: some `>>QueryDirectory` answers `c0000010` **in the script's
 flow** while the minimal create-then-list run answers `0[128]`. The next run must capture the *first* `c0000010` of a full L2 run together with the
 `>>Create` that produced its context.
+
+## Decisive: `mkdir` reports success and the directory is not there
+
+A real-machine run of the L2 script's first steps, one `std::fs` call at a time:
+
+```
+STEP write file: Ok(())      ← creating a file in the root works
+STEP mkdir:      Ok(())      ← **reports success**
+STEP write a:    Err(3, NotFound)   ← inside the new directory: not found
+STEP list dir:   Err(3, NotFound)
+STEP rename file: Err(2, NotFound)
+```
+
+So `Create` for a **directory** answers success while creating nothing usable. That is the "silent success" class in its purest form, and it
+explains the L2 classes together: `05` (listing an empty/missing dir), `07` (rename needs the source to be openable), `08`, `09` (delete needs
+the entry to resolve).
+
+Root cause is the gap recorded when the make-verb split landed: **there is no way to open an existing directory by path.**
+`create_or_open` is the *file* door (it refuses a directory), and the directory branch only runs for `FILE_CREATE`. Windows opens the directory
+again with `FILE_OPEN + FILE_DIRECTORY_FILE`, which falls into the file door and is refused — after `mkdir` has already told the caller "ok".
+
+The fix is a trait method — `open_dir(path) -> id` (or a `kind`-aware `create_or_open`) — implemented in both backends. That is a cut of its own,
+and it is the one that unblocks the four L2 classes.
