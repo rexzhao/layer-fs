@@ -185,3 +185,11 @@ fn the_real_backend_answers_a_case_only_rename() {
         .collect();
     assert_eq!(names, vec!["readme.txt".to_string()]);
 }
+
+/// **Scenario 6b on the real backend**: the same function the mock runs (472) — so "both backends answer the same way" is two readings.
+#[test]
+fn the_real_backend_satisfies_case_insensitive_names() {
+    let fixture = Fixture::new("fold");
+    let backend = fixture.backend();
+    fs_winfsp::scenarios::scenario_case_insensitive_names::<ApiBackend<'_>>(&backend);
+}

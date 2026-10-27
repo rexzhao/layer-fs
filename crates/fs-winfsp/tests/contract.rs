@@ -14,4 +14,7 @@ fn the_mock_satisfies_the_trait_contract() {
     fs_winfsp::scenarios::scenario_read_dir_by_id::<MockBackend>(&backend);
     let backend = MockBackend::new();
     fs_winfsp::scenarios::scenario_remove_non_empty_directory::<MockBackend>(&backend);
+    // Case-insensitive names: the one question both backends used to answer differently (472).
+    let backend = MockBackend::new();
+    fs_winfsp::scenarios::scenario_case_insensitive_names::<MockBackend>(&backend);
 }

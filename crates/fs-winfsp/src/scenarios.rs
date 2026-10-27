@@ -169,3 +169,60 @@ pub fn scenario_remove_non_empty_directory<B: WorkspaceOps>(backend: &B) {
         .remove_at(0, b"d", dir)
         .expect("now the directory is empty and goes away");
 }
+
+/// **Case-insensitive names, asked of both backends** (472/480/481).
+///
+/// This is the scenario that makes "the mock and the real backend answer the same question the same way" a reading rather than a hope. Both had
+/// their own story about folding: the mock folded inside its own `split`, the real backend did not fold at all, and a criterion that passed on one
+/// therefore said nothing about the other.
+///
+/// Four claims, each with the negative next to it:
+///
+/// 1. an existing name answers under **any** spelling — and a different name still does not;
+/// 2. a case-only rename keeps the identity, replaces nothing;
+/// 3. the listing shows **exactly one** entry, under the spelling that was asked for last (display is kept, not folded);
+/// 4. creating the other spelling is a **collision** — the two spellings cannot become two entries.
+pub fn scenario_case_insensitive_names<B: WorkspaceOps>(backend: &B) {
+    let id = create(backend, b"/ReadMe.txt");
+    backend.write(id, 0, b"body").expect("write");
+
+    // 1. Folding is for matching, not for inventing.
+    let folded = backend
+        .create_or_open(b"/readme.txt", Disposition::Open)
+        .expect("the other spelling resolves to the existing entry");
+    assert_eq!(folded.file_id, id, "cell 1: same entry under another case");
+    assert!(
+        matches!(
+            backend.create_or_open(b"/other.txt", Disposition::Open),
+            Err(OpsError::NotFound)
+        ),
+        "cell 1 negative: a different name is still missing"
+    );
+
+    // 2. Case-only rename: same object, nothing replaced.
+    let outcome = backend
+        .rename(b"/ReadMe.txt", b"/readme.txt", true)
+        .expect("case-only rename");
+    assert_eq!(outcome.file_id, id, "cell 2: identity kept");
+    assert_eq!(outcome.replaced, None, "cell 2: nothing lost the name");
+
+    // 3. One entry, and its display bytes are the ones asked for last.
+    let entries = backend.read_dir(ROOT).expect("list");
+    assert_eq!(entries.len(), 1, "cell 3: exactly one entry");
+    assert_eq!(
+        entries[0].name, b"readme.txt",
+        "cell 3: display follows the rename"
+    );
+
+    // 4. The two spellings cannot both exist.
+    assert!(
+        matches!(
+            backend.create_or_open(b"/README.TXT", Disposition::Create),
+            Err(OpsError::NameCollision)
+        ),
+        "cell 4: creating the other spelling is a collision"
+    );
+
+    // The bytes survived every step — the identity half of "same entry".
+    assert_eq!(backend.read(id, 0, 4).expect("read"), b"body");
+}
