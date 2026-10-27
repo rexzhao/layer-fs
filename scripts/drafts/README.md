@@ -625,3 +625,17 @@ The question is therefore not "which slot is missing" (324/455's plan is answere
 handle** — a lifecycle question, and the same family as the double-close finding: our `Close` may be freeing the context while the FSD still holds
 the file object. The next instrument should print the `FileContext` id at `open`/`read`/`cleanup`/`close` for one bash `cat`, so the pairing is
 visible on our side too.
+
+## `cat` reads once, we answer 3 bytes — and nothing reaches stdout
+
+```
+BACKEND read(id=1, offset=0, len=3) -> Ok(3)
+BASH exit 0  out "exit=0"  err ""
+```
+
+The clamp is not the suspect any more: `offset=0`, `len=3`, the backend answers 3 bytes, no EOF, no second read. Yet `cat` prints nothing while
+exiting 0.
+
+So the defect is in **how the answered bytes reach the caller's buffer**, not in the offset arithmetic. The next probe writes the first bytes of
+`Buffer` *before* and *after* our copy (and prints `*PBytesTransferred`), which separates "we copied the wrong bytes" from "we copied to the wrong
+place". (`wc -c` read 5 bytes correctly through the same shell, so the buffer plumbing works on that path — the difference is the length-3 read.)
