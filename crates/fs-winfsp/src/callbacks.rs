@@ -718,6 +718,67 @@ pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_v
     CONTEXTS_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The `Read` **shell**: fill the caller's buffer from the entry at `offset`, **zero-padding at EOF**.
+///
+/// The padding is this layer's job, not the backend's: `WorkspaceOps::read` documents "a short read at EOF is zero-padded by the
+/// caller's contract, not here", so a backend that returns three bytes for a ten-byte request is correct, and returning those three
+/// bytes with `*PBytesTransferred = 3` would make Windows treat the rest as a failure.
+///
+/// # Safety
+///
+/// `context` must point to an `EntryContext` owned by this frontend; `buffer` must be valid for writes of `length` bytes;
+/// `bytes_transferred` (when not null) must be writable.
+pub unsafe fn read_shell(
+    adapter: Option<&crate::DynAdapter>,
+    context: *const c_void,
+    buffer: *mut c_void,
+    offset: u64,
+    length: u32,
+    bytes_transferred: *mut u32,
+) -> i32 {
+    READ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if context.is_null() || (buffer.is_null() && length > 0) {
+        return OURS_INVALID_PARAMETER;
+    }
+    // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
+    let entry = unsafe { &*context.cast::<EntryContext>() };
+    let Some(adapter) = adapter else {
+        return NOT_IMPLEMENTED;
+    };
+    let len = length as usize;
+    let bytes = match adapter.backend().read(entry.file_id, offset, len) {
+        Ok(bytes) => bytes,
+        // A directory cannot be read through a file handle: that is a typed refusal, not an empty read.
+        Err(crate::ops::OpsError::IsADirectory) => return NOT_IMPLEMENTED,
+        Err(_) => return OURS_OBJECT_NAME_NOT_FOUND,
+    };
+    let taken = bytes.len().min(len);
+    // SAFETY: `buffer` is valid for `length >= taken` bytes per the caller's contract.
+    let out = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), taken) };
+    out.copy_from_slice(&bytes[..taken]);
+    // EOF: the rest of the buffer is **zeros** (a stale buffer would leak the previous file), but the **count is what was actually
+    // read** — reporting the padded length would tell Windows there is more data, and it would ask again forever (the first version of
+    // this function did exactly that and ended in an out-of-memory panic).
+    if taken < len {
+        // SAFETY: the same buffer, the remaining range.
+        let tail = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>().add(taken), len - taken) };
+        tail.fill(0);
+    }
+    if !bytes_transferred.is_null() {
+        // SAFETY: writable out-pointer per WinFsp's contract.
+        unsafe { std::ptr::write(bytes_transferred, u32::try_from(taken).unwrap_or(u32::MAX)) };
+    }
+    0
+}
+
+/// How many times `Read` was entered.
+static READ_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times `Read` was entered.
+#[must_use]
+pub fn read_call_count() -> usize {
+    READ_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// The `Overwrite` **shell**: truncate in place, apply the attribute policy, then **read both back**.
 ///
 /// The two header facts this is built on (`winfsp.h:326-346`):

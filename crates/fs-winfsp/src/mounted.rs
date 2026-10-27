@@ -333,6 +333,31 @@ mod platform {
             )
         }
     }
+    /// `Read` — `winfsp.h:441-444`, slot **8**.
+    ///
+    /// `(FSP_FILE_SYSTEM*, PVOID FileContext, PVOID Buffer, UINT64 Offset, ULONG Length, PULONG PBytesTransferred)`.
+    unsafe extern "system" fn read_trampoline(
+        file_system: *mut c_void,
+        file_context: *mut c_void,
+        buffer: *mut c_void,
+        offset: u64,
+        length: u32,
+        bytes_transferred: *mut u32,
+    ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
+        // SAFETY: WinFsp's contract for this callback.
+        unsafe {
+            crate::callbacks::read_shell(
+                adapter.as_deref(),
+                file_context,
+                buffer,
+                offset,
+                length,
+                bytes_transferred,
+            )
+        }
+    }
+
     /// `Flush`: `(FSP_FILE_SYSTEM*, PVOID FileContext, FSP_FSCTL_FILE_INFO*)` — `winfsp.h:490-492`, slot **10**.
     ///
     /// Registered because **its absence is visible**: a `WriteFile` followed by a close makes WinFsp flush, and an unset slot answers
@@ -574,6 +599,18 @@ mod platform {
                 ) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(writing));
+            // `Read` — `winfsp.h:441`, slot **8**: `(fs, FileContext, Buffer, UINT64 Offset, ULONG Length, PULONG PBytesTransferred)`.
+            interface.slots[slot::READ] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    u64,
+                    u32,
+                    *mut u32,
+                ) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(read_trampoline));
             // `Flush` — slot **10**: without it, a flush after a write answers INVALID_DEVICE_REQUEST and the write looks failed.
             interface.slots[slot::FLUSH] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(

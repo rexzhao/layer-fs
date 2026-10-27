@@ -72,3 +72,26 @@ That is the whole remaining gap for the chain — plus one open question:
 `QueryVolumeInformation IoStatus=c0000023` (`STATUS_BUFFER_TOO_SMALL`) — our volume shell answers that when the caller's buffer is
 smaller than `size_of::<VolumeInfo>()`, but the FSD's query does not print a length, so this needs one probe to see what size it passes.
 It is not fatal for the chain (Windows tolerates the retry), but it explains why the volume shows no size.
+
+## Third session: `Read@8` wired, and two new facts
+
+`read_shell` + slot 8 are in. With it, the chain stopped failing at `Read` and **immediately exposed two more things**:
+
+1. **`MockBackend::read` violates the trait contract.** The trait says "a short read at EOF is zero-padded by the caller's contract,
+   not here", but the mock pads to `len`. With `Read` wired that turns into: Windows asks 32 bytes, gets 32, asks at offset 32, gets 32
+   again… until the process runs **out of memory**. Fixing the mock (short read) makes the three existing expectations that encode the
+   padded behaviour fail:
+   `contract::the_mock_satisfies_the_trait_contract`, `criteria_1_2::a_supersede_is_visible_through_every_handle`,
+   `mock_identity::supersede_truncates_in_place_and_keeps_the_id` — all of them assert **eight zero bytes** from an empty file, i.e. the
+   padding. So the fix needs those expectations updated in the same commit, justified by the trait doc (not by "the test failed").
+   The mock change was therefore reverted for now; `read_shell` stays.
+
+2. **`SetInformation [EndOfFile]` now answers `c000000d`** (`STATUS_INVALID_PARAMETER`) — that is the next blocker:
+
+```
+>>SetInformation [EndOfFile] 00000293F8019A00, FileSize = 0:5
+<<SetInformation IoStatus=c000000d
+```
+
+   `set_file_size_shell` returns that code when the `FileContext` is null, so the first question is whether WinFsp passes a null context
+   for `SetInformation` (it does for some operations) or whether the slot's argument order is off. Same trace-first rule as before.
