@@ -520,3 +520,26 @@ So the cut is:
 5. then the core side, then L2.
 
 Measured on the attempt: it is a **single-commit** change of about 20 sites; splitting it produces a red tree, which is worse than not starting.
+
+## L2 after the fold (folded key + display bytes): `07` flipped, `02` regressed
+
+```
+01 root: not a directory or missing
+02 create+read: <unreadable>              ← was "alpha" before the fold
+03 truncate existing: ok
+04 missing file: not found
+05a dir listing (sorted): a,b,            ← ok
+06 rmdir non-empty: removed (wrong)
+07 rename: old=gone new=present           ← **flipped green** (matches NTFS)
+08 case-only rename: <missing>
+09 delete while open: name=present
+10 concurrent read after write: <unreadable>   ← downstream of 02
+11 long name: refused
+12a attributes (semantic): readonly=no
+12b attributes (raw):  Z:\l2-renamed
+```
+
+`07` behaves like NTFS now — the fold was its root cause, as predicted. But `02` (write then read back) stopped working, and `10` fails with
+it, which points at the **path the fold now returns**: `raw_names`/`read_dir` answer `display`, while `create_or_open` stores `display: raw`; if any
+consumer still compares against the folded key, the round trip breaks. That is the next thing to look at — a regression introduced by this cut, not a
+pre-existing difference.
