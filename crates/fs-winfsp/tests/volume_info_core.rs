@@ -50,23 +50,30 @@ fn a_volume_is_written_into_a_large_enough_buffer() {
 }
 
 #[test]
-fn a_short_buffer_is_told_so_rather_than_refused() {
-    let mut out = volume(0);
-    let short = u32::try_from(std::mem::size_of::<VolumeInfo>()).expect("fits") - 1;
+fn a_short_buffer_gets_the_prefix_that_fits() {
+    // One byte short of the whole structure: the answer is the prefix, and the byte **past** the buffer is never touched (the sentinel
+    // stays 0xAA). This replaces an earlier expectation that said "too small is refused" — true of the old single-phase body, and the
+    // reason the volume showed no size: the dispatcher asks with eight bytes, not with 88.
+    const SENTINEL: u8 = 0xAA;
+    let mut raw = [SENTINEL; 96];
+    let capacity = u32::try_from(std::mem::size_of::<VolumeInfo>()).expect("fits") - 1;
     let status = unsafe {
         get_volume_info_for(
             Some(volume(1 << 20)),
-            std::ptr::addr_of_mut!(out).cast::<c_void>(),
-            short,
+            raw.as_mut_ptr().cast::<c_void>(),
+            capacity,
         )
     };
+    assert_eq!(status, 0, "cell short: answered, not refused");
+    let prefix = u64::from_ne_bytes(raw[..8].try_into().expect("eight bytes"));
     assert_eq!(
-        status, OURS_BUFFER_TOO_SMALL,
-        "cell short: **too small is not unsupported** — and the volume was configured, so this cannot be the `None` answer"
+        prefix,
+        1 << 20,
+        "cell short: the prefix carries `TotalSize`"
     );
     assert_eq!(
-        out.total_size, 0,
-        "cell short: nothing was written into the short buffer"
+        raw[capacity as usize], SENTINEL,
+        "cell short: the first byte **past** the buffer is untouched — a prefix is not an overrun"
     );
 }
 

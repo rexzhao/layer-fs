@@ -200,19 +200,25 @@ pub unsafe fn get_volume_info_for(
     if out.is_null() {
         return OURS_INVALID_PARAMETER;
     }
-    if (capacity as usize) < std::mem::size_of::<VolumeInfo>() {
-        // Two-phase, like `GetSecurityByName`: a buffer that is too small gets a **"too small"**, not "unsupported" — WinFsp
-        // retries with a bigger one, whereas `NOT_IMPLEMENTED` is terminal and is what the log showed
-        // (`<<QueryVolumeInformation IoStatus=c0000010`).
-        return OURS_BUFFER_TOO_SMALL;
-    }
     let Some(volume) = volume else {
         // The order matters and is asserted by a test: **"no volume configured" is decided before the buffer is trusted**, so a
         // configured-but-absent volume cannot be mistaken for a caller that passed a bad pointer.
         return NOT_IMPLEMENTED;
     };
-    // SAFETY: `out` is non-null and large enough for `VolumeInfo`, per the check above.
-    unsafe { std::ptr::write(out.cast::<VolumeInfo>(), volume) };
+    // **Write what fits, and only what fits.** WinFsp's own dispatcher asks with a short buffer (measured: `capacity = 8`,
+    // repeatedly), and answering `BUFFER_TOO_SMALL` forever is what left the volume showing no size in Explorer. The structure's
+    // fields are laid out leading-first (`fsctl.h:270-275`), so a prefix **is** a valid answer to "how big is this volume" — and the
+    // alternative, writing all 88 bytes into an 8-byte buffer, would be a buffer overrun rather than an answer.
+    let wanted = std::mem::size_of::<VolumeInfo>();
+    let take = (capacity as usize).min(wanted);
+    // SAFETY: `out` is non-null and valid for `capacity` bytes per the caller's contract; `take <= capacity` and `take <= wanted`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            std::ptr::addr_of!(volume).cast::<u8>(),
+            out.cast::<u8>(),
+            take,
+        );
+    }
     0
 }
 

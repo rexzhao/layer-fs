@@ -11,8 +11,7 @@ use fs_semantics::disposition::Disposition;
 use fs_winfsp::abi::{FileInfo, VolumeInfo};
 use fs_winfsp::callbacks::NOT_IMPLEMENTED;
 use fs_winfsp::callbacks::{
-    get_file_info_shell, get_volume_info_shell, EntryContext, OURS_BUFFER_TOO_SMALL,
-    OURS_INVALID_PARAMETER,
+    get_file_info_shell, get_volume_info_shell, EntryContext, OURS_INVALID_PARAMETER,
 };
 use fs_winfsp::ops::DynOps;
 use fs_winfsp::ops::{
@@ -190,16 +189,20 @@ fn the_volume_record_is_copied_verbatim() {
 }
 
 #[test]
-fn a_short_buffer_is_refused_rather_than_half_filled() {
+fn a_short_buffer_gets_the_prefix_that_fits() {
+    // The dispatcher really asks with eight bytes (measured on this machine), and refusing forever is what left the volume showing no
+    // size at all. The structure is leading-first, so a prefix is a true answer — and writing the whole 88 bytes into an 8-byte buffer
+    // would be an overrun, not an answer.
     let adapter = adapter();
     let mut small = [0u8; 8];
     let status =
         unsafe { get_volume_info_shell(Some(&adapter), small.as_mut_ptr().cast::<c_void>(), 8) };
+    assert_eq!(status, 0, "cell short: answered, not refused");
     assert_eq!(
-        status, OURS_BUFFER_TOO_SMALL,
-        "cell short: \"too small\", not \"unsupported\""
+        u64::from_ne_bytes(small),
+        VOLUME.total_size,
+        "cell short: the eight bytes that fit are `TotalSize` — the field the caller asked for"
     );
-    assert_eq!(small, [0u8; 8], "cell short: not one byte written");
 }
 
 #[test]
