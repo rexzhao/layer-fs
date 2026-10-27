@@ -166,6 +166,23 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
     .expect("the mount path is available");
 
     let after_contexts = callbacks::context_counts();
+
+    // **Assertions, not observations** (QA's gap): the names are compared literally, and the context counts by difference.
+    // "the call succeeded" was already true when the listing came back empty, so a wrong name could pass unnoticed.
+    match &probe_result {
+        Some(Ok(names)) => assert_eq!(
+            names,
+            &vec!["alpha.txt".to_string(), "beta".to_string()],
+            "cell contents: the listing is exactly what the fixture declares, sorted"
+        ),
+        Some(Err(error)) => panic!("cell contents: the listing failed: {error}"),
+        None => panic!("cell contents: the probe never ran against the mounted volume"),
+    }
+    assert_eq!(
+        after_contexts.0 - before_contexts.0,
+        after_contexts.1 - before_contexts.1,
+        "cell contexts: every FileContext allocated during the mount was freed during it (before {before_contexts:?},          after {after_contexts:?})"
+    );
     eprintln!(
         "dispatcher result = {} (0x{:08X}) — 0 means the dispatcher threads survived",
         report.dispatcher_result, report.dispatcher_result as u32

@@ -524,10 +524,6 @@ mod platform {
             params.set_file_info_timeout(0);
             // **A directory mount has no name of its own**, unlike a drive letter, so the volume must carry one. Applied only for
             // that shape: a drive-letter volume should not advertise a UNC prefix it will never be reached by.
-            let is_drive_letter = {
-                let text = mount_point.to_string_lossy();
-                text.len() == 2 && text.ends_with(':')
-            };
             // **No `Prefix` for a directory mount.** It is the UNC form (`\server\share`); a volume whose name looks like a
             // network share is refused as a junction target (`mount.c`: `VolumeName` with three or more backslashes ⇒
             // `STATUS_NETWORK_ACCESS_DENIED`). The accessor stays, the call does not: one variable at a time.
