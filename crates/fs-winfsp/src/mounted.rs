@@ -269,7 +269,7 @@ mod platform {
         file_system: *mut c_void,
         file_context: *mut c_void,
         file_attributes: u32,
-        replace_attributes: u32,
+        replace_attributes: u8,
         allocation_size: u64,
         file_info: *mut crate::abi::FileInfo,
     ) -> i32 {
@@ -312,8 +312,8 @@ mod platform {
         buffer: *const c_void,
         offset: u64,
         length: u32,
-        write_to_end_of_file: u32,
-        constrained_io: u32,
+        write_to_end_of_file: u8,
+        constrained_io: u8,
         bytes_written: *mut u32,
         file_info: *mut crate::abi::FileInfo,
     ) -> i32 {
@@ -333,6 +333,26 @@ mod platform {
             )
         }
     }
+    /// `Flush`: `(FSP_FILE_SYSTEM*, PVOID FileContext, FSP_FSCTL_FILE_INFO*)` — `winfsp.h:490-492`, slot **10**.
+    ///
+    /// Registered because **its absence is visible**: a `WriteFile` followed by a close makes WinFsp flush, and an unset slot answers
+    /// `STATUS_INVALID_DEVICE_REQUEST`, which surfaces as `ERROR_INVALID_FUNCTION` on the very operation that had just succeeded.
+    /// The backend's own `flush` is the answer; a null `FileContext` means "the whole volume", which this layer has nothing to add to.
+    unsafe extern "system" fn flush_trampoline(
+        file_system: *mut c_void,
+        _file_context: *mut c_void,
+        _file_info: *mut crate::abi::FileInfo,
+    ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
+        let Some(adapter) = adapter else {
+            return crate::callbacks::NOT_IMPLEMENTED;
+        };
+        match adapter.backend().flush() {
+            Ok(()) => 0,
+            Err(_) => crate::callbacks::NOT_IMPLEMENTED,
+        }
+    }
+
     /// `Close`: `(FSP_FILE_SYSTEM*, PVOID FileContext)` — `winfsp.h:420`.
     unsafe extern "system" fn close_trampoline(
         file_system: *mut c_void,
@@ -497,7 +517,7 @@ mod platform {
                 *mut c_void,
                 *mut c_void,
                 u32,
-                u32,
+                u8,
                 u64,
                 *mut crate::abi::FileInfo,
             ) -> i32 = overwrite_trampoline;
@@ -506,7 +526,7 @@ mod platform {
                     *mut c_void,
                     *mut c_void,
                     u32,
-                    u32,
+                    u8,
                     u64,
                     *mut crate::abi::FileInfo,
                 ) -> i32,
@@ -535,8 +555,8 @@ mod platform {
                 *const c_void,
                 u64,
                 u32,
-                u32,
-                u32,
+                u8,
+                u8,
                 *mut u32,
                 *mut crate::abi::FileInfo,
             ) -> i32 = write_trampoline;
@@ -547,13 +567,22 @@ mod platform {
                     *const c_void,
                     u64,
                     u32,
-                    u32,
-                    u32,
+                    u8,
+                    u8,
                     *mut u32,
                     *mut crate::abi::FileInfo,
                 ) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(writing));
+            // `Flush` — slot **10**: without it, a flush after a write answers INVALID_DEVICE_REQUEST and the write looks failed.
+            interface.slots[slot::FLUSH] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut crate::abi::FileInfo,
+                ) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(flush_trampoline));
             interface.slots[slot::OPEN] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(
                     *mut c_void,
