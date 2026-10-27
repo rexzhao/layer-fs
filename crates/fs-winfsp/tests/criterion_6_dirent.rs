@@ -10,7 +10,7 @@
 //! tests below show `A` and `a` both survive.
 
 use fs_semantics::disposition::Disposition;
-use fs_winfsp::{DirentCursor, MockBackend, WorkspaceOps};
+use fs_winfsp::{DirEntry, DirentCursor, Kind, MockBackend, WorkspaceOps};
 
 fn create(backend: &MockBackend, path: &[u8]) {
     backend
@@ -119,18 +119,28 @@ fn an_unknown_marker_yields_an_empty_page_rather_than_restarting() {
     );
 }
 
-/// Raw-byte names: `A` and `a` are two entries, and the folded key only decides their **order**, never their presence.
+/// The cursor folds only to decide **order**, never to merge entries — fed **synthetic** entries.
+///
+/// It used to build its input through `MockBackend` by creating `/d/A` and `/d/a`, which the backend no longer allows: the volume folds names (the
+/// behaviour that `CasePreservedNames` + a case-insensitive volume require), so those two spellings are one entry and the fixture could not produce
+/// the input this test is about. The cursor's rule is about ordering two entries whose folded keys are equal, so the entries are supplied directly.
 #[test]
 fn folding_orders_entries_without_merging_them() {
-    let backend = MockBackend::new();
-    let dir = backend.mkdir(b"/d").expect("mkdir");
-    create(&backend, b"/d/A");
-    create(&backend, b"/d/a");
+    let entries = vec![
+        DirEntry {
+            name: b"A".to_vec(),
+            kind: Kind::File,
+            file_id: 1,
+        },
+        DirEntry {
+            name: b"a".to_vec(),
+            kind: Kind::File,
+            file_id: 2,
+        },
+    ];
     let mut cursor = DirentCursor::new();
     let list = cursor
-        .fill(backend.read_dir(dir).expect("read_dir"), |name| {
-            name.to_ascii_lowercase()
-        })
+        .fill(entries, |name| name.to_ascii_lowercase())
         .to_vec();
 
     assert_eq!(

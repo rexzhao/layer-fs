@@ -50,22 +50,44 @@ fn identity_is_stable_across_rename_and_never_reused() {
     );
 }
 
-/// M2 — bindings are **raw bytes**: `A` and `a` are different names in the same directory.
+/// **The volume folds names and keeps the bytes the caller wrote** — the two halves of `CasePreservedNames`.
 ///
-/// A case-folding mock would make every adapter case-collision test meaningless, so the mock is asserted to be
-/// case-sensitive before anything else is built on it.
+/// This replaces `bindings_are_raw_bytes_so_a_and_upper_a_coexist`, which pinned the *previous* semantics (raw byte keys, so `/A` and `/a` were two
+/// entries). Those semantics contradicted the volume's own declaration (`CaseSensitiveSearch = 0`) and are exactly what the mounted volume got wrong:
+/// Windows renames and deletes by an **upcased** name, and a byte-keyed store answered "not found" (`rename "/L2-FILE" -> "/l2-renamed"` on a file
+/// created as `/l2-file`). So this is not a design change — it is the declaration and the behaviour being made to agree.
 #[test]
-fn bindings_are_raw_bytes_so_a_and_upper_a_coexist() {
+fn the_fold_makes_a_and_upper_a_one_entry_that_keeps_its_display_bytes() {
     let backend = MockBackend::new();
     let upper = create(&backend, b"/A");
-    let lower = create(&backend, b"/a");
-    assert_ne!(upper, lower, "cell ids: two distinct entries");
-    assert_eq!(backend.resolve(b"/A"), Some(upper));
-    assert_eq!(backend.resolve(b"/a"), Some(lower));
-    let names = backend.raw_names(ROOT);
+    // Creating the other spelling is a **collision**: after folding it is the same name.
+    let collision = backend.create_or_open(b"/a", Disposition::Create);
     assert!(
-        names.contains(&b"A".to_vec()) && names.contains(&b"a".to_vec()),
-        "cell names: both spellings are bound in the root directory (got {names:?})"
+        matches!(collision, Err(OpsError::NameCollision)),
+        "cell collision: `/a` and `/A` are one name after folding (got {collision:?})"
+    );
+    assert_eq!(backend.resolve(b"/A"), Some(upper), "cell upper: resolves");
+    assert_eq!(
+        backend.resolve(b"/a"),
+        Some(upper),
+        "cell lower: the same entry through the fold"
+    );
+    assert_eq!(
+        backend.raw_names(ROOT),
+        vec![b"A".to_vec()],
+        "cell names: one binding, displayed with the bytes the caller wrote"
+    );
+
+    // A case-only rename changes the **display bytes** and keeps the **id** — three semantics in one assertion (manager 442): the fold matches,
+    // a case-only rename is not a collision, and the identity survives.
+    backend
+        .rename(b"/A", b"/a", true)
+        .expect("case-only rename");
+    assert_eq!(backend.resolve(b"/a"), Some(upper), "cell rename: same id");
+    assert_eq!(
+        backend.raw_names(ROOT),
+        vec![b"a".to_vec()],
+        "cell rename: the display follows the most recent spelling"
     );
 }
 

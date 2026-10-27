@@ -64,10 +64,22 @@ struct Node {
     live: bool,
 }
 
+/// One name binding: the **id** it names and the **display bytes** the caller last wrote.
+///
+/// Two things in one record — not a second map: a `folded -> display` map beside a `folded -> id` map could drift apart, and the point of folding
+/// is that matching and display are decided **together** when a name is written. NTFS keeps the same pair internally (`$UpCase` for lookup, the
+/// original name for display), which is exactly what our `CasePreservedNames` flag promises.
+#[derive(Clone, Debug)]
+struct Binding {
+    id: u64,
+    display: Vec<u8>,
+}
+
 #[derive(Debug)]
 struct Inner {
     nodes: BTreeMap<u64, Node>,
-    children: BTreeMap<(u64, Vec<u8>), u64>,
+    /// Keyed by the **folded** name; the binding carries the display bytes.
+    children: BTreeMap<(u64, Vec<u8>), Binding>,
     next_id: u64,
     clock: i64,
     calls: Vec<Call>,
@@ -86,7 +98,18 @@ impl Default for MockBackend {
     }
 }
 
-fn split(path: &[u8]) -> OpsResult<Vec<Vec<u8>>> {
+/// One path component: the **folded key** the store matches by and the **raw bytes** the caller wrote.
+///
+/// A pair rather than one value, and that pair is the whole design. Folding inside `split` alone would have made the display name folded too
+/// (measured: an entry created as `A` listed as `a`), and keeping a separate `folded -> display` map would let the two drift. One record, written
+/// together, is the only shape where matching and display cannot disagree.
+#[derive(Clone, Debug)]
+struct Component {
+    folded: Vec<u8>,
+    raw: Vec<u8>,
+}
+
+fn split(path: &[u8]) -> OpsResult<Vec<Component>> {
     if path.first() != Some(&b'/') {
         return Err(OpsError::InvalidParameter);
     }
@@ -103,7 +126,12 @@ fn split(path: &[u8]) -> OpsResult<Vec<Vec<u8>>> {
             // hide a normalisation bug behind a lenient mock.
             return Err(OpsError::InvalidParameter);
         }
-        out.push(component.to_vec());
+        out.push(Component {
+            // **ASCII lowercase only** — the fold range is part of the contract, not an implementation detail (manager 442: the L2 names are
+            // ASCII; full Unicode folding is a known limit and stays out of scope).
+            folded: component.to_ascii_lowercase(),
+            raw: component.to_vec(),
+        });
     }
     Ok(out)
 }
@@ -168,11 +196,17 @@ impl MockBackend {
         let clock = inner.clock;
         let components = split(path)?;
         let (parent, name) = parent_and_name(&inner, &components)?;
-        if inner.children.contains_key(&(parent, name.clone())) {
+        if inner.children.contains_key(&(parent, name.folded.clone())) {
             return Err(OpsError::NameCollision);
         }
         let id = inner.allocate(Kind::Directory, clock);
-        inner.children.insert((parent, name), id);
+        inner.children.insert(
+            (parent, name.folded),
+            Binding {
+                id,
+                display: name.raw,
+            },
+        );
         Ok(id)
     }
 
@@ -183,7 +217,7 @@ impl MockBackend {
         let components = split(path).ok()?;
         let mut current = ROOT;
         for component in components {
-            current = *inner.children.get(&(current, component))?;
+            current = inner.children.get(&(current, component.folded))?.id;
         }
         Some(current)
     }
@@ -200,20 +234,22 @@ impl MockBackend {
     }
 
     /// Directory entries as raw names, unsorted (the mock does not sort: the adapter owns ordering).
+    ///
+    /// The **display** bytes, not the folded key — that is what `CasePreservedNames` promises.
     #[must_use]
     pub fn raw_names(&self, dir: u64) -> Vec<Vec<u8>> {
         let inner = self.inner.lock().expect("mock lock");
         inner
             .children
-            .keys()
-            .filter(|(parent, _)| *parent == dir)
-            .map(|(_, name)| name.clone())
+            .iter()
+            .filter(|((parent, _), _)| *parent == dir)
+            .map(|(_, binding)| binding.display.clone())
             .collect()
     }
 }
 
-/// Resolves the parent of `components` and returns it with the final name.
-fn parent_and_name(inner: &Inner, components: &[Vec<u8>]) -> OpsResult<(u64, Vec<u8>)> {
+/// Resolves the parent of `components` and returns it with the final component (folded key + raw bytes).
+fn parent_and_name(inner: &Inner, components: &[Component]) -> OpsResult<(u64, Component)> {
     let Some((name, parents)) = components.split_last() else {
         return Err(OpsError::InvalidParameter);
     };
@@ -221,8 +257,8 @@ fn parent_and_name(inner: &Inner, components: &[Vec<u8>]) -> OpsResult<(u64, Vec
     for component in parents {
         let next = inner
             .children
-            .get(&(current, component.clone()))
-            .copied()
+            .get(&(current, component.folded.clone()))
+            .map(|binding| binding.id)
             .ok_or(OpsError::NotFound)?;
         match inner.nodes.get(&next).map(|node| node.kind) {
             Some(Kind::Directory) => current = next,
@@ -264,7 +300,7 @@ impl Inner {
             node.content.clear();
         }
         // Retiring an id also drops every name bound to it: a tombstone must not be reachable by name.
-        self.children.retain(|_, child| *child != id);
+        self.children.retain(|_, child| child.id != id);
     }
 
     fn live_node(&self, id: u64) -> OpsResult<&Node> {
@@ -281,18 +317,14 @@ impl Inner {
         replaced: Option<u64>,
     ) -> OpenOutcome {
         let node = self.nodes.get(&id).expect("just allocated");
-        let parent = self
+        // The binding that names this id, if any — the **display** bytes, since that is what a caller sees.
+        let binding = self
             .children
             .iter()
-            .find(|(_, child)| **child == id)
-            .map(|((parent, _), _)| *parent)
-            .unwrap_or(ROOT);
-        let name = self
-            .children
-            .iter()
-            .find(|(_, child)| **child == id)
-            .map(|((_, name), _)| name.clone())
-            .unwrap_or_default();
+            .find(|(_, child)| child.id == id)
+            .map(|((parent, _), child)| (*parent, child.display.clone()));
+        let parent = binding.as_ref().map_or(ROOT, |(parent, _)| *parent);
+        let name = binding.map_or_else(Vec::new, |(_, display)| display);
         OpenOutcome {
             file_id: id,
             kind: node.kind,
@@ -354,7 +386,10 @@ impl WorkspaceOps for MockBackend {
         let (parent, name) = parent_and_name(&inner, &components)?;
         use fs_semantics::disposition::Action;
 
-        let existing = inner.children.get(&(parent, name.clone())).copied();
+        let existing = inner
+            .children
+            .get(&(parent, name.folded.clone()))
+            .map(|binding| binding.id);
         let kind = existing.and_then(|id| inner.nodes.get(&id).map(|node| node.kind));
         // The disposition table (`fs-semantics`) decides; the mock only carries it out. `Failure` outcomes become typed
         // errors, which is the one place this mock adds judgement of its own.
@@ -406,7 +441,13 @@ impl WorkspaceOps for MockBackend {
                     Some(id) => (id, action, None),
                     None => {
                         let id = inner.allocate(Kind::File, clock);
-                        inner.children.insert((parent, name.clone()), id);
+                        inner.children.insert(
+                            (parent, name.folded.clone()),
+                            Binding {
+                                id,
+                                display: name.raw.clone(),
+                            },
+                        );
                         (id, action, None)
                     }
                 },
@@ -479,19 +520,20 @@ impl WorkspaceOps for MockBackend {
             return Err(OpsError::NotADirectory);
         }
         let mut entries = Vec::new();
-        for ((parent, name), child) in &inner.children {
+        for ((parent, _folded), binding) in &inner.children {
             if *parent != dir_id {
                 continue;
             }
-            let child_node = inner.nodes.get(child).ok_or(OpsError::NotFound)?;
+            let child_node = inner.nodes.get(&binding.id).ok_or(OpsError::NotFound)?;
             if !child_node.live {
                 continue;
             }
             entries.push(DirEntry {
-                name: name.clone(),
+                // **The display bytes**, not the folded key.
+                name: binding.display.clone(),
                 kind: child_node.kind,
                 // The id the backend would answer `get_info` with for this entry — the field's whole purpose (367).
-                file_id: *child,
+                file_id: binding.id,
             });
         }
         Ok(entries)
@@ -571,8 +613,8 @@ impl WorkspaceOps for MockBackend {
         let (to_parent, to_name) = parent_and_name(&inner, &to_components)?;
         let source = inner
             .children
-            .get(&(from_parent, from_name.clone()))
-            .copied()
+            .get(&(from_parent, from_name.folded.clone()))
+            .map(|binding| binding.id)
             .ok_or(OpsError::NotFound)?;
         let source_kind = inner.live_node(source)?.kind;
 
@@ -587,13 +629,17 @@ impl WorkspaceOps for MockBackend {
                 current = inner
                     .children
                     .iter()
-                    .find(|(_, child)| **child == id)
+                    .find(|(_, child)| child.id == id)
                     .map(|((parent, _), _)| *parent);
             }
         }
 
         let mut replaced = None;
-        if let Some(existing) = inner.children.get(&(to_parent, to_name.clone())).copied() {
+        if let Some(existing) = inner
+            .children
+            .get(&(to_parent, to_name.folded.clone()))
+            .map(|binding| binding.id)
+        {
             if existing != source {
                 if !replace {
                     return Err(OpsError::NameCollision);
@@ -608,20 +654,27 @@ impl WorkspaceOps for MockBackend {
                     }
                     _ => return Err(OpsError::TypeMismatch),
                 }
-                inner.children.remove(&(to_parent, to_name.clone()));
+                inner.children.remove(&(to_parent, to_name.folded.clone()));
                 inner.retire(existing);
                 replaced = Some(existing);
             }
         }
 
-        inner.children.remove(&(from_parent, from_name));
-        inner.children.insert((to_parent, to_name.clone()), source);
+        inner.children.remove(&(from_parent, from_name.folded));
+        // The destination binding carries the **bytes the caller asked for** — a case-only rename changes the display and keeps the id.
+        inner.children.insert(
+            (to_parent, to_name.folded),
+            Binding {
+                id: source,
+                display: to_name.raw.clone(),
+            },
+        );
         if let Some(node) = inner.nodes.get_mut(&source) {
             node.times.changed = clock;
         }
         Ok(RenameOutcome {
             file_id: source,
-            binding: (to_parent, to_name),
+            binding: (to_parent, to_name.raw),
             replaced,
         })
     }
@@ -644,7 +697,11 @@ impl WorkspaceOps for MockBackend {
         //      not an error, because NT sends `Cleanup` and `Close` on the same handle;
         //   3. the name is free and `expected_id` is still **live** -> `NotFound`: the entry moved away and the caller's
         //      identity no longer names anything.
-        match inner.children.get(&(parent, name.to_vec())).copied() {
+        match inner
+            .children
+            .get(&(parent, name.to_ascii_lowercase()))
+            .map(|binding| binding.id)
+        {
             // The name now belongs to a **different** entry. That is not "not found" — the caller's handle is stale, and
             // the core says `InvalidRecord` here for the same reason. Folding it into `NotFound` would report a missing
             // file where the truth is "your identity no longer names this name".
@@ -660,7 +717,7 @@ impl WorkspaceOps for MockBackend {
                 if has_children {
                     return Err(OpsError::NotEmpty);
                 }
-                inner.children.remove(&(parent, name.to_vec()));
+                inner.children.remove(&(parent, name.to_ascii_lowercase()));
                 inner.retire(bound);
                 Ok(())
             }
