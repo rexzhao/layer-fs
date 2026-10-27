@@ -933,7 +933,12 @@ unsafe fn open_like(
             // one before creating a child), and the file door correctly refuses it — so the directory door gets the second attempt. Without this
             // fallback the open of a perfectly good directory answers NotADirectory, and every child operation under it fails with
             // "path not found" (measured: `/d` Open -> NotADirectory, then `/d/a` -> NotFound, four calls in a row).
-            Err(crate::ops::OpsError::NotADirectory) => {
+            // **`NotFound` gets the same second attempt** (515). The file door says "no such name" for a path that a directory door answers happily: the
+            // root is the case that broke a whole mount, because a bare `/` has no name for some backends while still being the root. `NotADirectory`
+            // means "that is a directory, and I will not open it"; `NotFound` means "I cannot see it" — and for a directory, both are the same
+            // situation seen by a door that is not allowed to look. Measured: `Create("\\", FILE_OPEN)` answered `0xC0000034`, after which WinFsp
+            // synthesised `0xC000003A` for every child and no file could be created through the mount.
+            Err(crate::ops::OpsError::NotADirectory | crate::ops::OpsError::NotFound) => {
                 match adapter
                     .backend()
                     .open_dir(&crate::ops::Path::new(path.as_bytes()))

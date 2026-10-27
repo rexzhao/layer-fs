@@ -1102,3 +1102,17 @@ back to `open_dir` on **`NotADirectory`** (that fallback was added for 8fe5b81).
 **Fix sketch (next round):** in `open_like`, when the file door answers `NotFound` and the same path opens as a directory, answer the directory — the same
 asymmetry rule as 435 (`a no-flag open landing on a directory = open it`), applied to the one case where the door cannot even say "that is a directory".
 That is a product defect, reproducible with the stock `MockBackend` (no `SlashBackend` involved).
+
+## Fallback extended — and the failing probe **still fails** (515)
+
+`open_like` now treats `NotFound` like `NotADirectory` and retries through the directory door. It is the right change on its own terms, but it did **not**
+fix the probe:
+
+```
+mock root answers:  create_or_open("/", Open) = Ok((0, Directory))   open_dir("/") = Ok(0)   get_info(0) = Ok
+failing probe:      via_join = os error 3 ; via_format = os error 3   (unchanged)
+```
+
+So the backend answers the root correctly and the mount still refuses it: the `0xC0000034` in the debug log comes from **our `create_shell` after the door
+succeeded, or from a branch before the fallback**. The next reading is the same temporary print that produced the earlier `door-status` lines, now with the
+fallback in place — it will name the returning branch instead of leaving "we answered 0x34" as an inference.
