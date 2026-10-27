@@ -201,6 +201,24 @@ mod platform {
         context_out: *mut *mut c_void,
         info_out: *mut crate::abi::FileInfo,
     ) -> i32 {
+        // Raw values first, interpretation second: if the parameter order or the `Create`/`CreateEx` variant is not what we
+        // assume, the raw line still says what the driver actually passed.
+        eprintln!(
+            "create raw: fs={:p} p1={:p} p2={:#x} p3={:#x} p4={:#x} p5={:p} p6={:#x} p7={:p} p8={:p}",
+            _file_system,
+            file_name,
+            create_options,
+            _granted_access,
+            _file_attributes,
+            _security,
+            _allocation_size,
+            context_out,
+            info_out
+        );
+        eprintln!(
+            "create as decoded: FileName={:p} CreateOptions={:#x} GrantedAccess={:#x} FileAttributes={:#x} Security={:p} AllocationSize={:#x} ContextOut={:p} InfoOut={:p}",
+            file_name, create_options, _granted_access, _file_attributes, _security, _allocation_size, context_out, info_out
+        );
         // SAFETY: WinFsp's contract for this callback.
         unsafe { crate::callbacks::create(file_name, create_options, context_out, info_out) }
     }

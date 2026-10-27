@@ -244,7 +244,13 @@ pub unsafe fn open(
     context_out: *mut *mut c_void,
     info_out: *mut FileInfo,
 ) -> i32 {
+    OPEN_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if file_name.is_null() || context_out.is_null() || info_out.is_null() {
+        OPEN_EXITS[0].fetch_add(0, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "open: null argument (file_name={:?} context_out={:?} info_out={:?})",
+            file_name, context_out, info_out
+        );
         return OURS_INVALID_PARAMETER;
     }
     // SAFETY: `file_name` is NUL-terminated per WinFsp's contract.
@@ -277,6 +283,15 @@ pub unsafe fn open(
         std::ptr::write(info_out, record);
     }
     0
+}
+
+/// How many times `open` was actually entered (independent of how it exited).
+static OPEN_ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times `open` was entered.
+#[must_use]
+pub fn open_entry_count() -> usize {
+    OPEN_ENTRIES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How many times `Create` was called.

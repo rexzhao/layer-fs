@@ -151,6 +151,7 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
         report.dispatcher_result, report.dispatcher_result as u32
     );
     eprintln!("probe hits = {}", report.probe_hits);
+    eprintln!("open entries = {}", callbacks::open_entry_count());
     eprintln!(
         "open exits: no_resolver={} no_entry={} bad_record={}",
         callbacks::open_exit_counts().0,
