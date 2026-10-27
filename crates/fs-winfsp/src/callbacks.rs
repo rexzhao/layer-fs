@@ -485,7 +485,14 @@ unsafe fn open_like(
             .create_or_open(path.as_bytes(), disposition)
             // The backend's own answer carries where the name lives — that is the binding `remove_at` will guard with.
             .map(|outcome| (outcome.file_id, Some(outcome.binding)))
-            .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
+            .map_err(|error| {
+                // The refusal is **named** here: "which layer said no" is the question every write-chain failure starts with, and a
+                // bare NOT_FOUND cannot answer it (the same reason the GSBN finding needed a trace).
+                eprintln!(
+                    "open_like: backend refused path={path:?} disposition={disposition:?}: {error:?}"
+                );
+                OURS_OBJECT_NAME_NOT_FOUND
+            }),
     };
     let (file_id, binding) = match outcome {
         Ok(pair) => pair,

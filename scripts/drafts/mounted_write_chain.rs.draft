@@ -47,7 +47,23 @@ fn to_backend_path(path: &[u8]) -> Vec<u8> {
 
 impl WorkspaceOps for SlashBackend {
     fn create_or_open(&self, path: &[u8], disposition: Disposition) -> OpsResult<OpenOutcome> {
-        self.inner.create_or_open(&to_backend_path(path), disposition)
+        let normalized = to_backend_path(path);
+        // **The root is not a path the backend can parse**: `MockBackend::split` refuses `/` (an empty component after the leading
+        // slash). That is the fixture's limitation, and it is the same gap already recorded in the trait (a directory id is not
+        // reachable by path). Answered here, in the fixture, rather than papered over in the shell.
+        if normalized == b"/" {
+            return Ok(OpenOutcome {
+                file_id: 0,
+                kind: Kind::Directory,
+                action: fs_semantics::disposition::Action::Open,
+                size: 0,
+                times: fs_winfsp::file_info::times(1, 1, 1, 1),
+                attributes: Attributes(0x10),
+                binding: (0, Vec::new()),
+                replaced: None,
+            });
+        }
+        self.inner.create_or_open(&normalized, disposition)
     }
     fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
         self.inner.mkdir(&to_backend_path(path))
