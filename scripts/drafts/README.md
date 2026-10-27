@@ -289,3 +289,21 @@ paired with the `>>Create` line that precedes each failing `>>QueryDirectory`.
 
 Note also what the same trace shows: `>>Create "\written.txt", FILE_OPEN` answered `c0000034` (not found) right after a successful create of the
 same name — worth pairing as well, since it suggests the second open used a **different name shape** than the first.
+
+## The "second open of the same name" clue was wrong — and the trace says why
+
+```
+>>Cleanup [Delete] "\WRITTEN.TXT", 0000000000000007
+<<Cleanup IoStatus=0[0]
+>>Close 0000000000000007
+<<Close IoStatus=0[0]
+>>Create [UT----] "\written.txt", FILE_OPEN, CreateOptions=20 …
+<<Create IoStatus=c0000034
+```
+
+The second `Create` answers **not found because the previous step deleted the file**. That is correct behaviour, not a defect — the pairing I proposed
+as "the most valuable clue" was a false lead, and the trace settles it in four lines.
+
+So the open lead is back to the one place the L2 script differs from the minimal sequence: some `>>QueryDirectory` answers `c0000010` **in the script's
+flow** while the minimal create-then-list run answers `0[128]`. The next run must capture the *first* `c0000010` of a full L2 run together with the
+`>>Create` that produced its context.
