@@ -477,6 +477,16 @@ static DOUBLE_RELEASES: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 /// When non-zero, `close_shell` prints the context pointer it is about to release (paired with the FSD log).
 pub static CLOSE_TRACE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many releases arrived for an address that was never handed out (the "stale value" class).
+pub static STALE_RELEASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many releases arrived for an address that was never handed out — the class that says the value came from somewhere other than a
+/// successful open of ours.
+#[must_use]
+pub fn stale_release_count() -> usize {
+    STALE_RELEASES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many times a context was released twice.
 #[must_use]
 pub fn double_release_count() -> usize {
@@ -906,8 +916,11 @@ pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_v
     // again.
     if !take_context_live(context as usize) {
         DOUBLE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STALE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "close: {context:p} is not a live context — refusing to free it a second time (that is a double free)"
+            "close: {context:p} is not a live context — refusing to free it (null={} never-handed-out)"
+        ,
+            (context as usize) == 0
         );
         return;
     }

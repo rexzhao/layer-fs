@@ -229,3 +229,34 @@ Two facts, and they change the question:
 Next question is therefore: **which path returns success without setting `PFileContext`?** Candidates to read in order: `create_shell`'s early
 returns, `open_like`'s refusal paths (they return non-zero, so their slot stays untouched — the FSD then must not close it), and
 `overwrite_shell` (no context parameter at all).
+
+## The stale closes are all **non-null** — candidate 2 confirmed
+
+```
+close: 0x18f718ea9c0 is not a live context — refusing to free it (null=false never-handed-out)
+stale releases: 0 -> 17
+```
+
+Every one of the 17 is a **non-null address we never handed out**. Per the dispatcher's own source (`fsop.c`: the context slots are
+zeroed before the call and left alone on failure), a stale `NULL` would mean *we* returned success without writing the slot; a stale
+**non-null** value means the value came from somewhere else entirely — the FSD closing a context slot that was never ours.
+
+So the containment stands (`close` refuses), the crash is gone, and the **residual risk** is the one the pinning experiment could not
+trigger: an allocator reusing an address so that a stale close lands on a *live* context and frees the wrong object.
+
+### Why an issue number inside the context cannot fix that
+
+Reading a serial out of the pointed-to memory is only safe if the address is ours; under reuse the address *is* ours (the new context), so
+the serial read would be the **new** one and the check would pass. WinFsp hands us back only the pointer, so nothing in the pointed-to memory
+can distinguish "the context this close belongs to" from "whatever now lives at that address".
+
+### The fix that does not depend on addresses: hand out **indices**, not pointers
+
+`FileContext` = a monotonically increasing id (never reused), kept in a table `id -> Box<EntryContext>`:
+
+- a stale close carries an id that is **not in the table** ⇒ refused, no dereference, no UB;
+- a reused address cannot happen because we never interpret the value as an address;
+- the table is the single owner, so double-free is impossible by construction.
+
+That is the next cut — it replaces `LIVE_CONTEXTS: BTreeSet<usize>` (address-keyed) with `BTreeMap<u64, Box<EntryContext>>` (id-keyed) and
+makes `close_shell` look up by id.
