@@ -687,3 +687,23 @@ So the mechanism is (a)/(b): **the FSD keeps using a file object after (and acro
 *what a `Close` means for us*: today it frees the context immediately, and everything arriving afterwards is refused — including operations that belong to a
 still-live file object. Keeping the context alive until the object is really gone (a graveyard with an explicit "never reused" id) would make the later
 operations answerable instead of refused.
+
+## L2 after the reference-counted contexts: **10 of 12**
+
+```
+01 root: not a directory       ✗   NTFS: directory
+02 create+read: alpha          ✓   ← the whole "Invalid request code" chain, closed
+03 truncate: ok                ✓
+04 missing: not found          ✓
+05a/05b listing: a,b,          ✓
+06 rmdir non-empty: refused    ✓
+07 rename: old=gone new=present ✓
+08 case-only rename: <missing> ✗
+09 delete while open: name=gone ✓  ← flipped with the lifecycle fix
+10 concurrent read: beta       ✓  ← flipped with the lifecycle fix
+11 long name: refused          ✓
+12a readonly=yes               ✗   ours: readonly=no
+```
+
+`09` and `10` flipped with the reference count, as predicted — they were the same lifecycle defect seen from two sides. What is left is
+`01` (the script's own first `stat`), `08` (case-only rename) and `12a` (attributes), and each has a distinct question already written down.
