@@ -192,6 +192,25 @@ pub unsafe fn get_volume_info(out: *mut c_void, capacity: u32) -> i32 {
     unsafe { get_volume_info_for(volume, out, capacity) }
 }
 
+/// The `GetVolumeInfo` **shell**: the adapter comes from the mount registry, or `None` when the pointer is not a live mount.
+///
+/// `Option<&DynAdapter>` puts the miss **in the type**: the refusal path exists in the signature rather than in a fallback branch,
+/// so "no adapter" cannot quietly become "the last configuration" (352).
+///
+/// # Safety
+///
+/// `out` must be valid for writes of `capacity` bytes for the duration of the call.
+pub unsafe fn get_volume_info_shell(
+    adapter: Option<&crate::DynAdapter>,
+    out: *mut c_void,
+    capacity: u32,
+) -> i32 {
+    VOLUME_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let volume = adapter.and_then(|adapter| adapter.config().volume);
+    // SAFETY: the caller's contract covers `out`.
+    unsafe { get_volume_info_for(volume, out, capacity) }
+}
+
 /// The `GetVolumeInfo` body with the volume handed in: **the logic lives here, the process-wide lookup lives above** (361).
 ///
 /// Splitting it this way is what makes the two-phase contract testable without a mount: the size query, the "too small" answer,

@@ -93,3 +93,53 @@ fn a_null_buffer_is_refused_before_anything_else() {
         "cell null: the pointer is checked first"
     );
 }
+
+/// The **shell** asks the mount, not the process (352): an adapter with a volume answers it, and `None` — the registry miss —
+/// answers "no volume" instead of borrowing somebody else's configuration.
+#[test]
+fn the_shell_reads_the_volume_from_the_mount_it_was_given() {
+    use fs_winfsp::abi::VolumeInfo;
+    use fs_winfsp::adapter::AdapterConfig;
+    use fs_winfsp::callbacks::get_volume_info_shell;
+    use fs_winfsp::mock::MockBackend;
+    use fs_winfsp::DynAdapter;
+    use fs_winfsp::ops::DynOps;
+
+    let capacity = u32::try_from(std::mem::size_of::<VolumeInfo>()).expect("fits");
+    let configured: DynAdapter = DynAdapter::with_config(
+        Box::new(MockBackend::new()) as DynOps,
+        AdapterConfig {
+            volume: Some(volume(1 << 40)),
+            ..AdapterConfig::default()
+        },
+    );
+    let bare: DynAdapter = DynAdapter::new(Box::new(MockBackend::new()) as DynOps);
+
+    let read = |adapter: Option<&DynAdapter>| {
+        let mut out = volume(0);
+        let status = unsafe {
+            get_volume_info_shell(
+                adapter,
+                std::ptr::addr_of_mut!(out).cast::<c_void>(),
+                capacity,
+            )
+        };
+        (status, out.total_size)
+    };
+
+    assert_eq!(
+        read(Some(&configured)),
+        (0, 1 << 40),
+        "cell configured: the mount's own volume comes back"
+    );
+    assert_eq!(
+        read(Some(&bare)),
+        (NOT_IMPLEMENTED, 0),
+        "cell bare: a mount without a volume answer refuses — it does not borrow"
+    );
+    assert_eq!(
+        read(None),
+        (NOT_IMPLEMENTED, 0),
+        "cell miss: **no adapter is not a reason to invent a volume**"
+    );
+}
