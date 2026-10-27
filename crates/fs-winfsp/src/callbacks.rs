@@ -731,6 +731,30 @@ unsafe fn open_like(
             Err(crate::ops::OpsError::NameCollision) => Err(OURS_OBJECT_NAME_COLLISION),
             Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
         },
+        MakeVerb::OpenDirectory => match adapter.backend().open_dir(path.as_bytes()) {
+            Ok(file_id) => adapter
+                .backend()
+                .get_info(file_id)
+                .map(|_| (file_id, None))
+                .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
+            // Windows opens a directory with `FILE_OPEN_IF`, which means "open it, or make it": the make half is `mkdir`, and doing it here is
+            // what keeps the 2x2 from needing a fifth verb.
+            Err(crate::ops::OpsError::NotFound)
+                if disposition == fs_semantics::disposition::Disposition::OpenIf =>
+            {
+                match adapter.backend().mkdir(path.as_bytes()) {
+                    Ok(file_id) => adapter
+                        .backend()
+                        .get_info(file_id)
+                        .map(|_| (file_id, None))
+                        .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
+                    Err(crate::ops::OpsError::NameCollision) => Err(OURS_OBJECT_NAME_COLLISION),
+                    Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
+                }
+            }
+            Err(crate::ops::OpsError::NotADirectory) => Err(OURS_NOT_A_DIRECTORY),
+            Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
+        },
         MakeVerb::File => adapter
             .backend()
             .create_or_open(path.as_bytes(), disposition)
@@ -825,6 +849,9 @@ enum MakeVerb {
     File,
     /// `mkdir(path)` — a **new** directory (the disposition asked for creation).
     Directory,
+    /// `open_dir(path)` — an **existing** directory. Without this arm the second open of a directory
+    /// (`FILE_OPEN + FILE_DIRECTORY_FILE`) fell into the file door and was refused, after `mkdir` had already answered success.
+    OpenDirectory,
 }
 
 /// The decision, as a function: `FILE_DIRECTORY_FILE` + a creating disposition ⇒ `mkdir`.
@@ -839,7 +866,11 @@ fn make_verb(
 ) -> MakeVerb {
     use fs_semantics::disposition::Disposition;
     match (wants_directory, disposition) {
+        // The 2x2, flat in the dispatcher:
+        //   (directory, Create) => mkdir          (directory, Open) => open_dir
+        //   (file,      any)    => create_or_open (which carries the disposition)
         (true, Disposition::Create) => MakeVerb::Directory,
+        (true, Disposition::Open | Disposition::OpenIf) => MakeVerb::OpenDirectory,
         _ => MakeVerb::File,
     }
 }
@@ -984,6 +1015,9 @@ pub unsafe fn rename_shell(
         Err(_) => NOT_IMPLEMENTED,
     }
 }
+
+/// `STATUS_NOT_A_DIRECTORY` — "that name is a file, not a directory".
+pub const OURS_NOT_A_DIRECTORY: i32 = 0xC000_0103u32 as i32;
 
 /// `STATUS_DIRECTORY_NOT_EMPTY`.
 pub const OURS_DIRECTORY_NOT_EMPTY: i32 = 0xC000_0101u32 as i32;

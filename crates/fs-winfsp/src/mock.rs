@@ -301,6 +301,18 @@ impl Inner {
 }
 
 impl WorkspaceOps for MockBackend {
+    fn open_dir(&self, path: &[u8]) -> OpsResult<u64> {
+        // Resolve first, then check the kind: a file at that name is `NotADirectory`, not "not found" — the two must stay distinguishable, and
+        // both backends answer the same way (the shared contract asserts it).
+        let id = MockBackend::resolve(self, path).ok_or(OpsError::NotFound)?;
+        let inner = self.inner.lock().expect("mock lock");
+        let kind = inner.live_node(id)?.kind;
+        if kind != Kind::Directory {
+            return Err(OpsError::NotADirectory);
+        }
+        Ok(id)
+    }
+
     fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
         MockBackend::mkdir(self, path)
     }

@@ -196,6 +196,24 @@ pub trait WorkspaceOps {
     /// [`OpsError::NameCollision`] when the name is taken, [`OpsError::NotFound`] for a missing parent.
     fn mkdir(&self, path: &[u8]) -> OpsResult<u64>;
 
+    /// Opens an **existing** directory by path, answering its id.
+    ///
+    /// Separate from `create_or_open` on purpose: that method is the *file* door (it carries a disposition and refuses a directory), and the
+    /// kind × disposition matrix belongs in the dispatcher rather than folded into one signature. Windows opens a directory **twice** — once to
+    /// create it (`mkdir`) and again with `FILE_OPEN + FILE_DIRECTORY_FILE` — and without this method the second open has nowhere to go, which is
+    /// how `mkdir` could report success while the directory stayed unusable for every later call.
+    ///
+    /// # Errors
+    ///
+    /// [`OpsError::NotFound`] for a missing name; the kind rule (a file is not a directory) is the backend's to enforce, and both backends must
+    /// answer the same way (asserted by the shared contract).
+    ///
+    /// The default **refuses** rather than fabricating an answer: a fixture that never opens a directory by path says "I cannot", which is
+    /// falsifiable the moment a caller tries it, and both real backends override this.
+    fn open_dir(&self, _path: &[u8]) -> OpsResult<u64> {
+        Err(OpsError::NotFound)
+    }
+
     /// Reads up to `len` bytes at `offset`; a short read at EOF is zero-padded by the caller's contract, not here.
     ///
     /// # Errors
@@ -307,6 +325,10 @@ impl WorkspaceOps for Box<dyn WorkspaceOps + Send + Sync> {
 
     fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
         (**self).mkdir(path)
+    }
+
+    fn open_dir(&self, path: &[u8]) -> OpsResult<u64> {
+        (**self).open_dir(path)
     }
 
     fn read(&self, file_id: u64, offset: u64, len: usize) -> OpsResult<Vec<u8>> {

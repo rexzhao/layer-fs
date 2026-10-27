@@ -96,6 +96,18 @@ impl std::fmt::Debug for ApiBackend<'_> {
 }
 
 impl WorkspaceOps for ApiBackend<'_> {
+    fn open_dir(&self, path: &[u8]) -> OpsResult<u64> {
+        let rules = self.rules();
+        // The rules layer already resolves a path to an entry; the **kind** is what this method adds, and saying "that is a file" is the whole
+        // reason the method exists (a directory open must not silently answer a file's id).
+        let resolved = rules.resolve(&path_of(path)?).map_err(to_ops)?;
+        let view = self.view(resolved.serial())?;
+        if view.kind != fs_namespace::Kind::Directory {
+            return Err(OpsError::NotADirectory);
+        }
+        Ok(resolved.serial())
+    }
+
     fn mkdir(&self, path: &[u8]) -> OpsResult<u64> {
         let rules = self.rules();
         rules.mkdir(&path_of(path)?).map_err(to_ops)?;
