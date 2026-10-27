@@ -475,3 +475,20 @@ So the mapping prediction held for `05` (child creation was the single root caus
 non-empty directory is refused by NTFS and allowed by us. `07`/`08`/`09`/`10` remain, and `01` is the separate root-metadata question.
 
 Next: `06` first (shortest, a real semantic rule: a directory with children cannot be removed), then `07` (rename) which likely also explains `10`.
+
+## 07 cracked: Windows asks to rename the **upcased** source name
+
+```
+WITNESS before rename: [("/L2-FILE", None), ("/l2-renamed", None)]
+CALL rename "/L2-FILE" -> "/l2-renamed" replace=true -> Err(NotFound)
+```
+
+The file was created as `/l2-file`. The rename request carries **`/L2-FILE`** — the FSD upcased the name (a normalisation it performs for
+case-insensitive volumes). Our storage is byte-keyed and therefore **case-sensitive**, so the source does not resolve, the rename is refused, and
+`08`/`09`/`10` fail downstream of it.
+
+So `07`, `08`, `09` and `10` are **one defect**: no case-insensitive matching anywhere below the frontend. That is the same prerequisite `08` was
+known to have (manager 436: `\WRITTEN.TXT`, `\D\a`), now measured on the rename path as well.
+
+Where it belongs: at **resolution**, once — not in each shell. Both backends must fold the same way (the shared contract can assert it), and the
+frontend must not grow a second, different folding.
