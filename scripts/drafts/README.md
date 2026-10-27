@@ -543,3 +543,23 @@ Measured on the attempt: it is a **single-commit** change of about 20 sites; spl
 it, which points at the **path the fold now returns**: `raw_names`/`read_dir` answer `display`, while `create_or_open` stores `display: raw`; if any
 consumer still compares against the folded key, the round trip breaks. That is the next thing to look at — a regression introduced by this cut, not a
 pre-existing difference.
+
+## Four faces in one instrument: two are fine in isolation, one is a real defect
+
+```
+STEP 02 write: Ok(())     STEP 02 read: Ok("alpha")      ← the write/read chain works on a fresh mount
+STEP 06 rmdir: Ok(())     STEP 06 still there: false      ← **non-empty directory removed** (the rule did not fire)
+STEP 01 is_dir: true                                     ← the root answers a stat
+STEP 12 readonly: Ok(false)
+```
+
+Three observations:
+
+1. **`02` works in isolation** — so the L2 script's `<unreadable>` is not the backend: it is the *state the script left behind* (it runs `01`'s failing
+   `stat` and `03`'s truncation before it). Worth re-reading the script's ordering rather than the storage;
+2. **`06` is a real defect again**: removing a non-empty directory **succeeded**. The rule exists in `MockBackend::remove_at`, so the removal must be
+   reaching the store by a path that does not go through it — the deletion is performed from the adapter's handle close, and for a **directory**
+   `open_like` passes `binding: None`, so `Adapter::close` cannot find a name and swallows the failure. Something else then removed it.
+3. `01` now answers — the root fix holds.
+
+The next question is therefore narrow: **which path removes a directory when `remove_at` is never called with its name?**
