@@ -25,6 +25,12 @@ pub struct MountReport {
     pub start: i32,
     /// `FspFileSystemSetMountPoint(NULL)` — the unmount.
     pub unmount: i32,
+    /// The dispatcher's own death cause, read with `FspFileSystemGetDispatcherResultF` (`winfsp.h:1392`).
+    ///
+    /// `0` means the dispatcher is alive. Anything else is the NTSTATUS the dispatcher threads died with — and a dead dispatcher
+    /// produces exactly the shape we observed: the volume is mounted, every callback counter is zero, and IRPs come back as
+    /// `ERROR_INVALID_FUNCTION`. Reading it replaces "we infer the dispatcher is fine" with a value.
+    pub dispatcher_result: i32,
     /// Whether the drive letter / directory was **gone after `delete`**.
     ///
     /// A status code says what one call thought; this says what the OS now believes. For a drive letter it is read back with
@@ -89,6 +95,7 @@ mod platform {
     type StartFn = extern "system" fn(*mut c_void, u32) -> i32;
     type StopFn = extern "system" fn(*mut c_void);
     type DeleteFn = extern "system" fn(*mut c_void);
+    type DispatcherResultFn = extern "system" fn(*mut c_void, *mut i32);
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -331,6 +338,9 @@ mod platform {
             let start_address = resolve("FspFileSystemStartDispatcher")?;
             let stop_address = resolve("FspFileSystemStopDispatcher")?;
             let delete_address = resolve("FspFileSystemDelete")?;
+            // Optional on purpose: a build without this export must still be able to mount, so its absence only costs us the
+            // observation, not the function.
+            let dispatcher_result_address = resolve("FspFileSystemGetDispatcherResultF").ok();
 
             // SAFETY: each address came from this module's export table and the signatures are the SDK's.
             let (create, set_mount_point, start, stop, delete) = unsafe {
@@ -369,6 +379,7 @@ mod platform {
                     mount: 0,
                     start: 0,
                     unmount: 0,
+                    dispatcher_result: 0,
                     released_after_delete: true,
                     looked_like_a_mount: false,
                 });
@@ -384,6 +395,16 @@ mod platform {
             let looked_like_a_mount = mount_status == 0 && probe(mount_point).is_ok();
 
             // Unmount first, then stop, then delete.
+            let dispatcher_result = if let Some(address) = dispatcher_result_address {
+                // SAFETY: the address came from this module's export table; the signature is the SDK's.
+                let read: DispatcherResultFn = unsafe { std::mem::transmute(address) };
+                let mut value: i32 = 0;
+                read(file_system, &mut value);
+                value
+            } else {
+                0
+            };
+
             let unmount_status = set_mount_point(file_system, std::ptr::null());
             stop(file_system);
             delete(file_system);
@@ -404,6 +425,7 @@ mod platform {
                 mount: mount_status,
                 start: start_status,
                 unmount: unmount_status,
+                dispatcher_result,
                 released_after_delete,
                 looked_like_a_mount,
             })

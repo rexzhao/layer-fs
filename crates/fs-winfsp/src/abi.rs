@@ -203,6 +203,29 @@ impl VolumeParams {
         self.write_u16(6, value);
     }
 
+    /// `UINT64 VolumeCreationTime` — `fsctl.h:198` (offset 8, 8-aligned after the four `u16`s).
+    pub fn set_volume_creation_time(&mut self, value: u64) {
+        self.bytes[8..16].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    /// `UINT32 VolumeSerialNumber` — `fsctl.h:199` (offset 16).
+    pub fn set_volume_serial_number(&mut self, value: u32) {
+        self.bytes[16..20].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    /// The first bitfield word — `fsctl.h:206-215`, offset 36.
+    ///
+    /// Sets `CasePreservedNames`, `UnicodeOnDisk` and `PersistentAcls` (bits 1, 2 and 3; bit 0 is `CaseSensitiveSearch`, which a
+    /// workspace-backed volume does **not** want). `UnicodeOnDisk = 0` would make the volume advertise ANSI names — our names
+    /// are UTF-16 everywhere, so that flag is not cosmetic.
+    pub fn set_name_flags(&mut self) {
+        const CASE_PRESERVED_NAMES: u32 = 1 << 1;
+        const UNICODE_ON_DISK: u32 = 1 << 2;
+        const PERSISTENT_ACLS: u32 = 1 << 3;
+        let flags = CASE_PRESERVED_NAMES | UNICODE_ON_DISK | PERSISTENT_ACLS;
+        self.bytes[36..40].copy_from_slice(&flags.to_ne_bytes());
+    }
+
     /// `UINT32 FileInfoTimeout` — `fsctl.h:204`. Zero disables caching, which is what a workspace wants: the overlay is the
     /// only source of truth, and a cached `FileInfo` would hide a change made through another handle.
     pub fn set_file_info_timeout(&mut self, millis: u32) {
