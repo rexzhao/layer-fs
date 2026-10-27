@@ -292,10 +292,15 @@ mod platform {
     }
 
     /// `GetSecurity` — `winfsp.h:652`, slot **16**.
+    ///
+    /// `(FSP_FILE_SYSTEM*, PVOID FileContext, PSECURITY_DESCRIPTOR SecurityDescriptor, SIZE_T *PSecurityDescriptorSize)` — **four**
+    /// parameters. There used to be a fifth one here (`SecurityInformation`), which the header does not have: every argument after the
+    /// context was therefore read **one slot late**, so the size pointer we wrote through was the caller's *descriptor pointer* and the
+    /// pointer we treated as "size" was whatever came next on the stack. That is a write to an address nobody chose — the shape of the
+    /// `0xc0000374` this hunt started from.
     unsafe extern "system" fn get_security_trampoline(
         _file_system: *mut c_void,
         file_context: *mut c_void,
-        _security_information: u32,
         descriptor_out: *mut c_void,
         descriptor_size_out: *mut usize,
     ) -> i32 {
@@ -564,18 +569,11 @@ mod platform {
             let security_get: unsafe extern "system" fn(
                 *mut c_void,
                 *mut c_void,
-                u32,
                 *mut c_void,
                 *mut usize,
             ) -> i32 = get_security_trampoline;
             interface.slots[slot::GET_SECURITY] = Some(std::mem::transmute::<
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *mut c_void,
-                    u32,
-                    *mut c_void,
-                    *mut usize,
-                ) -> i32,
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *mut usize) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(security_get));
             let writing: unsafe extern "system" fn(
