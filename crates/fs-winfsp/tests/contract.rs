@@ -12,4 +12,6 @@ fn the_mock_satisfies_the_trait_contract() {
     fs_winfsp::scenarios::scenario_removal_cases::<MockBackend>(&backend);
     let backend = MockBackend::new();
     fs_winfsp::scenarios::scenario_read_dir_by_id::<MockBackend>(&backend);
+    let backend = MockBackend::new();
+    fs_winfsp::scenarios::scenario_remove_non_empty_directory::<MockBackend>(&backend);
 }

@@ -125,3 +125,11 @@ fn criterion_3_core_half_holds_on_the_real_backend() {
         other => panic!("cell 3: expected NotFound for a free name with a live id, got {other:?}"),
     }
 }
+
+/// A non-empty directory cannot be removed — and the refusal takes nothing with it (L2 class 06).
+#[test]
+fn the_real_backend_refuses_to_remove_a_non_empty_directory() {
+    let fixture = Fixture::new("nonempty");
+    let backend = fixture.backend();
+    fs_winfsp::scenarios::scenario_remove_non_empty_directory::<ApiBackend<'_>>(&backend);
+}

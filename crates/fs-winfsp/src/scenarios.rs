@@ -123,3 +123,49 @@ pub fn scenario_read_dir_by_id<B: WorkspaceOps>(backend: &B) {
         "cell by id: the old id still enumerates its own two entries"
     );
 }
+
+/// A directory with children **cannot** be removed — and the refusal must not take the children with it.
+///
+/// Measured defect (L2 class 06): `rmdir` on a non-empty directory **succeeded** on the mounted volume. That is not a wrong status code, it is
+/// **data loss**, so the criterion asserts more than the error: the children are still there afterwards, and still listable.
+pub fn scenario_remove_non_empty_directory<B: WorkspaceOps>(backend: &B) {
+    let dir = backend.mkdir(b"/d").expect("mkdir d");
+    let child = backend
+        .create_or_open(b"/d/a", fs_semantics::disposition::Disposition::Create)
+        .expect("create /d/a");
+
+    let refused = backend.remove_at(0, b"d", dir);
+    assert_eq!(
+        refused,
+        Err(OpsError::NotEmpty),
+        "cell refusal: a non-empty directory answers `NotEmpty` — the same rule the core applies"
+    );
+    // The name is still bound, the child is still reachable, and the listing still shows it: **nothing was deleted**.
+    assert!(
+        backend.get_info(dir).is_ok(),
+        "cell directory: it is still there after the refused removal"
+    );
+    assert_eq!(
+        backend.get_info(child.file_id).map(|info| info.kind),
+        Ok(crate::Kind::File),
+        "cell child: and so is the entry inside it — a refusal must not be a partial deletion"
+    );
+    let listing = backend.read_dir(dir).expect("list d");
+    assert_eq!(
+        listing.len(),
+        1,
+        "cell listing: one entry remains ({:?})",
+        listing
+            .iter()
+            .map(|entry| String::from_utf8_lossy(&entry.name).into_owned())
+            .collect::<Vec<_>>()
+    );
+
+    // And the empty case still works, so the rule is "non-empty", not "directories".
+    backend
+        .remove_at(1, b"a", child.file_id)
+        .expect("remove the child");
+    backend
+        .remove_at(0, b"d", dir)
+        .expect("now the directory is empty and goes away");
+}

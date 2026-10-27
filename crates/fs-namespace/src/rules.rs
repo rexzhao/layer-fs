@@ -333,6 +333,20 @@ impl<S: TreeStore> Rules<S> {
         self.store.write(OpLabel::Unlink, |tree| {
             match tree.lookup(parent, name)? {
                 Some(current) if current == expected_id => {
+                    // **The by-id removal applies the same rule as `rmdir`/`unlink`.** It is the path the FFI layer uses (the adapter removes by
+                    // identity, not by path), and until this check existed a non-empty directory could be removed through it — measured on the
+                    // mounted volume as L2 class 06, and it was not a wrong status code but **data loss**: the children went with it.
+                    match tree.inode(current)? {
+                        Some(view) if view.kind == Kind::Directory => {
+                            if !tree.is_dir_empty(current)? {
+                                return Err(NamespaceError::DirectoryNotEmpty {
+                                    path: String::from_utf8_lossy(name).into_owned(),
+                                });
+                            }
+                        }
+                        // A file is removed the same way it always was; `None` (already a tombstone) falls through to the idempotent case below.
+                        Some(_) | None => {}
+                    }
                     tree.unbind(parent, name)?;
                     tree.tombstone(current)?;
                     Ok(())

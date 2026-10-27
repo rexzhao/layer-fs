@@ -626,6 +626,13 @@ impl WorkspaceOps for MockBackend {
                 String::from_utf8_lossy(name)
             ))),
             Some(bound) => {
+                // **A directory with children cannot be removed.** The rule belongs here, at the real deletion, not in `CanDelete` (which only
+                // answers "may this be deleted"): the measured defect was `rmdir` on a non-empty directory succeeding, which is not a wrong status
+                // code but **data loss** — the children went with it.
+                let has_children = inner.children.keys().any(|(parent, _)| *parent == bound);
+                if has_children {
+                    return Err(OpsError::NotEmpty);
+                }
                 inner.children.remove(&(parent, name.to_vec()));
                 inner.retire(bound);
                 Ok(())
