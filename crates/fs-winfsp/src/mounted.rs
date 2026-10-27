@@ -138,6 +138,29 @@ mod platform {
         unsafe { crate::callbacks::read_directory(file_context, buffer, offset, marker, length) }
     }
 
+    /// `Open`: `(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess, PVOID *PFileContext,
+    /// FSP_FSCTL_FILE_INFO *FileInfo)` — `winfsp.h:322`.
+    unsafe extern "system" fn open_trampoline(
+        _file_system: *mut c_void,
+        file_name: *const u16,
+        _create_options: u32,
+        _granted_access: u32,
+        context_out: *mut *mut c_void,
+        info_out: *mut crate::abi::FileInfo,
+    ) -> i32 {
+        // SAFETY: WinFsp's contract — a NUL-terminated name and two valid out-pointers.
+        unsafe { crate::callbacks::open(file_name, context_out, info_out) }
+    }
+
+    /// `Close`: `(FSP_FILE_SYSTEM*, PVOID FileContext)` — `winfsp.h:420`.
+    unsafe extern "system" fn close_trampoline(
+        _file_system: *mut c_void,
+        file_context: *mut c_void,
+    ) {
+        // SAFETY: the context came from `open`, and WinFsp calls `Close` once per open.
+        unsafe { crate::callbacks::close(file_context) }
+    }
+
     fn interface_with_callbacks() -> FileSystemInterface {
         let mut interface = FileSystemInterface::empty();
         // SAFETY: the slot type carries **no signature** (the SDK's slots differ in arity), so registering a callback is a
@@ -160,6 +183,30 @@ mod platform {
                 unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(volume));
+            let opening: unsafe extern "system" fn(
+                *mut c_void,
+                *const u16,
+                u32,
+                u32,
+                *mut *mut c_void,
+                *mut crate::abi::FileInfo,
+            ) -> i32 = open_trampoline;
+            let closing: unsafe extern "system" fn(*mut c_void, *mut c_void) = close_trampoline;
+            interface.slots[slot::OPEN] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const u16,
+                    u32,
+                    u32,
+                    *mut *mut c_void,
+                    *mut crate::abi::FileInfo,
+                ) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(opening));
+            interface.slots[slot::CLOSE] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(*mut c_void, *mut c_void),
+                unsafe extern "C" fn() -> i32,
+            >(closing));
             interface.slots[slot::READ_DIRECTORY] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(
                     *mut c_void,

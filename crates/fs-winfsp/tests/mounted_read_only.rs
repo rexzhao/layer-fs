@@ -53,6 +53,19 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
         return;
     }
 
+    // Paths: the root is `\`; one child for the listing probe.
+    // Paths: the root is a single backslash; the listing probe asks for its children.
+    assert!(
+        callbacks::configure_paths(|path| {
+            let trimmed = path.trim_start_matches(char::from(92));
+            match trimmed {
+                "" => Some(0),
+                "alpha.txt" => Some(1),
+                _ => None,
+            }
+        }),
+        "cell paths: the resolver is configured once"
+    );
     let configured = callbacks::configure(
         &VolumeInfo {
             total_size: 1 << 20,
@@ -97,6 +110,7 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
 
     // The probe runs **while mounted**; its error is captured for the report.
     let mut probe_result: Option<Result<(), String>> = None;
+    let before_contexts = callbacks::context_counts();
     let report = mount_read_only(&library, &mount_point, |path| {
         let outcome = std::fs::read_dir(path)
             .map(|mut entries| {
@@ -110,6 +124,11 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
     })
     .expect("the mount path is available");
 
+    let after_contexts = callbacks::context_counts();
+    eprintln!(
+        "file contexts: allocated={} freed={} (before: {before_contexts:?})",
+        after_contexts.0, after_contexts.1
+    );
     eprintln!(
         "create={} mount={} start={} unmount={} released_after_delete={} looked_like_a_mount={} probe={:?}",
         report.create,

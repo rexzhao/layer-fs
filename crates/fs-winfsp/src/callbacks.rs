@@ -184,3 +184,91 @@ pub unsafe fn get_file_info(context: *const c_void, out: *mut c_void) -> i32 {
         Err(_) => NOT_IMPLEMENTED,
     }
 }
+
+/// Maps a WinFsp path (`\alpha.txt`, `\`) to an entry id, configured before the mount starts.
+static RESOLVE: OnceLock<fn(&str) -> Option<u64>> = OnceLock::new();
+
+/// Live `FileContext` allocations, and how many have been released.
+///
+/// Counted rather than merely asserted: when a mount crashes, the log's last numbers are the only evidence of whether contexts
+/// leaked or were freed twice — and a crash is exactly when `debug_assert` is too late.
+static CONTEXTS_ALLOCATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CONTEXTS_FREED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `(allocated, freed)`: equal at a clean shutdown, and printed by the mount test before it tears down.
+#[must_use]
+pub fn context_counts() -> (usize, usize) {
+    (
+        CONTEXTS_ALLOCATED.load(std::sync::atomic::Ordering::Relaxed),
+        CONTEXTS_FREED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Adds the path resolver to the configuration (call before [`configure`]).
+pub fn configure_paths(resolve: fn(&str) -> Option<u64>) -> bool {
+    RESOLVE.set(resolve).is_ok()
+}
+
+/// The `Open` body: resolve the path, hand WinFsp a `Box<EntryContext>`, and fill its `FileInfo`.
+///
+/// Deliberately shallow: the path is resolved once by the configured resolver, and **no recursion or caching** happens here.
+/// Enough for `dir Y:\`; the general case belongs with the callbacks that actually create and rename.
+///
+/// # Safety
+///
+/// `file_name` must be a NUL-terminated UTF-16 string; `context_out` and `info_out` must be valid for writes of a pointer
+/// and a `FileInfo` respectively.
+pub unsafe fn open(
+    file_name: *const u16,
+    context_out: *mut *mut c_void,
+    info_out: *mut FileInfo,
+) -> i32 {
+    if file_name.is_null() || context_out.is_null() || info_out.is_null() {
+        return OURS_INVALID_PARAMETER;
+    }
+    // SAFETY: `file_name` is NUL-terminated per WinFsp's contract.
+    let units = unsafe { crate::boundary::utf16_len(file_name) };
+    // SAFETY: same pointer, bounded by the terminator.
+    let slice = unsafe { std::slice::from_raw_parts(file_name, units) };
+    let path = String::from_utf16_lossy(slice);
+    let Some(resolve) = RESOLVE.get() else {
+        return NOT_IMPLEMENTED;
+    };
+    let Some(file_id) = resolve(&path) else {
+        // The code WinFsp itself uses for "that name is not here" — not one of our own inventions.
+        return OURS_OBJECT_NAME_NOT_FOUND;
+    };
+    let Some(node) = LOOKUP.get().and_then(|lookup| lookup(file_id)) else {
+        return OURS_OBJECT_NAME_NOT_FOUND;
+    };
+    let Ok(record) = crate::file_info::file_info(&node) else {
+        return NOT_IMPLEMENTED;
+    };
+    let context = Box::into_raw(Box::new(EntryContext { file_id }));
+    CONTEXTS_ALLOCATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: both out-pointers were checked non-null and are valid for their writes per the caller's contract.
+    unsafe {
+        std::ptr::write(context_out, context.cast::<c_void>());
+        std::ptr::write(info_out, record);
+    }
+    0
+}
+
+/// The `Close` body: frees the `FileContext` **once**.
+///
+/// # Safety
+///
+/// `context` must have come from [`open`] and must not be used afterwards.
+pub unsafe fn close(context: *mut c_void) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: the caller guarantees this pointer came from `Box::into_raw` in `open`, and that `Close` happens once per open.
+    drop(unsafe { Box::from_raw(context.cast::<EntryContext>()) });
+    CONTEXTS_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `STATUS_OBJECT_NAME_NOT_FOUND`.
+const OURS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+/// `STATUS_INVALID_PARAMETER`.
+const OURS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
