@@ -242,6 +242,24 @@ mod platform {
         unsafe { crate::callbacks::get_security(file_context, descriptor_out, descriptor_size_out) }
     }
 
+    /// `Write` — `winfsp.h:471`, slot **9**. Read-only volume: `STATUS_MEDIA_WRITE_PROTECTED`, like `Overwrite`.
+    ///
+    /// Wired now rather than with the write chain because the **class gate** (`fsop.c`) refuses a whole operation class when a
+    /// required member is missing — the same lesson `Overwrite@5` taught the hard way. Refusing with the write-protected status
+    /// is a true statement about this stage; a `NULL` slot would be a lie about what the volume supports.
+    unsafe extern "system" fn write_trampoline(
+        _file_system: *mut c_void,
+        _file_context: *mut c_void,
+        _buffer: *const c_void,
+        _length: u32,
+        _write_to_end_of_file: u32,
+        _constrained_io: u32,
+        _file_info: *mut crate::abi::FileInfo,
+        _bytes_written: *mut u32,
+    ) -> i32 {
+        0xC000_00EAu32 as i32
+    }
+
     /// `Close`: `(FSP_FILE_SYSTEM*, PVOID FileContext)` — `winfsp.h:420`.
     unsafe extern "system" fn close_trampoline(
         _file_system: *mut c_void,
@@ -423,6 +441,29 @@ mod platform {
                 ) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(security_get));
+            let writing: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                *const c_void,
+                u32,
+                u32,
+                u32,
+                *mut crate::abi::FileInfo,
+                *mut u32,
+            ) -> i32 = write_trampoline;
+            interface.slots[slot::WRITE] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *const c_void,
+                    u32,
+                    u32,
+                    u32,
+                    *mut crate::abi::FileInfo,
+                    *mut u32,
+                ) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(writing));
             interface.slots[slot::OPEN] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(
                     *mut c_void,
