@@ -1,0 +1,32 @@
+# Line endings are decided **here**, not by each developer's `core.autocrlf` (419).
+#
+# The failure that made this file necessary: a `perl -0pi` edit with `\n` patterns silently did nothing on a CRLF working tree, three times, and the
+# edit "succeeded". Whether a file is CRLF in the working tree is therefore not a detail of someone's git config — it is a property of the
+# repository, and this is where it is written down.
+#
+# `text=auto` normalises to LF **in the index** and checks out with the platform convention. Nothing changes for an existing clone; what changes is
+# that a machine with `core.autocrlf=false` no longer stores CRLF, so the same edit stops behaving differently on two machines.
+* text=auto
+
+# Source and text: LF in the repository.
+*.rs       text
+*.toml     text
+*.md       text
+*.sql      text
+*.json     text
+*.yml      text
+*.yaml     text
+*.txt      text
+
+# Shell scripts must stay LF even on a Windows checkout: a CRLF shebang line makes bash answer `bad interpreter`.
+*.sh       text eol=lf
+
+# Binary: never normalised, never diffed as text.
+*.dll      binary
+*.exe      binary
+*.sqlite   binary
+*.pack     binary
+*.png      binary
+
+# Test baselines under `scripts/` are compared byte-for-byte; normalising them would silently change what a baseline means.
+scripts/baselines/** -text

@@ -802,3 +802,26 @@ short-circuit is above user mode. The class therefore has three possible answers
 becomes P3-4b work through a mechanism that does not depend on this request reaching us.
 
 **Mounted-side scoreboard: 11 of 11 reachable classes green** (`08` carries a documented platform difference).
+
+## Bulk text replacement: the rule, written down (419 / 486)
+
+Four accidents came from the same root — a replacement tool that does not respect boundaries:
+
+```
+419  perl -0pi with \n patterns silently did nothing on a CRLF tree (three times, and the edit "succeeded")
+486  a \' -> ' replacement edited three unrelated files (caught by the compiler, not by the tool)
+```
+
+So, from now on:
+
+1. **`.gitattributes` decides line endings**, not any developer's `core.autocrlf`. The index is LF; a Windows checkout is CRLF by design.
+2. **A bulk replacement names its directory set first** and is never run over `crates/` as a whole.
+3. **After any bulk replacement, `git status --porcelain` is read as a list of files** and compared against what was intended — an unexpected path is a
+   bug in the replacement, not a bonus fix.
+4. **The pre-commit hook prints every staged path**, so that list is visible before the commit exists, and refuses a CRLF blob in the index.
+
+Enable the hook once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```

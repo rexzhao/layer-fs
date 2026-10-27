@@ -1,0 +1,40 @@
+#!/bin/sh
+# Two checks, both countermeasures to accidents that already happened.
+#
+# 1. **Show the files this commit touches.** A bulk text replacement that is not confined to its intended directory is silent until the compiler
+#    complains — and one such replacement (`\'` -> `'`) edited three unrelated files before the compiler caught it. Printing the list costs nothing
+#    and makes an out-of-scope file visible *before* the commit is written.
+# 2. **Refuse CRLF in a staged text file.** A CRLF working tree is what made `\n` patterns no-ops (419); the index is the one place that can be
+#    checked regardless of anyone's `core.autocrlf`.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+
+set -u
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$staged" ] && exit 0
+
+printf '%s\n' "$staged" | sed 's/^/  staged: /'
+
+bad=""
+for file in $staged; do
+  case "$file" in
+    *.rs|*.toml|*.md|*.sql|*.json|*.yml|*.yaml|*.txt|*.sh) ;;
+    *) continue ;;
+  esac
+  # Check the **blob in the index**, not the working-tree file: a Windows checkout is CRLF by design and that must not be refused. What must never
+  # be stored is a CRLF blob, because that is what turned a later `\n` edit into a silent no-op (419). `cat-file` reads the blob; `git show :path`
+  # applies the smudge filter and hands back CRLF even for a clean LF blob — the first version of this hook used `show` and refused a file whose
+  # index blob contained no CR at all (checked with `od -c`).
+  if git cat-file -p ":$file" 2>/dev/null | grep -qU "$(printf '\r')"; then
+    bad="$bad $file"
+  fi
+done
+
+if [ -n "$bad" ]; then
+  echo "pre-commit: CRLF in a text file:$bad" >&2
+  echo "pre-commit: the index is supposed to be LF (.gitattributes text=auto); refusing." >&2
+  exit 1
+fi
+
+exit 0
