@@ -13,9 +13,17 @@ use fs_winfsp::mounted::mount_read_only;
 use fs_winfsp::{Attributes, Kind, NodeInfo};
 
 fn node(file_id: u64) -> NodeInfo {
+    // **The root is a directory**, and that is a semantic fact, not a fixture detail: `read_dir("Z:\\")` opens `\` with
+    // `FILE_DIRECTORY_FILE`, and the only place that answers "what is this" is the attributes we report. A root reported as a
+    // file makes Windows see "you asked for a directory, here is a file" ⇒ ERROR_DIRECTORY.
+    let kind = if file_id == 0 {
+        Kind::Directory
+    } else {
+        Kind::File
+    };
     NodeInfo {
         file_id,
-        kind: Kind::File,
+        kind,
         size: 0,
         times: fs_winfsp::file_info::times(
             1_793_000_000_000_000_000,
@@ -23,7 +31,7 @@ fn node(file_id: u64) -> NodeInfo {
             1_793_000_000_000_000_000,
             1_793_000_000_000_000_000,
         ),
-        attributes: Attributes(0x80),
+        attributes: Attributes(if file_id == 0 { 0x10 } else { 0x80 }),
     }
 }
 
