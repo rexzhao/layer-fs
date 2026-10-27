@@ -904,3 +904,18 @@ shape (434): a probe whose success condition is `Ok(())` measures nothing.
 
 Next step: rewrite the probe so that **every failure comes back as `Err`** and let the existing mount machinery fail the test. Until that is done, no
 reading from this probe means anything about the file system.
+
+## Ready-timing probe: the variable is **the test file**, not the operation (503)
+
+Known-good and known-bad, same crate in some cases, same operations, letters free (`Get-PSDrive` lists only C,D,E,F,S,Y):
+
+```
+fs-winfsp::mounted_write_chain        (Mock, X:)   write/read/set_len/remove  -> PASS, 0.04 s
+fs-api::mounted_real_backend          (Api, V:)    write/read/list/create/list -> PASS, 2.1 s (incl. the reverted wait)
+fs-api::mounted_mock_same_shape       (Mock, U:)   same as above              -> PASS, 0.05 s
+fs-winfsp::instrument_ready_timing    (Mock, V: X:) write at t=4 ms -> os error 3 ; read_dir polled 200 ms -> never succeeds
+```
+
+So: same backend, same letter, same operation, same crate — and one shape serves while the other never does. The wait experiments are reverted; nothing in `src/` was changed by this round.
+
+Next experiment is a bisect, not a hypothesis: copy `mounted_write_chain.rs` and change **one** thing per run (probe body → my body; assertions → removed; letter → V:), until the copy stops working. The first single change that flips PASS→FAIL is the variable.
