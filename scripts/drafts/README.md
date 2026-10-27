@@ -772,3 +772,17 @@ Prime suspect, and the reason NTFS behaves differently: we answer the *destinati
 case-insensitive client that compares "same file → nothing to do" therefore returns early. The next experiment is to ask whether the request reaches
 `SetInformation`/`Rename` when the FSD's own volume parameters are compared against `memfs` (`CasePreservedNames` **and** `CaseSensitiveSearch`),
 which is the one place memfs declares both.
+
+## `08` boundary run: neither route reaches us, and the flag is not the condition
+
+```
+mv  Z:/l2-renamed Z:/L2-RENAMED   -> rc=0    POST: l2-renamed      (no Rename call)
+ren Z:\l2-second  L2-SECOND       -> rc=0    POST: l2-second       (no Rename call)
+```
+
+So it is not an MSYS shape (both routes use the same Win32 rename entry point) — but it is also **not** the volume-parameter guess: setting bit 0
+(`CaseSensitiveSearch`) and re-running the same two commands changed **nothing**. The short-circuit is therefore inside the FSD (or above it), and
+the next step is to read its source for the case-only branch rather than to keep flipping flags on our side.
+
+Our own `rename_shell` was checked and does **not** short-circuit: it converts both names and calls the backend. The absence of a `Rename` in the
+call log is genuine.
