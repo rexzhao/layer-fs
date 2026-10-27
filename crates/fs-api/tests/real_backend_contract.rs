@@ -133,3 +133,55 @@ fn the_real_backend_refuses_to_remove_a_non_empty_directory() {
     let backend = fixture.backend();
     fs_winfsp::scenarios::scenario_remove_non_empty_directory::<ApiBackend<'_>>(&backend);
 }
+
+/// **U1, asked where it can be answered** (480/481): a case-only rename on the real backend.
+///
+/// On a mounted volume this request never arrives — the FSD (or the kernel above it) drops it, measured from two independent routes, and `fsop.c`
+/// dispatches renames straight through, so the short-circuit is not ours to fix (U16). That leaves the semantics unproven *through the mount*, which
+/// is not the same as unproven: asked directly at the backend, the answer is a fact about our code.
+///
+/// Both directions are asserted, because "the old name is gone" and "the new name works" are different claims — a rename that dropped the entry
+/// would satisfy neither, and one that kept both spellings would satisfy only the first.
+#[test]
+fn the_real_backend_answers_a_case_only_rename() {
+    use fs_semantics::disposition::Disposition;
+    use fs_winfsp::ops::WorkspaceOps;
+
+    let fixture = Fixture::new("case-only");
+    let backend = fixture.backend();
+    let created = backend
+        .create_or_open(b"/ReadMe.txt", Disposition::Create)
+        .expect("create");
+    backend
+        .write(created.file_id, 0, b"body")
+        .expect("write the body");
+
+    let outcome = backend
+        .rename(b"/ReadMe.txt", b"/readme.txt", true)
+        .expect("a case-only rename is a legal request");
+    assert_eq!(
+        outcome.file_id, created.file_id,
+        "the same entry, not a new one"
+    );
+    assert_eq!(outcome.replaced, None, "nothing else lost the name");
+
+    // The entry still answers, under the spelling that was asked for **and** the one it was created with.
+    let info = backend.get_info(outcome.file_id).expect("still live");
+    assert_eq!(info.size, 4, "the bytes survived the rename");
+    assert!(
+        backend.get_info(created.file_id).is_ok(),
+        "the id is unchanged"
+    );
+    let again = backend
+        .create_or_open(b"/ReadMe.txt", Disposition::Open)
+        .expect("the fold makes the old spelling resolve");
+    assert_eq!(again.file_id, created.file_id);
+
+    // Exactly one entry, listed under the new spelling — the display half.
+    let entries = backend.read_dir(0).expect("list the root");
+    let names: Vec<String> = entries
+        .into_iter()
+        .map(|entry| String::from_utf8_lossy(&entry.name).into_owned())
+        .collect();
+    assert_eq!(names, vec!["readme.txt".to_string()]);
+}
