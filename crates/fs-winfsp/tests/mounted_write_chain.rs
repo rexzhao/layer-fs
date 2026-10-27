@@ -150,7 +150,6 @@ fn root_of(mount_point: &std::path::Path) -> PathBuf {
     }
 }
 
-
 #[test]
 fn windows_can_write_through_the_mount_and_read_the_bytes_back() {
     let library = default_library();
@@ -311,8 +310,3 @@ fn windows_can_write_through_the_mount_and_read_the_bytes_back() {
         counts_after.2, counts_before.3, counts_after.3
     );
 }
-
-
-
-
-

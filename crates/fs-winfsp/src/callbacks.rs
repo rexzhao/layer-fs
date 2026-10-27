@@ -938,7 +938,7 @@ unsafe fn open_like(
             // means "that is a directory, and I will not open it"; `NotFound` means "I cannot see it" — and for a directory, both are the same
             // situation seen by a door that is not allowed to look. Measured: `Create("\\", FILE_OPEN)` answered `0xC0000034`, after which WinFsp
             // synthesised `0xC000003A` for every child and no file could be created through the mount.
-            Err(crate::ops::OpsError::NotADirectory | crate::ops::OpsError::NotFound) => {
+            Err(crate::ops::OpsError::NotADirectory) => {
                 match adapter
                     .backend()
                     .open_dir(&crate::ops::Path::new(path.as_bytes()))
@@ -1529,7 +1529,7 @@ pub unsafe fn overwrite_shell(
     replace_attributes: bool,
     allocation_size: u64,
     out: *mut FileInfo,
- ) -> i32 {
+) -> i32 {
     OVERWRITE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if context.is_null() {
         return OURS_INVALID_PARAMETER;

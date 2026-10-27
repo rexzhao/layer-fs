@@ -34,3 +34,4 @@ fn bytes_that_are_not_utf8_still_work() {
     assert_eq!(path.key(), b"/\xff\xfeAB");
     assert_eq!(path.display_name(), Some(&b"\xff\xfeAb"[..]));
 }
+

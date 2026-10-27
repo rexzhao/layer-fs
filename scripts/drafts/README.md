@@ -1116,3 +1116,33 @@ failing probe:      via_join = os error 3 ; via_format = os error 3   (unchanged
 So the backend answers the root correctly and the mount still refuses it: the `0xC0000034` in the debug log comes from **our `create_shell` after the door
 succeeded, or from a branch before the fallback**. The next reading is the same temporary print that produced the earlier `door-status` lines, now with the
 fallback in place — it will name the returning branch instead of leaving "we answered 0x34" as an inference.
+
+## 515 — the separator fix works, and it also breaks a green test. Both readings, nothing committed to `src/`
+
+The missing piece in the `Create("\\")` chain was **separator normalisation**: WinFsp hands paths with backslashes and every backend here parses `/`. With
+`Path::new` normalising `\` -> `/` (key *and* display), the failing probe went from
+
+```
+TRACE create_shell path="\\" Open   -> 0xC0000034        (before: root refused, FSD synthesised 0xC000003A for every child)
+STATUS via_join = os error 3
+```
+to
+```
+TRACE create_shell path="\\" Open                     (no failure line)
+TRACE create_shell path="\written.txt" OpenIf        ← the FSD finally upgraded, and the request reached us
+STATUS via_join = Ok(()) ; via_format = Ok(())
+```
+
+So the diagnosis is confirmed end to end: **root open fixed ⇒ FSD upgrades `Open` to `OpenIf` ⇒ create succeeds**.
+
+But the same change regressed a green test:
+
+```
+HEAD (without it)              : mounted_read_only PASS
+with normalisation             : mounted_read_only FAIL  "the listing failed: os error 3"
+with normalisation AND the `NotFound` fallback removed : still FAIL
+```
+
+So the fallback is not the cause; the normalisation is. Reverted to keep the tree green — the direction is right, the **scope** is wrong: `Path::new` is used by
+tests and by production alike, and normalising there changes what every consumer sees at once. The next attempt should normalise where the FSD's bytes enter
+(the shells in `callbacks.rs`, one place per door) and leave `Path` a plain value, so the blast radius is the mount and not the whole crate.
