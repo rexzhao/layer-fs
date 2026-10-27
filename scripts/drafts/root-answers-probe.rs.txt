@@ -1,0 +1,30 @@
+//! What does the real backend answer about **the root**? The mock answers it with a special case; if the real backend does not, the mount handshake
+//! dies on the first question and no volume ever appears.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use fs_api::winfsp_backend::ApiBackend;
+use fs_semantics::disposition::Disposition;
+use fs_winfsp::ops::{Path, WorkspaceOps};
+use fs_workspace::Repo;
+
+#[test]
+fn what_the_real_backend_answers_about_the_root() {
+    let dir: PathBuf = std::env::temp_dir().join(format!("fs-api-root-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let repo = Arc::new(Repo::open(dir.join("store"), true).expect("repo"));
+    repo.init().expect("init");
+    let workspace = repo.workspace_create("w1", "main").expect("workspace");
+    let backend = ApiBackend::new(&workspace);
+
+    let root = Path::new(b"/");
+    println!("create_or_open(\"/\", Open) = {:?}", backend.create_or_open(&root, Disposition::Open).map(|o| (o.file_id, o.kind)));
+    println!("open_dir(\"/\")            = {:?}", backend.open_dir(&root));
+    println!("dir_binding(\"/\")         = {:?}", backend.dir_binding(&root));
+    println!("get_info(0)              = {:?}", backend.get_info(0).map(|i| (i.kind, i.size)));
+    println!("read_dir(0)              = {:?}", backend.read_dir(0).map(|entries| entries.len()));
+    println!("create_or_open(\"/x\", Create) = {:?}", backend.create_or_open(&Path::new(b"/x"), Disposition::Create).map(|o| o.file_id));
+    println!("read_dir(0) after create = {:?}", backend.read_dir(0).map(|entries| entries.iter().map(|e| String::from_utf8_lossy(&e.name).into_owned()).collect::<Vec<_>>()));
+    let _ = std::fs::remove_dir_all(&dir);
+}

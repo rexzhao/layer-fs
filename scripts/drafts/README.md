@@ -866,3 +866,22 @@ Next readings needed, in this order:
    never called us, but nothing is logged on the success path, so that inference is unsupported (the eprintln calls only fire on error branches);
 2. **run the same mount code with `MockBackend` from this same test file** — QA's working mount uses a different backend *and* a different scaffold, so
    "backend" and "scaffold" are two variables and only one has been varied so far.
+
+## The real backend answers about the root correctly — so the wiring is not the break
+
+```
+create_or_open("/", Open)     = Err(NotADirectory)        ← the **file** door refusing a directory, which GSBN falls back from
+open_dir("/")                 = Ok(0)
+dir_binding("/")              = Some(DirOutcome { id: 0, binding: (0, []) })
+get_info(0)                   = Ok((Directory, 0))
+read_dir(0)                   = Ok(0 entries)
+create_or_open("/x", Create)  = Ok(1)
+read_dir(0) after create      = Ok(["x"])
+```
+
+So the mock's root special case is not needed: the real backend resolves `/`, opens it as a directory, binds it and lists it. The earlier hypothesis
+("ApiBackend has no answer for `/`, so the handshake dies there") is therefore **wrong**, and the remaining difference between QA's working mount and
+mine is the **scaffold**, not the backend.
+
+Next reading, still unvaried: run the *same* mount code from the *same* test file with `MockBackend`. Two variables have been changed at once so far
+(backend **and** scaffold), and only by holding one still does the third answer mean anything.
