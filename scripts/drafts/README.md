@@ -1066,3 +1066,17 @@ calls, and `Overwrite` reaches us as `create_shell` with disposition `Supersede`
 
 Next probe, one line: log the **slot** that arrived (`Create` vs `Overwrite`) with its `CreateOptions` and the status we answer. If `Overwrite` is being
 called for a file that does not exist, the answer must still let the create happen.
+
+## Slot probe (513): `Overwrite@5` is **never** called — only `Create@0` with disposition `Open`, four times
+
+```
+SLOT Create@0 arrived, options -> Open      (x4)
+STATUS via_join = os error 3 ; via_format = os error 3
+```
+
+So the assumption that `std::fs::write` (CREATE_ALWAYS → `FILE_OVERWRITE_IF`) reaches `Overwrite` is **wrong here**: the only slot that arrives is `Create`,
+carrying disposition `Open`, and we answer `0xC0000034` every time and never get a follow-up.
+
+That contradicts the documented `FileOpenIf` / `FileOverwriteIf` sequences, which means the request is being handled **before** those paths, or the sequence
+differs for a mounted volume in this state. The instrument this file has not used yet is our own **debug log**, which records the calls WinFsp actually makes
+and their statuses — that is the next reading, and it must come before another guess about which door is wrong.

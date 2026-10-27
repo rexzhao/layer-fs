@@ -1524,7 +1524,7 @@ pub unsafe fn overwrite_shell(
     replace_attributes: bool,
     allocation_size: u64,
     out: *mut FileInfo,
-) -> i32 {
+ ) -> i32 {
     OVERWRITE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if context.is_null() {
         return OURS_INVALID_PARAMETER;
