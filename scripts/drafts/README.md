@@ -1028,3 +1028,23 @@ Decisive cheap probe, using instrumentation we already have: share the `MockBack
   OS routed it — that would be strange but it is a reading;
 - failing body: if `CreateOrOpen` **appears and returns Ok** while the caller gets `os error 3`, the *answer* is corrupted on the way back, which points at
   the out-parameter/signature layer (where two wrong signatures have already been found by measurement).
+
+## The failing body's request **does** reach us — and it is never a `Create` (511)
+
+Shared mock, the failing body, then the call log:
+
+```
+CALLS via_join = os error 3 ; via_format = os error 3
+CALL CreateOrOpen([92], Open)                                "\\"            (root)
+CALL CreateOrOpen([92, w r i t t e n . t x t], Open)          "\written.txt"
+CALL CreateOrOpen([92, w r i t t e n . t x t], Open)          again
+CALL CreateOrOpen([92], Open) ...                            (repeat)
+```
+
+So the FSD asks us to **open** a file that does not exist, again and again, and never follows up with a `Create`. The OS's `os error 3` is
+`ERROR_PATH_NOT_FOUND`; the FSD's own create-upgrade (`fsop.c`: `FileOpenIf` = GSBN → Open → **Create, only on exactly `0xC0000034`**) never fires, which
+means the answer we gave is not `STATUS_OBJECT_NAME_NOT_FOUND`.
+
+Our handler for a missing file in `\written.txt` is the file door's `create_or_open(..., Open)`, whose `NotFound` maps to… that mapping is the next thing
+to read, and the criterion is precise: **the status returned for a missing name must be `0xC0000034`**, or Windows will not upgrade an `Open` into a
+`Create` and no file can be created through the mount in this shape.

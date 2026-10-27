@@ -1,0 +1,108 @@
+//! (511) Does the failing body's `Create` even reach the backend? Share the mock, run the failing body, dump the call log.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use fs_semantics::disposition::Disposition;
+use fs_winfsp::abi::VolumeInfo;
+use fs_winfsp::loader::{default_library, resolve_library, LoadError};
+use fs_winfsp::mock::MockBackend;
+use fs_winfsp::mounted::mount_read_only;
+use fs_winfsp::ops::{
+    Attributes, DirEntry, DynOps, NodeInfo, OpsResult, OpenOutcome, Path, RenameOutcome,
+    WorkspaceOps,
+};
+
+struct Shared(Arc<MockBackend>);
+
+impl WorkspaceOps for Shared {
+    fn create_or_open(&self, p: &Path<'_>, d: Disposition) -> OpsResult<OpenOutcome> {
+        self.0.create_or_open(p, d)
+    }
+    fn mkdir(&self, p: &Path<'_>) -> OpsResult<u64> {
+        self.0.mkdir(p)
+    }
+    fn open_dir(&self, p: &Path<'_>) -> OpsResult<u64> {
+        self.0.open_dir(p)
+    }
+    fn dir_binding(&self, p: &Path<'_>) -> Option<fs_winfsp::ops::DirOutcome> {
+        self.0.dir_binding(p)
+    }
+    fn read(&self, id: u64, offset: u64, len: usize) -> OpsResult<Vec<u8>> {
+        self.0.read(id, offset, len)
+    }
+    fn write(&self, id: u64, offset: u64, bytes: &[u8]) -> OpsResult<usize> {
+        self.0.write(id, offset, bytes)
+    }
+    fn set_size(&self, id: u64, len: u64) -> OpsResult<()> {
+        self.0.set_size(id, len)
+    }
+    fn read_dir(&self, id: u64) -> OpsResult<Vec<DirEntry>> {
+        self.0.read_dir(id)
+    }
+    fn get_info(&self, id: u64) -> OpsResult<NodeInfo> {
+        self.0.get_info(id)
+    }
+    fn set_times(&self, id: u64, a: Option<i64>, w: Option<i64>, c: Option<i64>, r: Option<i64>) -> OpsResult<()> {
+        self.0.set_times(id, a, w, c, r)
+    }
+    fn set_attributes(&self, id: u64, attributes: Attributes) -> OpsResult<()> {
+        self.0.set_attributes(id, attributes)
+    }
+    fn rename(&self, from: &Path<'_>, to: &Path<'_>, replace: bool) -> OpsResult<RenameOutcome> {
+        self.0.rename(from, to, replace)
+    }
+    fn remove_at(&self, parent: u64, name: &[u8], expected: u64) -> OpsResult<()> {
+        self.0.remove_at(parent, name, expected)
+    }
+    fn flush(&self) -> OpsResult<()> {
+        self.0.flush()
+    }
+}
+
+fn volume() -> VolumeInfo {
+    VolumeInfo {
+        total_size: 1 << 20,
+        free_size: 1 << 19,
+        volume_label_length: 4,
+        volume_label: {
+            let mut label = [0u16; 32];
+            label[..4].copy_from_slice(&[b'w' as u16, b'r' as u16, b'i' as u16, b't' as u16]);
+            label
+        },
+    }
+}
+
+fn root_of(p: &std::path::Path) -> PathBuf {
+    if p.to_string_lossy().ends_with(':') {
+        PathBuf::from(format!("{}\\", p.display()))
+    } else {
+        p.to_path_buf()
+    }
+}
+
+#[test]
+fn does_the_failing_write_reach_the_backend() {
+    let library = default_library();
+    if let Err(LoadError::NotFound { path }) = resolve_library(&library) {
+        eprintln!("SKIP: no winfsp at {}", path.display());
+        return;
+    }
+    let mount_point = std::env::var_os("LAYER_FS_MNT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("V:"));
+    let mock = Arc::new(MockBackend::new());
+    let backend: DynOps = Box::new(Shared(Arc::clone(&mock)));
+    let _ = mount_read_only(&library, &mount_point, backend, volume(), |path: &std::path::Path| {
+        let root = root_of(path);
+        let joined = root.join("written.txt");
+        let formatted = PathBuf::from(format!("{}written.txt", root.display()));
+        let via_join = std::fs::write(&joined, b"hello layer-fs").map_err(|e| e.to_string());
+        let via_format = std::fs::write(&formatted, b"hello layer-fs").map_err(|e| e.to_string());
+        println!("CALLS via_join={via_join:?} via_format={via_format:?}");
+        Ok(())
+    });
+    for call in mock.calls() {
+        println!("CALL {call:?}");
+    }
+}
