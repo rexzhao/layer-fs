@@ -4,8 +4,8 @@
 //! boxed forwarding is faithful — and eleven hand-written `(**self)` calls are exactly where a swapped argument would hide. So
 //! the criterion is **behaviour through the box equals behaviour through the concrete type**, including the error variants.
 
-use fs_winfsp::mock::MockBackend;
 use fs_semantics::disposition::Disposition;
+use fs_winfsp::mock::MockBackend;
 use fs_winfsp::ops::{DynOps, OpsError, WorkspaceOps};
 
 #[test]

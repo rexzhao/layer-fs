@@ -20,7 +20,7 @@ use crate::ops::NodeInfo;
 
 /// Status code used for "this build cannot answer": `STATUS_INVALID_DEVICE_REQUEST` is what a caller sees when an
 /// operation is not implemented, and it is distinct from any of our own failures.
-const NOT_IMPLEMENTED: i32 = 0xC000_0010u32 as i32;
+pub const NOT_IMPLEMENTED: i32 = 0xC000_0010u32 as i32;
 
 /// The `FileContext` this frontend hands to WinFsp for an open entry.
 ///
@@ -169,6 +169,25 @@ pub fn reset_for_tests() {
 /// `out` must be valid for writes of `capacity` bytes for the duration of the call.
 pub unsafe fn get_volume_info(out: *mut c_void, capacity: u32) -> i32 {
     VOLUME_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let volume = VOLUME.get().copied();
+    // SAFETY: the caller guarantees `out` is valid for writes of `capacity` bytes.
+    unsafe { get_volume_info_for(volume, out, capacity) }
+}
+
+/// The `GetVolumeInfo` body with the volume handed in: **the logic lives here, the process-wide lookup lives above** (361).
+///
+/// Splitting it this way is what makes the two-phase contract testable without a mount: the size query, the "too small" answer,
+/// and the "no volume configured" answer are all reachable by passing `None` or a small buffer — the `unsafe` shell keeps only
+/// the parts that genuinely need an FFI call.
+///
+/// # Safety
+///
+/// `out` must be valid for writes of `capacity` bytes for the duration of the call.
+pub unsafe fn get_volume_info_for(
+    volume: Option<VolumeInfo>,
+    out: *mut c_void,
+    capacity: u32,
+) -> i32 {
     if out.is_null() {
         return OURS_INVALID_PARAMETER;
     }
@@ -178,11 +197,13 @@ pub unsafe fn get_volume_info(out: *mut c_void, capacity: u32) -> i32 {
         // (`<<QueryVolumeInformation IoStatus=c0000010`).
         return OURS_BUFFER_TOO_SMALL;
     }
-    let Some(volume) = VOLUME.get() else {
+    let Some(volume) = volume else {
+        // The order matters and is asserted by a test: **"no volume configured" is decided before the buffer is trusted**, so a
+        // configured-but-absent volume cannot be mistaken for a caller that passed a bad pointer.
         return NOT_IMPLEMENTED;
     };
     // SAFETY: `out` is non-null and large enough for `VolumeInfo`, per the check above.
-    unsafe { std::ptr::write(out.cast::<VolumeInfo>(), *volume) };
+    unsafe { std::ptr::write(out.cast::<VolumeInfo>(), volume) };
     0
 }
 
@@ -405,9 +426,9 @@ pub unsafe fn close(context: *mut c_void) {
 /// `STATUS_OBJECT_NAME_NOT_FOUND`.
 const OURS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 /// `STATUS_BUFFER_TOO_SMALL`.
-const OURS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
+pub const OURS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 /// `STATUS_INVALID_PARAMETER`.
-const OURS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+pub const OURS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 
 /// How many times `GetVolumeInfo` was called — the cheapest "did the OS talk to us at all" probe.
 static VOLUME_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
