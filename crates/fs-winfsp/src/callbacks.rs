@@ -240,6 +240,15 @@ pub fn configured() -> Configured {
     )
 }
 
+/// The path resolver currently in force, for the mount path to hand to the registry.
+///
+/// Separate from [`configured`] only because the resolver lives in its own static ([`configure_paths`]); the two are read together
+/// at mount time and never afterwards.
+#[must_use]
+pub fn configured_resolve() -> Option<fn(&str) -> Option<u64>> {
+    RESOLVE.get().copied()
+}
+
 /// Configures the callbacks for this process. Returns `false` if they were already set (a second mount is not supported at
 /// this stage, and silently overwriting would make two mounts share one answer).
 pub fn configure(volume: &VolumeInfo, lookup: fn(u64) -> Option<NodeInfo>, list: Lister) -> bool {
@@ -539,6 +548,92 @@ pub fn create_call_count() -> usize {
     CREATE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The `Open` **shell**: the name is resolved by **this mount's backend**, not by a process-wide resolver.
+///
+/// Behaviour is the same two steps the old body took (resolve, then fetch metadata) — but the steps now happen inside the backend,
+/// so `fs-winfsp` no longer needs to know how a name becomes an id (367's route, cashed in).
+///
+/// # Safety
+///
+/// `file_name` must be NUL-terminated; `context_out` and `info_out` must be valid for writes of a pointer and a `FileInfo`.
+pub unsafe fn open_shell(
+    adapter: Option<&crate::DynAdapter>,
+    file_name: *const u16,
+    context_out: *mut *mut c_void,
+    info_out: *mut FileInfo,
+) -> i32 {
+    OPEN_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if file_name.is_null() || context_out.is_null() || info_out.is_null() {
+        eprintln!(
+            "open: null argument (file_name={:?} context_out={:?} info_out={:?})",
+            file_name, context_out, info_out
+        );
+        return OURS_INVALID_PARAMETER;
+    }
+    // SAFETY: `file_name` is NUL-terminated per WinFsp's contract.
+    let units = unsafe { crate::boundary::utf16_len(file_name) };
+    // SAFETY: same pointer, bounded by the terminator.
+    let slice = unsafe { std::slice::from_raw_parts(file_name, units) };
+    let path = String::from_utf16_lossy(slice);
+    let Some(adapter) = adapter else {
+        OPEN_EXITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return NOT_IMPLEMENTED;
+    };
+    // `Open` **must not create** — the disposition says so, and the backend is where that promise is kept.
+    let outcome = match adapter.backend().create_or_open(
+        path.as_bytes(),
+        fs_semantics::disposition::Disposition::Open,
+    ) {
+        Ok(outcome) => outcome,
+        Err(crate::ops::OpsError::NotFound) => {
+            OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return OURS_OBJECT_NAME_NOT_FOUND;
+        }
+        Err(_) => {
+            OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return OURS_OBJECT_NAME_NOT_FOUND;
+        }
+    };
+    // The record is built from **current** metadata, read at return time — not from whatever the outcome remembered.
+    let Some(node) = adapter.backend().get_info(outcome.file_id).ok() else {
+        OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return OURS_OBJECT_NAME_NOT_FOUND;
+    };
+    let Ok(record) = crate::file_info::file_info(&node) else {
+        OPEN_EXITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return NOT_IMPLEMENTED;
+    };
+    let context = Box::into_raw(Box::new(EntryContext {
+        file_id: outcome.file_id,
+    }));
+    CONTEXTS_ALLOCATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: both out-pointers were checked non-null and are valid for their writes per the caller's contract.
+    unsafe {
+        std::ptr::write(context_out, context.cast::<c_void>());
+        std::ptr::write(info_out, record);
+    }
+    0
+}
+
+/// The `Create` **shell** for the read-only stage: only `FILE_OPEN` is answered, and it goes through [`open_shell`].
+///
+/// # Safety
+///
+/// Same contract as [`open_shell`].
+pub unsafe fn create_shell(
+    adapter: Option<&crate::DynAdapter>,
+    file_name: *const u16,
+    create_options: u32,
+    context_out: *mut *mut c_void,
+    info_out: *mut FileInfo,
+) -> i32 {
+    CREATE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // FILE_OPEN is the "must exist" disposition; WinFsp passes it as a create option when the caller opened an existing name.
+    let _ = create_options;
+    // SAFETY: the caller's contract for both pointers is the same as `open_shell`'s.
+    unsafe { open_shell(adapter, file_name, context_out, info_out) }
+}
+
 /// The `Create` body — **the required callback** (`winfsp.h:291`), and the one whose absence made every IRP come back as
 /// `STATUS_INVALID_DEVICE_REQUEST`.
 ///
@@ -578,7 +673,7 @@ pub unsafe fn close(context: *mut c_void) {
 }
 
 /// `STATUS_OBJECT_NAME_NOT_FOUND`.
-const OURS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+pub const OURS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 /// `STATUS_BUFFER_TOO_SMALL`.
 pub const OURS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 /// `STATUS_INVALID_PARAMETER`.

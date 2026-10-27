@@ -166,7 +166,9 @@ mod platform {
     ) -> i32 {
         let adapter = crate::registry::mounts().get(file_system as usize);
         // SAFETY: `file_context` is the `EntryContext` this frontend allocated, and `file_info` is WinFsp's output buffer.
-        unsafe { crate::callbacks::get_file_info_shell(adapter.as_deref(), file_context, file_info) }
+        unsafe {
+            crate::callbacks::get_file_info_shell(adapter.as_deref(), file_context, file_info)
+        }
     }
 
     /// `ReadDirectory`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PVOID Buffer, UINT64 Offset, PWSTR Pattern, PWSTR Marker,
@@ -198,21 +200,24 @@ mod platform {
     /// `Open`: `(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess, PVOID *PFileContext,
     /// FSP_FSCTL_FILE_INFO *FileInfo)` — `winfsp.h:322`.
     unsafe extern "system" fn open_trampoline(
-        _file_system: *mut c_void,
+        file_system: *mut c_void,
         file_name: *const u16,
         _create_options: u32,
         _granted_access: u32,
         context_out: *mut *mut c_void,
         info_out: *mut crate::abi::FileInfo,
     ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
         // SAFETY: WinFsp's contract — a NUL-terminated name and two valid out-pointers.
-        unsafe { crate::callbacks::open(file_name, context_out, info_out) }
+        unsafe {
+            crate::callbacks::open_shell(adapter.as_deref(), file_name, context_out, info_out)
+        }
     }
 
     /// `Create`: `(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess, UINT32 FileAttributes,
     /// PSECURITY_DESCRIPTOR, UINT64 AllocationSize, PVOID *PFileContext, FSP_FSCTL_FILE_INFO*)` — `winfsp.h:291`, slot **3**.
     unsafe extern "system" fn create_trampoline(
-        _file_system: *mut c_void,
+        file_system: *mut c_void,
         file_name: *const u16,
         create_options: u32,
         _granted_access: u32,
@@ -222,8 +227,17 @@ mod platform {
         context_out: *mut *mut c_void,
         info_out: *mut crate::abi::FileInfo,
     ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
         // SAFETY: WinFsp's contract for this callback.
-        unsafe { crate::callbacks::create(file_name, create_options, context_out, info_out) }
+        unsafe {
+            crate::callbacks::create_shell(
+                adapter.as_deref(),
+                file_name,
+                create_options,
+                context_out,
+                info_out,
+            )
+        }
     }
 
     /// `Overwrite` — `winfsp.h:345`, slot **5**. Required for the whole create class (`fsop.c:907`: the dispatcher refuses the
@@ -623,8 +637,13 @@ mod platform {
             // **Register right after `create`** — that is the first moment the pointer exists, and a callback can arrive as soon
             // as the dispatcher starts. The adapter carries this mount's configuration; nothing below reads a process-wide one.
             let (volume, lookup, list) = crate::callbacks::configured();
+            let resolve = crate::callbacks::configured_resolve();
             let mounted_adapter = std::sync::Arc::new(crate::DynAdapter::with_config(
-                Box::new(super::ConfiguredOps { lookup, list }) as crate::ops::DynOps,
+                Box::new(super::ConfiguredOps {
+                    lookup,
+                    list,
+                    resolve,
+                }) as crate::ops::DynOps,
                 crate::adapter::AdapterConfig {
                     volume,
                     ..crate::adapter::AdapterConfig::default()
@@ -730,15 +749,40 @@ mod platform {
 struct ConfiguredOps {
     lookup: Option<fn(u64) -> Option<crate::ops::NodeInfo>>,
     list: Option<crate::callbacks::Lister>,
+    resolve: Option<fn(&str) -> Option<u64>>,
 }
 
 impl crate::ops::WorkspaceOps for ConfiguredOps {
     fn create_or_open(
         &self,
-        _path: &[u8],
-        _disposition: fs_semantics::disposition::Disposition,
+        path: &[u8],
+        disposition: fs_semantics::disposition::Disposition,
     ) -> crate::ops::OpsResult<crate::ops::OpenOutcome> {
-        Err(crate::ops::OpsError::ReadOnly)
+        // The bridge's job is to keep the **existing** semantics: the injected resolver answers, and a metadata lookup follows —
+        // exactly what `open` did against the two statics. Only `Open` is supported, because this mount is read-only and a
+        // silent "created nothing" would be the failure mode the setter batch exists to avoid.
+        if disposition != fs_semantics::disposition::Disposition::Open {
+            return Err(crate::ops::OpsError::ReadOnly);
+        }
+        let text = String::from_utf8_lossy(path);
+        let file_id = self
+            .resolve
+            .and_then(|resolve| resolve(text.as_ref()))
+            .ok_or(crate::ops::OpsError::NotFound)?;
+        let info = self
+            .lookup
+            .and_then(|lookup| lookup(file_id))
+            .ok_or(crate::ops::OpsError::NotFound)?;
+        Ok(crate::ops::OpenOutcome {
+            file_id,
+            kind: info.kind,
+            size: info.size,
+            times: info.times,
+            attributes: info.attributes,
+            action: fs_semantics::disposition::Action::Open,
+            binding: (file_id, Vec::new()),
+            replaced: None,
+        })
     }
 
     fn mkdir(&self, _path: &[u8]) -> crate::ops::OpsResult<u64> {
