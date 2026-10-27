@@ -1009,3 +1009,22 @@ What is left, and it is now the honest shortlist:
    under `cargo test` instead of `cargo nextest` (different harness, same code).
 
 Until one of those is read, the mounting defect stays **unexplained**, and it is recorded as such rather than as a product defect.
+
+## Harness contrast (510): `cargo test` and `cargo nextest` fail **identically**
+
+```
+cargo test     : via_join = os error 3 ; via_format = os error 3
+cargo nextest  : via_join = os error 3 ; via_format = os error 3
+```
+
+So process isolation / harness / link order are all excluded (A and this), and the delta really is inside the body. Two bodies that differ only in
+*constructing one extra `PathBuf`* produce different filesystem results — that is not a property a filesystem can have, and it moves the leading
+suspicion to **undefined behaviour in our FFI layer** (an argument read from the wrong slot, an uninitialised value, a lifetime that the compiler is free
+to reshape). The heap-corruption saga had exactly this flavour.
+
+Decisive cheap probe, using instrumentation we already have: share the `MockBackend` through an `Arc`, run both bodies, and compare `mock.calls()`.
+
+- failing body: if `CreateOrOpen` **never appears** in the call log, the request dies above our callbacks (FSD/mount), so the body's shape changed how the
+  OS routed it — that would be strange but it is a reading;
+- failing body: if `CreateOrOpen` **appears and returns Ok** while the caller gets `os error 3`, the *answer* is corrupted on the way back, which points at
+  the out-parameter/signature layer (where two wrong signatures have already been found by measurement).
