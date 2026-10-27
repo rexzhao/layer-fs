@@ -52,6 +52,14 @@ pub struct Adapter<B: WorkspaceOps> {
     ops: B,
     handles: HandleTable,
     config: AdapterConfig,
+    /// `FileContext` allocations and frees **for this mount**.
+    ///
+    /// Process-wide counters answered the question "did anything leak anywhere"; per-mount counters answer "did *this* mount
+    /// balance", which is the question a teardown actually asks — and the reason 300 moves them here.
+    contexts: (
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    ),
 }
 
 impl<B: WorkspaceOps> std::fmt::Debug for Adapter<B> {
@@ -69,6 +77,10 @@ impl<B: WorkspaceOps> Adapter<B> {
             ops,
             handles: HandleTable::new(),
             config: AdapterConfig::default(),
+            contexts: (
+                std::sync::atomic::AtomicUsize::new(0),
+                std::sync::atomic::AtomicUsize::new(0),
+            ),
         }
     }
 
@@ -78,7 +90,34 @@ impl<B: WorkspaceOps> Adapter<B> {
             ops,
             handles: HandleTable::new(),
             config,
+            contexts: (
+                std::sync::atomic::AtomicUsize::new(0),
+                std::sync::atomic::AtomicUsize::new(0),
+            ),
         }
+    }
+
+    /// Records one `FileContext` allocation for this mount.
+    pub fn note_context_allocated(&self) {
+        self.contexts
+            .0
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Records one `FileContext` free for this mount.
+    pub fn note_context_freed(&self) {
+        self.contexts
+            .1
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `(allocated, freed)` for this mount: equal after a clean teardown.
+    #[must_use]
+    pub fn context_counts(&self) -> (usize, usize) {
+        (
+            self.contexts.0.load(std::sync::atomic::Ordering::Relaxed),
+            self.contexts.1.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// This mount's configuration.

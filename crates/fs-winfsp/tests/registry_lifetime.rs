@@ -191,3 +191,26 @@ fn a_missing_lookup_is_counted() {
         "cell hit: a successful lookup is not a miss"
     );
 }
+
+/// 300 migrates here: context counts are **per mount**, so the question "did this mount balance" is answerable without
+/// reading a process-wide counter that other mounts also touch.
+#[test]
+fn context_counts_are_per_mount() {
+    let first = adapter();
+    let second = adapter();
+
+    first.note_context_allocated();
+    first.note_context_freed();
+    second.note_context_allocated();
+
+    assert_eq!(
+        first.context_counts(),
+        (1, 1),
+        "cell first: this mount allocated one and freed one — balanced"
+    );
+    assert_eq!(
+        second.context_counts(),
+        (1, 0),
+        "cell second: and this one is still holding a context, which the first mount's numbers cannot hide"
+    );
+}
