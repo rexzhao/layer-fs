@@ -673,7 +673,8 @@ pub unsafe fn open_shell(
             adapter,
             file_name,
             fs_semantics::disposition::Disposition::Open,
-            // `Open` has no create options at all: a plain open never asks for a directory to be made.
+            // `Open` has no create options at all: a plain open never asks for a directory to be made, and it expresses no kind either.
+            false,
             false,
             context_out,
             info_out,
@@ -695,6 +696,7 @@ unsafe fn open_like(
     file_name: *const u16,
     disposition: fs_semantics::disposition::Disposition,
     wants_directory: bool,
+    expects_file: bool,
     context_out: *mut *mut c_void,
     info_out: *mut FileInfo,
 ) -> i32 {
@@ -769,6 +771,19 @@ unsafe fn open_like(
             return status;
         }
     };
+    // **The kind the caller asked for must be the kind it gets.** Windows expresses it in the create options (`FILE_DIRECTORY_FILE` or
+    // `FILE_NON_DIRECTORY_FILE`), and ignoring it is how a *file* got created over a directory's name: the third `Create` in the real trace
+    // carried `FILE_NON_DIRECTORY_FILE` for a name that was a directory, and answering it through the file door replaced the directory with an
+    // empty file — after which every child of it was "not found".
+    if let Ok(node) = adapter.backend().get_info(file_id) {
+        let is_directory = node.kind == crate::ops::Kind::Directory;
+        if wants_directory && !is_directory {
+            return OURS_NOT_A_DIRECTORY;
+        }
+        if expects_file && is_directory {
+            return OURS_IS_A_DIRECTORY;
+        }
+    }
     let _ = disposition;
     // The record is built from **current** metadata, read at return time — not from whatever the outcome remembered.
     let Some(node) = adapter.backend().get_info(file_id).ok() else {
@@ -826,6 +841,7 @@ pub unsafe fn create_shell(
     // `FILE_DIRECTORY_FILE` is the **option**, not the disposition — it says *what kind* to make, and it is the flag the SDK tells
     // user-mode file systems to look at (`winfsp.h:262-266`).
     let wants_directory = parts.options & FILE_DIRECTORY_FILE != 0;
+    let expects_file = parts.options & FILE_NON_DIRECTORY_FILE != 0;
     // SAFETY: the caller's contract for both pointers is the same as `open_shell`'s.
     unsafe {
         open_like(
@@ -833,6 +849,7 @@ pub unsafe fn create_shell(
             file_name,
             disposition,
             wants_directory,
+            expects_file,
             context_out,
             info_out,
         )
@@ -926,6 +943,11 @@ pub const FILE_OVERWRITE_IF: u32 = 0x05;
 /// The collision with `FILE_OPEN`'s value is exactly what made the low-bit reading look plausible and be wrong: the two live in
 /// different halves of the same word.
 pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+/// `FILE_NON_DIRECTORY_FILE` — `0x00000040`: "this name must be a file, not a directory".
+///
+/// Ignoring it is how a directory\x27s name got replaced by an empty file in the real trace: the create was answered through the file door
+/// without checking what the name already was.
+pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 
 /// The `Close` body: frees the `FileContext` **once**.
 ///
@@ -1015,6 +1037,9 @@ pub unsafe fn rename_shell(
         Err(_) => NOT_IMPLEMENTED,
     }
 }
+
+/// `STATUS_IS_A_DIRECTORY` — "that name is a directory; a file operation cannot answer it".
+pub const OURS_IS_A_DIRECTORY: i32 = 0xC000_0102u32 as i32;
 
 /// `STATUS_NOT_A_DIRECTORY` — "that name is a file, not a directory".
 pub const OURS_NOT_A_DIRECTORY: i32 = 0xC000_0103u32 as i32;
