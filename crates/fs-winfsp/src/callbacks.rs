@@ -720,6 +720,12 @@ unsafe fn open_like(
     // The disposition is passed through **unchanged** for a file: whether it creates or opens is the backend's decision, and the
     // promise that `Open` does not create lives there (asserted in `open_shell_criterion`).
     // A **directory** is different: `mkdir` is the only verb that can make one, so the decision is taken here and said out loud.
+    // The caller said "a file" (`FILE_NON_DIRECTORY_FILE`): if the name is a **directory**, that is `FILE_IS_A_DIRECTORY` before anything else is
+    // attempted. Checking it here (rather than only after the file door answers) is what makes the refusal independent of what the backend does with
+    // a directory name — and it is the check whose absence let a file replace a directory in the real trace.
+    if expects_file && adapter.backend().open_dir(path.as_bytes()).is_ok() {
+        return OURS_IS_A_DIRECTORY;
+    }
     let outcome = match make_verb(disposition, wants_directory) {
         MakeVerb::Directory => match adapter.backend().mkdir(path.as_bytes()) {
             // A directory made by `mkdir` has **no binding from the backend** (the trait answers only an id), so a pending deletion of
@@ -1038,8 +1044,11 @@ pub unsafe fn rename_shell(
     }
 }
 
-/// `STATUS_IS_A_DIRECTORY` — "that name is a directory; a file operation cannot answer it".
-pub const OURS_IS_A_DIRECTORY: i32 = 0xC000_0102u32 as i32;
+/// `STATUS_FILE_IS_A_DIRECTORY` — **`0xC00000BA`** ("that name is a directory; a file operation cannot answer it").
+///
+/// Read from the SDK, not from memory: `ntstatus.h:3773`. The first version of this constant used `0xC0000102`, which is
+/// `STATUS_FILE_CORRUPT_ERROR` (`ntstatus.h:4435`) — a wrong code here would have surfaced in L2 as a spurious difference from NTFS.
+pub const OURS_IS_A_DIRECTORY: i32 = 0xC000_00BAu32 as i32;
 
 /// `STATUS_NOT_A_DIRECTORY` — "that name is a file, not a directory".
 pub const OURS_NOT_A_DIRECTORY: i32 = 0xC000_0103u32 as i32;
