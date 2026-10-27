@@ -165,6 +165,49 @@ pub(crate) fn into_namespace(error: OverlayError) -> NamespaceError {
     }
 }
 
+/// Looks a name up **by its folded key**, scanning when the exact lookup misses (478).
+///
+/// The exact path is tried first and stays the common case. The scan is what makes `readme.txt` find an entry stored as `ReadMe.txt`: the base's
+/// pages are ordered by the bytes that were written, so a folded key cannot be found by searching for it. The overlay's own rows are compared the
+/// same way, and the overlay still shadows the base — a whiteout found by a folded match means "gone", exactly as it does for an exact match.
+///
+/// # Why a scan and not a cache
+///
+/// A `(parent, folded) -> display` index would be faster and would have to be updated on `bind`, `unbind`, `rename` and `remove_at`; missing one of
+/// those is a **silent wrong lookup**, which is the failure mode this whole layer is being built to avoid. A scan is slow **visibly**. The index is
+/// B-19, to be added later against this function as its correctness baseline.
+fn folded_scan(
+    connection: &Connection,
+    base: &BaseLayer,
+    parent: FileId,
+    name: &[u8],
+) -> OverlayResult<Option<FileId>> {
+    let wanted = fs_semantics::name::fold_bytes(name);
+    // The overlay first: it shadows the base, including through a whiteout (`child = NULL`).
+    for (stored, child) in entries_after(connection, parent.serial(), None)? {
+        if fs_semantics::name::fold_bytes(&stored) != wanted {
+            continue;
+        }
+        return Ok(child.map(FileId::from_serial));
+    }
+    let Some(dir) = base.directory(parent.serial())? else {
+        return Ok(None);
+    };
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let page = base.read_dir(&dir, after.as_deref(), 256)?;
+        if page.is_empty() {
+            return Ok(None);
+        }
+        for (stored, child) in &page {
+            if fs_semantics::name::fold_bytes(stored) == wanted {
+                return Ok(Some(FileId::from_serial(*child)));
+            }
+        }
+        after = page.last().map(|(stored, _)| stored.clone());
+    }
+}
+
 pub(crate) fn lookup_impl(
     connection: &Connection,
     base: &BaseLayer,
@@ -176,10 +219,15 @@ pub(crate) fn lookup_impl(
         // A whiteout masks the base: the name is gone even if the base binds it.
         Some(None) => Ok(None),
         None => match base.directory(parent.serial())? {
-            Some(dir) => Ok(base.lookup(&dir, name)?),
+            Some(dir) => {
+                if let Some(found) = base.lookup(&dir, name)? {
+                    return Ok(Some(FileId::from_serial(found)));
+                }
+                // Not found by its exact bytes: try the folded key (478). This is the case that makes a case-insensitive name work at all.
+                folded_scan(connection, base, parent, name)
+            }
             None => Ok(None),
-        }
-        .map(|found| found.map(FileId::from_serial)),
+        },
     }
 }
 

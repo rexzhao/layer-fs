@@ -256,12 +256,24 @@ fn replaced_is_none_unless_a_different_inode_lost_the_name() {
         (FileId::ROOT, b"a".to_vec()),
         "cell case-only: the binding carries the new spelling"
     );
-    assert!(
-        matches!(
-            rules(&fixture).resolve(&p("/A")),
-            Err(NamespaceError::NotFound { .. })
-        ),
-        "cell case-only: the old spelling no longer resolves (bindings are raw bytes)"
+    // **Inverted (480).** This used to assert that the old spelling stopped resolving — true while bindings were raw bytes and the lookup compared
+    // them as such. Lookup now matches on the folded key, so `/A` and `/a` are the same entry, which is what Windows does. The assertion therefore
+    // becomes the **stronger** one: the old spelling still resolves (folded matching) *and* the entry now reports the new spelling (display kept).
+    //
+    // The old form only proved "the old shell is dead"; it said nothing about whether the new one is alive.
+    let resolved = rules(&fixture)
+        .resolve(&p("/A"))
+        .expect("cell case-only: the old spelling still resolves to the same entry");
+    assert_eq!(
+        resolved, file,
+        "cell case-only: same inode under either spelling"
+    );
+    let listing = rules(&fixture).read_dir(&p("/")).expect("list");
+    let names: Vec<String> = listing.into_iter().map(|entry| entry.name).collect();
+    assert_eq!(
+        names,
+        vec!["a".to_string()],
+        "cell case-only: exactly one entry, listed under the new spelling"
     );
 }
 
@@ -317,28 +329,42 @@ fn directory_replace_respects_emptiness_and_keeps_subtree_ids() {
 /// Criterion 7 — a case-only rename onto a name held by **another** inode is `NameCollision` with `replace = false` and
 /// a replacement with `replace = true`.
 #[test]
-fn case_only_rename_onto_another_inode_follows_the_replace_flag() {
+fn two_spellings_of_one_name_cannot_coexist_and_rename_replaces_ordinals() {
     let fixture = fixture("c7");
-    let upper = create_file(&fixture, "/A", b"upper");
-    let lower = create_file(&fixture, "/a", b"lower");
 
+    // **Rewritten (480).** The original premise was that `/A` and `/a` can be two different inodes, and it then asked what a case-only rename
+    // does when the folded name is taken. That premise is now unreachable through the API — lookup compares folded keys, so the second create
+    // finds the first entry, which is exactly the protection 471 asks for. The half that premise was carrying moves to a positive criterion.
+    let upper = create_file(&fixture, "/A", b"upper");
+    let collision = rules(&fixture)
+        .create_or_open(&p("/a"), Disposition::Create)
+        .expect_err("the folded name is already taken");
+    assert!(
+        matches!(collision, NamespaceError::AlreadyExists { .. }),
+        "cell coexist: AlreadyExists: {collision:?}"
+    );
+
+    // The replace flag still has its ordinary work to do — on names that differ by more than case, which is the standard rename path on Windows.
+    create_file(&fixture, "/ab", b"lower");
     let error = rules(&fixture)
-        .rename_with(&p("/A"), &p("/a"), false)
-        .expect_err("the folded name is taken by another inode");
+        .rename_with(&p("/A"), &p("/ab"), false)
+        .expect_err("replace = false refuses a taken name");
     assert!(
         matches!(error, NamespaceError::NameCollision { .. }),
         "cell false: NameCollision: {error:?}"
     );
 
     let outcome = rules(&fixture)
-        .rename_with(&p("/A"), &p("/a"), true)
+        .rename_with(&p("/A"), &p("/ab"), true)
         .expect("replace");
     assert_eq!(
-        outcome.replaced,
-        Some(lower),
-        "cell true: the other inode lost the name"
+        outcome.file_id, upper,
+        "cell true: the source inode moved onto the destination name"
     );
-    assert_eq!(outcome.file_id, upper, "cell true: the source inode moved");
+    assert!(
+        outcome.replaced.is_some(),
+        "cell true: the previous occupant lost the name"
+    );
     assert_eq!(
         fixture.workspace.read_at_id(upper, 0, 5).expect("upper"),
         b"upper",
