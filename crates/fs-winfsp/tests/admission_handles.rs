@@ -9,6 +9,7 @@
 //! The mount form is `mount_serving`, whose closure is handed `&Mounted` with the adapter behind it; `mount_read_only` only hands a path, which is enough for
 //! "does the chain work" but not for "what does the table say".
 
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use fs_winfsp::abi::VolumeInfo;
@@ -216,11 +217,27 @@ fn a_file_handle_and_a_directory_handle_are_counted_apart_and_both_come_back_dow
             with_file.0
         );
 
-        let listing = std::fs::read_dir(root.join("beta")).expect("open the directory through the mount");
-        // Enumerate, not just open: `read_dir` returns a lazy iterator, so the directory is only really walked once something asks for an entry.
-        let walked = listing.flatten().count();
+        // **Hold a directory handle, don't just enumerate one.** `read_dir` finishes its enumeration through a short-lived handle, so the count read afterwards is
+        // legitimately zero — measured: `read_dir=1`, `open_entries=2`, `dirs=0`, i.e. the enumeration happened and the handle was already gone. The question
+        // this criterion asks is "is an open directory handle counted apart", so the handle has to still be open when the count is read.
+        // `FILE_FLAG_BACKUP_SEMANTICS` (0x0200_0000) is what lets `OpenOptions` open a directory at all.
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0200_0000)
+            .open(root.join("beta"))
+            .expect("open the directory through the mount");
         let with_dir = adapter.open_handle_kinds();
         readings.push(format!("with a directory open files={} dirs={}", with_dir.0, with_dir.1));
+        // **Three counters before the judgement** (383/589): a directory open that leaves `dirs` at zero could be "never reached us" (frontend), "reached us but was not
+        // registered" (handle table), or "reached us by another route" (routing). Printing all three makes the next reading a fact instead of a hypothesis.
+        eprintln!(
+            "Q2 COUNTERS miss={} create={} read_dir={} open_entries={} exits={:?} with_dir={with_dir:?}",
+            fs_winfsp::registry::miss_count(),
+            fs_winfsp::callbacks::create_call_count(),
+            fs_winfsp::callbacks::read_dir_call_count(),
+            fs_winfsp::callbacks::open_entry_count(),
+            fs_winfsp::callbacks::open_exit_counts(),
+        );
         assert!(
             with_dir.1 > with_file.1,
             "cell Q2: a directory handle must raise the DIRECTORY count, not the file count (dirs {} -> {})",
@@ -228,7 +245,7 @@ fn a_file_handle_and_a_directory_handle_are_counted_apart_and_both_come_back_dow
             with_dir.1
         );
 
-        drop(walked);
+        drop(directory);
         drop(file);
         // `Close` can arrive after `CloseHandle` returns (the cache manager keeps a file object for a moment), so the reading is taken in a bounded loop and
         // printed before it is judged (573).
