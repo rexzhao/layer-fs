@@ -3189,3 +3189,10 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      继承导致外层等 EOF——Drop 守卫 kill 子进程）。
      判据：+2 新例 +1 反转（init 后 ls 成功——前提被有意改掉，444 口径）。
      F: 的 0xC0000022 是"不是空位"场景（锦上添花待做）。
+
+540. 【0xC0000022 分支 + git add -A 事故】e545089：挂载点在已有卷上（如 F: 是 NTFS 分区）
+     时给出路："use a drive letter that has no volume, or a directory that does not exist yet"。
+     两条分支合起来：0x35=盘符被占用（umount --force）；0x22=位置不是空位（换字母/目录）。
+     提交事故：git add -A 卷进 manager 的 docs 改动；第一次修（rm --cached + amend）更糟
+     （变成 3184 行删除）；正确修法=reset --soft + restore --staged + 按路径 add。
+     教训：git add -A 在共享分支上是危险动作——以后只按路径 add。
