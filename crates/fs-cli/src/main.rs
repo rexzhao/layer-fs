@@ -10,7 +10,6 @@
 
 mod mountcmd;
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -57,8 +56,26 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("layerfs: {error}");
-            ExitCode::from(1)
+            // **Exit codes are part of the interface** (ADR-010 §8.3): a script has to tell "retry when the other process finishes" from "this command
+            // is wrong". Everything that is not a `Failure` keeps the old answer, so this changes nothing that did not opt in.
+            let code = error
+                .downcast_ref::<fs_cli::Failure>()
+                .map_or(1, |failure| failure.code);
+            ExitCode::from(code)
         }
+    }
+}
+
+/// The `--workspace` given on the command line, set once at startup.
+///
+/// Replaceable (ADR-010 §5): with `cli/current` gone, every command that needs a workspace takes it from the option, and a command that needs one
+/// without having it fails with [`fs_cli::NO_WORKSPACE`] — never with a guessed name.
+static WORKSPACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn require_workspace() -> Result<String, Box<dyn std::error::Error>> {
+    match WORKSPACE.get().and_then(Option::clone) {
+        Some(name) => Ok(name),
+        None => Err(fs_cli::Failure::usage(fs_cli::NO_WORKSPACE).into()),
     }
 }
 
@@ -69,7 +86,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let store = PathBuf::from(take_option(&mut arguments, "--store").unwrap_or_else(|| ".".into()));
+    // Read **before** the command name is taken: `--workspace` is a global option (ADR-010 §5), not a subcommand flag.
+    let workspace_option = take_option(&mut arguments, "--workspace");
+    let _ = WORKSPACE.set(workspace_option.clone());
     let command = arguments.remove(0);
+
+    // **The removed file commands answer before the store is touched** (A0c): with a `--store` that does not exist, "store does not exist" would be a
+    // true sentence about the wrong problem — the command is gone, and that is what the caller has to be told.
+    if let Some(removed) = fs_cli::FILE_COMMANDS
+        .iter()
+        .find(|name| **name == command.as_str())
+    {
+        return Err(fs_cli::Failure::usage(fs_cli::file_command_removed(removed)).into());
+    }
 
     if command == "init" {
         let path = arguments
@@ -77,18 +106,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_or_else(|| store.clone(), PathBuf::from);
         let repo = Repo::create(&path)?;
         let head = repo.branch_head("main")?;
-        // **`init` leaves the repository usable**, not merely created: a fresh store with no workspace makes the very next `put`/`ls` fail with
-        // "no current workspace", which is a step the user cannot see a reason for. Creating `main` and recording it is the same thing `checkout
-        // main` does, done once at the moment it is obviously wanted.
+        // **`init` leaves the repository usable**, not merely created: a fresh store with no workspace makes the very next lifecycle command fail for a
+        // reason the user cannot see. Creating `main` is the same thing `checkout main` does, done once at the moment it is obviously wanted. No
+        // `cli/current` is written any more (ADR-010 §5): the workspace is named on the command line from now on.
         let workspace = std::sync::Arc::new(repo).workspace_create("main", "main")?;
-        let name = workspace.name().to_owned();
-        workspace.close()?;
-        write_current(&path, &name)?;
         println!(
-            "initialised {} (main = {}, workspace {name})",
+            "initialised {} (main = {}, workspace {})",
             path.display(),
-            short(&head)
+            short(&head),
+            workspace.name()
         );
+        workspace.close()?;
         return Ok(());
     }
 
@@ -101,7 +129,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The interactive entry points run **before** a `Repo` is opened: `mount` opens its own (it needs an `Arc` for the workspace), and
     // `list`/`umount`/`version` need no store at all — opening one first made them fail on a directory that is not a repository.
     match command.as_str() {
-        "mount" => return mountcmd::mount(&store, &arguments),
+        "mount" => return mountcmd::mount(&store, workspace_option.as_deref(), &arguments),
         "umount" => return mountcmd::umount(&arguments),
         "list" => return mountcmd::list(),
         "version" => return mountcmd::version(),
@@ -114,77 +142,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "checkout" => checkout(&repo, &store, &arguments),
         "snapshot" => snapshot(&repo, &store, &arguments),
         "workspace" => workspace(&repo, &arguments),
-        "put" => with_workspace(&repo, &store, |workspace| {
-            let (local, path) = two(&arguments, "put <local> <path>")?;
-            let mut bytes = Vec::new();
-            std::fs::File::open(&local)?.read_to_end(&mut bytes)?;
-            if workspace.stat(&path).is_err() {
-                workspace.create(&path)?;
-            }
-            workspace.write_at(&path, 0, &bytes)?;
-            workspace.truncate(&path, u64::try_from(bytes.len()).unwrap_or(0))?;
-            workspace.flush()?;
-            println!("{path} <- {local} ({} bytes)", bytes.len());
-            Ok(())
-        }),
-        "get" => with_workspace(&repo, &store, |workspace| {
-            let (path, target) = one_or_two(&arguments, "get <path> [local]")?;
-            let bytes = read_all(workspace, &path)?;
-            match target {
-                Some(target) => {
-                    std::fs::write(&target, &bytes)?;
-                    println!("{path} ({} bytes) -> {target}", bytes.len());
-                }
-                None => std::io::stdout().write_all(&bytes)?,
-            }
-            Ok(())
-        }),
-        "ls" => {
-            // `ls <commit>:[path]` reads history; `ls [path]` reads the workspace.
-            let spec = arguments.first().map_or("", String::as_str);
-            match split_commit(spec) {
-                Some((commit, path)) => {
-                    let view = repo.read_view(&commit)?;
-                    print_entries(&view.read_dir(&path)?);
-                    Ok(())
-                }
-                None => with_workspace(&repo, &store, |workspace| {
-                    let path = arguments.first().map_or("/", String::as_str);
-                    print_entries(&workspace.read_dir(path)?);
-                    Ok(())
-                }),
-            }
-        }
-        "cat" => {
-            let spec = arguments.first().ok_or("expected cat <commit>:<path>")?;
-            let (commit, path) = split_commit(spec).ok_or("expected cat <commit>:<path>")?;
-            let view = repo.read_view(&commit)?;
-            std::io::stdout().write_all(&view.read_all(&path)?)?;
-            Ok(())
-        }
-        "stat" => with_workspace(&repo, &store, |workspace| {
-            let (path, _) = one_or_two(&arguments, "stat <path>")?;
-            print_stat(&path, &workspace.stat(&path)?);
-            Ok(())
-        }),
-        "mkdir" => with_workspace(&repo, &store, |workspace| {
-            let path = one(&arguments, "mkdir <path>")?;
-            workspace.mkdir(&path)?;
-            workspace.flush()?;
-            Ok(())
-        }),
-        "rm" => with_workspace(&repo, &store, |workspace| {
-            let path = one(&arguments, "rm <path>")?;
-            workspace.remove(&path)?;
-            workspace.flush()?;
-            Ok(())
-        }),
-        "mv" => with_workspace(&repo, &store, |workspace| {
-            let (from, to) = two(&arguments, "mv <from> <to>")?;
-            workspace.rename(&from, &to)?;
-            workspace.flush()?;
-            Ok(())
-        }),
         "commit" => commit(&repo, &store, &arguments.clone()),
         "status" => with_workspace(&repo, &store, |workspace| {
             let status = workspace.status()?;
@@ -205,7 +162,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }),
         "revert" => {
-            let branch = current_branch(&repo, &store)?;
+            let branch = branch_for(&repo, &arguments, "--branch")?;
             let info = repo.revert(&branch)?;
             println!("{}: revert {}", branch, info.id);
             Ok(())
@@ -343,7 +300,7 @@ fn branch(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::E
 
 fn checkout(
     repo: &Repo,
-    store: &Path,
+    _store: &Path,
     arguments: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let branch = arguments.first().ok_or("expected checkout <branch>")?;
@@ -356,8 +313,10 @@ fn checkout(
         }
         Err(error) => return Err(error.into()),
     };
-    write_current(store, workspace.name())?;
+    // `cli/current` is gone (ADR-010 §5): `checkout` still creates or resumes the workspace, and still reports it, but it no longer records a
+    // "current" that later commands would silently depend on.
     println!("on {} (workspace {})", workspace.branch(), workspace.name());
+    workspace.close()?;
     Ok(())
 }
 
@@ -390,11 +349,18 @@ fn commit(
     })
 }
 
-fn log(repo: &Repo, store: &Path, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let branch = current_branch(repo, store)?;
-    let limit = arguments
+fn log(repo: &Repo, _store: &Path, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    // `log [branch] [n]`: with a branch named on the command line no overlay is opened (A1), so `log dev` works while `dev` is mounted.
+    let named = arguments
         .first()
-        .and_then(|text| text.parse::<usize>().ok())
+        .filter(|text| !text.starts_with('-') && text.parse::<usize>().is_err());
+    let branch = match named {
+        Some(branch) => branch.clone(),
+        None => current_branch(repo)?,
+    };
+    let limit = arguments
+        .iter()
+        .find_map(|text| text.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
     for info in repo.log(&branch)?.into_iter().take(limit) {
         println!("{} {}", info.id, info.message);
@@ -404,7 +370,7 @@ fn log(repo: &Repo, store: &Path, arguments: &[String]) -> Result<(), Box<dyn st
 
 fn reset(
     repo: &Repo,
-    store: &Path,
+    _store: &Path,
     arguments: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let commit = one(arguments, "reset <commit> [--expect <c>]")?;
@@ -413,7 +379,7 @@ fn reset(
         .position(|a| a == "--expect")
         .and_then(|index| arguments.get(index + 1))
         .map(String::as_str);
-    let branch = current_branch(repo, store)?;
+    let branch = branch_for(repo, arguments, "--branch")?;
     repo.reset(&branch, &commit, expect)?;
     println!("{branch} -> {commit}");
     Ok(())
@@ -457,64 +423,34 @@ fn with_workspace(
     outcome
 }
 
-fn current_branch(repo: &Repo, store: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let name = read_current(store)?;
+/// The branch a command works on: **`--branch`, or the workspace's branch** (ADR-010 §13 A1).
+///
+/// With `--branch` no overlay is opened at all, so `log`/`reset`/`revert` keep working while another process has the workspace mounted — the whole point
+/// of A1. Without it the branch comes from the workspace, which is the case that genuinely needs the overlay.
+fn branch_for(
+    repo: &Repo,
+    arguments: &[String],
+    flag: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(index) = arguments.iter().position(|argument| argument == flag) {
+        if let Some(name) = arguments.get(index + 1) {
+            return Ok(name.clone());
+        }
+    }
+    current_branch(repo)
+}
+
+fn current_branch(repo: &Repo) -> Result<String, Box<dyn std::error::Error>> {
+    let name = require_workspace()?;
     Ok(repo.workspace_open(&name)?.branch().to_owned())
 }
 
-fn current_path(store: &Path) -> PathBuf {
-    store.join("cli").join("current")
-}
-
-fn read_current(store: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let text = std::fs::read_to_string(current_path(store))
-        .map_err(|_| "no current workspace; run checkout <branch>")?;
-    let name = text.trim();
-    if name.is_empty() {
-        return Err("no current workspace; run checkout <branch>".into());
-    }
-    Ok(name.to_owned())
-}
-
-fn write_current(store: &Path, workspace: &str) -> std::io::Result<()> {
-    let path = current_path(store);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{workspace}\n"))
-}
-
-fn read_all(workspace: &Workspace, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let size = usize::try_from(workspace.stat(path)?.size).unwrap_or(usize::MAX);
-    let mut bytes = vec![0u8; size];
-    let read = workspace.read_at(path, 0, &mut bytes)?;
-    bytes.truncate(read);
-    Ok(bytes)
-}
-
-fn print_entries(entries: &[fs_api::Entry]) {
-    for entry in entries {
-        println!("{:?}\t{}", entry.kind, entry.name);
-    }
-}
-
-fn print_stat(path: &str, stat: &fs_api::Stat) {
-    println!("path:      {path}");
-    println!("kind:      {:?}", stat.kind);
-    println!("id:        {}", stat.id.serial());
-    println!("size:      {}", stat.size);
-    println!("created:   {}", stat.created_ns);
-    println!("modified:  {}", stat.modified_ns);
-}
-
-/// Splits `<commit>:<path>`; `None` when the argument is a plain path.
-fn split_commit(spec: &str) -> Option<(String, String)> {
-    let (commit, path) = spec.split_once(':')?;
-    if commit.is_empty() {
-        return None;
-    }
-    let path = if path.is_empty() { "/" } else { path };
-    Some((commit.to_owned(), path.to_owned()))
+/// The workspace this command runs against: **the `--workspace` option, or nothing** (ADR-010 §5).
+///
+/// `cli/current` is gone: a file that remembers a name for you is a second source of truth, and it made every command's behaviour depend on a store
+/// nobody mentioned. The `store` parameter stays only so the call sites read unchanged while the S0 sweep removes them one by one.
+fn read_current(_store: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    require_workspace()
 }
 
 fn short(id: &str) -> &str {
@@ -540,24 +476,6 @@ fn take_option(arguments: &mut Vec<String>, name: &str) -> Option<String> {
 fn one(arguments: &[String], usage: &str) -> Result<String, Box<dyn std::error::Error>> {
     match arguments {
         [first, ..] if !first.starts_with("--") => Ok(first.clone()),
-        _ => Err(format!("expected {usage}").into()),
-    }
-}
-
-fn two(arguments: &[String], usage: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
-    match arguments {
-        [first, second, ..] => Ok((first.clone(), second.clone())),
-        _ => Err(format!("expected {usage}").into()),
-    }
-}
-
-fn one_or_two(
-    arguments: &[String],
-    usage: &str,
-) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
-    match arguments {
-        [first] => Ok((first.clone(), None)),
-        [first, second, ..] => Ok((first.clone(), Some(second.clone()))),
         _ => Err(format!("expected {usage}").into()),
     }
 }

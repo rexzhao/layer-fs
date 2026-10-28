@@ -10,6 +10,11 @@ license.workspace = true
 name = "fs-cli"
 path = "src/main.rs"
 
+# The vocabulary lives in a library so the criteria can assert the **same constants** the binary prints (ADR-010 §8.2).
+[lib]
+name = "fs_cli"
+path = "src/lib.rs"
+
 [dependencies]
 fs-api.workspace = true
 fs-workspace.workspace = true

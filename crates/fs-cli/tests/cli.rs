@@ -29,6 +29,113 @@ impl TempRoot {
         self.path.join("store")
     }
 
+    /// Runs the CLI with a **global** `--workspace` (ADR-010 §5/§8.4).
+    ///
+    /// The option sits before the command because that is the recommended shape; the parser accepts it anywhere, but a test that relies on the looser
+    /// form would stop documenting the shape a reader should copy.
+    fn run_ws(&self, workspace: &str, arguments: &[&str]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fs-cli"));
+        command
+            .arg("--store")
+            .arg(self.store())
+            .arg("--workspace")
+            .arg(workspace);
+        command.args(arguments).output().expect("run the CLI")
+    }
+
+    /// `run_ws`, requiring success.
+    fn ok_ws(&self, workspace: &str, arguments: &[&str]) -> String {
+        let output = self.run_ws(workspace, arguments);
+        assert!(
+            output.status.success(),
+            "{arguments:?} (workspace {workspace}) failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// `run_ws`, requiring failure; returns stderr.
+    fn fails_ws(&self, workspace: &str, arguments: &[&str]) -> String {
+        let output = self.run_ws(workspace, arguments);
+        assert!(
+            !output.status.success(),
+            "{arguments:?} (workspace {workspace}) should have failed but printed {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// Runs `body` against one workspace **through the library**, which is where file content lives now (ADR-010 §5: the CLI has no file commands).
+    ///
+    /// Every criterion that used `put`/`cat` to prepare or verify now goes through here, so the CLI is only ever asked about the behaviour it still
+    /// owns — lifecycle and mounting — while the content assertions stay as strong as they were.
+    fn with_workspace<T>(&self, name: &str, body: impl FnOnce(&mut fs_api::Workspace) -> T) -> T {
+        let repo = std::sync::Arc::new(fs_api::Repo::open(self.store()).expect("open repo"));
+        let mut workspace = repo.workspace_open(name).expect("open workspace");
+        let outcome = body(&mut workspace);
+        workspace.close().expect("close workspace");
+        outcome
+    }
+
+    /// Writes `bytes` at `path` in `workspace`, creating the file when it is not there.
+    fn write_via_api(&self, workspace: &str, path: &str, bytes: &[u8]) {
+        self.with_workspace(workspace, |handle| {
+            if handle.stat(path).is_err() {
+                handle.create(path).expect("create");
+            }
+            handle.write_at(path, 0, bytes).expect("write");
+            handle
+                .truncate(path, u64::try_from(bytes.len()).unwrap_or(0))
+                .expect("truncate");
+            handle.flush().expect("flush");
+        });
+    }
+
+    /// Reads `path` from `workspace`.
+    fn read_via_api(&self, workspace: &str, path: &str) -> Vec<u8> {
+        self.with_workspace(workspace, |handle| {
+            let size = usize::try_from(handle.stat(path).expect("stat").size).unwrap_or(0);
+            let mut bytes = vec![0u8; size];
+            let read = handle.read_at(path, 0, &mut bytes).expect("read");
+            bytes.truncate(read);
+            bytes
+        })
+    }
+
+    /// The names listed in `path` of `workspace`.
+    fn ls_via_api(&self, workspace: &str, path: &str) -> Vec<String> {
+        self.with_workspace(workspace, |handle| {
+            handle
+                .read_dir(path)
+                .expect("read_dir")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect()
+        })
+    }
+
+    /// The names listed in a **commit's** tree (history, not the workspace).
+    fn ls_in_commit(&self, commit: &str, path: &str) -> Vec<String> {
+        let repo = fs_api::Repo::open(self.store()).expect("open repo");
+        repo.read_view(commit)
+            .expect("read view")
+            .read_dir(path)
+            .expect("read_dir")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect()
+    }
+
+    /// The bytes of `path` in a **commit's** tree.
+    fn read_in_commit(&self, commit: &str, path: &str) -> Vec<u8> {
+        let repo = fs_api::Repo::open(self.store()).expect("open repo");
+        repo.read_view(commit)
+            .expect("read view")
+            .read_all(path)
+            .expect("read")
+    }
+
     fn file(&self, name: &str) -> PathBuf {
         self.path.join(name)
     }
@@ -81,15 +188,16 @@ impl TempRoot {
         assert!(String::from_utf8_lossy(&output.stdout).contains("initialised"));
     }
 
-    /// The id a `commit` printed.
-    fn commit(&self, message: &str) -> String {
-        let output = self.ok(&["commit", "-m", message]);
+    /// The id a `commit` printed, for a named workspace (ADR-010 §5: no implicit current).
+    fn commit_ws(&self, workspace: &str, message: &str) -> String {
+        let output = self.ok_ws(workspace, &["commit", "-m", message]);
         output
             .split_whitespace()
             .last()
             .expect("commit id")
             .to_owned()
     }
+
 }
 
 impl Drop for TempRoot {
@@ -112,63 +220,63 @@ fn the_full_command_sequence_round_trips() {
     root.ok(&["branch", "feature", "--from", "main"]);
     assert_eq!(root.ok(&["branch"]).lines().count(), 2);
 
-    // checkout makes a workspace current
+    // checkout creates or resumes the workspace and says so; it no longer records a "current" (ADR-010 §5).
     let checkout = root.ok(&["checkout", "main"]);
     assert!(checkout.contains("workspace main"), "got {checkout}");
 
-    // mkdir / put / ls / stat / get
-    root.ok(&["mkdir", "/docs"]);
-    let a = root.file("a.txt").display().to_string();
-    root.ok(&["put", &a, "/docs/a"]);
-    let b = root.file("b.txt").display().to_string();
-    root.ok(&["put", &b, "/docs/b"]);
-    assert_eq!(root.ok(&["ls", "/docs"]).lines().count(), 2);
-    assert!(root.ok(&["stat", "/docs/a"]).contains("size:      12"));
-    let out = root.file("out.txt");
-    root.ok(&["get", "/docs/a", &out.display().to_string()]);
-    assert_eq!(std::fs::read(&out).expect("read back"), b"hello from a");
+    // **Content lives through the library** (the CLI has no file commands any more): mkdir/write/stat/read all go through `fs-api`, and the CLI is
+    // asked only about the behaviour it still owns — lifecycle. The assertions are the same ones the `put`/`ls`/`stat`/`get` round trip made.
+    root.with_workspace("main", |workspace| workspace.mkdir("/docs").expect("mkdir"));
+    root.write_via_api("main", "/docs/a", b"hello from a");
+    root.write_via_api("main", "/docs/b", b"second file");
+    assert_eq!(root.ls_via_api("main", "/docs").len(), 2);
+    assert_eq!(
+        root.with_workspace("main", |workspace| workspace
+            .stat("/docs/a")
+            .expect("stat")
+            .size),
+        12
+    );
+    assert_eq!(root.read_via_api("main", "/docs/a"), b"hello from a");
 
     // status before and after the first commit
-    assert!(root.ok(&["status"]).contains("dirty:     yes"));
-    let first = root.commit("first");
+    assert!(root.ok_ws("main", &["status"]).contains("dirty:     yes"));
+    let first = root.commit_ws("main", "first");
     assert_eq!(first.len(), 64, "a commit id is 64 hex characters");
-    let log = root.ok(&["log"]);
+    let log = root.ok(&["log", "main"]);
     assert_eq!(log.lines().count(), 2, "genesis + first: {log}");
     assert!(log.contains(&first));
-    assert!(root.ok(&["status"]).contains("dirty:     no"));
+    assert!(root.ok_ws("main", &["status"]).contains("dirty:     no"));
 
-    // mv / rm, then a second commit
-    root.ok(&["mv", "/docs/b", "/docs/c"]);
-    root.ok(&["rm", "/docs/c"]);
-    let second = root.commit("second");
+    // rename / remove through the library, then a second commit
+    root.with_workspace("main", |workspace| {
+        workspace.rename("/docs/b", "/docs/c").expect("rename");
+        workspace.remove("/docs/c").expect("remove");
+        workspace.flush().expect("flush");
+    });
+    let second = root.commit_ws("main", "second");
 
     // History reads a commit, not the workspace.
-    assert_eq!(
-        root.ok(&["cat", &format!("{first}:/docs/a")]),
-        "hello from a"
-    );
-    assert_eq!(
-        root.ok(&["ls", &format!("{first}:/docs")]).lines().count(),
-        2
-    );
-    assert_eq!(root.ok(&["ls"]).lines().count(), 1);
-    assert_eq!(root.ok(&["log", "1"]).lines().count(), 1);
+    assert_eq!(root.read_in_commit(&first, "/docs/a"), b"hello from a");
+    assert_eq!(root.ls_in_commit(&first, "/docs").len(), 2);
+    assert_eq!(root.ls_via_api("main", "/").len(), 1);
+    assert_eq!(root.ok(&["log", "main", "1"]).lines().count(), 1);
 
     // restore replaces the view; the branch does not move.
-    root.ok(&["restore", &first]);
-    assert_eq!(root.ok(&["ls", "/docs"]).lines().count(), 2);
+    root.ok_ws("main", &["restore", &first]);
+    assert_eq!(root.ls_via_api("main", "/docs").len(), 2);
     assert!(
-        root.ok(&["log"]).contains(&second),
+        root.ok(&["log", "main"]).contains(&second),
         "restore moves no branch"
     );
 
     // revert undoes the head with a new commit.
-    let reverted = root.ok(&["revert"]);
+    let reverted = root.ok_ws("main", &["revert"]);
     assert!(reverted.contains("revert"), "got {reverted}");
 
     // reset moves the head back without growing history.
-    root.ok(&["reset", &second]);
-    assert_eq!(root.ok(&["log"]).lines().count(), 3);
+    root.ok(&["reset", &second, "--branch", "main"]);
+    assert_eq!(root.ok(&["log", "main"]).lines().count(), 3);
 
     // verify, deep verify, stats
     assert!(root.ok(&["verify"]).contains("ok"));
@@ -179,30 +287,33 @@ fn the_full_command_sequence_round_trips() {
     assert!(stats.contains("commits:            4"), "got {stats}");
 }
 
-/// **Failure paths** — every "you cannot do that" is a non-zero exit with a message.
+/// **Failure paths** — every "you cannot do that" is a non-zero exit with a message that names the way out.
 #[test]
 fn failures_are_reported() {
     let root = TempRoot::new("failures");
     root.init();
 
-    // **Inverted (538).** This used to assert that `ls` failed right after `init` — true while `init` left a store with no workspace, and the reason
-    // `put`/`ls` needed a `checkout` first. `init` now creates `main` and records it, so the useful assertions are: `ls` works and is empty, and the
-    // "no current workspace" message still exists when there genuinely is none (the record is what is removed here).
+    // **Rewritten (S0, ADR-010 §13).** The old first line asserted that `ls` failed right after `init`; `ls` is gone, and the workspace it needed is now
+    // created by `init`. What still matters is the message: without `--workspace` a lifecycle command must say so, using the constant the ADR fixes.
+    let no_workspace = root.fails(&["commit", "-m", "empty"]);
     assert!(
-        root.ok(&["ls"]).trim().is_empty(),
-        "cell init: a fresh repository lists nothing, and does not need a checkout"
+        no_workspace.contains(fs_cli::NO_WORKSPACE),
+        "cell workspace: {no_workspace:?}"
     );
-    std::fs::remove_file(root.store().join("cli").join("current"))
-        .expect("drop the current record");
-    assert!(root.fails(&["ls"]).contains("no current workspace"));
+
+    // A removed file command answers **before** the store is opened, so the message is about the command, not about a missing store.
+    let removed = root.fails(&["put", "a", "b"]);
+    assert!(
+        removed.contains("file operations go through the mounted file system"),
+        "cell removed: {removed:?}"
+    );
+
     root.ok(&["checkout", "main"]);
 
-    assert!(root.fails(&["get", "/nope"]).contains("no such path"));
     assert!(root
-        .fails(&["commit", "-m", "empty"])
+        .fails_ws("main", &["commit", "-m", "empty"])
         .contains("already equals its base"));
     assert!(root.fails(&["checkout", "nope"]).contains("not found"));
-    assert!(root.fails(&["cat", "00:/x"]).contains("not found"));
     assert!(root.fails(&["frobnicate"]).contains("unknown command"));
 }
 
@@ -210,14 +321,12 @@ fn failures_are_reported() {
 #[test]
 fn restore_refuses_to_drop_uncommitted_work() {
     let root = TempRoot::new("restore");
-    std::fs::write(root.file("a.txt"), b"one").expect("host file");
     root.init();
     root.ok(&["checkout", "main"]);
 
-    let a = root.file("a.txt").display().to_string();
-    root.ok(&["put", &a, "/one"]);
-    let head = root.commit("first");
-    let genesis = root.ok(&["log", "2"]);
+    root.write_via_api("main", "/one", b"one");
+    let head = root.commit_ws("main", "first");
+    let genesis = root.ok(&["log", "main", "2"]);
     let genesis = genesis
         .lines()
         .nth(1)
@@ -225,36 +334,39 @@ fn restore_refuses_to_drop_uncommitted_work() {
         .expect("genesis id")
         .to_owned();
 
-    root.ok(&["put", &a, "/two"]);
-    assert!(root.fails(&["restore", &genesis]).contains("changes"));
-    root.ok(&["restore", &genesis, "--discard"]);
+    root.write_via_api("main", "/two", b"two");
+    assert!(root
+        .fails_ws("main", &["restore", &genesis])
+        .contains("changes"));
+    root.ok_ws("main", &["restore", &genesis, "--discard"]);
     assert_eq!(
-        root.ok(&["ls"]).lines().count(),
+        root.ls_via_api("main", "/").len(),
         0,
         "back to the empty tree"
     );
-    assert!(root.ok(&["log"]).contains(&head), "restore moved no branch");
+    assert!(
+        root.ok(&["log", "main"]).contains(&head),
+        "restore moved no branch"
+    );
 }
 
 /// A branch created from a commit inherits its tree.
 #[test]
 fn a_branch_can_start_from_a_commit() {
     let root = TempRoot::new("from-commit");
-    std::fs::write(root.file("a.txt"), b"payload").expect("host file");
     root.init();
     root.ok(&["checkout", "main"]);
-    let a = root.file("a.txt").display().to_string();
-    root.ok(&["put", &a, "/f"]);
-    let first = root.commit("first");
+    root.write_via_api("main", "/f", b"payload");
+    let first = root.commit_ws("main", "first");
 
     root.ok(&["branch", "side", "--from", &first]);
     root.ok(&["checkout", "side"]);
     assert_eq!(
-        root.ok(&["ls"]).lines().count(),
+        root.ls_via_api("side", "/").len(),
         1,
         "side starts at `first`"
     );
-    assert_eq!(root.ok(&["cat", &format!("{first}:/f")]), "payload");
+    assert_eq!(root.read_in_commit(&first, "/f"), b"payload");
 }
 
 /// `gc` end to end: a dry run decides but changes nothing, and a real run collects.
@@ -263,9 +375,8 @@ fn gc_dry_run_and_real_run_are_different_commands() {
     let root = TempRoot::new("gc");
     root.init();
     root.ok(&["checkout", "main"]);
-    std::fs::write(root.file("a.txt"), b"kept").expect("write");
-    root.ok(&["put", root.file("a.txt").to_str().expect("utf8"), "/a.txt"]);
-    root.commit("one");
+    root.write_via_api("main", "/a.txt", b"kept");
+    root.commit_ws("main", "one");
 
     let dry = root.ok(&["gc", "--dry-run"]);
     assert!(dry.contains("dry run"), "{dry}");
@@ -276,7 +387,7 @@ fn gc_dry_run_and_real_run_are_different_commands() {
     assert!(real.contains("freed objects:       0"), "{real}");
 
     // The store is usable afterwards: the collector's handle did not linger.
-    root.ok(&["status"]);
+    root.ok_ws("main", &["status"]);
 }
 
 /// A `gc_repack_threshold` that cannot be a ratio is refused, and the message says why.
@@ -289,8 +400,7 @@ fn an_impossible_repack_threshold_is_reported_and_not_acted_on() {
     root.init();
     root.ok(&["checkout", "main"]);
     std::fs::write(root.file("a.txt"), b"kept").expect("write");
-    root.ok(&["put", root.file("a.txt").to_str().expect("utf8"), "/a.txt"]);
-    root.commit("one");
+    root.write_via_api("main", "/a.txt", b"kept");
 
     let connection =
         rusqlite::Connection::open(root.store().join("store.sqlite")).expect("open index");
@@ -308,7 +418,7 @@ fn an_impossible_repack_threshold_is_reported_and_not_acted_on() {
         "the refusal must name the range: {stderr}"
     );
     // Nothing was collected: the command failed before the sweep.
-    root.ok(&["status"]);
+    root.ok_ws("main", &["status"]);
 }
 
 /// `snapshot drop` removes the row; the tree's objects go on the **next** collection, and the other
@@ -318,33 +428,23 @@ fn dropping_a_snapshot_frees_only_what_nothing_else_reaches() {
     let root = TempRoot::new("snapshot-drop");
     root.init();
     root.ok(&["checkout", "main"]);
-    std::fs::write(root.file("kept.txt"), b"the committed bytes").expect("write");
-    root.ok(&[
-        "put",
-        root.file("kept.txt").to_str().expect("utf8"),
-        "/kept.txt",
-    ]);
-    let commit = root.commit("one");
+    root.write_via_api("main", "/kept.txt", b"the committed bytes");
+    let commit = root.commit_ws("main", "one");
 
     // A tree only a snapshot row reaches: write it, snapshot it, then wipe the workspace's pending
     // view so nothing but the snapshot row names these bytes.
-    std::fs::write(
-        root.file("gone.txt"),
-        b"only this snapshot reaches these bytes",
-    )
-    .expect("write");
-    root.ok(&[
-        "put",
-        root.file("gone.txt").to_str().expect("utf8"),
+    root.write_via_api(
+        "main",
         "/gone.txt",
-    ]);
-    let snapshotted = root.ok(&["snapshot", "create"]);
+        b"only this snapshot reaches these bytes",
+    );
+    let snapshotted = root.ok_ws("main", &["snapshot", "create"]);
     let snapshot_root = snapshotted
         .split_whitespace()
         .last()
         .expect("a root id")
         .to_owned();
-    root.ok(&["restore", &commit, "--discard"]);
+    root.ok_ws("main", &["restore", &commit, "--discard"]);
 
     let listed = root.ok(&["snapshot", "list"]);
     assert!(listed.contains(&snapshot_root), "{listed}");
@@ -364,8 +464,10 @@ fn dropping_a_snapshot_frees_only_what_nothing_else_reaches() {
     );
 
     // The committed file survives, byte for byte.
-    let out = root.ok(&["cat", &format!("{commit}:/kept.txt")]);
-    assert_eq!(out.as_bytes(), b"the committed bytes");
+    assert_eq!(
+        root.read_in_commit(&commit, "/kept.txt"),
+        b"the committed bytes"
+    );
 }
 
 /// `branch delete` keeps the history: the deleted branch's commits are still GC roots, so its objects
@@ -377,17 +479,12 @@ fn deleting_a_branch_keeps_its_objects_alive() {
     root.ok(&["checkout", "main"]);
     root.ok(&["branch", "topic"]);
     root.ok(&["checkout", "topic"]);
-    std::fs::write(
-        root.file("topic.txt"),
-        b"only the topic branch has these bytes",
-    )
-    .expect("write");
-    root.ok(&[
-        "put",
-        root.file("topic.txt").to_str().expect("utf8"),
+    root.write_via_api(
+        "topic",
         "/topic.txt",
-    ]);
-    let topic_commit = root.commit("topic work");
+        b"only the topic branch has these bytes",
+    );
+    let topic_commit = root.commit_ws("topic", "topic work");
 
     // Back to main, then delete the branch: the commit row stays, so nothing becomes unreachable.
     root.ok(&["checkout", "main"]);
@@ -404,8 +501,10 @@ fn deleting_a_branch_keeps_its_objects_alive() {
     );
 
     // And the history is still readable by commit id — that is what "still a root" means in practice.
-    let out = root.ok(&["cat", &format!("{topic_commit}:/topic.txt")]);
-    assert_eq!(out.as_bytes(), b"only the topic branch has these bytes");
+    assert_eq!(
+        root.read_in_commit(&topic_commit, "/topic.txt"),
+        b"only the topic branch has these bytes"
+    );
 }
 
 /// §27.C: `verify --deep` checks the **snapshot** table and every workspace's `base_root`.
@@ -418,21 +517,11 @@ fn verify_deep_checks_snapshot_roots() {
     let root = TempRoot::new("verify-snapshot");
     root.init();
     root.ok(&["checkout", "main"]);
-    std::fs::write(root.file("kept.txt"), b"committed").expect("write");
-    root.ok(&[
-        "put",
-        root.file("kept.txt").to_str().expect("utf8"),
-        "/kept.txt",
-    ]);
-    root.commit("one");
+    root.write_via_api("main", "/kept.txt", b"committed");
+    root.commit_ws("main", "one");
 
-    std::fs::write(root.file("snap.txt"), b"only in the snapshot").expect("write");
-    root.ok(&[
-        "put",
-        root.file("snap.txt").to_str().expect("utf8"),
-        "/snap.txt",
-    ]);
-    let created = root.ok(&["snapshot", "create"]);
+    root.write_via_api("main", "/snap.txt", b"only in the snapshot");
+    let created = root.ok_ws("main", &["snapshot", "create"]);
     let snapshot_root = created
         .split_whitespace()
         .last()

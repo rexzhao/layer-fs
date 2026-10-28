@@ -1,0 +1,94 @@
+//! The CLI's **vocabulary**, as a library so the criteria can reference the same constants the binary prints (ADR-010 §8.2).
+//!
+//! A test that restates a message in its own words stops testing the message the moment one of the two changes; asserting the constant makes the
+//! criterion and the binary fail together, which is the point.
+
+/// Printed when a command needs a workspace and none was given.
+///
+/// ADR-010 §8.2 fixes this text **byte for byte** (A0 asserts it). The S1 half of the sentence — `, or cd into a mount point` — is deliberately absent
+/// until path discovery exists: promising a way out that does not work yet is worse than saying less.
+pub const NO_WORKSPACE: &str = "no workspace specified; use --workspace <name>";
+
+/// The commands that were **removed** in ADR-010 §5: file operations happen through the mounted file system, not through the CLI.
+pub const FILE_COMMANDS: &[&str] = &["put", "get", "ls", "stat", "mkdir", "rm", "mv", "cat"];
+
+/// `FILE_COMMAND_REMOVED` (ADR-010 §8.2): the message a removed file command answers, naming the way it is done now.
+#[must_use]
+pub fn file_command_removed(command: &str) -> String {
+    format!(
+        "{command}: file operations go through the mounted file system; fs-cli mount <mount_point> --workspace <name>"
+    )
+}
+
+/// A failure that knows which **exit code** it deserves (ADR-010 §8.3).
+///
+/// The binary used to answer 1 for everything, which makes a script unable to tell "retry when the other process finishes" from "your command is wrong".
+/// Codes: 2 usage, 3 not found, 4 busy/in use, 5 conflict; everything else stays 1.
+#[derive(Debug)]
+pub struct Failure {
+    /// What to print.
+    pub message: String,
+    /// What to exit with.
+    pub code: u8,
+}
+
+impl Failure {
+    /// A usage error — the command line itself is wrong.
+    #[must_use]
+    pub fn usage(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: 2,
+        }
+    }
+
+    /// Something named in the command does not exist.
+    #[must_use]
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: 3,
+        }
+    }
+
+    /// Another process is using what this command needs.
+    #[must_use]
+    pub fn in_use(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: 4,
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Failure {}
+
+#[cfg(test)]
+mod tests {
+    use super::{file_command_removed, Failure, FILE_COMMANDS, NO_WORKSPACE};
+
+    #[test]
+    fn the_removed_commands_are_exactly_the_eight() {
+        assert_eq!(
+            FILE_COMMANDS,
+            &["put", "get", "ls", "stat", "mkdir", "rm", "mv", "cat"]
+        );
+        // The message has to name the replacement, not only the removal (ADR-010 §8.1).
+        assert!(file_command_removed("put").contains("mount"));
+    }
+
+    #[test]
+    fn the_no_workspace_text_is_the_one_the_adr_fixes() {
+        assert_eq!(
+            NO_WORKSPACE,
+            "no workspace specified; use --workspace <name>"
+        );
+        assert_eq!(Failure::usage(NO_WORKSPACE).code, 2);
+    }
+}

@@ -142,7 +142,7 @@ pub fn version() -> Result<(), Error> {
 }
 
 /// `layerfs mount <workspace> <mount_point> [--workspace <name>] [--no-version-gate]`
-pub fn mount(store: &Path, arguments: &[String]) -> Result<(), Error> {
+pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Result<(), Error> {
     // **Positionals are what is left after the options are removed**, not "the first two arguments": with `mount U: --workspace main`, counting by
     // position made `--workspace` the mount point and the store `U:` (measured: the child answered `store directory U: does not exist`).
     let mut positional: Vec<&String> = Vec::new();
@@ -175,7 +175,19 @@ pub fn mount(store: &Path, arguments: &[String]) -> Result<(), Error> {
         }
         _ => return Err("usage: layerfs --store <store> mount <mount_point>".into()),
     };
-    let name = option(arguments, "--workspace").unwrap_or_else(|| "main".to_string());
+    // **The workspace is named, never guessed** (ADR-010 §5 / A2): the old default of `"main"` meant a mount could serve a workspace the caller never
+    // mentioned, and that is exactly the kind of implicit choice this ADR removes.
+    let Some(name) = workspace else {
+        // A **usage** error, not a generic failure: the command line is wrong, and §8.3 gives that exit code 2 so a script can tell it from a busy
+        // drive letter (4) or a missing store (3).
+        return Err(fs_cli::Failure::usage(format!(
+            "mount needs a workspace: add `--workspace <name>` (for example `layerfs --store {} mount {} --workspace main`)",
+            store.display(),
+            positional.first().map_or_else(|| "<mount_point>".to_string(), |point| point.to_string())
+        ))
+        .into());
+    };
+    let name = name.to_string();
     let skip_gate = arguments
         .iter()
         .any(|argument| argument == "--no-version-gate");
@@ -368,11 +380,6 @@ pub fn list() -> Result<(), Error> {
         );
     }
     Ok(())
-}
-
-fn option(arguments: &[String], name: &str) -> Option<String> {
-    let at = arguments.iter().position(|argument| argument == name)?;
-    arguments.get(at + 1).cloned()
 }
 
 #[cfg(test)]
