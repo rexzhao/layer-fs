@@ -797,7 +797,12 @@ pub fn live_records() -> Vec<(fs_cli::discovery::Record, fs_cli::discovery::Live
 #[must_use]
 pub fn mount_of_cwd() -> Option<fs_cli::discovery::Record> {
     let cwd = std::env::current_dir().ok()?;
-    fs_cli::discovery::discover(&cwd, fs_cli::winpaths::volume_root, live_records)
+    fs_cli::discovery::discover(
+        &cwd,
+        fs_cli::winpaths::volume_root,
+        fs_cli::winpaths::is_volume_mount_point,
+        live_records,
+    )
 }
 
 /// The live mount serving `workspace`, if there is one: `(mount_point, pid)`.

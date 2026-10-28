@@ -153,7 +153,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         let current = std::env::current_dir().ok();
         let discovered = current.and_then(|cwd| {
-            fs_cli::discovery::discover(&cwd, fs_cli::winpaths::volume_root, mountcmd::live_records)
+            fs_cli::discovery::discover(
+                &cwd,
+                fs_cli::winpaths::volume_root,
+                fs_cli::winpaths::is_volume_mount_point,
+                mountcmd::live_records,
+            )
         });
         if std::env::var_os("LAYERFS_DEBUG_DISCOVERY").is_some() {
             eprintln!(

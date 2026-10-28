@@ -104,25 +104,32 @@ fn normalise(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-/// Finds the mount whose volume contains `cwd` (**ADR-010 §4.4**).
+/// Finds the mount whose volume contains `cwd` (**ADR-010 §4.4**, A6e–A6g).
 ///
 /// Two queries, both injected: what volume root and label the current directory sits on, and which records exist. Nothing else — no poking at drive letters,
-/// no guessing from `GetLogicalDrives`. The label is the safety net: a record that says it is mounted at `C:\` must not put a `git`-style command into a
-/// "mounting context" on somebody's system drive, and the label is what makes that impossible rather than unlikely.
+/// no guessing from `GetLogicalDrives`.
+///
+/// **Two shapes of mount point, two safety nets.** A *drive-letter* mount is a volume of its own, so the volume label (`layerfs`) is what keeps a record that
+/// points at `C:\` from putting a command into a "mounting context" on somebody's system drive. A *directory* mount point cannot use the label at all — a
+/// WinFsp directory mount is not reported by `GetVolumeNameForVolumeMountPointW`, so the volume under it is the **host** volume and its label is the host's
+/// (measured: `系统` for `C:`). What is structural there is the reparse point the mount was attached with, so `is_volume_mount_point` answers that question
+/// instead — a fact about the shape of the directory, not about its name.
 #[must_use]
 pub fn discover(
     cwd: &Path,
     volume_root: impl Fn(&Path) -> Option<(PathBuf, String)>,
+    is_volume_mount_point: impl Fn(&Path) -> bool,
     records: impl Fn() -> Vec<(Record, Liveness)>,
 ) -> Option<Record> {
-    let (_root, label) = volume_root(cwd)?;
-    if !label.eq_ignore_ascii_case(WORKSPACE_VOLUME_LABEL) {
-        return None;
-    }
+    let on_our_volume = volume_root(cwd)
+        .is_some_and(|(_, label)| label.eq_ignore_ascii_case(WORKSPACE_VOLUME_LABEL));
     records()
         .into_iter()
         .find(|(record, liveness)| {
-            *liveness == Liveness::Live && cwd.starts_with(&record.mount_point)
+            if *liveness != Liveness::Live || !cwd.starts_with(&record.mount_point) {
+                return false;
+            }
+            on_our_volume || is_volume_mount_point(&record.mount_point)
         })
         .map(|(record, _)| record)
 }
@@ -215,6 +222,7 @@ mod tests {
             discover(
                 cwd,
                 |_| Some((PathBuf::from("C:\\"), "OS".to_owned())),
+                |_| false,
                 || vec![(system_drive.clone(), Liveness::Live)]
             ),
             None,
@@ -225,7 +233,42 @@ mod tests {
             discover(
                 cwd,
                 |_| Some((PathBuf::from("C:\\"), WORKSPACE_VOLUME_LABEL.to_owned())),
+                |_| false,
                 || vec![(system_drive.clone(), Liveness::Live)]
+            )
+            .map(|record| record.workspace),
+            Some("dev".to_owned())
+        );
+    }
+
+    /// **A6f**: a **directory** mount point is found by its reparse point, because the host volume's label is not ours.
+    ///
+    /// This is the reading that made A6e worth taking seriously: on `C:\…\mnt` the volume under the current directory is the host volume (`系统`), so a
+    /// label test answers "not ours" for a directory that plainly is a mount of ours. The reparse point is what is *structural* there.
+    #[test]
+    fn a_directory_mount_point_is_found_by_its_reparse_point() {
+        let cwd = Path::new("C:\\work\\mnt\\sub");
+        let mounted = record("C:\\work\\mnt", "C:/repo", "dev");
+        let host_label = |_: &Path| Some((PathBuf::from("C:\\"), "系统".to_owned()));
+
+        // A directory that is not a mount point is not a mounting context, whatever a record says.
+        assert_eq!(
+            discover(
+                cwd,
+                host_label,
+                |_| false,
+                || vec![(mounted.clone(), Liveness::Live)]
+            ),
+            None,
+            "cell A6f: a plain directory under a host volume is not a mount"
+        );
+        // The same record, once the directory really is a mount point, is the mount.
+        assert_eq!(
+            discover(
+                cwd,
+                host_label,
+                |mount_point| mount_point == Path::new("C:\\work\\mnt"),
+                || vec![(mounted.clone(), Liveness::Live)]
             )
             .map(|record| record.workspace),
             Some("dev".to_owned())
@@ -240,18 +283,33 @@ mod tests {
         let other = record("V:", "C:/repo", "dev");
         let volume = |_: &Path| Some((PathBuf::from("U:\\"), WORKSPACE_VOLUME_LABEL.to_owned()));
         assert_eq!(
-            discover(cwd, volume, || vec![(here.clone(), Liveness::Stale)]),
+            discover(
+                cwd,
+                volume,
+                |_| false,
+                || vec![(here.clone(), Liveness::Stale)]
+            ),
             None,
             "cell stale: a dead owner is not a mount"
         );
         assert_eq!(
-            discover(cwd, volume, || vec![(other.clone(), Liveness::Live)]),
+            discover(
+                cwd,
+                volume,
+                |_| false,
+                || vec![(other.clone(), Liveness::Live)]
+            ),
             None,
             "cell elsewhere: a different mount point does not contain this directory"
         );
         assert_eq!(
-            discover(cwd, volume, || vec![(here.clone(), Liveness::Live)])
-                .map(|record| record.workspace),
+            discover(
+                cwd,
+                volume,
+                |_| false,
+                || vec![(here.clone(), Liveness::Live)]
+            )
+            .map(|record| record.workspace),
             Some("dev".to_owned())
         );
     }

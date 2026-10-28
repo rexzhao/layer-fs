@@ -185,6 +185,27 @@ pub fn volume_root(_path: &Path) -> Option<(PathBuf, String)> {
     None
 }
 
+/// Whether `directory` is a **volume mount point** — a volume attached into a directory (A6f).
+///
+/// Asked through the attribute the attachment leaves behind (`FILE_ATTRIBUTE_REPARSE_POINT`), not through the volume's name: a WinFsp directory mount is not
+/// reported by `GetVolumeNameForVolumeMountPointW`, so the name route answers the *host* volume and can never say "this is ours".
+#[cfg(windows)]
+#[must_use]
+pub fn is_volume_mount_point(directory: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let mut path = directory.as_os_str().to_os_string();
+    path.push("\\");
+    let wide: Vec<u16> = path.encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: the buffer is NUL-terminated.
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    attributes != u32::MAX && attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 #[cfg(test)]
 mod tests {
     /// The current directory is on **a** volume with a label, and asking twice gives the same answer — the smoke test that the pair of calls is wired the

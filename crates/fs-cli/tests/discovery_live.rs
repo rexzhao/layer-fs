@@ -56,17 +56,33 @@ fn start_mount(label: &str, mount_point: &Path) -> (PathBuf, MountChild) {
             .spawn()
             .expect("spawn mount"),
     );
-    let ready = if mount_point.to_string_lossy().ends_with(':') {
-        PathBuf::from(format!("{}\\", mount_point.display()))
-    } else {
-        mount_point.to_path_buf()
-    };
+    // **"Ready" means the control channel answers, not that a directory exists** (434): for a directory mount point the directory is on the *host* volume and
+    // exists before the mount is attached at all, so `metadata` succeeds immediately and the criterion would run against a volume that is not there yet.
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(10) && std::fs::metadata(&ready).is_err() {
-        std::thread::sleep(Duration::from_millis(50));
+    let mut ready = false;
+    while started.elapsed() < Duration::from_secs(10) && !ready {
+        let record = std::fs::read_to_string(
+            fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(mount_point))),
+        )
+        .unwrap_or_default();
+        let pipe = record
+            .lines()
+            .find_map(|line| line.strip_prefix("pipe=").map(str::to_string))
+            .unwrap_or_default();
+        if !pipe.is_empty() {
+            let request = fs_cli::pipe::Request {
+                v: fs_cli::pipe::PROTOCOL,
+                op: "hello".to_owned(),
+                args: serde_json::json!({}),
+            };
+            ready = fs_cli::pipe_win::call(&pipe, &request, 500).is_ok();
+        }
+        if !ready {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
     assert!(
-        std::fs::metadata(&ready).is_ok(),
+        ready,
         "cell setup: the mount at {} must serve",
         mount_point.display()
     );
@@ -128,9 +144,15 @@ fn a_directory_mount_point_is_measured_not_assumed() {
     let mount_point = root.join("mnt");
     let (dir_store, _child) = start_mount("dir", &mount_point);
 
-    let discovered = Command::new(binary())
-        .arg("status")
-        .current_dir(&mount_point)
+    // **`bash` cd, not `current_dir`** (579): `SetCurrentDirectory` answers ERROR_DIRECTORY (267) for a directory mount point, so a test driven by it would
+    // measure that Win32 boundary rather than the discovery logic. `bash cd` is what a user does here, and it works.
+    let discovered = Command::new("C:/Program Files/Git/bin/bash.exe")
+        .arg("-c")
+        .arg(format!(
+            "cd '{}' && '{}' status",
+            mount_point.display(),
+            binary().display()
+        ))
         .output()
         .expect("status from a directory mount");
     let stderr = String::from_utf8_lossy(&discovered.stderr).into_owned();
