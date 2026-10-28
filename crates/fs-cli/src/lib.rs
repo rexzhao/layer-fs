@@ -3,11 +3,14 @@
 //! A test that restates a message in its own words stops testing the message the moment one of the two changes; asserting the constant makes the
 //! criterion and the binary fail together, which is the point.
 
+pub mod discovery;
+
 /// Printed when a command needs a workspace and none was given.
 ///
-/// ADR-010 §8.2 fixes this text **byte for byte** (A0 asserts it). The S1 half of the sentence — `, or cd into a mount point` — is deliberately absent
-/// until path discovery exists: promising a way out that does not work yet is worse than saying less.
-pub const NO_WORKSPACE: &str = "no workspace specified; use --workspace <name>";
+/// ADR-010 §8.2 fixes this text **byte for byte** (A0 asserts it). The second half — `, or cd into a mount point` — arrived with path discovery: before that,
+/// a way out that did not work would have been a promise the CLI could not keep.
+pub const NO_WORKSPACE: &str =
+    "no workspace specified; use --workspace <name>, or cd into a mount point";
 
 /// The commands that were **removed** in ADR-010 §5: file operations happen through the mounted file system, not through the CLI.
 pub const FILE_COMMANDS: &[&str] = &["put", "get", "ls", "stat", "mkdir", "rm", "mv", "cat"];
@@ -87,7 +90,7 @@ mod tests {
     fn the_no_workspace_text_is_the_one_the_adr_fixes() {
         assert_eq!(
             NO_WORKSPACE,
-            "no workspace specified; use --workspace <name>"
+            "no workspace specified; use --workspace <name>, or cd into a mount point"
         );
         assert_eq!(Failure::usage(NO_WORKSPACE).code, 2);
     }
