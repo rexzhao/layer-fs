@@ -119,6 +119,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let explicit_store = take_option(&mut arguments, "--store").map(PathBuf::from);
+    let explicit_store_was_given = explicit_store.is_some();
     // Read **before** the command name is taken: `--workspace` is a global option (ADR-010 §5), not a subcommand flag.
     let workspace_option = take_option(&mut arguments, "--workspace");
     let command = arguments.remove(0);
@@ -134,6 +135,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let discovered = current.and_then(|cwd| {
             fs_cli::discovery::discover(&cwd, fs_cli::winpaths::volume_root, mountcmd::live_records)
         });
+        if std::env::var_os("LAYERFS_DEBUG_DISCOVERY").is_some() {
+            eprintln!(
+                "discovery: cwd={:?} volume={:?} records={:?} found={:?}",
+                std::env::current_dir().ok(),
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| fs_cli::winpaths::volume_root(&cwd)),
+                mountcmd::live_records(),
+                discovered.as_ref().map(|record| record.store.clone())
+            );
+        }
         let target = fs_cli::discovery::resolve(
             explicit_store.as_deref(),
             workspace_option.as_deref(),
@@ -147,6 +159,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
     let _ = WORKSPACE.set(workspace_option.clone());
+    // **No store and no discovery is a usage error, not a store error** (ADR-010 §4.2 row 2). Falling through would open `.` and answer "store directory
+    // .\objects does not exist", which is true about the wrong thing: the command never said where to look, and that is what to fix.
+    if needs_repository && !explicit_store_was_given && store.as_os_str() == "." && workspace_option.is_none() {
+        return Err(fs_cli::Failure::usage(fs_cli::NO_WORKSPACE).into());
+    }
 
     // **The removed file commands answer before the store is touched** (A0c): with a `--store` that does not exist, "store does not exist" would be a
     // true sentence about the wrong problem — the command is gone, and that is what the caller has to be told.

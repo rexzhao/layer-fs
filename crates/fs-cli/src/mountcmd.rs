@@ -61,7 +61,9 @@ fn volume() -> VolumeInfo {
     VolumeInfo {
         total_size: 1 << 30,
         free_size: 1 << 29,
-        volume_label_length: 7,
+        // **In bytes, not characters** — `VolumeLabelLength` counts the UTF-16 encoding. With 7 here the label came back as `lay`: WinFsp read 7 bytes, which is
+        // three and a half characters (measured with `vol J:`). Path discovery then refused to recognise the volume, because its label was not `layerfs`.
+        volume_label_length: 2 * 7,
         volume_label: {
             let mut label = [0u16; 32];
             for (index, unit) in "layerfs".encode_utf16().enumerate() {
@@ -520,7 +522,18 @@ fn install_console_handler() {
 fn install_console_handler() {}
 
 fn canonical(path: &Path) -> String {
-    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // **`V:` is not `V:\`** (the 317 trap, in the record layer this time): `canonicalize("V:")` asks for "the current directory on V", which a drive mounted by
+    // an FSD does not have, so it fails and the fallback stores `V:` — a path that `V:\...` does not start with. Discovery then never matches. Putting the
+    // separator back first makes the record say the same thing the shell says.
+    let target = {
+        let text = path.to_string_lossy();
+        if text.len() == 2 && text.ends_with(':') {
+            PathBuf::from(format!("{text}\\"))
+        } else {
+            path.to_path_buf()
+        }
+    };
+    let resolved = std::fs::canonicalize(&target).unwrap_or(target);
     let text = resolved.display().to_string();
     text.strip_prefix("\\\\?\\").unwrap_or(&text).to_string()
 }
