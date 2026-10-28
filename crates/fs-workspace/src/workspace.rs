@@ -31,6 +31,31 @@ pub struct Workspace {
     pub(crate) profile: Profile,
     /// The publication gate (ADR-010 §10.3): read by every data operation, written by the publication steps.
     pub(crate) gate: std::sync::Arc<crate::gate::Gate>,
+    /// The three fields a publication **moves**, behind one lock (S2 step 1).
+    ///
+    /// They live here as well as in the plain fields above **on purpose, for one commit**: this makes the type exist and be initialised while nothing reads it,
+    /// so the change is "added, behaviour unchanged". The plain fields stay the source of truth until step 3 moves the 17 reads over; dropping them first would
+    /// mean a single commit that both adds and removes, which is the shape this project keeps refusing.
+    #[allow(dead_code, reason = "S2 step 1: initialised now, read from step 3 on")]
+    pub(crate) state: std::sync::Mutex<BaseState>,
+}
+
+/// What a publication moves: the commit the view is based on, its root, and the branch it publishes to.
+///
+/// `allow(dead_code)` is the honest marker for one commit: the type exists and is initialised, and nothing reads it yet. Step 2 starts writing it, step 3 moves
+/// the reads over, and the attribute disappears with the plain fields.
+#[derive(Debug, Clone)]
+#[allow(
+    dead_code,
+    reason = "S2 step 1: added before the reads move over, so that each step stays behaviour-preserving"
+)]
+pub struct BaseState {
+    /// The commit the workspace's changes sit on.
+    pub base_commit: String,
+    /// That commit's root.
+    pub base_root: ObjectId,
+    /// The branch this workspace publishes to.
+    pub branch: String,
 }
 
 impl fmt::Debug for Workspace {
@@ -68,6 +93,11 @@ impl Workspace {
             },
         )?;
         Ok(Self {
+            state: std::sync::Mutex::new(BaseState {
+                base_commit: base_commit.clone(),
+                base_root,
+                branch: branch.clone(),
+            }),
             name,
             id,
             branch,
