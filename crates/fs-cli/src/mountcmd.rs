@@ -746,6 +746,7 @@ pub fn live_records() -> Vec<(fs_cli::discovery::Record, fs_cli::discovery::Live
                 mount_point: PathBuf::from(field("mount_point")),
                 pid: field("pid").parse().unwrap_or(0),
                 branch: field("branch"),
+                pipe: field("pipe"),
             },
             liveness,
         ));

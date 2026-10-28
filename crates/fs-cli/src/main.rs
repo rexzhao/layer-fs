@@ -161,7 +161,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _ = WORKSPACE.set(workspace_option.clone());
     // **No store and no discovery is a usage error, not a store error** (ADR-010 §4.2 row 2). Falling through would open `.` and answer "store directory
     // .\objects does not exist", which is true about the wrong thing: the command never said where to look, and that is what to fix.
-    if needs_repository && !explicit_store_was_given && store.as_os_str() == "." && workspace_option.is_none() {
+    if needs_repository
+        && !explicit_store_was_given
+        && store.as_os_str() == "."
+        && workspace_option.is_none()
+    {
         return Err(fs_cli::Failure::usage(fs_cli::NO_WORKSPACE).into());
     }
 
@@ -208,6 +212,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "list" => return mountcmd::list(),
         "version" => return mountcmd::version(),
         _ => {}
+    }
+
+    // **Inside a mount, `status` asks the mount** (ADR-010 §6): the overlay is held by the mount process, so opening it here would be refused — the same
+    // reason `checkout` asks the workspace *list*. The answer comes over the control pipe, which is also what makes it the mount's own view.
+    if command == "status" {
+        if let Some(here) = mountcmd::mount_of_cwd() {
+            if !here.pipe.is_empty() {
+                let request = fs_cli::pipe::Request {
+                    v: fs_cli::pipe::PROTOCOL,
+                    op: "status".to_owned(),
+                    args: serde_json::json!({}),
+                };
+                match fs_cli::pipe_win::call(
+                    &here.pipe,
+                    &request,
+                    fs_cli::pipe_win::CONNECT_WAIT_MS,
+                ) {
+                    Ok(fs_cli::pipe::Response::Status {
+                        workspace,
+                        branch,
+                        base_commit,
+                        dirty,
+                        handles,
+                    }) => {
+                        println!("workspace: {workspace}");
+                        println!("branch:    {branch}");
+                        println!("base:      {}", short(&base_commit));
+                        println!("dirty:     {}", if dirty { "yes" } else { "no" });
+                        println!("handles:   {handles}");
+                        return Ok(());
+                    }
+                    Ok(other) => {
+                        return Err(format!("the mount refused `status`: {other:?}").into());
+                    }
+                    Err(error) => {
+                        return Err(fs_cli::Failure::in_use(format!(
+                            "the mount at {} is not answering ({error})",
+                            here.mount_point.display()
+                        ))
+                        .into())
+                    }
+                }
+            }
+        }
     }
 
     let repo = Repo::open(&store)?;

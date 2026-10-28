@@ -19,6 +19,8 @@ pub struct Record {
     pub pid: u32,
     /// The branch that workspace publishes to.
     pub branch: String,
+    /// The control pipe this mount answers on (ADR-010 §9.1): a command run from inside the mount goes through it instead of opening the overlay.
+    pub pipe: String,
 }
 
 /// Whether a record's owner is still alive.
@@ -137,6 +139,7 @@ mod tests {
             mount_point: PathBuf::from(mount_point),
             pid: 4242,
             branch: workspace.to_owned(),
+            pipe: format!("\\\\.\\pipe\\layerfs-test-{workspace}"),
         }
     }
 
