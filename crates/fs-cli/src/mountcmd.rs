@@ -290,11 +290,15 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     );
 
     let library = default_library();
+    // Installed **before** mounting, so a Ctrl-C during the mount itself is already an orderly stop.
+    install_console_handler();
     let report = mount_read_only(&library, &mount_point, backend, volume(), |_path: &Path| {
         // The probe **is** the command's lifetime: everything below happens while the volume is attached.
         let started = Instant::now();
         loop {
-            if stop.exists() || !state.exists() {
+            // **Three ways to be asked to stop**, all answering the same way: the stop file (until the pipe replaces it), the record disappearing, and a
+            // console control event. Ctrl-C lands here as an **orderly unmount** rather than a kill, which is the whole point of the handler.
+            if stop.exists() || !state.exists() || stop_requested() {
                 println!("unmount requested after {:?}", started.elapsed());
                 break;
             }
@@ -429,11 +433,50 @@ pub fn list() -> Result<(), Error> {
     Ok(())
 }
 
-/// The path as it goes **into a record**: canonical when possible, with the `\\?\` prefix removed.
+/// Set when a console control event asks the mount to stop (Ctrl-C, Ctrl-Break, closing the console).
 ///
-/// Records are compared, not only displayed, so a path that canonicalises differently on two sides would never match. Normalising once at write time lets
-/// readers compare ordinary strings (ADR-010 §9.1).
+/// A console handler runs on a **separate thread** and must return quickly, so it does the smallest thing possible: set this flag. The mount loop notices
+/// it and returns, which unmounts through the normal path — Ctrl-C is an **orderly unmount**, not a crash (ADR-010 §7.1).
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The handler's whole effect, separately callable so a test can prove it flips the flag without sending a real Ctrl-C.
+pub fn request_stop() {
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[must_use]
+pub fn stop_requested() -> bool {
+    STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(windows)]
+extern "system" fn console_control_handler(event: u32) -> i32 {
+    // `CTRL_C_EVENT(0)`, `CTRL_BREAK_EVENT(1)`, `CTRL_CLOSE_EVENT(2)` and the logoff/shutdown pair (5/6) all mean "stop", and all are answered
+    // "handled": returning 0 would hand the event to the default handler, which terminates the process **before** the unmount runs.
+    match event {
+        0 | 1 | 2 | 5 | 6 => {
+            request_stop();
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(windows)]
+fn install_console_handler() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    }
+    // SAFETY: a plain Win32 call with a function pointer that outlives the process.
+    unsafe {
+        SetConsoleCtrlHandler(Some(console_control_handler), 1);
+    }
+}
+
+#[cfg(not(windows))]
+fn install_console_handler() {}
+
 fn canonical(path: &Path) -> String {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let text = resolved.display().to_string();
@@ -528,10 +571,22 @@ fn hold_record(path: &Path, contents: &str) -> Result<std::fs::File, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        calibrated_major, hold_record, mounts_dir, record_is_live, record_name, version_parts,
-        Liveness,
+        calibrated_major, hold_record, mounts_dir, record_is_live, record_name, request_stop,
+        stop_requested, version_parts, Liveness,
     };
     use std::path::Path;
+
+    /// **A10, the half that can be tested without a console**: the handler's effect is a flag, and the mount loop reads that flag.
+    ///
+    /// The other half — a real Ctrl-Break delivering the event — needs a process group and a console, so it lives in the integration test; what is pinned here
+    /// is that "handled" really means "remembered", because a handler that returned 1 without setting anything would let the default handler kill the process
+    /// with the volume still attached.
+    #[test]
+    fn a_control_event_asks_the_mount_to_stop() {
+        assert!(!stop_requested(), "cell start: nothing has asked yet");
+        request_stop();
+        assert!(stop_requested(), "cell after: the mount loop must see it");
+    }
 
     /// **A7 / §9.2**: a record held by its owner is `Live`, one nobody holds is `Stale`, and — because the owner uses `DELETE_ON_CLOSE` — the file is
     /// **gone** once the handle is dropped, which is what makes a crashed mount leave nothing behind.

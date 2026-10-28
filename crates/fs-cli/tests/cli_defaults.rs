@@ -300,3 +300,103 @@ fn mount_without_a_workspace_refuses() {
     );
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// **A10**: a console control event is an **orderly unmount**, not a kill.
+///
+/// The observation point is the OS, not the record: `DELETE_ON_CLOSE` removes the record whenever the process ends — orderly or not — so "the record is gone"
+/// proves nothing. What proves it is (a) the **exit code**, which is 0 only when `mount` returned normally and the unmount ran, and (b) the drive letter being
+/// gone afterwards.
+#[test]
+fn a_console_break_unmounts_orderly() {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CTRL_BREAK_EVENT: u32 = 1;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+    }
+
+    let store = temp_dir("ctrl-break");
+    Command::new(binary())
+        .arg("init")
+        .arg(&store)
+        .output()
+        .expect("init");
+    let mount_point = std::env::var_os("LAYER_FS_CLI_MNT_FOURTH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("Q:"));
+    let root = if mount_point.to_string_lossy().ends_with(':') {
+        PathBuf::from(format!("{}\\", mount_point.display()))
+    } else {
+        mount_point.clone()
+    };
+    let child = MountChild(
+        Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("mount")
+            .arg(&mount_point)
+            .arg("--workspace")
+            .arg("main")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .expect("spawn the mount"),
+    );
+    let pid = child.0.id();
+
+    // Wait until the volume really serves, so the event lands on a live mount.
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(10)
+        && std::fs::metadata(&root).is_err()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        std::fs::metadata(&root).is_ok(),
+        "cell A10: the mount must serve before the event"
+    );
+    std::fs::write(root.join("before-break.txt"), b"written before the break").expect("write");
+
+    // SAFETY: a plain Win32 call; the group id is the child's pid because it was created with CREATE_NEW_PROCESS_GROUP.
+    let raised = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) };
+    assert_ne!(
+        raised, 0,
+        "the control event must reach the child's process group"
+    );
+
+    // `MountChild` kills on drop; here the child is expected to exit by itself, so wait for it first.
+    let mut child = child;
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.0.try_wait().expect("wait") {
+            Some(status) => break status,
+            None if started.elapsed() > std::time::Duration::from_secs(15) => {
+                panic!("cell A10: the mount did not stop within 15s");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "cell A10: an orderly unmount exits 0 — a kill would not"
+    );
+    let gone = std::time::Instant::now();
+    while gone.elapsed() < std::time::Duration::from_secs(10) && mount_point.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!mount_point.exists(), "cell A10: the volume must be gone");
+
+    // And what was written before the break is in the workspace: the unmount flushed rather than dropped.
+    let repo = std::sync::Arc::new(fs_workspace::Repo::open(&store, false).expect("repo"));
+    let workspace = repo.workspace_open("main").expect("workspace");
+    let bytes = workspace
+        .read_at("/before-break.txt", 0, 24)
+        .expect("read back");
+    assert_eq!(bytes, b"written before the break");
+    let _ = std::fs::remove_dir_all(&store);
+}
