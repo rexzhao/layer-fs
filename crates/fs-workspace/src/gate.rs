@@ -32,30 +32,36 @@ impl Gate {
     }
 
     /// Takes the gate for **reading**: one data operation, many at a time.
+    ///
+    /// The returned [`ReadGuard`] is what makes `depth()` usable: it decrements on drop, so "how many read guards does this thread hold" is true at every
+    /// moment rather than only on the way in (G4a). Without the decrement the number only grew, and an assertion on it could never distinguish "one" from
+    /// "two" — an instrument that reads the same under the defect it is supposed to catch.
     #[must_use = "dropping the guard immediately releases the gate"]
-    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+    pub fn read(&self) -> ReadGuard<'_> {
         let guard = self
             .lock
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // **Checked before the counter moves**, so a refused nested read leaves the depth as it was: a panic that left it incremented would make the next
+        // acquisition on this thread look like a third level and report a defect that is not there.
         let held = DEPTH.with(|depth| {
-            let now = depth.get() + 1;
-            depth.set(now);
-            now
+            let now = depth.get();
+            if now >= 1 {
+                if STRICT.load(std::sync::atomic::Ordering::Relaxed) {
+                    panic!(
+                        "gate: nested read on one thread (depth {}) — a public data method is calling another",
+                        now + 1
+                    );
+                }
+                if DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("gate: nested read, depth {}", now + 1);
+                }
+            }
+            depth.set(now + 1);
+            now + 1
         });
-        // **G4's instrument, measured before it is asserted.** A public data operation must take the gate **once**; a second acquisition on the same thread
-        // means one public method is calling another, which is how a reader deadlocks against a queued writer. The threshold comes from what the code does
-        // (`LAYERFS_DEBUG_GATE=1` prints every nesting), not from what it is assumed to do; `LAYERFS_GATE_STRICT=1` turns it into a failure once the
-        // measurement says nothing nests.
-        if held > 1 {
-            if STRICT.load(std::sync::atomic::Ordering::Relaxed) {
-                panic!("gate: nested read on one thread (depth {held}) — a public data method is calling another");
-            }
-            if DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("gate: nested read, depth {held}");
-            }
-        }
-        guard
+        let _ = held;
+        ReadGuard { guard: Some(guard) }
     }
 
     /// Takes the gate for **writing**: one publication step, alone.
@@ -64,6 +70,36 @@ impl Gate {
         self.lock
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// A read guard that keeps [`depth`] honest: it decrements the thread's count when it drops (G4a).
+///
+/// The lock itself would be released by the standard guard either way; what this wrapper adds is the **count**, which is what the nesting assertion reads. A
+/// wrapper that only counted on the way in (the S2 state) is the reason G4 could not have caught a real nesting: the number never came back down.
+pub struct ReadGuard<'a> {
+    guard: Option<std::sync::RwLockReadGuard<'a, ()>>,
+}
+
+impl Drop for ReadGuard<'_> {
+    fn drop(&mut self) {
+        // Released **before** the count drops, so no window exists in which the depth says "free" while the lock is still held.
+        drop(self.guard.take());
+        DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+impl std::ops::Deref for ReadGuard<'_> {
+    type Target = ();
+
+    fn deref(&self) -> &Self::Target {
+        &()
+    }
+}
+
+impl std::fmt::Debug for ReadGuard<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ReadGuard").field("held", &self.guard.is_some()).finish()
     }
 }
 
@@ -77,9 +113,11 @@ thread_local! {
 
 /// Whether a nested read **fails** instead of merely being counted.
 ///
-/// Off by default, and set by a criterion: the measurement above showed nothing nests, so turning it on is a decision made against a reading rather than
-/// against an assumption. A test seam rather than an environment variable, because this crate forbids `unsafe` and reading the environment in a test means
-/// `set_var`.
+/// Off by default, and set by a criterion: the measurement showed nothing nests, so turning it on is a decision made against a reading rather than against an
+/// assumption. A test seam rather than an environment variable, because this crate forbids `unsafe` and reading the environment in a test means `set_var`.
+/// **These are the only two switches there are** (G4c): they are set through [`set_nesting_assertion`] / [`set_nesting_report`], and no environment variable is
+/// read anywhere in this crate — an earlier version of these comments named one that nothing read, which is how S2's "measured zero nesting" turned out to be
+/// a measurement of nothing at all.
 static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether nesting is reported as it happens (the **measurement** half of G4).
@@ -103,21 +141,29 @@ pub fn depth() -> usize {
     DEPTH.with(std::cell::Cell::get)
 }
 
-// (a `ReadGuard` wrapper that decrements the counter on drop arrives with the depth assertion in G4; until then the counter is informative only and the
-// lock itself is what enforces the ordering)
+// (the guard above carries the decrement: `ReadGuard::drop` is what makes `depth()` return to zero, so the assertion can tell "one" from "two")
 
 #[cfg(test)]
 mod tests {
     use super::{depth, Gate};
 
+    /// **G4a**: the depth is a *current* count, not a running total. In S2 the counter only grew, so the unit test below could pass while the number it reads
+    /// was already meaningless on the second call — the defect the card found by reading the code rather than by running it.
     #[test]
     fn the_depth_follows_the_guard() {
         let gate = Gate::new();
         assert_eq!(depth(), 0, "cell depth: nothing held");
         {
             let _guard = gate.read();
-            // The counter is incremented by `read`, so this is 1 inside the guard — G4 asserts on exactly this number at the start of a public call.
             assert_eq!(depth(), 1, "cell depth: one reader inside");
+        }
+        assert_eq!(depth(), 0, "cell G4a: the counter must come back down");
+        // Three take/drop rounds: a counter that only decremented once would leave 2 here.
+        for round in 0..3 {
+            {
+                let _guard = gate.read();
+            }
+            assert_eq!(depth(), 0, "cell G4a: round {round} must end at zero");
         }
     }
 
