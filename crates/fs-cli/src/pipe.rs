@@ -54,6 +54,10 @@ pub enum Response {
         branch: String,
         /// The commit its changes sit on.
         base_commit: String,
+        /// The root the view is composed over. **Not derivable from `base_commit`**: a `restore` moves the root and deliberately leaves the base commit where
+        /// the branch head was (history grows), so a report that named only the commit would say "on c2" while serving c1's tree.
+        #[serde(default)]
+        base_root: String,
         /// Whether there are unpublished changes.
         dirty: bool,
         /// How many file objects are open on the mount right now.
@@ -231,6 +235,7 @@ mod tests {
                 workspace: "dev".to_owned(),
                 branch: "dev".to_owned(),
                 base_commit: "00".to_owned(),
+                base_root: "00".to_owned(),
                 dirty: false,
                 handles: 0,
             }

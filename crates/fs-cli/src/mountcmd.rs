@@ -667,6 +667,7 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                         workspace: status.name,
                         branch: status.branch,
                         base_commit: status.base_commit,
+                        base_root: status.base_root,
                         dirty: status.dirty,
                         handles: self
                             .0

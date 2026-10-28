@@ -370,12 +370,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         workspace,
                         branch,
                         base_commit,
+                        base_root,
                         dirty,
                         handles,
                     }) => {
                         println!("workspace: {workspace}");
                         println!("branch:    {branch}");
                         println!("base:      {}", short(&base_commit));
+                        println!("root:      {}", short(&base_root));
                         println!("dirty:     {}", if dirty { "yes" } else { "no" });
                         println!("handles:   {handles}");
                         return Ok(());
@@ -407,6 +409,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("workspace: {}", status.name);
             println!("branch:    {}", status.branch);
             println!("base:      {}", short(&status.base_commit));
+            println!("root:      {}", short(&status.base_root));
             println!("dirty:     {}", if status.dirty { "yes" } else { "no" });
             Ok(())
         }),
