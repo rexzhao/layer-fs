@@ -3214,3 +3214,57 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      A6e-A6g 目录挂载点 reparse point 判定（结构性事实比名字可靠——两种挂载点两道安全网）。
      A6d 从未验证→读作工作。全量 710/711（唯一红已知族）。
      S3（管道 restore/switch）是最后一个阶段。
+
+583. 【S3 待命+代码摸底】worker 只读摸清了五处现状：fs-workspace 只有 restore 没有 switch /
+     publish.rs 已有 snapshot+commit（管道 op 之下）/ main.rs restore 走 with_workspace
+     （挂载内会 InUse）/ checkout 已走 workspace_list / pipe.rs 派发第 ~678 行可照抄。
+     switch 的两种含义（换 workspace vs 换 branch/base）——等卡确认，不预设。
+
+584. 【S3 派卡（arch/adr010-s3 @ 99d7bc6）——ADR-010 最后阶段】
+     D8 裁 (B)：只挡文件句柄，目录句柄放行（发起命令的 shell 自己持有目录句柄 ⇒ (A) 让
+     "挂载内 checkout 就换挂"永远做不到）。文件句柄 restore 后对象可能消失必须挡；
+     目录句柄只是失效不丢数据（同 NTFS 卸卷），放行 + 提示 cd . 刷新。
+     
+     G4 空转发现（S3 第一步修）：深度只增不减 + 环境变量没被读 ⇒ 严格模式从未跑过 ⇒
+     嵌套死锁风险无判据在护。S3 加准入锁后锁序更复杂 ⇒ 先修。
+     
+     准入状态机（adapter 层）：Create/Open/GSBN 持票 / restore 置 Paused 等票走完 /
+     期间到达的打开等新视图。Handle 加 is_dir，status.handles 改 {files, dirs}。
+     switch 用重挂不用热替换（热换需逐项论证内核状态失效，其中一项依赖未实现的 U9）。
+     V6 停卡：restore 后读旧内容 ⇒ 缓存问题 ⇒ 依赖 U9。
+
+604. 【★ switch 本体落地（8840035）：挂载内 checkout 换挂——W1 绿】
+     挂载内 checkout feat → "switched K:\ to feat" → 19 samples gone=0 stale=0。
+     四件事一次提交（槽/loop/管道op/尾部+回退），三处不半成：
+     清回执在写目标之前 / STOP 由 loop 清 / 6b 先 publish 再 continue。
+     调用侧 loop（601 裁）+ Current 可替换记录（602）+ 记录原地改写（600）。
+     owner 当初要的\"挂载内 checkout 换挂\"——实现了。
+     S3 剩 W2-W8 判据。
+
+619. 【★ HandleTable 泄漏修复（a9dc387+0e0744f）】根因：每次 open 注册新 handle
+     但上下文只记得第一个 ⇒ N 次打开只关 1 次。修法(甲)两件必须一起：
+     ①复用上下文时不注册新 handle（一个 file_id 一份记账）
+     ②HandleTable.refs（open+1/close-1/最后一个才移除）+ handle_kinds 按 refs 求和
+     只修①不修② ⇒ 泄漏没了但计数变成"条目数" ⇒ R3 红。
+     泄漏与观测用同一份数据——只修一边另一边以另一种方式坏掉。
+     读数：table=(0,0)（此前 22 且只增不减）。R3 恢复（restore_live 6/6）。
+     "同一个 handle"替换"两个不同的 handle"——更强断言，一个条目一份记账。
+     定位链（612-617）：Cleanup 到了 Close 没到 → 盘符也漏（reparse 排除）
+     → 不衰减 → refs 2→1 停住 → 记账自洽 live_refs=0 → 上下文表空泄漏在 HandleTable。
+     613 的 reparse 理论被排除；615 的"获取多了一次"被修正为"归零不移除"再修正为
+     "HandleTable 每次注册但只关一个"。
+
+626. 【★ S3 全部落地（adde6af）——ADR-010 四期完成】S3 判据：R1-R5（restore）+
+     W1-W8（switch）共 12 条全绿。W4 窗口 29.6ms（界 2000ms）。
+     W8 三种 shell（bash/cmd/powershell）在换挂后都存活，cd . 恢复（V13）。
+     W6 结构修正："成功由新挂载自己回答"——回答位置与事实发生对齐（DONE 的 switch 版）。
+     
+     ADR-010 四期：
+     S0  去文件命令 + 去 current + 全局 --workspace
+     S1  记录迁移 + 路径发现 + Ctrl-C + 管道骨架
+     S2  发布锁 G1-G7 + 管道 commit/snapshot + A17
+     S3  准入状态机 + 管道 restore/switch + W1-W8
+     
+     HandleTable 泄漏修复（619）：一个 file_id 一份 handle + refs 计数——泄漏消失且计数不变。
+     准入状态机（Q1）：Open/Paused/Closing + 三回调持票。变异 116 秒=真实死锁路径。
+     串行管道=过渡态的诚实（622）：switch 期间不答 hello，恢复 180µs。
