@@ -126,6 +126,7 @@ name = "fs-cli"
 version = "0.1.0"
 dependencies = [
  "fs-api",
+ "fs-winfsp",
  "fs-workspace",
  "rusqlite",
 ]

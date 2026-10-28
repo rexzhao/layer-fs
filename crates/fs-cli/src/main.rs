@@ -8,6 +8,8 @@
 //! Every command opens what it needs, does one thing, and exits: there are no open
 //! handles to leak and no session to corrupt.
 
+mod mountcmd;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -42,6 +44,11 @@ fs-cli [--store <dir>] <command> [args]
   verify [--deep]                 check objects and references
   stats                           object and repository counts
   gc [--dry-run]                  collect unreachable objects (offline: refuses while a writer holds the store)
+  mount <store> <mount_point> [--workspace <name>] [--no-version-gate]
+                                  serve a workspace over WinFsp until `umount` asks it to stop
+  umount <mount_point> [--force]  ask a running mount to unmount (--force clears a stale record too)
+  list                            the mounts recorded in %TEMP%/layerfs-mounts
+  version                         the WinFsp DLL's version versus the layout this build was measured on
   snapshot [list | create | drop <root>]
                                   named roots that keep a tree alive without moving a branch";
 
@@ -78,6 +85,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `Repo` holds two connections to it, so opening first would make the collector refuse itself.
     if command == "gc" {
         return gc(&store, &arguments);
+    }
+
+    // The interactive entry points run **before** a `Repo` is opened: `mount` opens its own (it needs an `Arc` for the workspace), and
+    // `list`/`umount`/`version` need no store at all — opening one first made them fail on a directory that is not a repository.
+    match command.as_str() {
+        "mount" => return mountcmd::mount(&arguments),
+        "umount" => return mountcmd::umount(&arguments),
+        "list" => return mountcmd::list(),
+        "version" => return mountcmd::version(),
+        _ => {}
     }
 
     let repo = Repo::open(&store)?;

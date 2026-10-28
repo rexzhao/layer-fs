@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 fs-api.workspace = true
 fs-workspace.workspace = true
+# The mount subcommands drive the WinFsp frontend directly (B-24); `fs-api` supplies the backend they hand it.
+fs-winfsp.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
