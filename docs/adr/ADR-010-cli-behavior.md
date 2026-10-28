@@ -355,6 +355,7 @@ pub fn rebind(&self, branch: &str) -> …
   必须远小于 WinFsp 的 `IrpTimeout`（`VolumeParams` 置零 ⇒ 默认 `FspFsctlIrpTimeoutDefault = 300000` ms，SDK `fsctl.h:184-186,202`），
   超过则内核取消挂起的 IRP。S2 判据 A16 记录"commit 期间文件操作的最长等待"与视图大小的关系（带红值出档，不设通过线前先测）。
 - `fs-api::Workspace` 同步改为 `&self`（`fs-api/src/workspace.rs:180,193,206`）；CLI 进程内（未挂载语境）调用不受影响。
+- **落位（S2 卡 §1，2026-10-28 澄清）**：闸是 `fs-workspace` 内的 `Arc<Gate>`（`Gate` 即 `RwLock<BaseState>`），由 `Workspace` 与它发出的每个 `WorkspaceStore` 共享；读锁取在 `WorkspaceStore::read/write`（一个事务一次）与 `Workspace` 直接碰 overlay 的公共方法（一次调用一次），写锁取在 `commit/snapshot/restore/rebind`（flush 之前到 adopt 改完内存 base 之后）；**一条调用链只取一次**（debug 下线程局部深度断言）；绕过闸的入口——`Workspace::overlay()`、`WorkspaceStore::overlay()`、`impl Deref for WorkspaceStore`、`top_up`——改为 `pub(crate)` 或删除，`set_times/set_attributes` 下沉为 `Workspace` 方法。闸不放在 `fs-overlay`：overlay 看不见跨主库的发布过程，且 materialise 本身要读 overlay，放在那里会自锁。
 
 ### 10.4 op 规范
 
@@ -374,6 +375,8 @@ pub fn rebind(&self, branch: &str) -> …
 | `unmount` | `{wait_ms}` | `{}`（响应在卸载、flush 与删记录**之后**才发） | `HandlesOpen{handles}`（等满 `wait_ms` 句柄仍不为零；未发停止，状态不变） |
 
 通用代理错误：`ProtocolVersion{supported}`、`FrameTooLarge`、`BadRequest{detail}`、`ShuttingDown`（停止序列已开始后到达的请求）。
+
+**S2 澄清（2026-10-28）**：操作失败统一为 `Failed{kind, detail, fields}`——`kind` 为核心错误变体名，CLI 用与本地相同的 `exit_code` 表映射（S1 的 `Failed{detail}` 丢了类型，脚本无法区分）；成功响应名为 `Committed{commit, root}` / `Snapshotted{root}`。`commit/snapshot` 由管道线程直接执行（闸提供互斥），**不**经主线程的 Control/DONE 握手——那是给会停止挂载的 op（`unmount`、将来的 `switch`）用的。
 核心错误照传，例：`{"kind":"BranchMoved","branch":"dev","expected":"…","actual":"…"}`、`{"kind":"NothingToCommit"}`。
 
 ### 10.5 挂载进程的线程结构（C11；答"A / B / C"）
@@ -588,3 +591,4 @@ D7 的后果（记录，不另需裁决）：CLI 不再能读历史文件。需�
 - 2026-10-26 按 owner 裁决 D7 修订：**去掉全部文件级命令**（C0）；§5 收为"只剩宿主路径"，初稿的 `//path`/相对路径/双拼写问题整类消失；
   §6.1 改为"文件操作不在 CLI 里"；管道 op 去掉 `flush`（7 个，无文件 op）；S0 增 A0c 与逐用例的测试处置表，删 A9、A13a；新增 D7。
 - 2026-10-28 随 S1 卡（`docs/process/adr010-s1-card.md`）澄清：停止顺序改为"卸载 → flush → 删记录"（§7.1）；远程 umount 有句柄时 `HandlesOpen` 且不改状态、控制台停止不看句柄（§7.2）；记录以 `DELETE_ON_CLOSE` + `READ|DELETE` 共享打开（§9.2）；`unmount` 错误统一名为 `HandlesOpen`（§10.4）。判据影响：无（澄清）。
+- 2026-10-28 随 S2 卡（`docs/process/adr010-s2-card.md`）澄清：§10.3 闸的落位与取锁规则、绕过入口的处置；§10.4 `Failed` 带类型、`commit/snapshot` 不走 Control 握手。判据影响：无（澄清）。
