@@ -8,6 +8,8 @@
 //!    unchanged**. "the field did not change" would pass for an implementation that touches the inode and writes the same
 //!    value back; "the root is the same object" can only hold if no write path ran at all.
 
+mod common;
+
 use std::sync::Arc;
 
 use fs_namespace::{FileId, Path, Rules};
@@ -64,6 +66,7 @@ fn committed_file(fixture: &mut Fixture, name: &str, content: &[u8]) -> FileId {
 /// rewritten and its id would differ.
 #[test]
 fn reading_twice_does_not_change_the_root_id() {
+    common::strict_gate();
     let mut fixture = fixture("accessed");
     let id = committed_file(&mut fixture, "/f", b"payload");
     let before = fixture.workspace.base_root();
@@ -89,6 +92,7 @@ fn reading_twice_does_not_change_the_root_id() {
 /// `None` here is a statement about this store, not an unfinished feature: v2 has no column for it.
 #[test]
 fn security_is_a_separate_accessor_and_v2_has_none() {
+    common::strict_gate();
     let mut fixture = fixture("security");
     let id = committed_file(&mut fixture, "/f", b"payload");
     assert_eq!(

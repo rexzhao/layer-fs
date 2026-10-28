@@ -4,6 +4,8 @@
 //! criteria print what was measured next to the line they are compared with. A measurement that only ever says "ok" cannot tell anyone when the machine got
 //! ten times slower.
 
+mod common;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,6 +31,7 @@ use fs_workspace::Workspace;
 /// The reading is the **maximum** wait, because starvation is about the worst case: an average would let one 4.9 s stall hide behind a hundred fast reads.
 #[test]
 fn a_reader_is_not_starved_by_commits() {
+    common::strict_gate();
     let (directory, workspace) = fixture("g6");
     let stop = Arc::new(AtomicBool::new(false));
     let worst = Arc::new(AtomicU64::new(0));
@@ -69,6 +72,7 @@ fn a_reader_is_not_starved_by_commits() {
 /// This is G1's number, measured instead of assumed — the card's line is the point where the FSD's timeout (not our lock) would become the failure mode.
 #[test]
 fn a_write_blocked_by_a_commit_is_released_within_the_bound() {
+    common::strict_gate();
     let (directory, workspace) = fixture("g7");
 
     // SAFETY: `set_var` is safe in edition 2021; the commit thread reads it.

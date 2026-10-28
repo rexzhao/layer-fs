@@ -5,6 +5,8 @@
 //! that only has `Repo` must be able to create a store, edit a workspace, publish a
 //! commit, and read that commit back later.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -55,6 +57,7 @@ fn put(workspace: &fs_api::Workspace, path: &str, bytes: &[u8]) {
 /// **ADR-006 §13** — the whole surface in one pass: create, edit, commit, read history.
 #[test]
 fn a_workspace_round_trip_publishes_a_readable_commit() {
+    common::strict_gate();
     let root = TempRoot::new("round-trip");
     let repo = Repo::create(root.store()).expect("create");
 
@@ -160,6 +163,7 @@ fn a_workspace_round_trip_publishes_a_readable_commit() {
 /// A missing path is reported as such, and `is_not_found` says so without matching enums.
 #[test]
 fn a_missing_path_is_a_not_found_error() {
+    common::strict_gate();
     let root = TempRoot::new("not-found");
     let repo = Repo::create(root.store()).expect("create");
     let workspace = repo.workspace_create("w1", "main").expect("workspace");
@@ -177,6 +181,7 @@ fn a_missing_path_is_a_not_found_error() {
 /// `snapshot` publishes without moving the branch, and never loses the work.
 #[test]
 fn a_snapshot_does_not_move_the_branch() {
+    common::strict_gate();
     let root = TempRoot::new("snapshot");
     let repo = Repo::create(root.store()).expect("create");
     let genesis = repo.branch_head("main").expect("head");
@@ -206,6 +211,7 @@ fn a_snapshot_does_not_move_the_branch() {
 /// **F1 through the new surface** — a moved branch is a typed error and the work survives.
 #[test]
 fn a_moved_branch_is_typed_and_keeps_the_work() {
+    common::strict_gate();
     let root = TempRoot::new("branch-moved");
     let repo = Repo::create(root.store()).expect("create");
     let base = repo.branch_head("main").expect("head");
@@ -250,6 +256,7 @@ fn a_moved_branch_is_typed_and_keeps_the_work() {
 /// `NotFound` from the workspace layer is surfaced, not swallowed.
 #[test]
 fn an_unknown_workspace_or_branch_is_reported() {
+    common::strict_gate();
     let root = TempRoot::new("unknown");
     let repo = Repo::create(root.store()).expect("create");
     assert!(matches!(

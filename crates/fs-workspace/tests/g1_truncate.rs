@@ -4,6 +4,8 @@
 //! afterwards, because that is where QA found the gap: an entry can report size 0 and still serve the old bytes if the
 //! truncation never reached the pages.
 
+mod common;
+
 use std::sync::Arc;
 
 use fs_namespace::{FileId, Path, Rules};
@@ -77,6 +79,7 @@ fn seeded(label: &str, payload: &[u8]) -> (Fixture, Rules<fs_workspace::Workspac
 /// `OVERWRITE_IF` and `OVERWRITE` on an existing file must leave it **empty as read**, not just size 0.
 #[test]
 fn the_overwriting_dispositions_leave_nothing_to_read() {
+    common::strict_gate();
     let payload = vec![0xABu8; 8192];
     for disposition in [Disposition::OverwriteIf, Disposition::Overwrite] {
         let (fixture, rules) = seeded(&format!("{disposition:?}"), &payload);
@@ -105,6 +108,7 @@ fn the_overwriting_dispositions_leave_nothing_to_read() {
 /// `OVERWRITE` on a name that does not exist is a refusal, and it must not create anything.
 #[test]
 fn overwrite_without_a_target_is_refused_and_creates_nothing() {
+    common::strict_gate();
     let fixture = fixture("missing");
     let rules = Rules::new(fixture.workspace.store());
     assert!(
@@ -126,6 +130,7 @@ fn overwrite_without_a_target_is_refused_and_creates_nothing() {
 /// deleted because the *question* is still worth asking: what does a handle opened before a SUPERSEDE see afterwards?
 #[test]
 fn supersede_truncates_in_place() {
+    common::strict_gate();
     let payload = b"bytes the old entry loses".to_vec();
     let (fixture, rules) = seeded("supersede", &payload);
     let before = rules.resolve(&p("/f")).expect("entry before");

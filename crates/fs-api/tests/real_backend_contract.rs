@@ -7,6 +7,8 @@
 //! The real backend is exercised through the same calls the adapter makes, which is what makes "the mock honours the
 //! contract" and "the backend honours the contract" two facts rather than one assumption.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -55,6 +57,7 @@ impl Fixture {
 /// The real backend satisfies the identity-across-rename scenario (P3-3a's `scenario_identity_across_rename`).
 #[test]
 fn the_real_backend_satisfies_identity_across_rename() {
+    common::strict_gate();
     let fixture = Fixture::new("identity");
     let backend = fixture.backend();
     fs_winfsp::scenarios::scenario_identity_across_rename::<ApiBackend<'_>>(&backend);
@@ -63,6 +66,7 @@ fn the_real_backend_satisfies_identity_across_rename() {
 /// The real backend satisfies the "SUPERSEDE truncates in place" scenario.
 #[test]
 fn the_real_backend_satisfies_supersede_in_place() {
+    common::strict_gate();
     let fixture = Fixture::new("supersede");
     let backend = fixture.backend();
     fs_winfsp::scenarios::scenario_supersede_truncates_in_place::<ApiBackend<'_>>(&backend);
@@ -71,6 +75,7 @@ fn the_real_backend_satisfies_supersede_in_place() {
 /// The real backend satisfies the three removal cases (the core half of criterion 3 — see the scenario's docs).
 #[test]
 fn the_real_backend_satisfies_removal_cases() {
+    common::strict_gate();
     let fixture = Fixture::new("removal");
     let backend = fixture.backend();
     fs_winfsp::scenarios::scenario_removal_cases::<ApiBackend<'_>>(&backend);
@@ -79,6 +84,7 @@ fn the_real_backend_satisfies_removal_cases() {
 /// The real backend enumerates a directory by id after another directory took its old path.
 #[test]
 fn the_real_backend_satisfies_read_dir_by_id() {
+    common::strict_gate();
     let fixture = Fixture::new("readdir");
     let backend = fixture.backend();
     fs_winfsp::scenarios::scenario_read_dir_by_id::<ApiBackend<'_>>(&backend);
@@ -91,6 +97,7 @@ fn the_real_backend_satisfies_read_dir_by_id() {
 /// split is documented on `fs_winfsp::scenarios`, so its absence here is a scope statement rather than a gap.
 #[test]
 fn criterion_3_core_half_holds_on_the_real_backend() {
+    common::strict_gate();
     use fs_semantics::disposition::Disposition;
     use fs_winfsp::{OpsError, WorkspaceOps, ROOT};
 
@@ -134,6 +141,7 @@ fn criterion_3_core_half_holds_on_the_real_backend() {
 /// A non-empty directory cannot be removed — and the refusal takes nothing with it (L2 class 06).
 #[test]
 fn the_real_backend_refuses_to_remove_a_non_empty_directory() {
+    common::strict_gate();
     let fixture = Fixture::new("nonempty");
     let backend = fixture.backend();
     fs_winfsp::scenarios::scenario_remove_non_empty_directory::<ApiBackend<'_>>(&backend);
@@ -149,6 +157,7 @@ fn the_real_backend_refuses_to_remove_a_non_empty_directory() {
 /// would satisfy neither, and one that kept both spellings would satisfy only the first.
 #[test]
 fn the_real_backend_answers_a_case_only_rename() {
+    common::strict_gate();
     use fs_semantics::disposition::Disposition;
     use fs_winfsp::ops::WorkspaceOps;
 
@@ -204,6 +213,7 @@ fn the_real_backend_answers_a_case_only_rename() {
 /// **Scenario 6b on the real backend**: the same function the mock runs (472) — so "both backends answer the same way" is two readings.
 #[test]
 fn the_real_backend_satisfies_case_insensitive_names() {
+    common::strict_gate();
     let fixture = Fixture::new("fold");
     let backend = fixture.backend();
     fs_winfsp::scenarios::scenario_case_insensitive_names::<ApiBackend<'_>>(&backend);

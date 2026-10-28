@@ -5,6 +5,8 @@
 //! through the workspace, then read it back with the snapshot reader and inspect the content
 //! the root actually recorded.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -74,6 +76,7 @@ fn publish(label: &str, bytes: &[u8]) -> Content {
 /// `size == 0` → `Empty` (the first row of ADR-007 §3.2).
 #[test]
 fn an_empty_file_is_empty() {
+    common::strict_gate();
     assert_eq!(publish("empty", b""), Content::Empty);
 }
 
@@ -83,6 +86,7 @@ fn an_empty_file_is_empty() {
 /// 7 KiB file are both a single chunk, so both are `Blob`.
 #[test]
 fn a_single_chunk_is_a_blob() {
+    common::strict_gate();
     for len in [1usize, 100, 4_096, 7_000] {
         let mut bytes = vec![0u8; len];
         bytes[0] = 0x5A;
@@ -96,6 +100,7 @@ fn a_single_chunk_is_a_blob() {
 /// Every chunk zero → `Empty`, even though the file is well past one chunk.
 #[test]
 fn an_all_zero_file_is_empty() {
+    common::strict_gate();
     assert_eq!(
         publish("zeros", &vec![0u8; 100_000]),
         Content::Empty,
@@ -106,6 +111,7 @@ fn an_all_zero_file_is_empty() {
 /// Two or more chunks, some non-zero → `Extents`.
 #[test]
 fn a_large_file_is_extents() {
+    common::strict_gate();
     // Pseudo-random bytes so CDC produces many chunks.
     let mut state = 0x1234_5678u64;
     let mut bytes = Vec::with_capacity(200_000);
@@ -126,6 +132,7 @@ fn a_large_file_is_extents() {
 /// A file whose bytes round-trip exactly, whatever shape it took.
 #[test]
 fn every_shape_reads_back_byte_for_byte() {
+    common::strict_gate();
     let cases: Vec<Vec<u8>> = vec![
         Vec::new(),
         vec![0u8; 1],

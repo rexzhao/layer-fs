@@ -1,5 +1,7 @@
 //! The collector end to end (P2b-6 §18, §15): one run over a real store.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -83,6 +85,7 @@ fn repo_with_one_orphan(label: &str) -> (TempRoot, cas_core::ObjectId, cas_core:
 
 #[test]
 fn a_run_frees_the_orphan_and_keeps_the_committed_tree_readable() {
+    common::strict_gate();
     let (root, orphan, _) = repo_with_one_orphan("real");
 
     let outcome = run(root.store(), GcOptions::default()).expect("run the collector");
@@ -122,6 +125,7 @@ fn a_run_frees_the_orphan_and_keeps_the_committed_tree_readable() {
 
 #[test]
 fn a_dry_run_decides_but_changes_nothing() {
+    common::strict_gate();
     let (root, orphan, _) = repo_with_one_orphan("dry");
 
     let outcome = run(
@@ -154,6 +158,7 @@ fn a_dry_run_decides_but_changes_nothing() {
 /// The threshold is a policy value; a run with an impossible one must be refused before anything moves.
 #[test]
 fn an_impossible_threshold_is_refused_before_anything_moves() {
+    common::strict_gate();
     let (root, orphan, _) = repo_with_one_orphan("threshold");
     let error = run(
         root.store(),
@@ -174,6 +179,7 @@ fn an_impossible_threshold_is_refused_before_anything_moves() {
 /// While a workspace is open, the collector refuses instead of collecting a half-visible store.
 #[test]
 fn a_run_refuses_while_a_workspace_is_open() {
+    common::strict_gate();
     let root = TempRoot::new("busy");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
@@ -198,6 +204,7 @@ fn a_run_refuses_while_a_workspace_is_open() {
 /// lingered would still block the *next* maintenance open.
 #[test]
 fn a_run_releases_the_store_for_an_ordinary_open_and_for_another_run() {
+    common::strict_gate();
     let (root, _, _) = repo_with_one_orphan("release");
     run(root.store(), GcOptions::default()).expect("first run");
 
@@ -221,6 +228,7 @@ fn a_run_releases_the_store_for_an_ordinary_open_and_for_another_run() {
 /// §25.6: the report can be reconciled without trusting any single number.
 #[test]
 fn the_report_reconciles_with_a_hand_counted_store() {
+    common::strict_gate();
     let root = TempRoot::new("accounting");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
@@ -265,6 +273,7 @@ fn the_report_reconciles_with_a_hand_counted_store() {
 /// "a shared tree" from "a missed root", and the criterion stops being evidence.
 #[test]
 fn two_labels_on_one_tree_are_both_recorded_and_the_tree_is_walked_once() {
+    common::strict_gate();
     let root = TempRoot::new("shared-label");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
@@ -313,6 +322,7 @@ fn two_labels_on_one_tree_are_both_recorded_and_the_tree_is_walked_once() {
 /// nothing), this pins down which layer owns the de-duplication instead of asserting it in prose.
 #[test]
 fn a_subtree_reached_from_two_roots_is_fetched_once() {
+    common::strict_gate();
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::rc::Rc;

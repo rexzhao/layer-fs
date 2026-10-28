@@ -3,6 +3,8 @@
 //! The table (`fs_semantics::disposition`) says *what* happens; this file asserts the **third column**: what the call
 //! leaves behind — the action, the node's kind, and that the returned `FileId` is the entry the name now carries.
 
+mod common;
+
 use std::sync::Arc;
 
 use fs_namespace::{CreateOutcome, FileId, Kind, NamespaceError, Path, Rules};
@@ -72,6 +74,7 @@ fn seed(
 
 #[test]
 fn every_cell_has_an_action_a_kind_and_a_file_id() {
+    common::strict_gate();
     let mut cells = 0usize;
     for disposition in Disposition::ALL {
         for exists in [Exists::Absent, Exists::File, Exists::Directory] {
@@ -179,6 +182,7 @@ fn flags_early_resolve(body: &str) -> bool {
 
 #[test]
 fn create_or_open_resolves_inside_the_single_write_closure() {
+    common::strict_gate();
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("fs-namespace")
@@ -237,6 +241,7 @@ fn create_or_open_resolves_inside_the_single_write_closure() {
 /// Criterion 3 — **a refusal changes nothing**, asserted on the two things a caller can see.
 #[test]
 fn a_refused_disposition_leaves_the_entry_and_its_bytes_alone() {
+    common::strict_gate();
     let fixture = fixture("refusal");
     let rules = Rules::new(fixture.workspace.store());
     seed(&fixture.workspace, &rules, Exists::File);
@@ -282,6 +287,7 @@ const MIN_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
 /// not a fast path), which is why the assertion is about elapsed time rather than about success.
 #[test]
 fn the_write_closure_holds_the_lock_for_its_whole_body() {
+    common::strict_gate();
     use std::sync::mpsc;
     use std::time::Instant;
 
@@ -321,6 +327,7 @@ fn the_write_closure_holds_the_lock_for_its_whole_body() {
 /// Criterion 2 (behavioural): under contention exactly one entry is created and the loser sees the typed refusal.
 #[test]
 fn concurrent_creators_produce_exactly_one_entry() {
+    common::strict_gate();
     use std::sync::Barrier;
 
     for round in 0..20usize {
@@ -394,6 +401,7 @@ fn two_step_create(
 /// structural criterion is no longer the whole story.
 #[test]
 fn the_two_step_version_is_constructible_but_produces_no_double_winner() {
+    common::strict_gate();
     use std::sync::Barrier;
 
     let mut rounds_with_two_winners = 0usize;
@@ -435,6 +443,7 @@ fn the_two_step_version_is_constructible_but_produces_no_double_winner() {
 /// race, and "which old entry lost the name" cannot be recovered at all once the binding is gone.
 #[test]
 fn the_outcome_reports_the_binding_and_the_replaced_entry() {
+    common::strict_gate();
     let fixture = fixture("outcome-fields");
     let rules = Rules::new(fixture.workspace.store());
 

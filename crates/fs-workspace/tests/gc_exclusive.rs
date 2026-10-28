@@ -6,6 +6,8 @@
 //! discovering it was not alone would fail here — which is exactly the failure mode a "we promise
 //! not to write" comment cannot catch.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use fs_workspace::Repo;
@@ -72,6 +74,7 @@ fn fingerprint(root: &Path) -> Vec<(String, u64)> {
 
 #[test]
 fn a_refused_exclusive_open_leaves_every_byte_alone() {
+    common::strict_gate();
     let root = TempRoot::new("refused");
     let dir = root.store();
     let repo = std::sync::Arc::new(Repo::open(&dir, true).expect("open"));
@@ -107,6 +110,7 @@ fn a_refused_exclusive_open_leaves_every_byte_alone() {
 
 #[test]
 fn an_unused_store_can_be_taken_exclusively() {
+    common::strict_gate();
     let root = TempRoot::new("taken");
     let dir = root.store();
     let repo = std::sync::Arc::new(Repo::open(&dir, true).expect("open"));

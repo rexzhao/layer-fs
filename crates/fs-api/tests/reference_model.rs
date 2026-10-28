@@ -37,6 +37,8 @@
 //! cargo test --release -p fs-api --test reference_model -- --ignored
 //! ```
 
+mod common;
+
 #[path = "reference/support.rs"]
 mod reference;
 
@@ -56,6 +58,7 @@ const SOAK_STEPS: usize = 1000;
 /// **The sequence is the test.** Each seed is a different random walk over the same rules.
 #[test]
 fn random_sequences_match_the_reference_model() {
+    common::strict_gate();
     for seed in 0..40u64 {
         run_sequence(seed, STEPS);
     }
@@ -70,6 +73,7 @@ fn random_sequences_match_the_reference_model() {
 #[test]
 #[ignore = "soak: 10 sequences x 1000 steps; run explicitly with --ignored"]
 fn a_longer_soak_matches_the_reference_model() {
+    common::strict_gate();
     let seeds: Vec<u64> = SOAK_SEEDS.collect();
     let failures = soak(&seeds, SOAK_STEPS);
     assert!(
@@ -221,6 +225,7 @@ fn replay_steps() -> usize {
 /// see every step.
 #[test]
 fn a_single_seed_can_be_replayed() {
+    common::strict_gate();
     let Some(seed) = replay_seed() else {
         return;
     };

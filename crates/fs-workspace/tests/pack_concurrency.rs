@@ -1,5 +1,6 @@
 //! Two workspaces publishing the same objects at the same time (ADR-008 §5).
 //!
+
 // KI-11: a third-party process on this host deletes newly created .pack files. ADR-008 §5.2's
 // pin covers rename → COMMIT, so a pack can still disappear after publication. That is data
 // loss (ADR-008 §7.1 MissingPack), not a publication inconsistency — which is the claim this
@@ -12,6 +13,8 @@
 //! the loser's dead frame, and a `verify` that stays clean. A dead frame is legal (ADR-008 §5,
 //! §6.3) and is exactly what GC's repack is for; a store that reports it as corruption would
 //! push an operator to "repair" healthy data (KI-10).
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -212,6 +215,7 @@ fn commit(workspace: &mut fs_workspace::Workspace) -> Result<String, WorkspaceEr
 #[ignore = "KI-11: under concurrent publication the index can name a pack file that is not there; not yet diagnosed, run with --ignored"]
 #[test]
 fn two_workspaces_publishing_the_same_page_leave_one_row_and_a_clean_store() {
+    common::strict_gate();
     for round in 0..5 {
         let root = TempRoot::new(&format!("round-{round}"));
         let dir = root.store();
@@ -308,6 +312,7 @@ fn two_workspaces_publishing_the_same_page_leave_one_row_and_a_clean_store() {
 #[ignore = "KI-11: under concurrent publication the index can name a pack file that is not there; not yet diagnosed, run with --ignored"]
 #[test]
 fn concurrent_opens_wait_then_publish_correctly() {
+    common::strict_gate();
     for round in 0..10 {
         let root = TempRoot::new(&format!("open-{round}"));
         let dir = root.store();

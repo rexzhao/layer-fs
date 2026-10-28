@@ -3,6 +3,8 @@
 //! This is the criterion the card asks for, and it is deliberately written against the **binary**: `mount`/`umount`/`list` are the interface, so a test
 //! that called the library directly would prove something else.
 
+mod common;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -82,6 +84,7 @@ fn wait_until<F: Fn() -> bool>(what: &str, ready: F) {
 
 #[test]
 fn mount_write_unmount_through_the_cli() {
+    common::strict_gate();
     let (_root, store) = fixture("rw");
     let mount_point = mount_point();
     let root = root_of(&mount_point);

@@ -13,6 +13,8 @@
 //!
 //! Every expected set here is built by the test, never read from the collector's own root table.
 
+mod common;
+
 use std::collections::BTreeSet;
 
 use cas_core::{Object, ObjectId, Role};
@@ -123,6 +125,7 @@ fn pass(
 /// Expected: G2 (a declared root was never visited) and G3 (a declared root id is not among the visited).
 #[test]
 fn counter_example_c_missing_root_fails_g2_and_g3_only() {
+    common::strict_gate();
     let fixture = fixture();
     let all = Fixed(fixture.declared.entries().to_vec());
     let partial = Fixed(vec![fixture.declared.entries()[0].clone()]);
@@ -160,6 +163,7 @@ fn counter_example_c_missing_root_fails_g2_and_g3_only() {
 /// covers D.
 #[test]
 fn counter_example_d_short_declaration_is_caught_by_ground_truth_not_by_a_criterion() {
+    common::strict_gate();
     let fixture = fixture();
     let all = Fixed(fixture.declared.entries().to_vec());
 
@@ -220,6 +224,7 @@ fn counter_example_d_short_declaration_is_caught_by_ground_truth_not_by_a_criter
 #[test]
 #[cfg(feature = "gc-test-hooks")]
 fn counter_example_f_a_skipped_root_fails_g2_and_g3_and_leaves_no_residue() {
+    common::strict_gate();
     let fixture = fixture();
     let source = Fixed(fixture.declared.entries().to_vec());
 
@@ -261,6 +266,7 @@ fn counter_example_f_a_skipped_root_fails_g2_and_g3_and_leaves_no_residue() {
 #[test]
 #[cfg(feature = "gc-test-hooks")]
 fn counter_example_g_forced_free_fails_g1_and_g4_only() {
+    common::strict_gate();
     let fixture = fixture();
     let source = Fixed(fixture.declared.entries().to_vec());
     let reachable = fixture.declared.entries()[0].root;
@@ -299,6 +305,7 @@ fn counter_example_g_forced_free_fails_g1_and_g4_only() {
 /// the only case whose expected failure set is exactly G5.
 #[test]
 fn counter_example_e_a_vacuous_run_fails_g5_only() {
+    common::strict_gate();
     let fixture = fixture();
     let source = Fixed(fixture.declared.entries().to_vec());
 

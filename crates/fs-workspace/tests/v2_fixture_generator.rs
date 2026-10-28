@@ -8,6 +8,8 @@
 //! It is `#[ignore]`d and writes only when `V2_FIXTURE_OUT` is set, because a test that regenerated the
 //! fixture on demand would destroy the property the fixture exists for.
 
+mod common;
+
 use std::sync::Arc;
 
 use fs_namespace::Path as FsPath;
@@ -20,6 +22,7 @@ fn p(text: &str) -> FsPath {
 #[test]
 #[ignore = "generator: run once, with V2_FIXTURE_OUT=<dir>, at the commit recorded in the fixture README"]
 fn generate_a_v2_store() {
+    common::strict_gate();
     let Ok(out) = std::env::var("V2_FIXTURE_OUT") else {
         eprintln!("V2_FIXTURE_OUT is not set: nothing generated");
         return;

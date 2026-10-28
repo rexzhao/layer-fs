@@ -5,6 +5,8 @@
 //! the premise is live — a second connection to that same overlay really is refused, so the test would
 //! not pass on a filesystem where the lock was not exclusive.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -87,6 +89,7 @@ fn dirty_workspace(label: &str) -> (TempRoot, Arc<Repo>, PathBuf) {
 
 #[test]
 fn maintenance_reads_the_overlay_pending_root_through_its_own_connection() {
+    common::strict_gate();
     let (root, repo, _overlay) = dirty_workspace("pending");
     drop(repo);
 
@@ -137,6 +140,7 @@ fn maintenance_reads_the_overlay_pending_root_through_its_own_connection() {
 /// be revisited — which is why the assertion is here and not in a comment.
 #[test]
 fn a_second_connection_to_a_maintenance_held_overlay_is_refused() {
+    common::strict_gate();
     let (root, repo, overlay) = dirty_workspace("premise");
     drop(repo);
 
@@ -173,6 +177,7 @@ fn a_second_connection_to_a_maintenance_held_overlay_is_refused() {
 /// workspace is clean, so there is no `OverlayPending` row at all — not an id parsed from `""`.
 #[test]
 fn a_committed_workspace_contributes_no_pending_root() {
+    common::strict_gate();
     let root = TempRoot::new("clean");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
@@ -209,6 +214,7 @@ fn a_committed_workspace_contributes_no_pending_root() {
 /// it for GC would silently protect nothing from a pending publication.
 #[test]
 fn the_bare_root_list_works_while_a_workspace_is_open_and_omits_overlay_roots() {
+    common::strict_gate();
     let root = TempRoot::new("bare");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
@@ -240,6 +246,7 @@ fn the_bare_root_list_works_while_a_workspace_is_open_and_omits_overlay_roots() 
 /// subtree the sweep would delete. This is the property, not the error class.
 #[test]
 fn a_live_overlay_is_never_silently_omitted() {
+    common::strict_gate();
     let root = TempRoot::new("loud");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");

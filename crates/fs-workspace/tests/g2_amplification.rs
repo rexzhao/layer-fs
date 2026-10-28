@@ -14,6 +14,8 @@
 //!      that reading 512 bytes does not get more expensive as the file grows. An implementation that read every extent's
 //!      data scored **ratio 8.838** in the card's red run, so this is a live criterion rather than a formality.
 
+mod common;
+
 use std::sync::Arc;
 
 use fs_namespace::{FileId, Path, Rules};
@@ -93,6 +95,7 @@ fn read_cost(fixture: &Fixture, file_id: FileId, len: usize) -> u64 {
 /// whole file (or several blocks) would exceed the bound immediately.
 #[test]
 fn a_small_read_of_a_64_kib_file_costs_at_most_thirty_six_kib() {
+    common::strict_gate();
     let _serialised = cas_store::testing::serialised();
     let fixture = fixture("single");
     let file_id = committed_file(&fixture, "/big", 64 * 1024);
@@ -110,6 +113,7 @@ fn a_small_read_of_a_64_kib_file_costs_at_most_thirty_six_kib() {
 /// the card's red run scored 8.838 by doing exactly that.
 #[test]
 fn a_small_read_does_not_scale_with_the_file() {
+    common::strict_gate();
     let _serialised = cas_store::testing::serialised();
     let fixture = fixture("ratio");
     let small = committed_file(&fixture, "/32k", 32 * 1024);

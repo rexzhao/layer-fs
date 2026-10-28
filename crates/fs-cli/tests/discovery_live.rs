@@ -4,6 +4,8 @@
 //! workspace it is serving. A6d is the question the card says to **measure and record** rather than assume: what does a *directory* mount point answer, and does
 //! discovery work there?
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -92,6 +94,7 @@ fn start_mount(label: &str, mount_point: &Path) -> (PathBuf, MountChild) {
 /// **A6b**: standing inside a drive-letter mount, `status` needs no options — and standing outside one, it still refuses with the ADR's constant.
 #[test]
 fn status_inside_a_mount_needs_no_options() {
+    common::strict_gate();
     let mount_point = std::env::var_os("LAYER_FS_CLI_MNT_DISC_A")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("J:"));
@@ -140,6 +143,7 @@ fn status_inside_a_mount_needs_no_options() {
 /// instead of in somebody's memory.
 #[test]
 fn a_directory_mount_point_is_measured_not_assumed() {
+    common::strict_gate();
     let root = temp_dir("dir-mount");
     let mount_point = root.join("mnt");
     let (dir_store, _child) = start_mount("dir", &mount_point);

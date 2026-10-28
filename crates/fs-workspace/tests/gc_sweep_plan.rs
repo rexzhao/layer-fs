@@ -1,5 +1,7 @@
 //! The sweep plan: what garbage is, decided before anything is deleted (P2b-6 §18.3).
 
+mod common;
+
 use std::path::PathBuf;
 
 use cas_core::Role;
@@ -55,6 +57,7 @@ fn index(store_dir: &std::path::Path) -> rusqlite::Connection {
 
 #[test]
 fn an_unmarked_loose_object_is_the_only_thing_freed() {
+    common::strict_gate();
     let root = TempRoot::new("loose");
     let store = Store::open(root.store(), OpenMode::Create).expect("open store");
     let keep = store.put(Role::Bytes, b"reachable").expect("put").oid;
@@ -90,6 +93,7 @@ fn an_unmarked_loose_object_is_the_only_thing_freed() {
 
 #[test]
 fn a_pack_whose_frames_are_all_unreachable_is_deleted() {
+    common::strict_gate();
     let root = TempRoot::new("pack-delete");
     let store = Store::open(root.store(), OpenMode::Create).expect("open store");
     let mut batch = store.batch();
@@ -133,6 +137,7 @@ fn a_pack_whose_frames_are_all_unreachable_is_deleted() {
 
 #[test]
 fn a_missing_pack_file_is_reported_and_its_rows_are_left_alone() {
+    common::strict_gate();
     let root = TempRoot::new("missing");
     let store = Store::open(root.store(), OpenMode::Create).expect("open store");
     let mut batch = store.batch();
@@ -180,6 +185,7 @@ fn a_missing_pack_file_is_reported_and_its_rows_are_left_alone() {
 
 #[test]
 fn a_threshold_outside_the_unit_interval_is_refused() {
+    common::strict_gate();
     let root = TempRoot::new("threshold");
     let store = Store::open(root.store(), OpenMode::Create).expect("open store");
     store.put(Role::Bytes, b"x").expect("put");
@@ -201,6 +207,7 @@ fn a_threshold_outside_the_unit_interval_is_refused() {
 
 #[test]
 fn a_pack_file_without_a_row_is_an_orphan() {
+    common::strict_gate();
     let root = TempRoot::new("orphan");
     let store = Store::open(root.store(), OpenMode::Create).expect("open store");
     store.put(Role::Bytes, b"x").expect("put");
@@ -263,6 +270,7 @@ fn packed_and_loose(label: &str) -> (TempRoot, cas_core::ObjectId, cas_core::Obj
 
 #[test]
 fn apply_deletes_a_loose_object_file_and_its_row() {
+    common::strict_gate();
     let (root, keep, garbage) = packed_and_loose("apply-loose");
     // Positive control: the loose object is readable *before* the sweep, so "it is gone afterwards"
     // is a change and not a fixture that never had it.
@@ -309,6 +317,7 @@ fn apply_deletes_a_loose_object_file_and_its_row() {
 
 #[test]
 fn apply_removes_an_empty_pack_rows_first_then_file() {
+    common::strict_gate();
     let root = TempRoot::new("apply-pack");
     let store = Store::open(root.store(), OpenMode::Create).expect("open store");
     let mut batch = store.batch();
@@ -337,6 +346,7 @@ fn apply_removes_an_empty_pack_rows_first_then_file() {
 /// gone only after no row names it.
 #[test]
 fn apply_repacks_a_half_surviving_pack_and_the_survivor_still_reads() {
+    common::strict_gate();
     let root = TempRoot::new("apply-repack");
     let store = Store::open(root.store(), OpenMode::Create).expect("open store");
     let mut batch = store.batch();
@@ -413,6 +423,7 @@ fn apply_repacks_a_half_surviving_pack_and_the_survivor_still_reads() {
 
 #[test]
 fn apply_removes_orphan_packs_and_temporaries() {
+    common::strict_gate();
     let root = TempRoot::new("apply-orphans");
     let store = Store::open(root.store(), OpenMode::Create).expect("open store");
     let keep = store.put(Role::Bytes, b"reachable").expect("put").oid;

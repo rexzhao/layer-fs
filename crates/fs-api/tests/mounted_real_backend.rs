@@ -4,6 +4,8 @@
 //! mount?" test, so that probe measured nothing and its readings meant nothing (434/496). Everything below returns `Err` on the first sign of
 //! trouble, so a mount that does not work fails the test instead of producing a tidy list of failures.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -81,6 +83,7 @@ impl Fixture {
 
 #[test]
 fn windows_can_write_and_list_through_a_real_backend_mount() {
+    common::strict_gate();
     let library = default_library();
     if let Err(LoadError::NotFound { path }) = resolve_library(&library) {
         eprintln!("SKIP: no winfsp at {}", path.display());

@@ -3,6 +3,8 @@
 //! Every case talks to the mount over the pipe its record names, which is what `umount` and `status` do. Using the client rather than calling the server's
 //! functions means the criteria cover the wire format *and* the record's `pipe` field together.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -125,6 +127,7 @@ fn mount_point(label: &str, default: &str) -> PathBuf {
 /// **A11**: `hello` agrees with the record field by field, and a frame over the limit is refused **without taking the mount down**.
 #[test]
 fn hello_matches_the_record_and_an_oversized_frame_does_not_kill_the_mount() {
+    common::strict_gate();
     let mount_point = mount_point("PIPE_A", "N:");
     let _child = start_mount("hello", &mount_point);
     let record = read_record(&mount_point);
@@ -194,6 +197,7 @@ fn hello_matches_the_record_and_an_oversized_frame_does_not_kill_the_mount() {
 /// handles on the volume.
 #[test]
 fn status_reports_dirty_and_open_handles() {
+    common::strict_gate();
     let mount_point = mount_point("PIPE_B", "M:");
     let _child = start_mount("status", &mount_point);
     let root = root_of(&mount_point);
@@ -224,6 +228,7 @@ fn status_reports_dirty_and_open_handles() {
 /// **A12**: a remote `unmount` with a file open is refused and changes nothing; after closing, it succeeds **and the record is gone when the answer arrives**.
 #[test]
 fn unmount_refuses_while_a_handle_is_open() {
+    common::strict_gate();
     let mount_point = mount_point("PIPE_C", "L:");
     let _child = start_mount("unmount", &mount_point);
     let root = root_of(&mount_point);
@@ -265,6 +270,7 @@ fn unmount_refuses_while_a_handle_is_open() {
 /// **A15s**: the old stop **file** no longer stops a mount — the control channel is the only signal.
 #[test]
 fn the_old_stop_file_does_not_stop_a_mount() {
+    common::strict_gate();
     let mount_point = mount_point("PIPE_D", "K:");
     let _child = start_mount("stops", &mount_point);
     let stop = fs_cli::mounts_dir().join(format!("{}.stop", fs_cli::record_name(&mount_point)));

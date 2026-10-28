@@ -14,6 +14,8 @@
 //! `close()` then `workspace_open` is deliberate: `set_attributes` followed by `get_info` in the same session would pass
 //! for an implementation that kept the bits in memory.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -95,6 +97,7 @@ fn attributes_after_reopen(label: &str, disposition: Disposition, set: u32) -> u
 /// SUPERSEDE replaces the stored attributes; the replacement survives a reopen.
 #[test]
 fn supersede_replaces_attributes_on_disk() {
+    common::strict_gate();
     // `0x01 | 0x20` = READONLY | ARCHIVE, both storable bits.
     let after = attributes_after_reopen("supersede", Disposition::Supersede, 0x01 | 0x20);
     // `get_info` reports **derived** attributes (G3's ruling): a file with nothing stored is `NORMAL` (0x80), not 0.
@@ -109,6 +112,7 @@ fn supersede_replaces_attributes_on_disk() {
 /// OVERWRITE / OVERWRITE_IF keep the stored attributes; keeping them survives a reopen too.
 #[test]
 fn overwrite_keeps_attributes_on_disk() {
+    common::strict_gate();
     for disposition in [Disposition::Overwrite, Disposition::OverwriteIf] {
         let after = attributes_after_reopen("overwrite", disposition, 0x01 | 0x20);
         assert_eq!(

@@ -14,6 +14,8 @@
 //! They do **not** prove fsync or power-loss semantics — a killed process still leaves the
 //! operating system's page cache intact (ADR-006 §8, §17.3).
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -129,6 +131,7 @@ fn prepared(label: &str) -> (TempRoot, PathBuf, String) {
 #[test]
 #[ignore = "spawned as a child process by the crash drivers below"]
 fn crash_child() {
+    common::strict_gate();
     let Some(spec) = std::env::var_os(CHILD_ENV) else {
         return;
     };
@@ -207,6 +210,7 @@ fn assert_tree_holds_payload(dir: &Path, root: &str) {
 /// them leaves the repository exactly as it was, plus unreferenced objects.
 #[test]
 fn a_crash_during_materialisation_publishes_nothing() {
+    common::strict_gate();
     let (_root, dir, head) = prepared("during-materialise");
     run_child(&dir, "commit", "during-materialise");
     let (repo, workspace) = recovered(&dir);
@@ -224,6 +228,7 @@ fn a_crash_during_materialisation_publishes_nothing() {
 /// **§9.4 第 2 步之前** — nothing was recorded, nothing moved.
 #[test]
 fn a_crash_before_the_intent_leaves_the_branch_and_the_work() {
+    common::strict_gate();
     let (_root, dir, head) = prepared("after-materialise");
     run_child(&dir, "commit", "after-materialise");
     let (repo, workspace) = recovered(&dir);
@@ -239,6 +244,7 @@ fn a_crash_before_the_intent_leaves_the_branch_and_the_work() {
 /// This is §9.3's third row: `pending_root = R` but the main database never adopted R.
 #[test]
 fn a_crash_after_the_intent_clears_it_and_keeps_the_work() {
+    common::strict_gate();
     let (_root, dir, head) = prepared("after-intent");
     run_child(&dir, "commit", "after-intent");
     {
@@ -260,6 +266,7 @@ fn a_crash_after_the_intent_clears_it_and_keeps_the_work() {
 /// (§9.3's second row) and the published tree must be complete.
 #[test]
 fn a_crash_after_the_publication_completes_it_on_reopen() {
+    common::strict_gate();
     let (_root, dir, head) = prepared("after-publish");
     run_child(&dir, "commit", "after-publish");
     let (repo, workspace) = recovered(&dir);
@@ -286,6 +293,7 @@ fn a_crash_after_the_publication_completes_it_on_reopen() {
 /// **§9.4 snapshot 的第 3 步之后** — a snapshot records a GC root without moving a branch.
 #[test]
 fn a_crash_after_a_snapshot_publishes_keeps_the_root_readable() {
+    common::strict_gate();
     let (_root, dir, head) = prepared("snapshot-publish");
     run_child(&dir, "snapshot", "after-publish");
     let (repo, workspace) = recovered(&dir);
@@ -313,6 +321,7 @@ fn a_crash_after_a_snapshot_publishes_keeps_the_root_readable() {
 /// **§9.4 discard 删行后删文件前** — the next open sweeps the orphan directory.
 #[test]
 fn a_crash_during_discard_is_swept_on_reopen() {
+    common::strict_gate();
     let (_root, dir, _head) = prepared("discard");
     let workspace_dir = {
         let repo = Repo::open(&dir, false).expect("open");
@@ -347,6 +356,7 @@ fn a_crash_during_discard_is_swept_on_reopen() {
 /// — readable through `SnapshotReader`, i.e. without any of our tables.
 #[test]
 fn every_commit_crash_point_recovers_to_a_clean_store_with_all_roots_readable() {
+    common::strict_gate();
     for point in [
         "during-materialise",
         "after-materialise",

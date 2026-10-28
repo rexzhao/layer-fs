@@ -4,6 +4,8 @@
 //! — must not change what the caller sees. Each test states the before/after pair rather than only the after state,
 //! because "still readable" says nothing without "was readable, with these bytes".
 
+mod common;
+
 use std::sync::Arc;
 
 use fs_namespace::{FileId, Path, Rules};
@@ -50,6 +52,7 @@ fn p(text: &str) -> Path {
 /// A file read by FileId keeps its bytes across a rename of its parent **and** of itself.
 #[test]
 fn a_file_reads_by_file_id_after_both_kinds_of_rename() {
+    common::strict_gate();
     let fixture = fixture("rename-file");
     let rules = Rules::new(fixture.workspace.store());
     rules.mkdir(&p("/d")).expect("mkdir");
@@ -92,6 +95,7 @@ fn a_file_reads_by_file_id_after_both_kinds_of_rename() {
 /// A directory listed by FileId keeps its entries, and the order is stable across calls.
 #[test]
 fn a_directory_lists_by_file_id_after_a_rename_with_a_stable_order() {
+    common::strict_gate();
     let fixture = fixture("rename-dir");
     let rules = Rules::new(fixture.workspace.store());
     rules.mkdir(&p("/d")).expect("mkdir");
@@ -142,6 +146,7 @@ fn a_directory_lists_by_file_id_after_a_rename_with_a_stable_order() {
 /// Listing a removed directory is a typed error, not a panic and not an empty listing.
 #[test]
 fn listing_a_removed_directory_is_a_typed_error() {
+    common::strict_gate();
     let fixture = fixture("removed-dir");
     let rules = Rules::new(fixture.workspace.store());
     rules.mkdir(&p("/gone")).expect("mkdir");
@@ -174,6 +179,7 @@ fn listing_a_removed_directory_is_a_typed_error() {
 /// Reading a directory's content by FileId is `IsADirectory`, not an empty byte string.
 #[test]
 fn reading_a_directory_by_file_id_is_refused() {
+    common::strict_gate();
     let fixture = fixture("read-dir");
     let rules = Rules::new(fixture.workspace.store());
     rules.mkdir(&p("/d")).expect("mkdir");
@@ -214,6 +220,7 @@ fn reading_a_directory_by_file_id_is_refused() {
 /// path side just describes a rename.
 #[test]
 fn a_reused_path_is_a_different_entry_and_the_old_id_does_not_see_it() {
+    common::strict_gate();
     let fixture = fixture("reuse");
     let rules = Rules::new(fixture.workspace.store());
 
@@ -281,6 +288,7 @@ fn a_reused_path_is_a_different_entry_and_the_old_id_does_not_see_it() {
 /// entry. All three outcomes are asserted — matches, differs, already gone.
 #[test]
 fn remove_at_refuses_a_name_that_belongs_to_another_entry() {
+    common::strict_gate();
     let fixture = fixture("remove-guard");
     let rules = Rules::new(fixture.workspace.store());
     let first = rules
@@ -341,6 +349,7 @@ fn remove_at_refuses_a_name_that_belongs_to_another_entry() {
 /// pair no longer finds it.
 #[test]
 fn remove_at_follows_the_binding_after_a_rename() {
+    common::strict_gate();
     let fixture = fixture("remove-rename");
     let rules = Rules::new(fixture.workspace.store());
     let created = rules
@@ -435,6 +444,7 @@ fn seed_committed(store: &OneAtATime, count: usize) -> FileId {
 /// Criterion 1: one object read touches **one frame** and never the pack tail.
 #[test]
 fn reading_one_object_by_file_id_reads_one_frame_and_no_tail() {
+    common::strict_gate();
     let _serialised = cas_store::testing::serialised();
     let store = one_at_a_time("amplification");
     // **One chunk on purpose.** The criterion distinguishes "covers the frames it needs" from "reads the pack"; with a
@@ -491,6 +501,7 @@ fn reading_one_object_by_file_id_reads_one_frame_and_no_tail() {
 /// Criterion 4: the same FileId locates the same object after a restart.
 #[test]
 fn a_file_id_survives_a_reopen() {
+    common::strict_gate();
     let store = one_at_a_time("restart");
     let file_id = seed_committed(&store, 4096);
     let expected = {

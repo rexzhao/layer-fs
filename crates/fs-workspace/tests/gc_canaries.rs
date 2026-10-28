@@ -5,6 +5,8 @@
 //! reads the expectation out of `GcReport`: that would be the "use the thing under test to prove the
 //! thing under test" failure this project has already paid for twice.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -107,6 +109,7 @@ fn committed(label: &str, files: &[(&str, &[u8])]) -> (TempRoot, String) {
 /// The expectation is hand-built: this test wrote these bytes, so it compares against them.
 #[test]
 fn k1_no_reachable_object_is_taken_and_every_root_still_reads() {
+    common::strict_gate();
     let (root, _commit) = committed(
         "k1",
         &[("/a.txt", b"alpha bytes"), ("/b.txt", b"beta bytes")],
@@ -146,6 +149,7 @@ fn k1_no_reachable_object_is_taken_and_every_root_still_reads() {
 /// abort first — that is K8b's shape, not this one, and it is why the two are separate tests.
 #[test]
 fn k8a_a_missing_pack_fails_the_run_and_leaves_every_row_alone() {
+    common::strict_gate();
     let (root, _commit) = committed("k8a", &[("/a.txt", b"alpha")]);
 
     // An object nothing references: its pack can vanish without marking noticing.
@@ -222,6 +226,7 @@ fn k8a_a_missing_pack_fails_the_run_and_leaves_every_row_alone() {
 /// **G1c**: a dry run changes no store file at all (its own marker is scratch, and is excluded).
 #[test]
 fn g1c_a_dry_run_leaves_every_store_file_alone() {
+    common::strict_gate();
     let (root, _commit) = committed("g1c", &[("/a.txt", b"alpha bytes")]);
     let store = Store::open(root.store(), OpenMode::ReadWrite).expect("open store");
     let orphan = store
@@ -263,6 +268,7 @@ fn g1c_a_dry_run_leaves_every_store_file_alone() {
 #[test]
 #[cfg(feature = "gc-test-hooks")]
 fn k9_dead_frames_without_dead_objects_report_zero_objects_and_one_repack() {
+    common::strict_gate();
     let root = TempRoot::new("k9");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
@@ -382,6 +388,7 @@ fn k9_dead_frames_without_dead_objects_report_zero_objects_and_one_repack() {
 /// file vanished.
 #[test]
 fn k8b_a_pack_missing_on_the_walk_aborts_and_deletes_nothing() {
+    common::strict_gate();
     let (root, _commit) = committed("k8b", &[("/a.txt", b"reachable bytes")]);
 
     // Every pack goes: whatever the tree needs, it needs from here.
@@ -458,6 +465,7 @@ fn k8b_a_pack_missing_on_the_walk_aborts_and_deletes_nothing() {
 #[test]
 #[cfg(feature = "gc-test-hooks")]
 fn crash_points_1_2_and_5_leave_a_recoverable_store() {
+    common::strict_gate();
     use fs_workspace::gc::{crash, GcStep};
 
     for (step, label) in [
@@ -519,6 +527,7 @@ fn crash_points_1_2_and_5_leave_a_recoverable_store() {
 #[test]
 #[cfg(feature = "gc-test-hooks")]
 fn crash_points_3_and_4_hold_their_own_invariants() {
+    common::strict_gate();
     use fs_workspace::gc::{crash, GcStep};
 
     for (step, staged_expectation) in [
@@ -702,6 +711,7 @@ fn crash_points_3_and_4_hold_their_own_invariants() {
 /// test this repository does not have.
 #[test]
 fn every_root_kind_is_covered_by_a_named_canary() {
+    common::strict_gate();
     use fs_workspace::gc::RootKind;
 
     // (kind, the test that would fail if the collector stopped protecting it)

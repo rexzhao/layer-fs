@@ -3,6 +3,8 @@
 //! These cover the two commands the CLI gained in P2a-7b and the one place where a store
 //! from an older schema must be named rather than silently reinterpreted.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -52,6 +54,7 @@ fn put(workspace: &fs_api::Workspace, path: &str, bytes: &[u8]) {
 /// A clean repository verifies at both levels, and `stats` agrees with what exists.
 #[test]
 fn verify_and_stats_agree_with_a_clean_repository() {
+    common::strict_gate();
     let root = TempRoot::new("clean");
     let repo = Repo::create(root.store()).expect("create");
     let mut workspace = repo.workspace_create("w1", "main").expect("workspace");
@@ -86,6 +89,7 @@ fn verify_and_stats_agree_with_a_clean_repository() {
 /// — not the workspace — is what holds the tree.
 #[test]
 fn verify_still_passes_after_the_workspace_is_gone() {
+    common::strict_gate();
     let root = TempRoot::new("after-discard");
     let repo = Repo::create(root.store()).expect("create");
     let mut workspace = repo.workspace_create("w1", "main").expect("workspace");
@@ -103,6 +107,7 @@ fn verify_still_passes_after_the_workspace_is_gone() {
 /// **A P1 store is refused by name**, not silently reinterpreted as an empty one.
 #[test]
 fn a_previous_schema_is_named_and_refused() {
+    common::strict_gate();
     let root = TempRoot::new("legacy");
     let store = root.store();
     std::fs::create_dir_all(&store).expect("store dir");
@@ -141,6 +146,7 @@ fn a_previous_schema_is_named_and_refused() {
 /// deleted object file.
 #[test]
 fn verify_names_an_object_that_is_gone() {
+    common::strict_gate();
     let root = TempRoot::new("damaged");
     let repo = Repo::create(root.store()).expect("create");
     let mut workspace = repo.workspace_create("w1", "main").expect("workspace");

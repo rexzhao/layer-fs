@@ -8,6 +8,8 @@
 //! They are deliberately runnable now, before mark/sweep exist: if the seam is wrong, later
 //! injections cannot be built on it, and no amount of green GC code fixes that.
 
+mod common;
+
 use cas_core::{Object, ObjectId, Role};
 use fs_workspace::gc::{RepoRoots, RootKind, RootRef, RootSet, RootSource};
 use fs_workspace::Repo;
@@ -60,6 +62,7 @@ impl RootSource for Fixed {
 
 #[test]
 fn the_root_set_deduplicates_by_fact_not_by_object_id() {
+    common::strict_gate();
     // Two rows can protect the same tree: a commit and a snapshot of it. Both are facts, and G2
     // compares facts, so both survive — while the *ids* the sweep walks are deduplicated.
     let tree = oid("tree");
@@ -83,6 +86,7 @@ fn the_root_set_deduplicates_by_fact_not_by_object_id() {
 
 #[test]
 fn dropping_a_row_is_visible_as_a_set_difference() {
+    common::strict_gate();
     // The G1 injection in miniature: a snapshot row disappears from the enumeration while the
     // objects it protects are still reachable from it. Comparing facts, the difference names the
     // missing row instead of just "an id changed".
@@ -113,6 +117,7 @@ fn dropping_a_row_is_visible_as_a_set_difference() {
 
 #[test]
 fn a_replaceable_source_is_what_the_collector_consumes() {
+    common::strict_gate();
     // The seam itself: production reads the repository, a test supplies a lie, and both are just
     // `RootSource`. Nothing in the collector may query the database for roots directly.
     let root = TempRoot::new("seam");
@@ -158,6 +163,7 @@ fn clean_pair() -> (RootSet, RootSet) {
 
 #[test]
 fn a_clean_mark_passes_g1_g2_g3_and_fails_only_g5_for_lack_of_collection() {
+    common::strict_gate();
     let (declared, walked) = clean_pair();
     let mut report = fs_workspace::gc::GcReport::skeleton(&declared);
     for entry in walked.entries() {
@@ -175,6 +181,7 @@ fn a_clean_mark_passes_g1_g2_g3_and_fails_only_g5_for_lack_of_collection() {
 
 #[test]
 fn skipping_one_root_is_caught_by_g2_and_g3() {
+    common::strict_gate();
     // Counter-example D: the source omits a root, so mark never visits it.
     let (declared, walked) = clean_pair();
     let mut report = fs_workspace::gc::GcReport::skeleton(&declared);
@@ -192,6 +199,7 @@ fn skipping_one_root_is_caught_by_g2_and_g3() {
 
 #[test]
 fn visiting_a_root_without_counting_it_is_caught_by_g3_per_kind() {
+    common::strict_gate();
     // Counter-example F: the label is in the visited list but the per-kind counter never moved —
     // the shape a UNION query invites when the per-kind dispatch forgets a source.
     let (declared, walked) = clean_pair();
@@ -218,6 +226,7 @@ fn visiting_a_root_without_counting_it_is_caught_by_g3_per_kind() {
 
 #[test]
 fn forcing_a_reachable_object_into_the_free_set_is_caught_by_g1_and_g4() {
+    common::strict_gate();
     // Counter-example G: the sweep's seam adds an id that mark reached.
     let (declared, walked) = clean_pair();
     let mut report = fs_workspace::gc::GcReport::skeleton(&declared);
@@ -242,6 +251,7 @@ fn forcing_a_reachable_object_into_the_free_set_is_caught_by_g1_and_g4() {
 
 #[test]
 fn freeing_only_unreachable_objects_satisfies_all_five() {
+    common::strict_gate();
     // Counter-example E's positive side: a genuinely unreachable object is freed, live ones are not.
     let (declared, walked) = clean_pair();
     let mut report = fs_workspace::gc::GcReport::skeleton(&declared);
@@ -289,6 +299,7 @@ impl RootSource for Toggle {
 /// The three-step template (card §8.3): clean → injected (only the named criterion red) → clean.
 #[test]
 fn the_injection_seam_is_consumed_and_leaves_no_residue() {
+    common::strict_gate();
     // Ground truth, held by the test: two roots, plus one object that must be collected.
     let commit = oid("ground-commit");
     let snap = oid("ground-snapshot");
@@ -382,6 +393,7 @@ fn the_injection_seam_is_consumed_and_leaves_no_residue() {
 
 #[test]
 fn skip_root_makes_counter_example_f_constructible() {
+    common::strict_gate();
     // F: the root stays in the declared set, but mark refuses to visit it. Only G3's per-kind /
     // oid comparison can see this — G2 compares the declared set against what mark *reports*, and
     // mark reports nothing here, so the label is simply absent.
@@ -417,6 +429,7 @@ fn skip_root_makes_counter_example_f_constructible() {
 
 #[test]
 fn a_label_naming_two_trees_is_an_error_not_two_facts() {
+    common::strict_gate();
     // Without this, a mistyped label silently becomes two "facts" and G2's set comparison stops
     // meaning what it says.
     let error = RootSet::try_from_entries(vec![
@@ -823,6 +836,7 @@ fn schema_columns(connection: &rusqlite::Connection) -> Vec<(String, String)> {
 
 #[test]
 fn t1_every_column_of_every_database_is_classified() {
+    common::strict_gate();
     let (_root, dir) = fixture("t1-columns");
 
     let mut actual: Vec<(String, String, String)> = Vec::new();
@@ -871,6 +885,7 @@ fn t1_every_column_of_every_database_is_classified() {
 
 #[test]
 fn t2_every_classified_root_source_has_a_kind_and_a_kind_has_a_column() {
+    common::strict_gate();
     // Two independent sides: the classification table (T1) and the `RootKind` variants (the code).
     // Comparing them catches "added a source, forgot the kind" and "added a kind, forgot a column".
     let classified: std::collections::BTreeSet<&str> = CLASSIFIED
@@ -918,6 +933,7 @@ fn t2_every_classified_root_source_has_a_kind_and_a_kind_has_a_column() {
 
 #[test]
 fn t3_root_source_values_parse_as_object_ids_and_are_published() {
+    common::strict_gate();
     let (_root, dir) = fixture("t3-values");
     let index = rusqlite::Connection::open(dir.join("store.sqlite")).expect("index");
     let mut checked = 0usize;
@@ -981,6 +997,7 @@ fn t3_root_source_values_parse_as_object_ids_and_are_published() {
 /// nothing, would pass).
 #[test]
 fn the_column_enumerator_applies_both_filters() {
+    common::strict_gate();
     let connection = rusqlite::Connection::open_in_memory().expect("memory db");
     connection
         .execute_batch(

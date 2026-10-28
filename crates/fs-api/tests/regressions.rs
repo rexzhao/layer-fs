@@ -6,6 +6,8 @@
 //! not reproduce: the overlay fixture attaches to a snapshot it did not create, while the
 //! bug needs a *workspace's own* snapshot as its base.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -46,6 +48,7 @@ impl Drop for TempRoot {
 /// again. Found by the reference-model sequence at `seed=1 step=126`.
 #[test]
 fn removing_a_snapshotted_name_twice_keeps_it_gone() {
+    common::strict_gate();
     let root = TempRoot::new("whiteout");
     let repo = Repo::create(root.path.join("store")).expect("create");
     let mut workspace = repo.workspace_create("w1", "main").expect("create");
@@ -95,6 +98,7 @@ fn removing_a_snapshotted_name_twice_keeps_it_gone() {
 /// instead of losing them.
 #[test]
 fn growing_a_shrunk_file_reads_zeros_not_the_cut_bytes() {
+    common::strict_gate();
     let root = TempRoot::new("truncate-resurrect");
     let repo = Repo::create(root.path.join("store")).expect("create");
     let workspace = repo.workspace_create("w1", "main").expect("create");
@@ -133,6 +137,7 @@ fn growing_a_shrunk_file_reads_zeros_not_the_cut_bytes() {
 /// only come back as zeros.
 #[test]
 fn growing_a_shrunk_file_across_pages_reads_zeros() {
+    common::strict_gate();
     let root = TempRoot::new("truncate-resurrect-pages");
     let repo = Repo::create(root.path.join("store")).expect("create");
     let workspace = repo.workspace_create("w1", "main").expect("create");
@@ -162,6 +167,7 @@ fn growing_a_shrunk_file_across_pages_reads_zeros() {
 /// branch for it (there is no straddling page to zero).
 #[test]
 fn shrinking_to_zero_and_growing_reads_zeros() {
+    common::strict_gate();
     let root = TempRoot::new("truncate-zero");
     let repo = Repo::create(root.path.join("store")).expect("create");
     let workspace = repo.workspace_create("w1", "main").expect("create");
@@ -192,6 +198,7 @@ fn shrinking_to_zero_and_growing_reads_zeros() {
 /// there says nothing about the defect.
 #[test]
 fn a_reopened_workspace_does_not_resurrect_cut_bytes() {
+    common::strict_gate();
     let root = TempRoot::new("truncate-reopen");
     let repo = Repo::create(root.path.join("store")).expect("create");
 
@@ -219,6 +226,7 @@ fn a_reopened_workspace_does_not_resurrect_cut_bytes() {
 /// must read back the truncated length and nothing else.
 #[test]
 fn committing_a_shrunk_file_stores_only_the_prefix() {
+    common::strict_gate();
     let root = TempRoot::new("truncate-commit");
     let repo = Repo::create(root.path.join("store")).expect("create");
     let mut workspace = repo.workspace_create("w1", "main").expect("create");
@@ -248,6 +256,7 @@ fn committing_a_shrunk_file_stores_only_the_prefix() {
 /// pinned; it must not be used as an A/B judge.
 #[test]
 fn snapshotting_a_shrunk_file_then_growing_reads_zeros() {
+    common::strict_gate();
     let root = TempRoot::new("truncate-snapshot");
     let repo = Repo::create(root.path.join("store")).expect("create");
     let mut workspace = repo.workspace_create("w1", "main").expect("create");

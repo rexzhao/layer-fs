@@ -15,6 +15,8 @@
 //! | A7 | the materialiser walks from the root only | [`a7_an_unreachable_inode_never_reaches_a_snapshot`] |
 //! | A8 | schema v3 refuses v1/v2 | [`a8_an_older_schema_is_refused_even_with_create`] |
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
@@ -80,6 +82,7 @@ fn read(workspace: &Workspace, path: &str) -> Vec<u8> {
 #[test]
 #[ignore = "heavy: ten workspaces x 200 files, run explicitly"]
 fn a1_ten_workspaces_do_not_interfere() {
+    common::strict_gate();
     const WORKSPACES: usize = 10;
     const FILES: usize = 200;
 
@@ -155,6 +158,7 @@ fn a1_ten_workspaces_do_not_interfere() {
 /// **A2** — what `flush` covered is still there after the handle is closed and reopened.
 #[test]
 fn a2_a_flushed_change_survives_a_reopen() {
+    common::strict_gate();
     let root = TempRoot::new("a2");
     let repo = Repo::create(root.store()).expect("create");
     let workspace = repo.workspace_create("w1", "main").expect("workspace");
@@ -176,6 +180,7 @@ fn a2_a_flushed_change_survives_a_reopen() {
 /// **A3** — a commit's tree is readable after every row and overlay file about it is gone.
 #[test]
 fn a3_history_is_readable_without_any_row() {
+    common::strict_gate();
     let root = TempRoot::new("a3");
     let repo = Repo::create(root.store()).expect("create");
     let mut workspace = repo.workspace_create("w1", "main").expect("workspace");
@@ -201,6 +206,7 @@ fn a3_history_is_readable_without_any_row() {
 /// **A4** — the loser of a race keeps its work and can publish by rebinding or forcing.
 #[test]
 fn a4_a_moved_branch_is_refused_and_can_be_rebound() {
+    common::strict_gate();
     let root = TempRoot::new("a4");
     let repo = Repo::create(root.store()).expect("create");
     let base = repo.branch_head("main").expect("head");
@@ -261,6 +267,7 @@ fn a4_a_moved_branch_is_refused_and_can_be_rebound() {
 /// (§11.1's bounded wait), and the wait must stay a safety net rather than the norm.
 #[test]
 fn a5_two_publications_share_the_main_database() {
+    common::strict_gate();
     const FILES: usize = 1000;
     let root = TempRoot::new("a5");
     let repo = Arc::new(Repo::create(root.store()).expect("create"));
@@ -311,6 +318,7 @@ fn a5_two_publications_share_the_main_database() {
 /// half-applied rename, and a rejected operation changes nothing (K3/TX1–TX3).
 #[test]
 fn a6_operations_in_one_workspace_are_linearizable() {
+    common::strict_gate();
     let root = TempRoot::new("a6");
     let repo = Repo::create(root.store()).expect("create");
     let workspace = repo.workspace_create("w1", "main").expect("workspace");
@@ -334,6 +342,7 @@ fn a6_operations_in_one_workspace_are_linearizable() {
 /// never appears in a snapshot, and a bound-away subtree disappears with its name.
 #[test]
 fn a7_an_unreachable_inode_never_reaches_a_snapshot() {
+    common::strict_gate();
     let root = TempRoot::new("a7");
     let repo = Repo::create(root.store()).expect("create");
     let mut workspace = repo.workspace_create("w1", "main").expect("workspace");
@@ -372,6 +381,7 @@ fn a7_an_unreachable_inode_never_reaches_a_snapshot() {
 /// **A8** — a store from schema v1/v2 is refused, and `create` does not write over it.
 #[test]
 fn a8_an_older_schema_is_refused_even_with_create() {
+    common::strict_gate();
     let root = TempRoot::new("a8");
     // A real cas-store with the P1 namespace tables on top: the shape a v2 store has.
     drop(cas_store::Store::open(root.store(), cas_store::OpenMode::Create).expect("store"));

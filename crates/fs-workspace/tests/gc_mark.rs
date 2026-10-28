@@ -7,6 +7,8 @@
 //!   reachable (otherwise "every declared root is reachable" passes on a run that visited nothing);
 //! - a decode failure **aborts**, it does not skip the subtree: skipping is deleting.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -118,6 +120,7 @@ fn head_root(repo: &Repo) -> ObjectId {
 
 #[test]
 fn mark_reaches_the_file_content_of_a_commit() {
+    common::strict_gate();
     let (root, repo) = repository("content");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"the bytes that must survive");
@@ -180,6 +183,7 @@ fn mark_reaches_the_file_content_of_a_commit() {
 /// would answer yes on a walk that marked nothing at all.
 #[test]
 fn a_root_that_references_nothing_is_still_marked() {
+    common::strict_gate();
     let (root, repo) = repository("empty-root");
     let store = store_of(&root);
     let leaf = store
@@ -215,6 +219,7 @@ fn a_root_that_references_nothing_is_still_marked() {
 #[test]
 #[cfg(feature = "gc-test-hooks")]
 fn a_skipped_root_marks_nothing_and_its_control_marks_something() {
+    common::strict_gate();
     let (root, repo) = repository("skip");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"content that only a walked root reaches");
@@ -269,6 +274,7 @@ fn a_skipped_root_marks_nothing_and_its_control_marks_something() {
 /// always failed would not pass.
 #[test]
 fn a_damaged_object_aborts_the_mark_and_changes_nothing() {
+    common::strict_gate();
     let (root, repo) = repository("damaged");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"still here");
@@ -325,6 +331,7 @@ fn a_damaged_object_aborts_the_mark_and_changes_nothing() {
 /// and removing it takes its companions with it.
 #[test]
 fn the_marker_lives_beside_the_store_and_is_removed_cleanly() {
+    common::strict_gate();
     let (root, repo) = repository("marker-place");
     let declared = roots_of(&repo);
     let store = store_of(&root);
@@ -360,6 +367,7 @@ fn the_marker_lives_beside_the_store_and_is_removed_cleanly() {
 /// A marker left behind by a crashed run must not be read as this run's marks.
 #[test]
 fn a_stale_marker_is_replaced_not_inherited() {
+    common::strict_gate();
     let (root, repo) = repository("stale");
     let declared = roots_of(&repo);
     let store = store_of(&root);
@@ -395,6 +403,7 @@ fn a_stale_marker_is_replaced_not_inherited() {
 /// holds the store's lock, which is the only way marking can work during an offline sweep.
 #[test]
 fn the_maintenance_source_answers_what_the_store_answers() {
+    common::strict_gate();
     let (root, repo) = repository("source");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"bytes that both sources must read");

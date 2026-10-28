@@ -8,6 +8,8 @@
 //! The drop is the **real** `Repo::snapshot_drop`, not a hand-written `DELETE`: a row deleted by the test
 //! proves the collector reacts to a missing row, not that dropping a snapshot is safe.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -80,6 +82,7 @@ fn reachable_from(store: &Store, root: ObjectId) -> Vec<ObjectId> {
 /// - K5c: drop the other → the shared object is now unreachable, and the next collection frees it.
 #[test]
 fn a_shared_object_survives_dropping_one_root_and_is_freed_once_both_are_gone() {
+    common::strict_gate();
     let root = TempRoot::new("shared");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");

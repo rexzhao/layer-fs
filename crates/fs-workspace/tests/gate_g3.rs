@@ -6,6 +6,8 @@
 //! The write is parked **inside the gate** (`pause_point("inside-write")` runs after the read lock is taken), so the ordering is a fact the test arranges, not
 //! a race it hopes for.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,6 +40,7 @@ fn wait_for(path: &std::path::Path, what: &str) {
 
 #[test]
 fn a_write_that_started_before_the_commit_is_included() {
+    common::strict_gate();
     let directory = temp_dir("g3");
     let repo = Arc::new(Repo::open(directory.join("store"), true).expect("repo"));
     repo.init().expect("init");

@@ -6,6 +6,8 @@
 //! (A file test earlier reported this as "old name remains" while its own subsequent `exists()` calls contradicted the file-system log; that probe was
 //! wrong about the mechanism, this one is what makes the absence of the fix fail.)
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -31,6 +33,7 @@ fn volume() -> VolumeInfo {
 
 #[test]
 fn a_rename_through_a_mounted_volume_moves_the_name() {
+    common::strict_gate();
     let library = default_library();
     if let Err(LoadError::NotFound { path }) = resolve_library(&library) {
         eprintln!("SKIP: no winfsp at {}", path.display());

@@ -9,6 +9,8 @@
 //! 2. the handle's `FileIndex` (what the OS calls the identity) is **unchanged**;
 //! 3. writing through it again works, makes the workspace dirty, and a **second** commit publishes.
 
+mod common;
+
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -75,6 +77,7 @@ fn file_index(handle: &std::fs::File) -> u64 {
 
 #[test]
 fn a_handle_keeps_its_identity_across_a_commit() {
+    common::strict_gate();
     let mount_point = std::env::var_os("LAYER_FS_CLI_MNT_A17")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("I:"));

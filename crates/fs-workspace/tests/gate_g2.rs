@@ -6,6 +6,8 @@
 //!
 //! One test file, one process: `LAYERFS_PAUSE_AT` is a process-level variable, and a second pause in the same process would confuse which commit is parked.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,6 +41,7 @@ fn wait_for(path: &std::path::Path, what: &str) {
 
 #[test]
 fn a_read_during_a_commit_waits() {
+    common::strict_gate();
     let directory = temp_dir("g1");
     let repo = Arc::new(Repo::open(directory.join("store"), true).expect("repo"));
     repo.init().expect("init");

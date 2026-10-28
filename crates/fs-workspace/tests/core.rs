@@ -3,6 +3,8 @@
 //! Each test names the acceptance item it covers. They drive `fs_namespace::Rules` and the
 //! overlay's content API directly — `fs-api` is P2a-7 and is deliberately not involved.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -99,6 +101,7 @@ fn names(workspace: &Workspace, dir: &str) -> Vec<String> {
 /// API would work only on the thread that opened it.
 #[test]
 fn the_handles_are_send_and_sync() {
+    common::strict_gate();
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<fs_workspace::Repo>();
     assert_send_sync::<fs_workspace::Workspace>();
@@ -107,6 +110,7 @@ fn the_handles_are_send_and_sync() {
 /// **§18.1** — `init` publishes an empty tree and records the first commit.
 #[test]
 fn init_creates_the_default_branch_and_one_commit() {
+    common::strict_gate();
     let (_root, repo) = repository("init");
     let head = repo.branch_head("main").expect("head");
     let info = repo.commit_info(&head).expect("commit");
@@ -123,6 +127,7 @@ fn init_creates_the_default_branch_and_one_commit() {
 /// **§18.9 / lifecycle matrix** — create, open, list, close, discard.
 #[test]
 fn workspace_lifecycle_matrix() {
+    common::strict_gate();
     let (_root, repo) = repository("lifecycle");
 
     let workspace = repo.workspace_create("w1", "main").expect("create");
@@ -165,6 +170,7 @@ fn workspace_lifecycle_matrix() {
 /// **Lifecycle failure paths** — every "not there / already there" shape is typed.
 #[test]
 fn lifecycle_failures_are_typed() {
+    common::strict_gate();
     let (_root, repo) = repository("lifecycle-fail");
 
     assert!(matches!(
@@ -203,6 +209,7 @@ fn lifecycle_failures_are_typed() {
 /// **§18.8** — a commit with no change is refused, and nothing moves.
 #[test]
 fn nothing_to_commit_when_the_view_equals_the_base() {
+    common::strict_gate();
     let (_root, repo) = repository("nothing");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     let before = repo.branch_head("main").expect("head");
@@ -220,6 +227,7 @@ fn nothing_to_commit_when_the_view_equals_the_base() {
 /// token would be meaningless.
 #[test]
 fn two_snapshots_without_change_produce_the_same_root() {
+    common::strict_gate();
     let (_root, repo) = repository("idempotent");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     Rules::new(workspace.store())
@@ -242,6 +250,7 @@ fn two_snapshots_without_change_produce_the_same_root() {
 /// **§18.5** — a commit moves the branch, and the tree stays readable afterwards.
 #[test]
 fn commit_moves_the_branch_and_grows_history() {
+    common::strict_gate();
     let (_root, repo) = repository("commit");
     let initial = repo.branch_head("main").expect("head");
     let workspace = repo.workspace_create("w1", "main").expect("create");
@@ -272,6 +281,7 @@ fn commit_moves_the_branch_and_grows_history() {
 /// **§18.5 / I1** — a published tree is readable with no workspace and no rows left.
 #[test]
 fn a_committed_tree_is_readable_after_the_workspace_is_gone() {
+    common::strict_gate();
     let (_root, repo) = repository("zero-table");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/kept", b"payload");
@@ -303,6 +313,7 @@ fn a_committed_tree_is_readable_after_the_workspace_is_gone() {
 /// `--force` records the displaced head.
 #[test]
 fn branch_moved_is_typed_and_force_records_the_displaced_head() {
+    common::strict_gate();
     let (_root, repo) = repository("f1");
     let base = repo.branch_head("main").expect("head");
     let first = repo.workspace_create("w1", "main").expect("create");
@@ -360,6 +371,7 @@ fn branch_moved_is_typed_and_force_records_the_displaced_head() {
 /// **§10.3 出路 1** — after a conflict, rebind onto a branch created from the base commit.
 #[test]
 fn rebind_lets_the_loser_publish_on_another_branch() {
+    common::strict_gate();
     let (_root, repo) = repository("rebind");
     let base = repo.branch_head("main").expect("head");
     let first = repo.workspace_create("w1", "main").expect("create");
@@ -387,6 +399,7 @@ fn rebind_lets_the_loser_publish_on_another_branch() {
 /// **§18.7** — reset moves the head without growing history; revert grows it.
 #[test]
 fn reset_moves_and_revert_grows() {
+    common::strict_gate();
     let (_root, repo) = repository("history");
     let initial = repo.branch_head("main").expect("head");
     let workspace = repo.workspace_create("w1", "main").expect("create");
@@ -429,6 +442,7 @@ fn reset_moves_and_revert_grows() {
 /// **§10.2 `restore`** — the view changes, the base commit does not.
 #[test]
 fn restore_changes_the_view_but_not_the_base_commit() {
+    common::strict_gate();
     let (_root, repo) = repository("restore");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"one");
@@ -466,6 +480,7 @@ fn restore_changes_the_view_but_not_the_base_commit() {
 /// path must give up after roughly the configured wait rather than hang or fail instantly.
 #[test]
 fn a_held_main_database_lock_ends_in_a_typed_busy() {
+    common::strict_gate();
     let (_root, repo) = repository("busy");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"x");
@@ -519,6 +534,7 @@ fn a_held_main_database_lock_ends_in_a_typed_busy() {
 /// **§9.3 `creating` recovery** — a workspace row left in `creating` is rebuilt on open.
 #[test]
 fn a_workspace_stuck_in_creating_is_rebuilt_when_opened() {
+    common::strict_gate();
     let (_root, repo) = repository("creating");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     let id = workspace.id().to_owned();
@@ -556,6 +572,7 @@ fn a_workspace_stuck_in_creating_is_rebuilt_when_opened() {
 /// **§9.3 orphan sweep** — a workspace directory with no row is removed on open.
 #[test]
 fn an_orphan_workspace_directory_is_swept_on_open() {
+    common::strict_gate();
     let (root, repo) = repository("sweep");
     let orphan = repo.workspace_dir("deadbeef");
     std::fs::create_dir_all(&orphan).expect("orphan dir");
@@ -570,6 +587,7 @@ fn an_orphan_workspace_directory_is_swept_on_open() {
 /// **§6** — opening a store that has no workspace tables is a typed error, not a panic.
 #[test]
 fn a_store_without_workspace_tables_reports_not_initialised() {
+    common::strict_gate();
     let root = TempRoot::new("not-initialised");
     let store = Store::open(root.join("store"), OpenMode::Create).expect("store");
     drop(store);
@@ -582,6 +600,7 @@ fn a_store_without_workspace_tables_reports_not_initialised() {
 /// **§6** — each workspace reserves its own segment of the shared scope.
 #[test]
 fn every_workspace_reserves_a_serial_segment() {
+    common::strict_gate();
     let (_root, repo) = repository("serials");
     let scope = repo.branches().expect("branches")[0].scope_id.clone();
     let read_next = |_label: &str| -> i64 {
@@ -613,6 +632,7 @@ fn every_workspace_reserves_a_serial_segment() {
 /// **K3 within one workspace** — writes through the tree backend are transactional.
 #[test]
 fn a_rejected_rule_leaves_the_view_unchanged() {
+    common::strict_gate();
     let (_root, repo) = repository("atomic");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     Rules::new(workspace.store())
@@ -649,6 +669,7 @@ fn a_rejected_rule_leaves_the_view_unchanged() {
 /// "B-1": the backlog's B-1 is Seal/Compact, and reusing that number would point a reader at the wrong item.)
 #[test]
 fn a_blocked_cas_index_also_waits_boundedly() {
+    common::strict_gate();
     let (_root, repo) = repository("cas-busy");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"x");
@@ -723,6 +744,7 @@ fn fill(workspace: &Workspace, prefix: char, count: usize) {
 /// discipline: fsync the chunk first, then one short index transaction.
 #[test]
 fn two_workspaces_publish_a_thousand_files_concurrently() {
+    common::strict_gate();
     const FILES: usize = 1000;
 
     let (_root, repo) = repository("concurrent");
@@ -771,6 +793,7 @@ fn two_workspaces_publish_a_thousand_files_concurrently() {
 /// P2a-8 flush benchmark at N=10 000.
 #[test]
 fn a_workspace_can_create_more_files_than_one_serial_segment() {
+    common::strict_gate();
     let (_root, repo) = repository("serial-growth");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     // Two and a half segments: past the first reservation, and past one top-up.
@@ -810,6 +833,7 @@ fn a_workspace_can_create_more_files_than_one_serial_segment() {
 /// true if the transaction asks for the write lock up front.
 #[test]
 fn a_publication_waits_for_the_write_lane_before_reading_the_head() {
+    common::strict_gate();
     let (_root, repo) = repository("immediate");
     let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"x");

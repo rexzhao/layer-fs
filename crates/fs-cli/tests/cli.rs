@@ -4,6 +4,8 @@
 //! parsing, the current-workspace file, exit codes, and the fact that every command opens
 //! and closes what it needs.
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -208,6 +210,7 @@ impl Drop for TempRoot {
 /// **Acceptance: the whole command set in one round trip.**
 #[test]
 fn the_full_command_sequence_round_trips() {
+    common::strict_gate();
     let root = TempRoot::new("round-trip");
     std::fs::write(root.file("a.txt"), b"hello from a").expect("host file");
     std::fs::write(root.file("b.txt"), b"second file").expect("host file");
@@ -289,6 +292,7 @@ fn the_full_command_sequence_round_trips() {
 /// **Failure paths** — every "you cannot do that" is a non-zero exit with a message that names the way out.
 #[test]
 fn failures_are_reported() {
+    common::strict_gate();
     let root = TempRoot::new("failures");
     root.init();
 
@@ -319,6 +323,7 @@ fn failures_are_reported() {
 /// **A dirty workspace needs `--discard`** before `restore` replaces it.
 #[test]
 fn restore_refuses_to_drop_uncommitted_work() {
+    common::strict_gate();
     let root = TempRoot::new("restore");
     root.init();
     root.ok(&["checkout", "main"]);
@@ -352,6 +357,7 @@ fn restore_refuses_to_drop_uncommitted_work() {
 /// A branch created from a commit inherits its tree.
 #[test]
 fn a_branch_can_start_from_a_commit() {
+    common::strict_gate();
     let root = TempRoot::new("from-commit");
     root.init();
     root.ok(&["checkout", "main"]);
@@ -371,6 +377,7 @@ fn a_branch_can_start_from_a_commit() {
 /// `gc` end to end: a dry run decides but changes nothing, and a real run collects.
 #[test]
 fn gc_dry_run_and_real_run_are_different_commands() {
+    common::strict_gate();
     let root = TempRoot::new("gc");
     root.init();
     root.ok(&["checkout", "main"]);
@@ -395,6 +402,7 @@ fn gc_dry_run_and_real_run_are_different_commands() {
 /// exactly why the collector has to validate it at run time instead of trusting a constant.
 #[test]
 fn an_impossible_repack_threshold_is_reported_and_not_acted_on() {
+    common::strict_gate();
     let root = TempRoot::new("gc-threshold");
     root.init();
     root.ok(&["checkout", "main"]);
@@ -424,6 +432,7 @@ fn an_impossible_repack_threshold_is_reported_and_not_acted_on() {
 /// roots stay byte-identical (§25.C-8).
 #[test]
 fn dropping_a_snapshot_frees_only_what_nothing_else_reaches() {
+    common::strict_gate();
     let root = TempRoot::new("snapshot-drop");
     root.init();
     root.ok(&["checkout", "main"]);
@@ -473,6 +482,7 @@ fn dropping_a_snapshot_frees_only_what_nothing_else_reaches() {
 /// survive a collection (§25.C-9).
 #[test]
 fn deleting_a_branch_keeps_its_objects_alive() {
+    common::strict_gate();
     let root = TempRoot::new("branch-delete");
     root.init();
     root.ok(&["checkout", "main"]);
@@ -513,6 +523,7 @@ fn deleting_a_branch_keeps_its_objects_alive() {
 /// control, without which "verify failed" could just mean "verify always fails here".
 #[test]
 fn verify_deep_checks_snapshot_roots() {
+    common::strict_gate();
     let root = TempRoot::new("verify-snapshot");
     root.init();
     root.ok(&["checkout", "main"]);

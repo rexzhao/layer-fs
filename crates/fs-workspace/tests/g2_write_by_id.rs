@@ -7,6 +7,8 @@
 //! write landed on whatever is at the old path now". A test that only wrote by id without a rename in between would pass
 //! for an implementation that resolved the path internally.
 
+mod common;
+
 use std::sync::Arc;
 
 use fs_namespace::{FileId, Path, Rules};
@@ -61,6 +63,7 @@ fn seeded(fixture: &Fixture, name: &str, content: &[u8]) -> FileId {
 /// A write by id lands on **that object**, even after its name moved — and the old path is not written to.
 #[test]
 fn a_write_by_id_follows_the_object_across_a_rename() {
+    common::strict_gate();
     let fixture = fixture("write");
     let id = seeded(&fixture, "/a", b"original");
     let rules = Rules::new(fixture.workspace.store());
@@ -101,6 +104,7 @@ fn a_write_by_id_follows_the_object_across_a_rename() {
 /// `truncate_id` follows the object too: the intruder at the old path keeps its size.
 #[test]
 fn a_truncate_by_id_follows_the_object_across_a_rename() {
+    common::strict_gate();
     let fixture = fixture("truncate");
     let id = seeded(&fixture, "/a", b"original");
     let rules = Rules::new(fixture.workspace.store());

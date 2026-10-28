@@ -4,6 +4,8 @@
 //! `set_times`/`set_attributes`, and the public accessor itself); both were closed in step 2. A criterion is what keeps them closed, because the next person to
 //! need "just one field" will find the escape hatch attractive.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 fn workspace_root() -> PathBuf {
@@ -49,6 +51,7 @@ fn collect(directory: &Path, out: &mut Vec<(PathBuf, String)>) {
 /// taken the gate first.
 #[test]
 fn nothing_outside_the_workspace_crate_reaches_the_overlay() {
+    common::strict_gate();
     let mut offenders = Vec::new();
     for (path, text) in source_files() {
         if path
@@ -77,6 +80,7 @@ fn nothing_outside_the_workspace_crate_reaches_the_overlay() {
 /// **G5 (the other half)**: the accessor inside the crate is **not** `pub`.
 #[test]
 fn the_accessor_inside_the_crate_is_crate_private() {
+    common::strict_gate();
     let path = workspace_root().join("crates/fs-workspace/src/workspace.rs");
     let text = std::fs::read_to_string(&path).expect("workspace.rs");
     let mut public = Vec::new();

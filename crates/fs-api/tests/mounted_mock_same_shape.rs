@@ -3,6 +3,8 @@
 //! Paired with `mounted_real_backend.rs`, which runs the identical sequence over `ApiBackend`: two readings of the same question, so "the mount works"
 //! is not one assumption. Both return `Err` on the first failure — a probe that answers `Ok(())` unconditionally measures nothing (434/496).
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use fs_winfsp::abi::VolumeInfo;
@@ -40,6 +42,7 @@ fn root_of(mount_point: &Path) -> PathBuf {
 
 #[test]
 fn windows_can_write_and_list_through_a_mock_mount() {
+    common::strict_gate();
     let library = default_library();
     if let Err(LoadError::NotFound { path }) = resolve_library(&library) {
         eprintln!("SKIP: no winfsp at {}", path.display());

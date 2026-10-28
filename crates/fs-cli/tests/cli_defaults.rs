@@ -1,6 +1,8 @@
 //! The three conveniences B-24 needed to be usable: `init` leaves a workspace behind, `mount` takes the store as a global option, and a taken drive
 //! letter says what to do about it.
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -36,6 +38,7 @@ fn temp_dir(label: &str) -> PathBuf {
 /// The criterion this replaces (`init` then `put`/`ls` without a checkout) is void: those commands no longer exist — the ADR's own wording for this row.
 #[test]
 fn the_removed_file_commands_say_so_and_init_leaves_no_current() {
+    common::strict_gate();
     let store = temp_dir("init");
     let init = Command::new(binary())
         .arg("init")
@@ -82,6 +85,7 @@ fn the_removed_file_commands_say_so_and_init_leaves_no_current() {
 /// **A0**: with no `--workspace`, a lifecycle command fails with the ADR's constant and exit code 2 — and nothing else.
 #[test]
 fn a_lifecycle_command_without_a_workspace_says_so() {
+    common::strict_gate();
     let store = temp_dir("no-workspace");
     Command::new(binary())
         .arg("init")
@@ -121,6 +125,7 @@ fn a_lifecycle_command_without_a_workspace_says_so() {
 /// Section 3: a drive letter that is already mounted must produce a message that names the way out.
 #[test]
 fn a_taken_drive_letter_says_what_to_do() {
+    common::strict_gate();
     let store = temp_dir("collision");
     Command::new(binary())
         .arg("init")
@@ -206,6 +211,7 @@ fn a_taken_drive_letter_says_what_to_do() {
 /// "no workspace main".
 #[test]
 fn the_branch_verbs_work_without_the_workspace() {
+    common::strict_gate();
     let store = temp_dir("branch-verbs");
     Command::new(binary())
         .arg("init")
@@ -268,6 +274,7 @@ fn the_branch_verbs_work_without_the_workspace() {
 /// **A2** (ADR-010 §13): `mount` without `--workspace` refuses, says which option is missing, and mounts nothing.
 #[test]
 fn mount_without_a_workspace_refuses() {
+    common::strict_gate();
     let store = temp_dir("mount-no-workspace");
     Command::new(binary())
         .arg("init")
@@ -308,6 +315,7 @@ fn mount_without_a_workspace_refuses() {
 /// gone afterwards.
 #[test]
 fn a_console_break_unmounts_orderly() {
+    common::strict_gate();
     use std::os::windows::process::CommandExt;
 
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;

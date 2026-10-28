@@ -17,6 +17,8 @@
 //! so it is kept as the fast regression (M6). The real prefix behaviour needs a subprocess;
 //! that lives in `crash_child` below.
 
+mod common;
+
 #[path = "reference/support.rs"]
 mod reference;
 
@@ -43,6 +45,7 @@ const COMMIT_EVERY: usize = 23;
 /// (M7), and each `commit` with no change must be refused as `NothingToCommit`.
 #[test]
 fn transitions_do_not_change_the_view_and_commits_are_readable() {
+    common::strict_gate();
     for seed in 0..12u64 {
         run_transitions(seed, STEPS);
     }
@@ -53,6 +56,7 @@ fn transitions_do_not_change_the_view_and_commits_are_readable() {
 /// accept it as a prefix.
 #[test]
 fn an_in_process_crash_recovers_to_a_prefix() {
+    common::strict_gate();
     for seed in 100..106u64 {
         run_with_crashes(seed, STEPS, CrashMode::InProcess);
     }
@@ -63,6 +67,7 @@ fn an_in_process_crash_recovers_to_a_prefix() {
 /// flush. This exercises the M4 assertion rather than the `k = n` shortcut.
 #[test]
 fn a_crash_after_a_flush_recovers_to_a_prefix_at_or_after_it() {
+    common::strict_gate();
     for seed in 200..206u64 {
         run_with_crashes(seed, STEPS, CrashMode::AfterFlush);
     }
@@ -291,6 +296,7 @@ fn replay_seed() -> Option<u64> {
 /// reported as `seed=… step=…` can be reproduced on its own.
 #[test]
 fn a_single_seed_can_be_replayed() {
+    common::strict_gate();
     let Some(seed) = replay_seed() else {
         return;
     };

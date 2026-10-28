@@ -8,6 +8,8 @@
 //! verified**; these tests do not rely on it, because they only ever assert what the core does. The consequence for a
 //! future L2 measurement is recorded in the card, not here.
 
+mod common;
+
 use std::sync::Arc;
 
 use fs_namespace::{FileId, NamespaceError, Path, RenameOutcome, Rules};
@@ -121,6 +123,7 @@ fn create_file(fixture: &Fixture, path: &str, content: &[u8]) -> FileId {
 /// renamed *onto* a name that happened to already exist with those bytes.
 #[test]
 fn replace_true_moves_the_content_and_frees_the_source_name() {
+    common::strict_gate();
     let fixture = fixture("c1");
     let source = create_file(&fixture, "/src", b"source");
     let target = create_file(&fixture, "/dst", b"target");
@@ -159,6 +162,7 @@ fn replace_true_moves_the_content_and_frees_the_source_name() {
 /// parent's enumeration and the two inodes are identical before and after.
 #[test]
 fn replace_false_collision_changes_nothing() {
+    common::strict_gate();
     let fixture = fixture("c2");
     let source = create_file(&fixture, "/src", b"source");
     let target = create_file(&fixture, "/dst", b"target");
@@ -191,6 +195,7 @@ fn replace_false_collision_changes_nothing() {
 /// bytes are the **raw** destination name (case preserved).
 #[test]
 fn the_binding_can_be_handed_to_remove_at() {
+    common::strict_gate();
     let fixture = fixture("c4");
     let _source = create_file(&fixture, "/src", b"payload");
     rules(&fixture).mkdir(&p("/dir")).expect("mkdir");
@@ -227,6 +232,7 @@ fn the_binding_can_be_handed_to_remove_at() {
 /// by id X" and retires X, which here *is* the inode being moved.
 #[test]
 fn replaced_is_none_unless_a_different_inode_lost_the_name() {
+    common::strict_gate();
     let fixture = fixture("c5");
     let file = create_file(&fixture, "/A", b"body");
 
@@ -281,6 +287,7 @@ fn replaced_is_none_unless_a_different_inode_lost_the_name() {
 /// non-empty one is refused with no outcome and no change.
 #[test]
 fn directory_replace_respects_emptiness_and_keeps_subtree_ids() {
+    common::strict_gate();
     let fixture = fixture("c6");
     let rules = rules(&fixture);
     rules.mkdir(&p("/from")).expect("mkdir from");
@@ -330,6 +337,7 @@ fn directory_replace_respects_emptiness_and_keeps_subtree_ids() {
 /// a replacement with `replace = true`.
 #[test]
 fn two_spellings_of_one_name_cannot_coexist_and_rename_replaces_ordinals() {
+    common::strict_gate();
     let fixture = fixture("c7");
 
     // **Rewritten (480).** The original premise was that `/A` and `/a` can be two different inodes, and it then asked what a case-only rename
@@ -376,6 +384,7 @@ fn two_spellings_of_one_name_cannot_coexist_and_rename_replaces_ordinals() {
 /// own subtree, and the `replace = false` collision. The store fingerprint is part of each assertion.
 #[test]
 fn refusals_are_typed_and_leave_no_trace() {
+    common::strict_gate();
     let fixture = fixture("c8");
     let rules = rules(&fixture);
     rules.mkdir(&p("/dir")).expect("mkdir");
@@ -419,6 +428,7 @@ fn refusals_are_typed_and_leave_no_trace() {
 /// each round asserts the pair (winners == 1, losers == 1) and the final view.
 #[test]
 fn concurrent_replace_false_renames_have_exactly_one_winner() {
+    common::strict_gate();
     let fixture = fixture("c9");
     const ROUNDS: usize = 20;
     let mut wins = 0usize;
