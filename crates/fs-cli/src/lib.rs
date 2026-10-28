@@ -131,6 +131,32 @@ pub fn record_name(mount_point: &std::path::Path) -> String {
     }
 }
 
+#[must_use]
+pub fn restore_refusal(files: usize, dirs: usize) -> String {
+    let files = if files == 1 {
+        "1 file".to_owned()
+    } else {
+        format!("{files} files")
+    };
+    if dirs == 0 {
+        format!("restore: {files} still open; close them and try again — nothing was changed")
+    } else {
+        format!(
+            "restore: {files} still open ({dirs} directory handle(s) do not block); close the files and try again — nothing was changed"
+        )
+    }
+}
+
+/// Printed after a `restore` / `switch` that left directory handles pointing at the old view.
+#[must_use]
+pub fn dirs_invalidated(dirs: usize) -> String {
+    let handles = if dirs == 1 {
+        "1 directory handle".to_owned()
+    } else {
+        format!("{dirs} directory handles")
+    };
+    format!("{handles} (a shell's cwd or an Explorer window) now point at the old view; run `cd .` in them to refresh")
+}
 #[cfg(test)]
 mod tests {
     use super::{

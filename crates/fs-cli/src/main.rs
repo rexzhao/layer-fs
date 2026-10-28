@@ -298,6 +298,61 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if command == "restore" {
+        if let Some(here) = mountcmd::mount_of_cwd() {
+            if !here.pipe.is_empty() {
+                // `restore <commit> [--discard]` — the arguments travel as fields, not as a command line, because the mount answers an **outcome** (restored /
+                // refused with counts) and the CLI's job is to print it, not to re-derive it.
+                let commit = arguments
+                    .iter()
+                    .find(|argument| !argument.starts_with('-'))
+                    .cloned()
+                    .unwrap_or_default();
+                let discard = arguments.iter().any(|argument| argument == "--discard");
+                let request = fs_cli::pipe::Request {
+                    v: fs_cli::pipe::PROTOCOL,
+                    op: "restore".to_owned(),
+                    args: serde_json::json!({"commit": commit, "discard": discard}),
+                };
+                return match fs_cli::pipe_win::call(
+                    &here.pipe,
+                    &request,
+                    fs_cli::pipe_win::CONNECT_WAIT_MS,
+                ) {
+                    Ok(fs_cli::pipe::Response::Failed {
+                        kind,
+                        detail,
+                        fields,
+                    }) if kind == "restored" => {
+                        let dirs = fields
+                            .get("dirs_invalidated")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        println!("restored {} to {detail}", here.workspace);
+                        if dirs > 0 {
+                            // **The count is part of the answer**: a shell whose cwd sits inside the mount has a handle that just went stale, and saying so is
+                            // the difference between "it worked" and "it worked and your next `dir` will complain until you `cd .`".
+                            println!("{}", fs_cli::dirs_invalidated(dirs as usize));
+                        }
+                        Ok(())
+                    }
+                    Ok(fs_cli::pipe::Response::RestoreRefused { files, dirs }) => {
+                        Err(fs_cli::Failure::in_use(fs_cli::restore_refusal(files, dirs)).into())
+                    }
+                    Ok(fs_cli::pipe::Response::Failed { kind, detail, .. }) => {
+                        Err(format!("the mount refused `restore` ({kind}): {detail}").into())
+                    }
+                    Ok(other) => Err(format!("the mount answered {other:?}").into()),
+                    Err(error) => Err(fs_cli::Failure::in_use(format!(
+                        "the mount at {} is not answering ({error})",
+                        here.mount_point.display()
+                    ))
+                    .into()),
+                };
+            }
+        }
+    }
+
     if command == "status" {
         if let Some(here) = mountcmd::mount_of_cwd() {
             if !here.pipe.is_empty() {

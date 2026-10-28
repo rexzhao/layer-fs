@@ -83,6 +83,17 @@ pub enum Response {
         /// How many were open when the wait expired.
         handles: usize,
     },
+    /// A remote `restore` was refused because **file** handles were open (D8 = B): the objects under them could vanish.
+    ///
+    /// Its own variant rather than `HandlesOpen` because the two answer different questions: `unmount` needs **every** handle closed (the volume goes away),
+    /// `restore` draws the line at files and lets directory handles through. Folding them into one shape would let a reader assume the numbers mean the same
+    /// thing.
+    RestoreRefused {
+        /// Open file handles — the blocking kind.
+        files: usize,
+        /// Open directory handles — reported so the message can say the view will be stale, not blocking.
+        dirs: usize,
+    },
     /// The operation itself failed.
     Failed {
         /// **Which kind of failure** — a script can branch on this, where a message can only be read (ADR-010 §10.4).
@@ -108,6 +119,11 @@ pub trait Context {
     fn commit(&self, message: &str, force: bool) -> Response;
     /// Takes a snapshot, for `snapshot`.
     fn snapshot(&self) -> Response;
+    /// Moves the mount's workspace back to `commit`, for `restore` (S3 card §4).
+    ///
+    /// Goes through the mount because the mount is the only thing that can (a) quiesce its own opens and (b) hold the publication gate: a second handle opened
+    /// by the CLI would be a second view of the same overlay, which is exactly what the release lock exists to prevent.
+    fn restore(&self, commit: &str, discard: bool) -> Response;
     /// Whether the stop sequence has begun.
     fn shutting_down(&self) -> bool;
 }
@@ -155,6 +171,19 @@ pub fn dispatch(frame: &[u8], context: &impl Context) -> Response {
             context.commit(message, force)
         }
         "snapshot" => context.snapshot(),
+        "restore" => {
+            let commit = request
+                .args
+                .get("commit")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let discard = request
+                .args
+                .get("discard")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            context.restore(commit, discard)
+        }
         // `unmount` is answered by the server loop itself (it has to stop the mount), so reaching here means the loop forgot to intercept it.
         "unmount" => Response::BadRequest {
             detail: "unmount is handled by the server, not the dispatcher".to_owned(),
@@ -220,6 +249,15 @@ mod tests {
             Response::Failed {
                 kind: "snapshotted".to_owned(),
                 detail: String::new(),
+                fields: serde_json::json!({}),
+            }
+        }
+
+        fn restore(&self, commit: &str, discard: bool) -> Response {
+            // Identifiable for the same reason as `commit`: a dispatch test must see that **both** arguments arrived, not merely that something answered.
+            Response::Failed {
+                kind: "restored".to_owned(),
+                detail: format!("{commit}|{discard}"),
                 fields: serde_json::json!({}),
             }
         }

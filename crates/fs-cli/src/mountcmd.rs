@@ -716,6 +716,53 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                 }
             }
 
+            fn restore(&self, commit: &str, discard: bool) -> fs_cli::pipe::Response {
+                // **Admission first, then the publication gate** (S3 §3.2): the mount stops new opens, waits for the ones in flight, and only then decides. A
+                // restore that ran before this would leave a callback that had just resolved an old path about to register a handle on a vanished object.
+                const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+                let Some(adapter) = self.0.adapter.get() else {
+                    return fs_cli::pipe::Response::Failed {
+                        kind: "restore".to_owned(),
+                        detail: "the mount is not serving yet".to_owned(),
+                        fields: serde_json::json!({}),
+                    };
+                };
+                match adapter.quiesce(fs_winfsp::admission::QuiesceKind::Restore, WAIT) {
+                    fs_winfsp::admission::Quiesce::HandlesOpen { files, dirs } => {
+                        // **Nothing moved**: the refusal happens before `restore` is called, so the view is exactly what it was.
+                        fs_cli::pipe::Response::RestoreRefused { files, dirs }
+                    }
+                    fs_winfsp::admission::Quiesce::TimedOut { in_flight } => {
+                        fs_cli::pipe::Response::Failed {
+                            kind: "restore".to_owned(),
+                            detail: format!(
+                                "{in_flight} open(s) did not finish within {}s",
+                                WAIT.as_secs()
+                            ),
+                            fields: serde_json::json!({"in_flight": in_flight}),
+                        }
+                    }
+                    fs_winfsp::admission::Quiesce::Quiesced(guard) => {
+                        let dirs = adapter.open_handle_kinds().1;
+                        let outcome = self.0.workspace_handle.restore(commit, discard);
+                        // Released whether the restore worked or not: a guard dropped only on success would leave the mount refusing opens after a failure.
+                        drop(guard);
+                        match outcome {
+                            Ok(()) => fs_cli::pipe::Response::Failed {
+                                kind: "restored".to_owned(),
+                                detail: commit.to_owned(),
+                                fields: serde_json::json!({"commit": commit, "dirs_invalidated": dirs}),
+                            },
+                            Err(error) => fs_cli::pipe::Response::Failed {
+                                kind: "restore".to_owned(),
+                                detail: error.to_string(),
+                                fields: serde_json::json!({}),
+                            },
+                        }
+                    }
+                }
+            }
+
             fn shutting_down(&self) -> bool {
                 stop_requested()
             }
