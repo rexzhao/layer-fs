@@ -21,6 +21,24 @@ use crate::ops::NodeInfo;
 /// operation is not implemented, and it is distinct from any of our own failures.
 pub const NOT_IMPLEMENTED: i32 = 0xC000_0010u32 as i32;
 
+/// `STATUS_VOLUME_DISMOUNTED` — "an operation was attempted to a volume after it was dismounted" (`ntstatus.h:7047`).
+///
+/// Read from the header (Windows Kits `10.0.26100.0`), not from memory: this is the answer an arriving open gets while a `switch` is closing the mount, and a
+/// wrong code would show up as a confusing error instead of "the volume is going away".
+pub const OURS_VOLUME_DISMOUNTED: i32 = 0xC000_026Eu32 as i32;
+
+/// Takes an admission ticket for a path-entering callback, or answers the status that refuses the open.
+///
+/// The three doors that resolve a **name** (`Create`, `Open`, `GetSecurityByName`) all route through this, so "a restore/switch excludes new opens" is one
+/// rule with three callers rather than three chances to forget it. The ticket must be held for the whole callback — resolve, backend call and handle
+/// registration included — which is the window it exists to cover (S3 card §3).
+fn admit(adapter: &crate::DynAdapter) -> Result<crate::admission::Ticket<'_>, i32> {
+    adapter.admit().map_err(|refusal| match refusal {
+        // Waiting here would deadlock the unmount that is waiting for the dispatcher, so the open fails — what NTFS does while a volume is being dismounted.
+        crate::admission::Refused::Closing => OURS_VOLUME_DISMOUNTED,
+    })
+}
+
 /// The `FileContext` this frontend hands to WinFsp for an open entry.
 ///
 /// Minimal on purpose: `file_id` is enough to answer `GetFileInfo`, and every extra field would be state kept in memory
@@ -840,6 +858,12 @@ unsafe fn open_like(
     let Some(adapter) = adapter else {
         OPEN_EXITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
+    };
+    // **The ticket lives for this whole callback** (S3 §3.2): a `restore` must not start while a name is being resolved into a handle, or the handle would name
+    // an object the restore just removed. Held here rather than next to the registration, because the resolve is half the window.
+    let _ticket = match admit(adapter) {
+        Ok(ticket) => ticket,
+        Err(status) => return status,
     };
     // The disposition is passed through **unchanged** for a file: whether it creates or opens is the backend's decision, and the
     // promise that `Open` does not create lives there (asserted in `open_shell_criterion`).
@@ -1813,6 +1837,12 @@ pub unsafe fn get_security_by_name_shell(
     let path = fsd_path(slice);
     let Some(adapter) = adapter else {
         return NOT_IMPLEMENTED;
+    };
+    // This door resolves a name too, and Windows asks it **before** opening — so it is the first place a `restore` would be overtaken by an open that has
+    // already decided what the name means.
+    let _ticket = match admit(adapter) {
+        Ok(ticket) => ticket,
+        Err(status) => return status,
     };
     // `Open` is the read-only disposition that **does not create** — the right question for "does this name exist".
     //

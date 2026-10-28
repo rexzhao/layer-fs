@@ -54,8 +54,6 @@ impl QuiesceKind {
 pub enum Refused {
     /// A `switch` is running: the volume is going away, and waiting would deadlock the unmount.
     Closing,
-    /// The quiesce did not see the last ticket come back in time.
-    TimedOut,
 }
 
 #[derive(Debug)]
