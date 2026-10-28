@@ -26,12 +26,40 @@ use crate::workspace::Workspace;
 /// The environment variable that names a crash-injection point (ADR-006 §9.4).
 pub(crate) const CRASH_AT: &str = "WCAS_WORKSPACE_CRASH_AT";
 
+/// The environment variable that names a **pause** point (ADR-010 S2).
+pub(crate) const PAUSE_AT: &str = "LAYERFS_PAUSE_AT";
+
 /// Aborts the process when the harness asked for a crash here.
 ///
 /// ADR-006 §9.4 lists the points where a publication can be interrupted, and each one is
 /// only meaningful if the process really dies: no unwinding, no Drop, no SQLite close.
 /// The hook is inert unless the variable names this exact point, so a normal run pays one
 /// environment lookup.
+/// **Stops inside a publication until someone lets it continue** (ADR-010 S2, G1/G2/G3).
+///
+/// With `LAYERFS_PAUSE_AT=<point>` set, the named point blocks until its release file appears (or 30 s pass). That turns "a write arriving during a commit"
+/// from a race nobody can schedule into an experiment: the test starts a commit, waits for the `.here` marker, and only then writes.
+///
+/// Deliberately **not** a crash point: crashing tests recovery, pausing tests **ordering**, and a pause that could abort would conflate the two.
+fn pause_point(name: &str) {
+    let Ok(requested) = std::env::var(PAUSE_AT) else {
+        return;
+    };
+    if requested != name {
+        return;
+    }
+    let directory = std::env::temp_dir();
+    let release = directory.join(format!("layerfs-pause-{name}.go"));
+    let marker = directory.join(format!("layerfs-pause-{name}.here"));
+    let _ = std::fs::remove_file(&release);
+    let _ = std::fs::write(&marker, std::process::id().to_string());
+    let started = std::time::Instant::now();
+    while !release.exists() && started.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let _ = std::fs::remove_file(&marker);
+}
+
 pub(crate) fn crash_point(name: &str) {
     if let Ok(requested) = std::env::var(CRASH_AT) {
         if requested == name {
@@ -103,6 +131,8 @@ impl Workspace {
         let _gate = gate.write();
         let root = self.materialise()?;
         crash_point("after-materialise");
+        // **The window G1 is about**: materialise has read the view, adopt has not moved the base yet. A write here would be in neither tree.
+        pause_point("after-materialise");
         if root == self.repo.commit_root(&self.base_commit)? {
             return Err(WorkspaceError::NothingToCommit);
         }
