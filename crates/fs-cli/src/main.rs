@@ -56,11 +56,9 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("layerfs: {error}");
-            // **Exit codes are part of the interface** (ADR-010 §8.3): a script has to tell "retry when the other process finishes" from "this command
-            // is wrong". Everything that is not a `Failure` keeps the old answer, so this changes nothing that did not opt in.
-            let code = error
-                .downcast_ref::<fs_cli::Failure>()
-                .map_or(1, |failure| failure.code);
+            // **Exit codes are part of the interface** (ADR-010 §8.3): a script has to tell "retry when the other process finishes" from "this command is
+            // wrong". Three layers can answer: a `Failure` from the CLI itself, an `ApiError` bubbled up from the core, and everything else (1).
+            let code = exit_code(&*error);
             ExitCode::from(code)
         }
     }
@@ -71,6 +69,41 @@ fn main() -> ExitCode {
 /// Replaceable (ADR-010 §5): with `cli/current` gone, every command that needs a workspace takes it from the option, and a command that needs one
 /// without having it fails with [`fs_cli::NO_WORKSPACE`] — never with a guessed name.
 static WORKSPACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The **exit code** a failure deserves (ADR-010 §8.3).
+///
+/// Collected in one function rather than sprinkled through the commands: a script's ability to tell "retry" from "fix your command" should not depend on which
+/// verb happened to translate the error. The distinction the ADR draws:
+///
+/// ```
+/// 2  usage        (a `Failure` the CLI raised itself)
+/// 3  not found    (store / workspace / branch / commit)
+/// 4  busy         (in use, waiting, offline maintenance)
+/// 5  conflict     (branch moved, nothing to commit, already exists)
+/// 1  anything else
+/// ```
+fn exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
+    if let Some(failure) = error.downcast_ref::<fs_cli::Failure>() {
+        return failure.code;
+    }
+    if let Some(api) = error.downcast_ref::<ApiError>() {
+        return match api {
+            ApiError::Workspace(fs_workspace::WorkspaceError::NotFound { .. }) => 3,
+            ApiError::Workspace(
+                fs_workspace::WorkspaceError::StoreInUse { .. }
+                | fs_workspace::WorkspaceError::Busy { .. },
+            ) => 4,
+            ApiError::Workspace(
+                fs_workspace::WorkspaceError::BranchMoved { .. }
+                | fs_workspace::WorkspaceError::NothingToCommit
+                | fs_workspace::WorkspaceError::AlreadyExists { .. }
+                | fs_workspace::WorkspaceError::WorkspaceDirty,
+            ) => 5,
+            _ => 1,
+        };
+    }
+    1
+}
 
 fn require_workspace() -> Result<String, Box<dyn std::error::Error>> {
     match WORKSPACE.get().and_then(Option::clone) {
@@ -85,11 +118,56 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("{USAGE}");
         return Ok(());
     }
-    let store = PathBuf::from(take_option(&mut arguments, "--store").unwrap_or_else(|| ".".into()));
+    let explicit_store = take_option(&mut arguments, "--store").map(PathBuf::from);
+    let explicit_store_was_given = explicit_store.is_some();
     // Read **before** the command name is taken: `--workspace` is a global option (ADR-010 §5), not a subcommand flag.
     let workspace_option = take_option(&mut arguments, "--workspace");
-    let _ = WORKSPACE.set(workspace_option.clone());
     let command = arguments.remove(0);
+
+    // **Path discovery happens here, once** (ADR-010 §4.2): a command run from inside a mount works without saying so, and a command that names both
+    // explicitly keeps what it named. The three verbs that do not need a repository keep their place *before* this, so discovery costs them nothing.
+    let needs_repository = !matches!(
+        command.as_str(),
+        "mount" | "umount" | "list" | "version" | "init" | "gc"
+    ) && !fs_cli::FILE_COMMANDS.contains(&command.as_str());
+    let (store, workspace_option) = if needs_repository {
+        let current = std::env::current_dir().ok();
+        let discovered = current.and_then(|cwd| {
+            fs_cli::discovery::discover(&cwd, fs_cli::winpaths::volume_root, mountcmd::live_records)
+        });
+        if std::env::var_os("LAYERFS_DEBUG_DISCOVERY").is_some() {
+            eprintln!(
+                "discovery: cwd={:?} volume={:?} records={:?} found={:?}",
+                std::env::current_dir().ok(),
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| fs_cli::winpaths::volume_root(&cwd)),
+                mountcmd::live_records(),
+                discovered.as_ref().map(|record| record.store.clone())
+            );
+        }
+        let target = fs_cli::discovery::resolve(
+            explicit_store.as_deref(),
+            workspace_option.as_deref(),
+            discovered.as_ref(),
+        );
+        (target.store, target.workspace)
+    } else {
+        (
+            explicit_store.unwrap_or_else(|| PathBuf::from(".")),
+            workspace_option,
+        )
+    };
+    let _ = WORKSPACE.set(workspace_option.clone());
+    // **No store and no discovery is a usage error, not a store error** (ADR-010 §4.2 row 2). Falling through would open `.` and answer "store directory
+    // .\objects does not exist", which is true about the wrong thing: the command never said where to look, and that is what to fix.
+    if needs_repository
+        && !explicit_store_was_given
+        && store.as_os_str() == "."
+        && workspace_option.is_none()
+    {
+        return Err(fs_cli::Failure::usage(fs_cli::NO_WORKSPACE).into());
+    }
 
     // **The removed file commands answer before the store is touched** (A0c): with a `--store` that does not exist, "store does not exist" would be a
     // true sentence about the wrong problem — the command is gone, and that is what the caller has to be told.
@@ -134,6 +212,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "list" => return mountcmd::list(),
         "version" => return mountcmd::version(),
         _ => {}
+    }
+
+    // **Inside a mount, `status` asks the mount** (ADR-010 §6): the overlay is held by the mount process, so opening it here would be refused — the same
+    // reason `checkout` asks the workspace *list*. The answer comes over the control pipe, which is also what makes it the mount's own view.
+    if command == "status" {
+        if let Some(here) = mountcmd::mount_of_cwd() {
+            if !here.pipe.is_empty() {
+                let request = fs_cli::pipe::Request {
+                    v: fs_cli::pipe::PROTOCOL,
+                    op: "status".to_owned(),
+                    args: serde_json::json!({}),
+                };
+                match fs_cli::pipe_win::call(
+                    &here.pipe,
+                    &request,
+                    fs_cli::pipe_win::CONNECT_WAIT_MS,
+                ) {
+                    Ok(fs_cli::pipe::Response::Status {
+                        workspace,
+                        branch,
+                        base_commit,
+                        dirty,
+                        handles,
+                    }) => {
+                        println!("workspace: {workspace}");
+                        println!("branch:    {branch}");
+                        println!("base:      {}", short(&base_commit));
+                        println!("dirty:     {}", if dirty { "yes" } else { "no" });
+                        println!("handles:   {handles}");
+                        return Ok(());
+                    }
+                    Ok(other) => {
+                        return Err(format!("the mount refused `status`: {other:?}").into());
+                    }
+                    Err(error) => {
+                        return Err(fs_cli::Failure::in_use(format!(
+                            "the mount at {} is not answering ({error})",
+                            here.mount_point.display()
+                        ))
+                        .into())
+                    }
+                }
+            }
+        }
     }
 
     let repo = Repo::open(&store)?;
@@ -212,7 +334,7 @@ fn workspace(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error
 
 fn snapshot(
     repo: &Repo,
-    store: &std::path::Path,
+    _store: &std::path::Path,
     arguments: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     match arguments.first().map(String::as_str) {
@@ -228,7 +350,7 @@ fn snapshot(
             Ok(())
         }
         Some("create") => {
-            let name = read_current(store)?;
+            let name = require_workspace()?;
             let mut workspace = repo.workspace_open(&name)?;
             let root = workspace.snapshot()?;
             workspace.close()?;
@@ -304,20 +426,67 @@ fn checkout(
     arguments: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let branch = arguments.first().ok_or("expected checkout <branch>")?;
-    // The workspace is named after its branch: one current workspace per branch, and a
-    // second `checkout` of the same branch resumes the first.
-    let workspace = match repo.workspace_open(branch) {
-        Ok(workspace) => workspace,
-        Err(ApiError::Workspace(fs_workspace::WorkspaceError::NotFound { .. })) => {
-            repo.workspace_create(branch, branch)?
-        }
-        Err(error) => return Err(error.into()),
+    // The workspace is named after its branch: one workspace per branch, and a second `checkout` of the same branch resumes the first.
+    //
+    // **Existence is asked of the workspace *list*, not of `workspace_open`** (A3b): opening is what a mount holds, so asking it would make `checkout dev`
+    // fail exactly when `dev` is mounted — the case where the user most needs to be told it is already there and where.
+    let existing = repo
+        .workspaces()?
+        .into_iter()
+        .find(|workspace| &workspace.name == branch)
+        .or_else(|| {
+            repo.workspaces()
+                .ok()?
+                .into_iter()
+                .find(|workspace| &workspace.branch == branch)
+        });
+    let Some(existing) = existing else {
+        // No row: create it (the branch must exist, or `workspace_create` says so).
+        let created = match repo.workspace_create(branch, branch) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return Err(fs_cli::Failure::not_found(format!(
+                    "cannot create a workspace on {branch}: {error}; \
+                     if that branch does not exist, create it with `fs-cli branch {branch} --from main`"
+                ))
+                .into())
+            }
+        };
+        println!("on {} (workspace {})", created.branch(), created.name());
+        created.close()?;
+        return Ok(());
     };
-    // `cli/current` is gone (ADR-010 §5): `checkout` still creates or resumes the workspace, and still reports it, but it no longer records a
-    // "current" that later commands would silently depend on.
-    println!("on {} (workspace {})", workspace.branch(), workspace.name());
-    workspace.close()?;
-    Ok(())
+
+    // The workspace exists. If it is **mounted**, say so and keep the mount: `checkout` is not a request to unmount anything (A3b).
+    // **A3b's third case**: run from inside another workspace's mount, `checkout` must not disturb that mount — it says which two steps would switch it.
+    if let Some(here) = mountcmd::mount_of_cwd() {
+        if here.workspace != existing.name {
+            println!(
+                "this directory is inside the mount of {} at {}; to switch it:\n  layerfs umount {}\n  layerfs mount {} --workspace {}",
+                here.workspace,
+                here.mount_point.display(),
+                here.mount_point.display(),
+                here.mount_point.display(),
+                existing.name
+            );
+        }
+    }
+
+    match mountcmd::live_mount_of(&existing.name) {
+        Some((mount_point, pid)) => {
+            println!(
+                "on {} (workspace {}) — mounted at {mount_point} (pid {pid})",
+                existing.branch, existing.name
+            );
+            Ok(())
+        }
+        None => {
+            let workspace = repo.workspace_open(&existing.name)?;
+            println!("on {} (workspace {})", workspace.branch(), workspace.name());
+            workspace.close()?;
+            Ok(())
+        }
+    }
 }
 
 fn commit(
@@ -413,20 +582,53 @@ fn verify(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::E
 /// Runs `body` against the current workspace, opening and closing it around the call.
 fn with_workspace(
     repo: &Repo,
-    store: &Path,
+    _store: &Path,
     body: impl FnOnce(&mut Workspace) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let name = read_current(store)?;
-    let mut workspace = repo.workspace_open(&name)?;
+    let name = require_workspace()?;
+    let mut workspace = match repo.workspace_open(&name) {
+        Ok(workspace) => workspace,
+        Err(error) => return Err(open_refusal(&name, error, "open")),
+    };
     let outcome = body(&mut workspace);
     workspace.close()?;
     outcome
 }
 
-/// The branch a command works on: **`--branch`, or the workspace's branch** (ADR-010 §13 A1).
+/// Turns "cannot open this workspace" into a message that says **why** (A3, ADR-010 §8.2).
 ///
-/// With `--branch` no overlay is opened at all, so `log`/`reset`/`revert` keep working while another process has the workspace mounted — the whole point
-/// of A1. Without it the branch comes from the workspace, which is the case that genuinely needs the overlay.
+/// Two different situations hide behind one error: a workspace this machine is serving (there is a record with a mount point and a pid) and one held by a
+/// process with no record (another `fs-cli`). The first tells the user which mount to unmount; the second says so plainly. Rendering both the same way would
+/// lose the only part of the message that is actionable.
+fn open_refusal(workspace: &str, error: ApiError, command: &str) -> Box<dyn std::error::Error> {
+    if let Some((mount_point, pid)) = mountcmd::live_mount_of(workspace) {
+        return fs_cli::Failure::in_use(fs_cli::mounted_refusal(
+            command,
+            workspace,
+            &mount_point,
+            pid,
+        ))
+        .into();
+    }
+    // Not found is not "in use": it keeps its own exit code and its own way out.
+    if matches!(
+        error,
+        ApiError::Workspace(fs_workspace::WorkspaceError::NotFound { .. })
+    ) {
+        return fs_cli::Failure::not_found(format!(
+            "no workspace {workspace}; `fs-cli checkout <branch>` creates one"
+        ))
+        .into();
+    }
+    // Anything else while such a workspace exists is the lock talking: another process has it open.
+    fs_cli::Failure::in_use(fs_cli::IN_USE_ELSEWHERE).into()
+}
+
+/// The branch a command works on: **`--branch`, or the workspace's branch** (ADR-010 §13 A1/A1b).
+///
+/// With `--branch` no overlay is opened at all, so `log`/`reset`/`revert` keep working while another process has the workspace mounted. The same has to
+/// be true of the fallback: `current_branch` reads the **workspace row** (via `workspaces()`), never the overlay, or `--workspace dev log` would fail
+/// exactly when `dev` is in use — which is the case that matters (A1b).
 fn branch_for(
     repo: &Repo,
     arguments: &[String],
@@ -442,17 +644,21 @@ fn branch_for(
 
 fn current_branch(repo: &Repo) -> Result<String, Box<dyn std::error::Error>> {
     let name = require_workspace()?;
-    Ok(repo.workspace_open(&name)?.branch().to_owned())
+    // **The row, not the overlay** (A1b): opening the workspace would fail while it is mounted, and answering "which branch am I on" must not require
+    // the lock that a mount holds. The row is what `workspace_list` reads.
+    match repo.workspaces()?.into_iter().find(|row| row.name == name) {
+        Some(row) => Ok(row.branch),
+        None => Err(fs_cli::Failure::not_found(format!(
+            "no workspace {name}; `fs-cli checkout <branch>` creates one"
+        ))
+        .into()),
+    }
 }
 
 /// The workspace this command runs against: **the `--workspace` option, or nothing** (ADR-010 §5).
 ///
 /// `cli/current` is gone: a file that remembers a name for you is a second source of truth, and it made every command's behaviour depend on a store
 /// nobody mentioned. The `store` parameter stays only so the call sites read unchanged while the S0 sweep removes them one by one.
-fn read_current(_store: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    require_workspace()
-}
-
 fn short(id: &str) -> &str {
     id.get(..12).unwrap_or(id)
 }

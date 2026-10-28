@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use fs_api::winfsp_backend::ApiBackend;
 use fs_winfsp::abi::VolumeInfo;
 use fs_winfsp::loader::default_library;
-use fs_winfsp::mounted::mount_read_only;
+use fs_winfsp::mounted::mount_serving;
 use fs_winfsp::ops::DynOps;
 use fs_workspace::Repo;
 
@@ -33,47 +33,13 @@ const OURS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 /// `STATUS_ACCESS_DENIED` — what WinFsp answers when the mount point exists as a real volume (`ntstatus.h:4392`).
 const OURS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 
-/// A drive letter or directory, reduced to something usable as a file name: `V:` -> `V`, `C:\mnt\x` -> `C_mnt_x`.
-#[must_use]
-pub fn record_name(mount_point: &Path) -> String {
-    let text = mount_point.to_string_lossy();
-    let trimmed = text.trim_end_matches([':', '/', '\\']);
-    // Runs of separators collapse: `C:\mnt` is one boundary, not two, and a double underscore in a file name helps nobody.
-    let mut flattened = String::new();
-    for character in trimmed.chars() {
-        let replacement = if matches!(character, ':' | '/' | '\\') {
-            '_'
-        } else {
-            character
-        };
-        if replacement == '_' && flattened.ends_with('_') {
-            continue;
-        }
-        flattened.push(replacement);
-    }
-    // A drive letter is the common case and deserves a short name rather than `V_`.
-    if flattened.is_empty() {
-        "root".to_string()
-    } else {
-        flattened.trim_matches('_').to_string()
-    }
-}
-
-fn runtime_dir() -> PathBuf {
-    std::env::temp_dir().join("layerfs-mounts")
-}
-
+/// `V:` becomes `V`; `C:mntx` becomes `C_mnt_x` (ADR-010 §9.1). The implementation lives in the library so the criteria compute the same name.
 fn state_path(mount_point: &Path) -> PathBuf {
-    runtime_dir().join(format!("{}.mount", record_name(mount_point)))
+    mounts_dir().join(format!("{}.mount", record_name(mount_point)))
 }
 
-fn stop_path(mount_point: &Path) -> PathBuf {
-    runtime_dir().join(format!("{}.stop", record_name(mount_point)))
-}
+pub use fs_cli::{mounts_dir, record_name};
 
-/// `FspVersion`'s two halves. The calibration in `fs_winfsp::abi::measured::DLL_BUILD` is a full build string, so the gate compares the **major
-/// version** it starts with — the layout was measured against 2.x, and a 3.x DLL may renumber the slots again.
-#[must_use]
 pub fn version_parts(version: u32) -> (u16, u16) {
     (
         u16::try_from((version >> 16) & 0xFFFF).unwrap_or(0),
@@ -95,7 +61,9 @@ fn volume() -> VolumeInfo {
     VolumeInfo {
         total_size: 1 << 30,
         free_size: 1 << 29,
-        volume_label_length: 7,
+        // **In bytes, not characters** — `VolumeLabelLength` counts the UTF-16 encoding. With 7 here the label came back as `lay`: WinFsp read 7 bytes, which is
+        // three and a half characters (measured with `vol J:`). Path discovery then refused to recognise the volume, because its label was not `layerfs`.
+        volume_label_length: 2 * 7,
         volume_label: {
             let mut label = [0u16; 32];
             for (index, unit) in "layerfs".encode_utf16().enumerate() {
@@ -222,19 +190,56 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     let workspace: &'static fs_workspace::Workspace = Box::leak(Box::new(workspace));
     let backend: DynOps = Box::new(ApiBackend::new(workspace));
 
-    std::fs::create_dir_all(runtime_dir())?;
+    std::fs::create_dir_all(mounts_dir())?;
     let state = state_path(&mount_point);
-    let stop = stop_path(&mount_point);
-    let _ = std::fs::remove_file(&stop);
-    std::fs::write(
-        &state,
-        format!(
-            "pid={}\nmount_point={}\nworkspace={name}\nstore={}\n",
-            std::process::id(),
-            mount_point.display(),
-            store.display()
-        ),
-    )?;
+    // **The pipe name is part of the record** (ADR-010 §9.1): a reader that has the record can reach the mount without asking anyone, and `umount` is exactly
+    // that reader.
+    let pipe = fs_cli::pipe_win::pipe_name(&record_name(&mount_point), std::process::id());
+    // **A record that is still held means this letter is already served** (§9.2): say who holds it instead of failing with `os error 80` from
+    // `create_new`. A **stale** record is the leftover of a dead owner (power cut) and is replaced — `DELETE_ON_CLOSE` already covers every ordinary death,
+    // so this branch is rare by construction.
+    match record_is_live(&state) {
+        Liveness::Live => {
+            let owner = std::fs::read_to_string(&state).unwrap_or_default();
+            let field = |key: &str| {
+                owner
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix(key)?
+                            .strip_prefix('=')
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default()
+            };
+            return Err(fs_cli::Failure::in_use(format!(
+                "{} is already mounted (pid {}) — `layerfs umount {}` first",
+                mount_point.display(),
+                field("pid"),
+                mount_point.display()
+            ))
+            .into());
+        }
+        Liveness::Stale => {
+            let _ = std::fs::remove_file(&state);
+        }
+        Liveness::Gone => {}
+    }
+    // **The record's life is the process's life** (ADR-010 §9.2): created with `DELETE_ON_CLOSE` and held open, so however this process dies —
+    // `taskkill /F` included — the kernel closes the handle and removes the file. A leftover record then means a power cut, which is the only case the
+    // reader's staleness check has to handle.
+    let record = format!(
+        "version=1\npid={}\nmount_point={}\nstore={}\nworkspace={name}\nbranch={}\npipe={}\nstarted_at={}\n",
+        std::process::id(),
+        canonical(&mount_point),
+        canonical(&store),
+        branch_of(&repo, &name).unwrap_or_default(),
+        pipe,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+    );
+    let _record_handle = hold_record(&state, &record)?;
     println!(
         "mounting {} at {} (workspace {name}); stop with `layerfs umount {}`",
         store.display(),
@@ -242,21 +247,75 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
         mount_point.display()
     );
 
-    let library = default_library();
-    let report = mount_read_only(&library, &mount_point, backend, volume(), |_path: &Path| {
-        // The probe **is** the command's lifetime: everything below happens while the volume is attached.
-        let started = Instant::now();
-        loop {
-            if stop.exists() || !state.exists() {
-                println!("unmount requested after {:?}", started.elapsed());
-                break;
-            }
-            std::thread::sleep(POLL);
-        }
-        Ok(())
+    // **The control channel starts before the volume does**: a `status` that arrives a millisecond after the drive appears must not race a pipe that is not
+    // listening yet, and a serve loop that fails to start is worth knowing about before the mount commits.
+    let adapter_slot: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<fs_winfsp::DynAdapter>>> =
+        std::sync::Arc::new(std::sync::OnceLock::new());
+    let serving: std::sync::Arc<dyn fs_cli::pipe_win::Serving> = std::sync::Arc::new(PipeServing {
+        store: canonical(&store),
+        workspace: name.clone(),
+        branch: branch_of(&repo, &name).unwrap_or_default(),
+        mount_point: canonical(&mount_point),
+        workspace_handle: workspace,
+        record: state.clone(),
+        adapter: std::sync::Arc::clone(&adapter_slot),
     });
-    let _ = std::fs::remove_file(&stop);
+    let server = std::sync::Arc::new(fs_cli::pipe_win::Server::new(pipe, serving));
+    if let Ok(started) = std::thread::Builder::new()
+        .name("layerfs-control".to_owned())
+        .spawn({
+            let server = std::sync::Arc::clone(&server);
+            move || {
+                let _ = server.run();
+            }
+        })
+    {
+        // The thread is joined by process exit; keeping the handle would only be a place to forget it.
+        std::mem::forget(started);
+    }
+
+    let library = default_library();
+    // Installed **before** mounting, so a Ctrl-C during the mount itself is already an orderly stop.
+    install_console_handler();
+    let report = mount_serving(
+        &library,
+        &mount_point,
+        backend,
+        volume(),
+        |mounted: &fs_winfsp::mounted::Mounted| {
+            // **`status.handles` reads the adapter at the moment of the ask**, so the control channel needs the adapter — not a number captured now.
+            // (Until this line runs, the channel answers 0, which is also the truth: nobody has opened a file yet.)
+            let _ = adapter_slot.set(mounted.adapter());
+            // The probe **is** the command's lifetime: everything below happens while the volume is attached.
+            let started = Instant::now();
+            loop {
+                // **Three ways to be asked to stop**, all answering the same way: the stop file (until the pipe replaces it), the record disappearing, and a
+                // console control event. Ctrl-C lands here as an **orderly unmount** rather than a kill, which is the whole point of the handler.
+                // **Two ways to be asked to stop**, both answering the same way: the control pipe (through `request_stop`) and a console control event. The
+                // stop **file** is gone — A15s asserts that writing one no longer stops a mount, because a signal nobody can see the receipt of was the thing
+                // being replaced.
+                if stop_requested() {
+                    // **A console stop does not wait for handles** (ADR-010 §7.2): the user in front of the window asked for it, so the mount unmounts and the
+                    // handles die — but it says how many, because "my editor lost the file" is much easier to understand with a number attached.
+                    let open = adapter_slot
+                        .get()
+                        .map_or(0, |adapter| adapter.open_handles());
+                    if open > 0 {
+                        println!("{open} open handle(s) will be invalidated");
+                    }
+                    println!("unmount requested after {:?}", started.elapsed());
+                    break;
+                }
+                std::thread::sleep(POLL);
+            }
+            Ok(())
+        },
+    );
+    // (the stop file is gone: the control pipe is the only stop signal — A15s)
     let _ = std::fs::remove_file(&state);
+    // **The teardown is done; the pending `unmount` answer may leave now** (ADR-010 §5.1). This must happen before the process exits, or the client reads a
+    // successful unmount as a dropped connection.
+    server.teardown_finished();
     match report {
         Ok(report) if report.looked_like_a_mount => {
             println!(
@@ -304,12 +363,49 @@ pub fn umount(arguments: &[String]) -> Result<(), Error> {
     let mount_point = PathBuf::from(mount_point);
     let force = arguments.iter().any(|argument| argument == "--force");
     let state = state_path(&mount_point);
-    let stop = stop_path(&mount_point);
     if !state.exists() {
         return Err(format!("no mount recorded for {}", mount_point.display()).into());
     }
-    std::fs::create_dir_all(runtime_dir())?;
-    std::fs::write(&stop, b"stop\n")?;
+    // **Ask the mount, do not write a file it might never read** (ADR-010 §10.2): the answer is the mount's own, which is also what lets `unmount` report
+    // handles it refuses on. The stop file is gone — its absence is what A15s asserts.
+    let record_text = std::fs::read_to_string(&state).unwrap_or_default();
+    let pipe = record_text
+        .lines()
+        .find_map(|line| line.strip_prefix("pipe=").map(str::to_string))
+        .unwrap_or_default();
+    if pipe.is_empty() {
+        return Err(fs_cli::Failure::in_use(format!(
+            "{} has no control pipe recorded (a mount from an older build?); end the mounting process",
+            mount_point.display()
+        ))
+        .into());
+    }
+    let request = fs_cli::pipe::Request {
+        v: fs_cli::pipe::PROTOCOL,
+        op: "unmount".to_owned(),
+        args: serde_json::json!({ "wait_ms": UNMOUNT_WAIT.as_millis() as u64 }),
+    };
+    let answer = fs_cli::pipe_win::call(&pipe, &request, fs_cli::pipe_win::CONNECT_WAIT_MS);
+    match answer {
+        Ok(fs_cli::pipe::Response::Unmounted {}) => {}
+        Ok(fs_cli::pipe::Response::HandlesOpen { handles }) => {
+            return Err(fs_cli::Failure::in_use(format!(
+                "{} still has {handles} open handle(s); close them and try again — the mount was left as it was",
+                mount_point.display()
+            ))
+            .into())
+        }
+        Ok(other) => {
+            return Err(format!("{} refused to unmount: {other:?}", mount_point.display()).into())
+        }
+        Err(error) => {
+            return Err(fs_cli::Failure::in_use(format!(
+                "{} is not answering ({error}); the mounting process may be wedged",
+                mount_point.display()
+            ))
+            .into())
+        }
+    }
     let started = Instant::now();
     while started.elapsed() < UNMOUNT_WAIT {
         if !state.exists() {
@@ -321,7 +417,6 @@ pub fn umount(arguments: &[String]) -> Result<(), Error> {
     if force {
         // Honest about what this can and cannot do: the WinFsp handle lives in the other process, so a forced unmount here would be a claim, not an
         // action. What *is* removed is the record, so a crashed mount does not block the next one.
-        let _ = std::fs::remove_file(&stop);
         let _ = std::fs::remove_file(&state);
         return Err(format!(
             "{} did not release within {UNMOUNT_WAIT:?}; removed the stale record, the volume may still be attached (end the mounting process)",
@@ -338,7 +433,7 @@ pub fn umount(arguments: &[String]) -> Result<(), Error> {
 
 /// `layerfs list` — every recorded mount, with the pid that is serving it.
 pub fn list() -> Result<(), Error> {
-    let directory = runtime_dir();
+    let directory = mounts_dir();
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -382,10 +477,397 @@ pub fn list() -> Result<(), Error> {
     Ok(())
 }
 
+/// Set when a console control event asks the mount to stop (Ctrl-C, Ctrl-Break, closing the console).
+///
+/// A console handler runs on a **separate thread** and must return quickly, so it does the smallest thing possible: set this flag. The mount loop notices
+/// it and returns, which unmounts through the normal path — Ctrl-C is an **orderly unmount**, not a crash (ADR-010 §7.1).
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The handler's whole effect, separately callable so a test can prove it flips the flag without sending a real Ctrl-C.
+pub fn request_stop() {
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[must_use]
+pub fn stop_requested() -> bool {
+    STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(windows)]
+extern "system" fn console_control_handler(event: u32) -> i32 {
+    // `CTRL_C_EVENT(0)`, `CTRL_BREAK_EVENT(1)`, `CTRL_CLOSE_EVENT(2)` and the logoff/shutdown pair (5/6) all mean "stop", and all are answered
+    // "handled": returning 0 would hand the event to the default handler, which terminates the process **before** the unmount runs.
+    match event {
+        0 | 1 | 2 | 5 | 6 => {
+            request_stop();
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(windows)]
+fn install_console_handler() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    }
+    // SAFETY: a plain Win32 call with a function pointer that outlives the process.
+    unsafe {
+        SetConsoleCtrlHandler(Some(console_control_handler), 1);
+    }
+}
+
+#[cfg(not(windows))]
+fn install_console_handler() {}
+
+fn canonical(path: &Path) -> String {
+    // **`V:` is not `V:\`** (the 317 trap, in the record layer this time): `canonicalize("V:")` asks for "the current directory on V", which a drive mounted by
+    // an FSD does not have, so it fails and the fallback stores `V:` — a path that `V:\...` does not start with. Discovery then never matches. Putting the
+    // separator back first makes the record say the same thing the shell says.
+    let target = {
+        let text = path.to_string_lossy();
+        if text.len() == 2 && text.ends_with(':') {
+            PathBuf::from(format!("{text}\\"))
+        } else {
+            path.to_path_buf()
+        }
+    };
+    let resolved = std::fs::canonicalize(&target).unwrap_or(target);
+    let text = resolved.display().to_string();
+    text.strip_prefix("\\\\?\\").unwrap_or(&text).to_string()
+}
+
+fn branch_of(repo: &Repo, name: &str) -> Option<String> {
+    repo.workspace_list()
+        .ok()?
+        .into_iter()
+        .find(|workspace| workspace.name == name)
+        .map(|workspace| workspace.branch)
+}
+
+/// Whether a record's owner is still alive (**ADR-010 §9.2**).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Liveness {
+    /// The owner still holds the file: opening it for writing hits a sharing violation.
+    Live,
+    /// Nobody holds it any more: the process is gone and the record is a leftover.
+    Stale,
+    /// There is no record at all.
+    Gone,
+}
+
+/// The one implementation of "is this mount still alive".
+///
+/// The owner holds the record with `share_mode(READ | DELETE)` and **no write share**, so a reader that asks for write access gets
+/// `ERROR_SHARING_VIOLATION (32)` while the owner lives — the whole test, with no pid probing and no timestamp guessing.
+#[must_use]
+pub fn record_is_live(path: &Path) -> Liveness {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4; // READ | WRITE | DELETE
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(SHARE_ALL)
+            .open(path)
+        {
+            Ok(_) => Liveness::Stale,
+            Err(error) if error.raw_os_error() == Some(32) => Liveness::Live,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Liveness::Gone,
+            // Anything else (a permission problem, a locking tool) is **not** evidence of life: calling it stale is the conservative reading, because the
+            // alternative is refusing to work on a filesystem that is actually free.
+            Err(_) => Liveness::Stale,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if path.exists() {
+            Liveness::Stale
+        } else {
+            Liveness::Gone
+        }
+    }
+}
+
+/// Creates the record and **keeps it open** for the process's lifetime.
+///
+/// `DELETE_ON_CLOSE` is why a crashed mount leaves nothing behind: the kernel closes every handle when the process dies, `taskkill /F` included.
+#[cfg(windows)]
+fn hold_record(path: &Path, contents: &str) -> Result<std::fs::File, Error> {
+    use std::io::Write as _;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.flush()?;
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn hold_record(path: &Path, contents: &str) -> Result<std::fs::File, Error> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.flush()?;
+    Ok(file)
+}
+
+/// What the control pipe answers for one mount: the three S1 operations, computed from the mount itself.
+///
+/// It holds the **leaked** workspace the backend already serves, so `status` reports the same view the filesystem is serving — not a second connection that
+/// could disagree with it.
+struct PipeServing {
+    store: String,
+    workspace: String,
+    branch: String,
+    mount_point: String,
+    workspace_handle: &'static fs_workspace::Workspace,
+    /// Where this mount's record lives: `teardown_complete` is "the record is gone".
+    record: std::path::PathBuf,
+    /// The mount's adapter, filled in by the mount closure: `status.handles` must be read at the moment of the ask.
+    adapter: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<fs_winfsp::DynAdapter>>>,
+}
+
+impl PipeServing {
+    fn record_fields(&self) -> fs_cli::pipe::Response {
+        fs_cli::pipe::Response::Hello {
+            store: self.store.clone(),
+            workspace: self.workspace.clone(),
+            branch: self.branch.clone(),
+            pid: std::process::id(),
+            mount_point: self.mount_point.clone(),
+            protocol: fs_cli::pipe::PROTOCOL,
+        }
+    }
+}
+
+impl fs_cli::pipe_win::Serving for PipeServing {
+    fn answer(&self, frame: &[u8]) -> fs_cli::pipe::Response {
+        // A tiny adapter: the protocol module wants a `Context`, and everything it needs is right here.
+        struct Ctx<'a>(&'a PipeServing);
+        impl fs_cli::pipe::Context for Ctx<'_> {
+            fn hello(&self) -> fs_cli::pipe::Response {
+                self.0.record_fields()
+            }
+
+            fn status(&self) -> fs_cli::pipe::Response {
+                match self.0.workspace_handle.status() {
+                    Ok(status) => fs_cli::pipe::Response::Status {
+                        workspace: status.name,
+                        branch: status.branch,
+                        base_commit: status.base_commit,
+                        dirty: status.dirty,
+                        handles: self
+                            .0
+                            .adapter
+                            .get()
+                            .map_or(0, |adapter| adapter.open_handles()),
+                    },
+                    Err(error) => fs_cli::pipe::Response::Failed {
+                        detail: error.to_string(),
+                    },
+                }
+            }
+
+            fn shutting_down(&self) -> bool {
+                stop_requested()
+            }
+        }
+        fs_cli::pipe::dispatch(frame, &Ctx(self))
+    }
+
+    fn request_stop(&self) -> bool {
+        request_stop();
+        true
+    }
+
+    fn shutting_down(&self) -> bool {
+        stop_requested()
+    }
+
+    fn open_handles(&self) -> usize {
+        self.adapter
+            .get()
+            .map_or(0, |adapter| adapter.open_handles())
+    }
+
+    fn teardown_complete(&self) -> bool {
+        // The record is removed by `DELETE_ON_CLOSE` when the mount's handle drops, which happens **after** the unmount and the flush — so its absence is the
+        // moment the whole stop sequence is done.
+        !self.record.exists()
+    }
+}
+/// Every live mount record, as `discovery::discover` wants them: the records and their liveness in one pass.
+///
+/// One reader for both the A3 message (`live_mount_of`) and path discovery, so a record that one of them considers live cannot be dead to the other.
+#[must_use]
+pub fn live_records() -> Vec<(fs_cli::discovery::Record, fs_cli::discovery::Liveness)> {
+    let Ok(entries) = std::fs::read_dir(mounts_dir()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "mount")
+        {
+            continue;
+        }
+        let liveness = match record_is_live(&path) {
+            Liveness::Live => fs_cli::discovery::Liveness::Live,
+            Liveness::Stale | Liveness::Gone => fs_cli::discovery::Liveness::Stale,
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let field = |key: &str| {
+            text.lines()
+                .find_map(|line| {
+                    line.strip_prefix(key)?
+                        .strip_prefix('=')
+                        .map(str::to_string)
+                })
+                .unwrap_or_default()
+        };
+        out.push((
+            fs_cli::discovery::Record {
+                store: PathBuf::from(field("store")),
+                workspace: field("workspace"),
+                mount_point: PathBuf::from(field("mount_point")),
+                pid: field("pid").parse().unwrap_or(0),
+                branch: field("branch"),
+                pipe: field("pipe"),
+            },
+            liveness,
+        ));
+    }
+    out
+}
+
+/// The mount whose volume contains the current directory, if any (ADR-010 §4.4).
+///
+/// Same two queries as `run`'s discovery, exposed so a command can ask "am I being run from inside a mount" without re-implementing path discovery — A3b's
+/// third case is exactly that question.
+#[must_use]
+pub fn mount_of_cwd() -> Option<fs_cli::discovery::Record> {
+    let cwd = std::env::current_dir().ok()?;
+    fs_cli::discovery::discover(&cwd, fs_cli::winpaths::volume_root, live_records)
+}
+
+/// The live mount serving `workspace`, if there is one: `(mount_point, pid)`.
+///
+/// Read from the records rather than guessed: the point of A3's message is that it names **which** mount and **which** process, and a generic "in use" would
+/// leave the user to hunt for the window.
+#[must_use]
+pub fn live_mount_of(workspace: &str) -> Option<(String, u32)> {
+    let entries = std::fs::read_dir(mounts_dir()).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "mount")
+        {
+            continue;
+        }
+        if record_is_live(&path) != Liveness::Live {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let field = |key: &str| {
+            text.lines()
+                .find_map(|line| {
+                    line.strip_prefix(key)?
+                        .strip_prefix('=')
+                        .map(str::to_string)
+                })
+                .unwrap_or_default()
+        };
+        if field("workspace") == workspace {
+            return Some((field("mount_point"), field("pid").parse().unwrap_or(0)));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{calibrated_major, record_name, version_parts};
+    use super::{
+        calibrated_major, hold_record, mounts_dir, record_is_live, record_name, request_stop,
+        stop_requested, version_parts, Liveness,
+    };
     use std::path::Path;
+
+    /// **A10, the half that can be tested without a console**: the handler's effect is a flag, and the mount loop reads that flag.
+    ///
+    /// The other half — a real Ctrl-Break delivering the event — needs a process group and a console, so it lives in the integration test; what is pinned here
+    /// is that "handled" really means "remembered", because a handler that returned 1 without setting anything would let the default handler kill the process
+    /// with the volume still attached.
+    #[test]
+    fn a_control_event_asks_the_mount_to_stop() {
+        assert!(!stop_requested(), "cell start: nothing has asked yet");
+        request_stop();
+        assert!(stop_requested(), "cell after: the mount loop must see it");
+    }
+
+    /// **A7 / §9.2**: a record held by its owner is `Live`, one nobody holds is `Stale`, and — because the owner uses `DELETE_ON_CLOSE` — the file is
+    /// **gone** once the handle is dropped, which is what makes a crashed mount leave nothing behind.
+    #[test]
+    fn a_record_is_live_while_held_and_gone_once_released() {
+        let directory = std::env::temp_dir().join(format!("fs-cli-record-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp");
+
+        let held = directory.join("held.mount");
+        let handle = hold_record(&held, "version=1\npid=1\n").expect("hold a record");
+        assert_eq!(
+            record_is_live(&held),
+            Liveness::Live,
+            "cell live: the owner still holds it"
+        );
+        drop(handle);
+        assert_eq!(
+            record_is_live(&held),
+            Liveness::Gone,
+            "cell gone: DELETE_ON_CLOSE removes the record when the owner dies"
+        );
+
+        // A record written the ordinary way is `Stale`: nobody holds it, so its owner is gone.
+        let stale = directory.join("stale.mount");
+        std::fs::write(&stale, b"version=1\n").expect("write");
+        assert_eq!(record_is_live(&stale), Liveness::Stale, "cell stale");
+
+        assert_eq!(
+            record_is_live(&directory.join("missing.mount")),
+            Liveness::Gone,
+            "cell missing"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The mounts directory is one function, and the override is what keeps tests from touching the real one.
+    #[test]
+    fn the_mounts_directory_can_be_redirected() {
+        let before = mounts_dir();
+        // SAFETY: single-threaded unit test; nothing else in this binary reads the variable concurrently.
+        unsafe { std::env::set_var("LAYERFS_MOUNTS_DIR", "C:\\layerfs-test-mounts") };
+        assert_eq!(mounts_dir(), Path::new("C:\\layerfs-test-mounts"));
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("LAYERFS_MOUNTS_DIR") };
+        assert_eq!(
+            mounts_dir(),
+            before,
+            "without the override the default comes back"
+        );
+    }
 
     #[test]
     fn a_mount_point_becomes_a_file_name() {

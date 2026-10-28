@@ -197,7 +197,6 @@ impl TempRoot {
             .expect("commit id")
             .to_owned()
     }
-
 }
 
 impl Drop for TempRoot {
