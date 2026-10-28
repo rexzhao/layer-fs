@@ -394,10 +394,19 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                 // *after* the rollback is on its way, not instead of it.
                 // **The kind is classified where the error type still exists**: a workspace another process holds is "in use" (exit 4), a missing one is
                 // "not found" (3), anything else is a remount failure (1). One string for all three is what made the local and pipe paths disagree before (R5).
+                // **The kind is classified where the error type still exists** (S3 W3): a workspace another process holds is "busy" (exit 4). The overlay lock
+                // surfaces as `StoreInUse`, but the same situation can surface from the store's own connection as "database is locked" — to the user those are
+                // one fact ("another process has it"), so they must be one kind. Matching on the message is only for that last case, and it is named here rather
+                // than left to the default arm.
+                let busy_by_message = error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("database is locked");
                 let kind = match &error {
                     fs_workspace::WorkspaceError::StoreInUse { .. }
                     | fs_workspace::WorkspaceError::Busy { .. } => "in-use",
                     fs_workspace::WorkspaceError::NotFound { .. } => "not-found",
+                    _ if busy_by_message => "in-use",
                     _ => "remount-failed",
                 };
                 publish_switch(Err((kind.to_owned(), error.to_string())));
