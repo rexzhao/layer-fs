@@ -191,6 +191,21 @@ impl HandleTable {
         self.handles.get(&handle_id)
     }
 
+    /// How many handles are open right now.
+    ///
+    /// This is the number `status.handles` reports and the number a **remote** `umount` refuses on (ADR-010 §7.2): the caller that asks over the pipe cannot
+    /// see who has a file open, so the answer has to come from the mount that can.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Whether no handle is open.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
     /// Every open handle of `file_id`, in creation order.
     #[must_use]
     pub fn handles_of(&self, file_id: u64) -> Vec<HandleId> {

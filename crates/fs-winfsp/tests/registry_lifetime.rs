@@ -275,3 +275,60 @@ fn dir_outcome_pairs_the_identity_with_the_binding() {
         "a path that names nothing has no binding — not a name that would fail later"
     );
 }
+
+/// `mount_serving` hands the closure a [`Mounted`] **while the volume is up**, and `open_handles` reports what the handle table holds.
+///
+/// The number matters twice over: `status.handles` reports it, and a **remote** `umount` refuses on it (ADR-010 §7.2) — the caller asking over the pipe cannot
+/// see who has a file open, so the answer has to come from the mount that can.
+#[test]
+fn mount_serving_sees_its_own_open_handles() {
+    use std::path::{Path, PathBuf};
+
+    use fs_winfsp::abi::VolumeInfo;
+    use fs_winfsp::loader::{default_library, resolve_library, LoadError};
+    use fs_winfsp::mock::MockBackend;
+    use fs_winfsp::mounted::mount_serving;
+    use fs_winfsp::ops::DynOps;
+
+    let library = default_library();
+    if let Err(LoadError::NotFound { path }) = resolve_library(&library) {
+        eprintln!("SKIP: no winfsp at {}", path.display());
+        return;
+    }
+    let mount_point = std::env::var_os("LAYER_FS_MNT_SERVING")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("O:"));
+    let volume = VolumeInfo {
+        total_size: 1 << 20,
+        free_size: 1 << 19,
+        volume_label_length: 4,
+        volume_label: {
+            let mut label = [0u16; 32];
+            label[..4].copy_from_slice(&[b'w' as u16, b'r' as u16, b'i' as u16, b't' as u16]);
+            label
+        },
+    };
+    let backend: DynOps = Box::new(MockBackend::new());
+    let report = mount_serving(&library, &mount_point, backend, volume, |mounted: &_| {
+        let root = if mounted.path().to_string_lossy().ends_with(':') {
+            PathBuf::from(format!("{}\\", mounted.path().display()))
+        } else {
+            PathBuf::from(mounted.path())
+        };
+        // Nothing open yet: the closure runs before anyone has touched the volume.
+        assert_eq!(mounted.open_handles(), 0, "cell start: no handles");
+
+        std::fs::write(root.join("open.txt"), b"x").expect("write");
+        let held = std::fs::File::open(root.join("open.txt")).expect("open");
+        let handles = mounted.open_handles();
+        assert!(
+            handles >= 1,
+            "cell open: a file opened through the mount must be visible to the mount (got {handles})"
+        );
+        drop(held);
+        Ok(())
+    })
+    .expect("the mount path is available");
+    assert_eq!(report.mount, 0, "cell mounted");
+    let _ = Path::new(&mount_point);
+}

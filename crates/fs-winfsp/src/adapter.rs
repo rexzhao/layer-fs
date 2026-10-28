@@ -133,6 +133,15 @@ impl<B: WorkspaceOps> Adapter<B> {
         )
     }
 
+    /// How many file objects this mount currently has open.
+    ///
+    /// Read from the **handle table**, not from the context counters: the counters answer "was every context released", which is a teardown question, while
+    /// this answers "is a file open right now", which is the question `status.handles` reports and the one a remote `umount` refuses on (ADR-010 §7.2).
+    #[must_use]
+    pub fn open_handles(&self) -> usize {
+        self.handles.lock().expect("handle table").len()
+    }
+
     /// The backend, borrowed: the callbacks need `read_dir`/`get_info` directly, and going through the adapter's handle semantics
     /// would be the wrong question for a listing (there is no handle — the directory id is already known).
     #[must_use]

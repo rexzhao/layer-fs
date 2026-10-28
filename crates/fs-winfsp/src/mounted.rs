@@ -78,8 +78,51 @@ pub fn mount_read_only(
     volume: crate::abi::VolumeInfo,
     probe: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<MountReport, LoadError> {
+    // A thin wrapper: the probe only ever wanted the path, and the existing criteria keep saying so (ADR-010 §10.5).
+    mount_serving(library, mount_point, backend, volume, |mounted| {
+        probe(mounted.path())
+    })
+}
+
+/// A mount that is **serving**, as the closure of [`mount_serving`] sees it.
+///
+/// The closure is handed this instead of a bare path because a mount has more than one thing worth asking while it is up: where it is attached, and how
+/// many file objects are open on it — the number `status.handles` reports and the one a **remote** `umount` refuses on (ADR-010 §7.2).
+pub struct Mounted {
+    path: std::path::PathBuf,
+    adapter: std::sync::Arc<crate::DynAdapter>,
+}
+
+impl Mounted {
+    /// Where the mount is attached.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// How many file objects are open right now.
+    #[must_use]
+    pub fn open_handles(&self) -> usize {
+        self.adapter.open_handles()
+    }
+}
+
+/// Mounts read-only at `mount_point` and runs `serve` **while the volume is up**, then unmounts and tears everything down.
+///
+/// `serve` is the mount's whole lifetime: it returns when the caller wants the mount gone, and its `Result` decides whether the mount "looked like a mount".
+///
+/// # Errors
+///
+/// [`LoadError`] from the loader or a missing export.
+pub fn mount_serving(
+    library: &Path,
+    mount_point: &Path,
+    backend: crate::ops::DynOps,
+    volume: crate::abi::VolumeInfo,
+    serve: impl FnOnce(&Mounted) -> Result<(), String>,
+) -> Result<MountReport, LoadError> {
     resolve_library(library)?;
-    platform::mount_read_only(library, mount_point, backend, volume, probe)
+    platform::mount_serving(library, mount_point, backend, volume, serve)
 }
 
 #[cfg(windows)]
@@ -776,12 +819,12 @@ mod platform {
         units
     }
 
-    pub(super) fn mount_read_only(
+    pub(super) fn mount_serving(
         library: &Path,
         mount_point: &Path,
         backend: crate::ops::DynOps,
         volume: crate::abi::VolumeInfo,
-        probe: impl FnOnce(&Path) -> Result<(), String>,
+        serve: impl FnOnce(&super::Mounted) -> Result<(), String>,
     ) -> Result<super::MountReport, LoadError> {
         let module_path = wide(library.as_os_str());
         // SAFETY: `module_path` is NUL-terminated and outlives the call.
@@ -892,7 +935,7 @@ mod platform {
                 },
             ));
             let key = file_system as usize;
-            crate::registry::mounts().insert(key, mounted_adapter);
+            crate::registry::mounts().insert(key, std::sync::Arc::clone(&mounted_adapter));
 
             let mount_path = wide(mount_point.as_os_str());
             let mount_status = set_mount_point(file_system, mount_path.as_ptr());
@@ -901,7 +944,12 @@ mod platform {
             let start_status = start(file_system, 2);
 
             // Observe **while mounted**: this is the only window in which the OS can see the file system.
-            let looked_like_a_mount = mount_status == 0 && probe(mount_point).is_ok();
+            let looked_like_a_mount = mount_status == 0
+                && serve(&super::Mounted {
+                    path: mount_point.to_path_buf(),
+                    adapter: mounted_adapter,
+                })
+                .is_ok();
             let dispatcher_result = if let Some(address) = dispatcher_result_address {
                 // SAFETY: the address came from this module's export table; the signature is the SDK's.
                 let read: DispatcherResultFn = unsafe { std::mem::transmute(address) };
