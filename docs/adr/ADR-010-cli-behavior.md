@@ -1,6 +1,6 @@
 # ADR-010：CLI 行为模式（workspace 定位、路径、挂载生命周期、多挂载、错误）
 
-- 状态：**草案（Proposed）**——architect 起草，2026-10-26；manager review 后交 worker。**owner 已裁 D1（2026-10-26）：去掉 `cli/current`**，本稿已按裁决修订（见文末修订记录）；§14 其余裁决点待 owner
+- 状态：**Accepted（设计定稿）**——architect 起草，2026-10-26；owner 已裁 D1–D6（§14）；worker 落地核对后加"落地核对完成 <日期/commit>"
 - 日期：2026-10-26
 - 起草：architect
 - 依据：owner 2026-10-26 两条意见（"mount 后 current 应跟着变"、"应能从当前路径所属挂载点反查 workspace/branch，
@@ -32,13 +32,15 @@ CLI（`fs-cli`）现在用 `<store>/cli/current` 记录"当前 workspace"，文�
 | C1 | **去掉 `cli/current`（owner 裁决 D1）**：CLI 不保存任何"当前 workspace"状态；不读、不写、不作回落。workspace 只来自显式参数或路径发现 |
 | C2 | **定位优先级**：`--workspace` 显式 > **路径发现**（cwd 在一个活的挂载内）> **无默认：报错** `no workspace specified; use --workspace <name>, or cd into a mount point`；store：`--store` > 路径发现 > `.`。路径发现给出的是 **(store, workspace) 二元组**，不与显式 `--store` 拆开混用（§4.2） |
 | C3 | **`mount` 必须显式 `--workspace`**：挂载前 cwd 不可能在"这个"挂载内，路径发现不适用；现硬编码的缺省 `"main"` 是隐式默认，与 C1 同类，删除 |
-| C4 | **挂载期间按命令类别分流**（§6 表）：仓库级只读命令照常；文件级命令**拒绝并指路到挂载点**（挂载期的文件操作就走文件系统本身——总原则）；工作区级写命令 **S1 拒绝并指路，S2 经挂载进程代理** |
+| C4 | **挂载期间不打扰用户（owner 裁决 D2/D3）**：按命令类别分流（§6 表）——仓库级命令照常；**文件级命令经挂载点执行**（CLI 把 workspace 路径翻译成挂载点下的宿主路径，走文件系统本身，FSD 的 share/delete-pending/缓存语义一并生效）；**工作区级命令经管道交给挂载进程执行**（§10）。没有一条命令因"正在挂载"而要求用户先 umount，唯一例外是 `workspace discard` 与 `gc` |
 | C5 | **路径**：CLI 的 workspace 路径是 ADR-003 §3.1 的绝对路径 `/a/b`；CLI 入口唯一一处归一化：前导 `//` 折叠为 `/`、`\` 视为 `/`；识别 Git Bash 把 `/a` 改写成 `C:/…/Git/a` 的形态并给出去路；相对路径**只在挂载语境**下有锚点（§5） |
-| C6 | **挂载记录**：一条记录、一个位置（`%LOCALAPPDATA%\layerfs\mounts\`），由挂载进程**持有不可写共享的句柄**作为存活证明；**不在 store 目录另存一份**（§9） |
-| C7 | **mount 生命周期**：前台进程；Ctrl-C / Ctrl-Break / 关闭控制台 = 一次正常 umount 请求（flush → 卸载 → 删记录）；`umount` 语义保持（正常 / 超时 / `--force` 只清陈旧记录并如实说明） |
-| C8 | **同一 workspace 不得被两个打开者持有**：两层——记录层（友好错误，指出已挂在哪里）+ 锁层（W2，真正的保证）；跨进程锁层**目前无判据**（B-14b / B-22），本 ADR 把它列为 S1 判据 |
+| C6 | **挂载记录**：一条记录、一个位置（`%LOCALAPPDATA%\layerfs\mounts\`），由挂载进程**持有不可写共享的句柄**作为存活证明，记录里写管道名；**不在 store 目录另存一份**（§9） |
+| C7 | **mount 生命周期（owner 裁决 D4）**：前台进程；Ctrl-C / Ctrl-Break / 关闭控制台 = 一次正常 umount 请求（flush → 卸载 → 删记录）；`umount` 经管道（正常 / 超时报句柄数 / `--force` 只清陈旧记录并如实说明） |
+| C8 | **同一 workspace 不得被两个打开者持有（owner 裁决 D5）**：两层——记录层（友好错误，指出已挂在哪里）+ 锁层（W2，真正的保证）；跨进程锁层**目前无判据**（B-14b / B-22），本 ADR 把它列为 S1 判据 |
 | C9 | **错误**：按"用户下一步做什么"分类并带去路；区分 store / workspace / branch / path 四种"不存在"；退出码分档（§8.3） |
-| C10 | **`checkout <b>` = 创建或恢复名为 `<b>` 的 workspace，无副作用**（不再"切换"任何东西）；不改变任何运行中的挂载；在挂载语境里"换分支" = 换挂（S2，需无打开句柄），S1 给出 `umount`+`mount` 两步（§7.3，owner 裁决 D3） |
+| C10 | **`checkout <b>` = 创建或恢复名为 `<b>` 的 workspace，无副作用**（不再"切换"任何东西）；在挂载语境里（cwd 在 U: 内）`checkout <b>` 额外请求挂载进程**换挂**到 `<b>`（管道 `switch`，要求无打开句柄，§7.3） |
+| C11 | **挂载进程的线程结构**：WinFsp 回调本来就在 WinFsp 自己的分发线程上（`mounted.rs:901` 起 2 个）；主线程只管生命周期；**管道服务一个独立线程**，与主线程用一条 channel 通信（§10.5，选 B） |
+| C12 | **发布锁**：`Workspace` 增一把读写锁——所有视图操作取读锁，`commit/snapshot/restore/rebind` 取写锁并改为 `&self`；把 ADR-006 §9.1 第 0 步"发布期间写操作阻塞"从借用规则搬到运行时（§10.3） |
 
 ## 3. 事实基线（决定设计的四件事）
 
@@ -71,10 +73,15 @@ CLI（`fs-cli`）现在用 `<store>/cli/current` 记录"当前 workspace"，文�
   **未验证**（是否会清扫正在使用目录内的新文件取决于策略），但后果不可接受，C6 换位置。
 - 陈旧：进程被 `taskkill /F` 后记录残留（M7），目前只能 `umount --force` 手清。
 
-### 3.4 工作区级写操作要 `&mut Workspace`
+### 3.4 工作区级写操作要 `&mut Workspace`，且这不只是类型问题
 
-`Workspace::commit / snapshot / restore` 取 `&mut self`（`fs-api/src/workspace.rs:180,193,206`）；挂载进程持有的是
-`&'static Workspace`（共享引用，回调线程并发使用）。⇒ **"挂载进程代理 commit"需要先改 API 形状**（§10.2），不是只接一条管道。
+- `Workspace::commit / snapshot / restore` 取 `&mut self`（`fs-api/src/workspace.rs:180,193,206`；`fs-workspace/src/publish.rs:61,96`、
+  `workspace.rs:337`）；挂载进程持有的是 `&'static Workspace`（`mountcmd.rs:210`），被 WinFsp 分发线程并发使用。
+- `&mut` 在今天**承担了一个正确性前提**：发布 = `materialise`（`publish.rs:120-125`：flush，再遍历视图并编码）→ 记录 → `adopt`
+  （`workspace.rs:386`→ `fs-overlay/src/publish.rs:133-153`：**`DELETE FROM ov_entry / ov_page / ov_inode`**，`:139-141`）。
+  若在 materialise 之后、adopt 之前有一次写进入 overlay，它**不在新根里，又被 adopt 删掉——静默丢写**。今天挂载进程从不调 commit，
+  CLI 进程用 `&mut` 独占，所以不会发生；**代理 commit 一旦接入，这个窗口就打开**。
+- ⇒ 代理不是"接一条管道"，前置是 C12 的发布锁（§10.3），其判据（L1）必须能复现上面的丢写。
 
 ## 4. workspace 定位
 
@@ -179,16 +186,37 @@ CLI 作为入口，在**唯一一个函数**（`cli_path()`）里做以下三条
 ## 6. 挂载期间的命令分流（C4）
 
 "挂载语境" = 解析出的 workspace 正被一个活的挂载持有（不论 cwd 是否在挂载内——`--workspace dev` 指向一个挂着的 `dev` 也算）。
+CLI 从挂载记录得到挂载点 `M.mount_point` 与管道名 `M.pipe`。
 
 | 类别 | 命令 | 挂载期间 | 实现要点 |
 | --- | --- | --- | --- |
-| 仓库级、只读、不需要 overlay | `log`、`branch`（列出）、`cat <c>:<p>`、`ls <c>:<p>`、`stats`、`verify`、`list`、`version`、`snapshot list` | **照常** | `log/reset/revert` 取分支按 §4.3，走 `workspace_list()` |
-| 仓库级、写主库、不碰该 overlay | `branch <new>`、`branch delete`（另一分支）、`reset`、`revert`、`snapshot drop` | **照常**；`reset/revert` 作用于被挂载 workspace 的分支时打印警告：挂载侧下次 commit 会按 ADR-006 §10.3 得到 `BranchMoved` | 不新增语义 |
-| 文件级 | `put/get/ls/stat/mkdir/rm/mv`（无 `<commit>:`） | **拒绝**：`workspace dev 挂载在 U:（pid N）——请直接在 U: 上用普通文件操作，或先 umount U:` | 总原则：挂载期的文件操作走文件系统本身；CLI 不做第二条写路径 |
-| 工作区级写 | `commit`、`status`、`snapshot create`、`restore` | **S1：拒绝并指路**（`umount` 后再执行）；**S2：`commit/status/snapshot create` 经挂载进程代理**（§10）；`restore` S2 仍拒绝（§10.3） | |
-| 维护 | `gc` | **拒绝**（ADR-008 §6.1、B-9）；错误信息列出活的挂载 | 已有 `StoreInUse`，补去路 |
-| 生命周期 | `workspace discard dev` | **拒绝**：先 umount | 删一个正在服务的 workspace 等于从挂载下抽走存储（`branch delete` 在 workspace 仍在该分支上时本就拒绝，`main.rs` `workspace()` 注释，不另加） |
+| 仓库级、只读、不需要 overlay | `log`、`branch`（列出）、`cat <c>:<p>`、`ls <c>:<p>`、`stats`、`verify`、`list`、`version`、`snapshot list` | **照常**（CLI 进程内） | `log/reset/revert` 取分支按 §4.3，走 `workspace_list()` |
+| 仓库级、写主库、不碰该 overlay | `branch <new>`、`branch delete`（另一分支）、`reset`、`revert`、`snapshot drop` | **照常**（CLI 进程内）；`reset/revert` 作用于被挂载 workspace 的分支时打印：挂载侧下次 commit 会按 ADR-006 §10.3 得到 `BranchMoved` | 不新增语义 |
+| 文件级 | `put/get/ls/stat/mkdir/rm/mv`（无 `<commit>:`） | **经挂载点执行**：workspace 路径 `/a/b` ⇒ 宿主路径 `M.mount_point\a\b`，用 `std::fs` 完成；`put` 结束前 `File::sync_all`（⇒ `FlushFileBuffers` ⇒ 适配器 `Flush` ⇒ `Workspace::flush`，与未挂载时"每条命令退出前 flush"同一保证） | 走 FSD：share mode、delete-pending、目录非空、大小写折叠全部由同一条路径裁决（§6.1） |
+| 工作区级 | `status`、`commit`、`snapshot create` | **经管道交给挂载进程**（§10.4 `status/commit/snapshot`） | `status` 只读（S1）；`commit/snapshot` 需 C12 发布锁（S2） |
+| 工作区级、替换视图 | `restore` | **经管道**，**仅当挂载上无打开句柄**；否则拒绝并报句柄数（§10.4 `restore`） | §6.2 |
+| 生命周期 | `umount` | **经管道**（§10.4 `unmount`） | 取代 stop 文件 |
+| 换挂 | `checkout <b>`（cwd 在挂载内） | **经管道**，**仅当无打开句柄**（§10.4 `switch`） | §7.3 |
+| 维护 | `gc` | **拒绝**（ADR-008 §6.1、B-9：GC 期间不得有句柄是其正确性前提）；错误列出活的挂载 | 不代理：在挂载进程里跑 GC 正是 B-9 要防的事 |
+| 生命周期 | `workspace discard dev` | **拒绝**：先 umount | 删一个正在服务的 workspace 等于从挂载下抽走存储（`branch delete` 在 workspace 仍在该分支上时本就拒绝） |
 | 同一 workspace 再挂 | `mount V: --workspace dev` | **拒绝**：`dev 已挂载在 U:` | C8 |
+
+### 6.1 为什么文件级命令走挂载点而不走管道
+
+- **一条写路径**：经挂载点 = 与任何应用程序完全相同的路径；FSD 的 share 检查、delete-pending、`FileNode` 缓存、通知都自然一致。
+  经管道直接调 `Workspace::write_at` 会**绕过 FSD**：应用以 deny-write 打开的文件会被 CLI 改写，FSD 的 `FileNode` 里缓存的大小
+  不会更新——正是 ADR-009 W6/W7 要防的两套状态。
+- **零新协议**：不需要为 9 个文件命令各设计一个 op。
+- 代价：`stat` 的输出字段来自 Win32（`GetFileInformationByHandle`：`FileIndex` 即 FileId、大小、时间），与未挂载时的 `Stat` 字段同名同义，
+  实现时在一处做映射；`ls` 的顺序按 `read_dir` 返回顺序（与未挂载时一致：核心按名字排序，ADR-009 U15）。
+
+### 6.2 为什么 restore 只在无句柄时代理
+
+- restore 把视图换成另一棵树：打开句柄底下的对象可能消失或内容整体变化。NTFS 没有"文件底下换内容"的行为；总原则下不可接受。
+- 无句柄时没有观察者。内核侧：`FileInfoTimeout = 0`（`mounted.rs:838`）关闭了元数据缓存；**数据缓存在 `FileInfoTimeout = 0` 时
+  不启用——未验证（V6）**，S3 判据 A20 直接测"restore 后重新打开读到新内容"。
+- "句柄数"来自适配器的注册表（P3-4 收口 §1.2：一挂载一 HandleTable），不是 FSD 的计数；Explorer 打开着目录窗口会持有目录句柄——
+  这时 restore 被拒是**正确**的，错误信息写明"有 N 个打开的句柄（包括资源管理器窗口）"。
 
 ## 7. 生命周期
 
@@ -199,22 +227,23 @@ CLI 作为入口，在**唯一一个函数**（`cli_path()`）里做以下三条
 3. **记录层互斥**：存在指向同 `(store, workspace)` 的活记录 ⇒ 拒绝（C8 第一层）；
 4. `workspace_open`（W2 锁，C8 第二层）；
 5. 写记录并**持有其句柄**（§9.2）；挂载；前台阻塞；
-6. 停止条件：`umount` 请求（S1 仍为 stop 文件；S2 改为管道 `Unmount` 请求）、**Ctrl-C / Ctrl-Break / 控制台关闭**
-   （`SetConsoleCtrlHandler`；现状无处理，Ctrl-C 直接结束进程 ≈ M7 的残留形态）；
+6. 停止条件：管道 `unmount` 请求、**Ctrl-C / Ctrl-Break / 控制台关闭**（`SetConsoleCtrlHandler`；现状无处理，Ctrl-C 直接结束进程 ≈ M7 的残留形态）、
+   `switch` 请求（停止后用新 workspace 重挂，§7.3）——三者都只是往主线程的 channel 发一条消息（§10.5）；
 7. 停止序列：`flush`（W3/W4：使挂载期全部写入持久）→ 卸载 → 关闭并删除记录。第二次 Ctrl-C（5 s 内）= 立即退出，
    打印"未 flush 的写入可能丢失（最后一次 flush 之前的都在）"。
    - `CTRL_CLOSE_EVENT` 系统只给约 5 s：flush 是一次 `synchronous=FULL` 提交，正常远小于此；**未验证**大 overlay 下的上界。
 
-后台挂载（`mount --detach`）**不在本 ADR**：它需要服务化或分离进程，属 owner 产品决策（§14 D4）。
+后台挂载（`mount --detach` / 服务化）**不在本 ADR**：涉及会话、登录、服务账户，若要另立 ADR。
 
 ### 7.2 umount
 
-| 情形 | 行为（保持现状语义） |
+| 情形 | 行为 |
 | --- | --- |
-| 正常 | 发停止请求，等待 ≤ `UNMOUNT_WAIT`（10 s，`mountcmd.rs:28`）记录消失 ⇒ "unmounted" |
-| 超时（通常是有打开句柄，M5） | 报"未在 10 s 内卸载"，**不改任何状态**；S2 起列出持有句柄数（B-26） |
-| `--force` | 只删陈旧记录，并如实说明"卷可能仍挂着，结束挂载进程"（WinFsp 句柄在对方进程里——`mountcmd.rs:1-12` 的诚实原则保留） |
-| 无参数且 cwd 在挂载内 | 卸载该挂载（便利；显式参数优先） |
+| 正常 | 管道 `unmount{wait_ms: UNMOUNT_WAIT}`（10 s，`mountcmd.rs:28` 的常量保留为唯一来源）⇒ 挂载进程 flush、卸载、删记录后回 `ok` ⇒ "unmounted" |
+| 超时（通常是有打开句柄，M5） | 回 `Timeout{handles}`；CLI 报"未在 10 s 内卸载，N 个打开的句柄"，**不改任何状态**（关闭 B-26 的"持有者打印"一半：给出数量，不给进程名——WinFsp 用户态拿不到打开者进程） |
+| 管道连不上，记录判活为陈旧 | "挂载进程已不在；`umount <mp> --force` 清理记录" |
+| `--force` | 只删陈旧记录，并如实说明"卷可能仍挂着，结束挂载进程"（WinFsp 句柄在对方进程里——`mountcmd.rs:1-12` 的诚实原则保留）；记录判活为**活**时 `--force` 拒绝（不删活记录） |
+| 无参数且 cwd 在挂载内 | 卸载该挂载（显式参数优先） |
 
 ### 7.3 checkout 与挂载（C10）
 
@@ -224,11 +253,14 @@ CLI 作为入口，在**唯一一个函数**（`cli_path()`）里做以下三条
 - 存在性检查走 `workspace_list()`，**不打开 overlay**（现 `main.rs:344-360` 打开它——`<b>` 正被挂载时 checkout 会失败）。
   中断发布的恢复（ADR-006 §9.3）由下一次真正的 `workspace_open` 完成，checkout 不必为此打开。
 - 分支 `<b>` 不存在 ⇒ `NotFound{branch}`，去路 `fs-cli branch <b> --from main`。
-- **挂载语境下"换分支"**：owner 期望"同一挂载点 checkout 另一分支"。一个挂载在其生命周期内绑定一个 workspace（W2），换分支 = **换挂**：
-  - S1：`checkout <b>` 在挂载语境里**只做上面的创建/恢复**，并提示两步：`fs-cli umount U: && fs-cli mount U: --workspace <b>`；
-  - S2（owner 裁决 D3）：增 `mount U: --switch <b>`，经管道请求挂载进程**换挂**：要求挂载上**无打开句柄**
-    （NTFS 没有"文件底下换卷"的对应行为，有句柄时换挂会让句柄指向消失的对象——总原则下不可接受），flush → 关旧 workspace → 开新 workspace → 重新挂载同一挂载点。
-  - "U: 现在是哪个分支"只从**挂载记录**读（单一来源）。
+- **挂载语境下"换分支"（owner 裁决 D3）**：cwd 在 U: 内时，`checkout <b>` 先做上面的创建/恢复，再经管道发 `switch{workspace: b}`：
+  - 挂载进程检查**无打开句柄**（§6.2 同一理由：有句柄时换挂会让句柄指向消失的对象），否则回 `HandlesOpen{handles}`，CLI 报数量并给出
+    "关闭文件/资源管理器窗口后重试"；
+  - 无句柄：flush → 卸载 → 关闭旧 workspace → 打开 `<b>`（W2 锁；`<b>` 被别处持有 ⇒ 回 `WorkspaceInUse`，**旧 workspace 重新挂回**，
+    不留下"盘符空了"的中间态）→ 以同一挂载点重挂 → 原地更新记录（`workspace`、`branch`；同一句柄，判活不间断）→ 回 `ok`；
+  - 重挂失败（盘符被抢等）⇒ 回错误并保持未挂载、记录删除，CLI 如实报告"U: 已卸载，未能以 `<b>` 重挂：<原因>"。
+- cwd 不在挂载内时 `checkout <b>` **从不**影响任何挂载（要换某个挂载，cd 进去，或 `umount` + `mount`）。
+- "U: 现在是哪个分支"只从**挂载记录**读（单一来源）。
 
 ## 8. 错误模式（C9）
 
@@ -289,42 +321,114 @@ CLI 作为入口，在**唯一一个函数**（`cli_path()`）里做以下三条
   `taskkill /F` 也一样）。比 `pid` 校验强：不受 pid 复用影响，不需要比对进程启动时间。
 - 陈旧记录由**下一个读者**清理（能以写权限打开即可删除），并在 stderr 说明；`umount --force` 仍保留作显式清理。
 - 记录内容（S1）：`pid`、`mount_point`（规范化）、`store`（规范化）、`workspace`、`branch`（挂载时的值，仅展示）、
-  `started_at`；若 §4.4 需要，再加 `volume_guid`。S2 加 `pipe`（管道名）。
+  `started_at`、`pipe`（管道名，§10.1）；若 §4.4 需要，再加 `volume_guid`。
 
-## 10. 挂载进程代理（S2 接口草案）
+## 10. 挂载进程代理（正式设计）
 
 ### 10.1 通道
 
-- 命名管道 `\\.\pipe\layerfs-<record>-<pid>`，名字写进记录；ACL 只允许同一用户。挂载进程服务，单请求单响应，按行 JSON。
-- 取代 stop 文件：管道在即进程在，umount 走同一通道。`mountcmd.rs:1-8` 的"不用 IPC 是因为它带来要测试的协议"在只做 stop 时成立；
-  一旦代理 commit 就躲不掉，那时一并迁移。
+- **命名管道** `\\.\pipe\layerfs-<record>-<pid>`（`<record>` 即 `record_name(mount_point)`，`mountcmd.rs:38`），名字写进挂载记录 `pipe` 字段。
+- 创建：`PIPE_ACCESS_DUPLEX`、`PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS`，`nMaxInstances = 1`；
+  安全描述符只允许**当前用户 SID**（不用默认 DACL：默认允许 Everyone 读）。
+- **一次连接一个请求**：客户端连上 → 写一行请求 → 读一行响应 → 双方关闭。不做持久会话：无会话状态 = 无会话失步。
+- **服务端一次只处理一个请求**（`nMaxInstances = 1`，§10.5）。忙时客户端 `WaitNamedPipeW` 等待，超时见 §10.2。
+- 取代 stop 文件与"记录消失即停止"（`mountcmd.rs:238`）：两者都删除——停止只有一个入口（channel，§10.5），不再有两种互相竞争的信号。
 
-```text
-→ {"op":"status"}                          ← {"ok":true,"workspace":"dev","branch":"dev","base":"…","dirty":true,"handles":3}
-→ {"op":"commit","message":"…","force":false} ← {"ok":true,"commit":"…"} | {"ok":false,"error":"BranchMoved","expected":"…","found":"…"}
-→ {"op":"snapshot"}                        ← {"ok":true,"root":"…"}
-→ {"op":"flush"}                           ← {"ok":true}
-→ {"op":"unmount","wait_ms":10000}         ← {"ok":true} | {"ok":false,"error":"Timeout","handles":2}
-→ {"op":"switch","workspace":"feat"}       ← {"ok":false,"error":"HandlesOpen","handles":1}   （D3 批准时）
+### 10.2 帧、版本、超时
+
+- 帧：**一行 UTF-8 JSON + `\n`**；单帧上限 `PIPE_FRAME_MAX = 64 KiB`（超限 ⇒ 服务端回 `FrameTooLarge` 并关闭）。
+- 每个请求带 `"v": 1`；服务端不支持 ⇒ `{"v":1,"ok":false,"error":{"kind":"ProtocolVersion","supported":[1]}}`。
+  CLI 与挂载进程是同一个二进制，版本不符只在"升级二进制时有旧挂载在跑"时出现；错误信息给出"umount 后用新版本重挂"。
+- 超时（常量各一处，名字即语义）：
+
+| 常量 | 值 | 用途 |
+| --- | --- | --- |
+| `PIPE_CONNECT_WAIT` | 2 s | `WaitNamedPipeW`；超时 ⇒ 判活：活 ⇒ `Busy`（"挂载进程正在处理另一个请求"）；陈旧 ⇒ 按 §7.2 |
+| `PIPE_REPLY_WAIT_QUICK` | 30 s | `hello/status/flush` |
+| 无上限 | — | `commit/snapshot/restore/switch/unmount`：它们是原子的，客户端放弃等待不改变结果。客户端被 Ctrl-C 时打印"请求已发出，结果未知；用 `fs-cli status` 查看"并退出 |
+
+### 10.3 发布锁（C12，API 改动）
+
+- `fs_workspace::Workspace` 增 `publish: RwLock<()>`，并把发布会改写的字段（`branch`、`base_commit`、`base_root`）收进同一把锁保护的结构：
+
+```rust
+struct BaseState { branch: String, base_commit: String, base_root: ObjectId }
+pub struct Workspace { /* … */ base: RwLock<BaseState>, /* 取代三个可变字段 */ }
+
+// 视图操作（read_at / write_at / write_at_id / truncate / create / mkdir / remove / remove_at / rename / stat / read_dir / flush / status …）
+fn op(&self, …) { let _base = self.base.read(); … }
+// 发布与替换（签名由 &mut self 改为 &self）
+pub fn commit(&self, msg: &str, force: bool) -> … { let mut base = self.base.write(); /* materialise → record → adopt */ }
+pub fn snapshot(&self) -> …   // 同上
+pub fn restore(&self, commit: &str, discard: bool) -> …
+pub fn rebind(&self, branch: &str) -> …
 ```
 
-错误以核心的类型名回传，CLI 按 §8.2 渲染——**CLI 不在客户端重新判断语义**。
+- **锁序**（防死锁，一处写明、处处照做）：`base` 读写锁 → overlay 连接互斥 → `store` 互斥（`workspace.rs:30`）。**只有公共入口取 `base`**；
+  内部函数（`materialise` 的 `encode` 回调里调的 `overlay.read_at` 等）不再取——否则写锁持有者重入读锁即自锁。
+- **为什么读也取读锁**：`adopt_base` 是"删 overlay 行 + 改 meta"一个事务、再改内存里的 base（`fs-overlay/src/publish.rs:144-151`）；
+  事务提交与内存更新之间若有读，会看到"空 overlay + 旧 base"。读锁让读者只能看到发布前或发布后。
+- **阻塞代价**：commit 持写锁期间（materialise 遍历整棵视图 + 编码改动），所有文件操作在 WinFsp 分发线程上等待。上界约束：
+  必须远小于 WinFsp 的 `IrpTimeout`（`VolumeParams` 置零 ⇒ 默认 `FspFsctlIrpTimeoutDefault = 300000` ms，SDK `fsctl.h:184-186,202`），
+  超过则内核取消挂起的 IRP。S2 判据 A16 记录"commit 期间文件操作的最长等待"与视图大小的关系（带红值出档，不设通过线前先测）。
+- `fs-api::Workspace` 同步改为 `&self`（`fs-api/src/workspace.rs:180,193,206`）；CLI 进程内（未挂载语境）调用不受影响。
 
-### 10.2 前置：API 形状
+### 10.4 op 规范
 
-`commit / snapshot` 取 `&mut Workspace`（§3.4），挂载进程只有 `&'static Workspace` 被回调线程共享。需要其一：
+所有响应：成功 `{"v":1,"ok":true, …}`；失败 `{"v":1,"ok":false,"error":{"kind":"<类型名>","message":"<人读>", …字段}}`。
+`kind` 取核心错误的类型名（`WorkspaceError` / `ApiError` 变体名）或下表的代理自有错误；**CLI 按 `kind` 渲染 §8.2 的去路，不在客户端重新判断语义**。
 
-- **(a) 推荐**：`Workspace` 内部互斥——`commit/snapshot(&self)`，内部取一把与回调路径相同的写锁。ADR-006 §9.1 第 0 步本来就规定
-  "取 workspace 锁（本 workspace 的写操作在此期间阻塞）；flush"——(a) 只是把这把锁从 `&mut` 的借用规则搬到运行时，语义不变；
-- (b) 挂载进程在代理请求时暂停分发（WinFsp 无此原语，需自己在回调入口挡）。
+| op | 请求 | 成功响应 | 代理自有错误 |
+| --- | --- | --- | --- |
+| `hello` | `{}` | `{store, workspace, branch, pid, mount_point, protocol:1}` | — |
+| `status` | `{}` | `{workspace, branch, base_commit, dirty, handles}` | — |
+| `flush` | `{}` | `{}` | — |
+| `snapshot` | `{}` | `{root}` | — |
+| `commit` | `{message, force}` | `{commit, root}` | — |
+| `restore` | `{commit, discard}` | `{}` | `HandlesOpen{handles}` |
+| `switch` | `{workspace}` | `{workspace, branch}` | `HandlesOpen{handles}`；`WorkspaceInUse`（已挂回原 workspace） |
+| `unmount` | `{wait_ms}` | `{}`（响应在卸载与删记录**之后**才发） | `Timeout{handles}` |
 
-### 10.3 语义前置（**未验证，S2 开工前必须先定判据**）
+通用代理错误：`ProtocolVersion{supported}`、`FrameTooLarge`、`BadRequest{detail}`、`ShuttingDown`（停止序列已开始后到达的请求）。
+核心错误照传，例：`{"kind":"BranchMoved","branch":"dev","expected":"…","actual":"…"}`、`{"kind":"NothingToCommit"}`。
 
-- **commit 之后打开句柄的身份**：ADR-006 §9 的发布把 overlay 换到新 base。挂载中的句柄按 FileId 工作（ADR-009 G2）——
-  发布前后同一 FileId 必须指向同一对象、读到同样内容、可继续写。FileId 是 scope serial（ADR-006 §6），**推断**发布后不变，
-  但没有判据。S2 判据：`open(h) → write → 代理 commit → read(h) == 写入内容 && FileIndex 不变 → write(h) → status.dirty`。
-- **restore 不代理**：restore 把视图换成另一棵树，打开句柄底下的对象会消失；NTFS 无对应行为。S2 仍要求先 umount。
-- **flush 与 commit 的顺序**：commit 第 0 步已含 flush（ADR-006 §9.1）；代理不另加。
+### 10.5 挂载进程的线程结构（C11；答"A / B / C"）
+
+**事实**：WinFsp 回调**不在**主线程上——`FspFileSystemStartDispatcher(fs, 2)`（`mounted.rs:901`）起两条 WinFsp 自己的分发线程，
+回调在它们上面同步执行；主线程目前只在探针闭包里轮询 stop 文件（`mountcmd.rs:234-245`）。所以"单线程轮询会阻塞文件操作"的前提不成立；
+真正的问题是**管道 I/O 放在哪条线程、停止信号怎么汇合**。
+
+**选 B**：
+
+```text
+主线程（生命周期所有者）           管道线程（一个）                    控制台处理器（系统线程）
+  open workspace（W2）               loop:                                on Ctrl-C/Break/Close:
+  写记录 + 持句柄                       ConnectNamedPipe（阻塞）              tx.send(Stop{reason})
+  mount（分发线程开始服务）             读一行 → 分派：                       return TRUE
+  loop: match rx.recv():                 hello/status/flush/snapshot/commit/restore
+    Stop{reason, reply} ⇒ 跳出            ⇒ 本线程直接调 Workspace（C12 锁保护）
+    Switch{ws, reply}  ⇒ 停→换→重挂      unmount/switch ⇒ tx.send(…, reply_tx)，等 reply_rx
+  停止序列：flush → 卸载 → 删记录        写一行响应，断开
+  reply.send(ok)                        收到 ShuttingDown 标志 ⇒ 对新请求回 ShuttingDown
+```
+
+- **为什么不是 A（在主线程轮询里查管道）**：要么非阻塞/重叠 I/O 加轮询（每个请求多 ≤ 50 ms 延迟，且实现比一条阻塞线程更复杂），
+  要么阻塞 `ConnectNamedPipe` 让主线程收不到停止信号。它省掉的只是一条线程，而这条线程的共享状态只有 `&'static Workspace`
+  （本来就 `Sync`，被分发线程共享）与一条 channel。
+- **为什么不是 C（async）**：WinFsp 回调是同步的（我们同步返回状态，不用 `STATUS_PENDING`），async 运行时只能包住管道这一端；
+  多一个运行时依赖，换来的并发（同时服务多个管道请求）恰恰是我们**不要**的——发布本来就要串行。
+- **正确性论证只需三条**：① 文件操作与代理操作的互斥由 C12 的锁保证，与线程从哪来无关；② 停止只有一个入口（channel），
+  不存在 stop 文件与记录消失两路信号的竞争；③ 管道线程不持有任何跨请求状态，一个请求失败不影响下一个。
+- **退出**：主线程完成停止序列后关闭管道句柄（使阻塞中的 `ConnectNamedPipe` 以错误返回），join 管道线程。
+
+### 10.6 句柄语义（S2 判据的依据）
+
+- **commit/snapshot 后 FileId 不变**：物化把每个可达 inode 的 serial 原样编码进新根（`materialize.rs:181,224-226`），`adopt` 后视图 = 新根，
+  同一 serial 仍可达 ⇒ 同一 FileId（ADR-009 G2 按 FileId 读写）。**这是从代码推出的结论，判据 A13 直接验证**。
+- 不可达的行（`remove_at` 的 tombstone）不进新根，`adopt` 后消失；它们按 ADR-009 §5.4 本来就没有打开句柄（两段删除在最后一个 Cleanup 才 `remove_at`），
+  rename-replace 有句柄的保留路径已由 P3-4 U1 证明不会发生（FSD 拒绝）⇒ **commit 不会让任何打开句柄失去对象**。
+- delete-pending 中的文件（已标删除、句柄未关）在 commit 时仍有名字 ⇒ 进入新根；最后一个 Cleanup 时照常 `remove_at` ⇒ 下一次 commit 才消失。与 NTFS 一致（删除挂起期间名字仍在）。
+- 适配器侧的句柄缓存（size 等）在 commit 前后**内容不变**，无需失效。restore/switch 才改变内容，故要求无句柄（§6.2、§7.3）。
 
 ## 11. 替代方案（已否决）
 
@@ -336,7 +440,10 @@ CLI 作为入口，在**唯一一个函数**（`cli_path()`）里做以下三条
 | 挂载记录写进 store 目录 | §9.1：查询方向不对 + 第二份真相 |
 | 只用 pid 判活 | pid 复用；需比对启动时间且仍有竞态。句柄判活（§9.2）严格更强且更简单 |
 | 挂载期间 CLI 文件命令"绕过"挂载直接写 overlay | 违反 W2；即便锁允许，也是同一 workspace 的第二条写路径，挂载侧缓存（FileNode、size 缓存）不会知道 |
-| 挂载期间 CLI 文件命令经管道代理 | 能做，但与"在 U: 上直接 copy"重复，且要复制一套路径/句柄语义；总原则下挂载期文件操作就该走文件系统。只代理工作区级操作 |
+| 挂载期间 CLI 文件命令经管道代理 | 绕过 FSD（share、delete-pending、`FileNode` 缓存），造出第二条写路径；§6.1。改为经挂载点执行 |
+| 挂载期间文件/工作区命令一律拒绝、要求先 umount（初稿 S1 方案） | **owner 否决（D2/D3）**：打扰用户；代理与经挂载点执行都可做到语义一致 |
+| 挂载进程事件循环 A（主线程轮询管道）/ C（async） | §10.5 |
+| 代理期间暂停 WinFsp 分发（不加锁） | WinFsp 无暂停原语，需在每个回调入口自己挡——就是一把锁，只是放在了更远、更难论证的位置 |
 | 卷内放一个虚拟文件（如 `U:\.layerfs`）供反查 | 污染命名空间，`dir /a`、备份工具都会看见——违反"与普通文件系统一致" |
 
 ## 12. 影响面
@@ -358,8 +465,13 @@ CLI 作为入口，在**唯一一个函数**（`cli_path()`）里做以下三条
 | §6 分流 | 每条命令一个类别常量，表驱动 | S1 |
 | Ctrl-C 处理（§7.1） | `SetConsoleCtrlHandler` | S1 |
 | 退出码（§8.3） | | S1 |
-| `fs-api` `Workspace::commit/snapshot(&self)` | §10.2 (a) | S2 |
-| 管道服务与客户端（§10.1） | | S2 |
+| `fs-cli/src/mountcmd.rs:217-245` stop 文件与"记录消失即停止" | 删除；改为 channel + 管道 `unmount`（§10.1、§10.5） | S1 |
+| 管道服务（`hello/status/flush/unmount`）与客户端；管道线程 + channel | §10 | S1 |
+| 文件级命令经挂载点执行（§6.1） | workspace 路径 → 宿主路径；`stat` 字段映射一处 | S1 |
+| `fs-workspace::Workspace` 发布锁、`BaseState`、`commit/snapshot/restore/rebind(&self)`；`fs-api` 同步 | §10.3 | S2 |
+| 管道 `commit/snapshot` | §10.4 | S2 |
+| 适配器暴露打开句柄数（注册表计数） | `status.handles`、`unmount` 的 `Timeout{handles}` 用 | S1 |
+| 管道 `restore/switch` | §6.2、§7.3 | S3 |
 | ADR-006 §13 CLI 段 | 标"已由 ADR-010 取代" | 本 ADR 合入时（已在本分支） |
 | A5（可选）：挂载点内宿主路径自动翻译为 workspace 路径 | | 不排期 |
 
@@ -380,32 +492,68 @@ CLI 作为入口，在**唯一一个函数**（`cli_path()`）里做以下三条
 | A3 | 撞 `WorkspaceInUse` 且有该 workspace 的活挂载时，错误含挂载点与 pid | 渲染不查记录 |
 | A3b | `checkout <b>` 在 `<b>` 正被另一进程持有时成功并报告其状态；`checkout nope`（分支不存在）⇒ `NotFound` 且去路含 `branch nope --from` | 存在性改回 `workspace_open` |
 
-### S1
+### S1（依赖 S0；不改核心，只动 CLI 与挂载进程）
+
+范围：记录迁移与句柄判活（§9）、路径发现（§4.4）、`cli_path()`（§5.1）、Ctrl-C（§7.1）、退出码（§8.3）、适配器句柄数、**管道骨架**（线程结构 §10.5、
+帧/版本/超时 §10.2、op `hello/status/flush/unmount`）、**文件级命令经挂载点**（§6.1）。`status` 进入 S1：它只读，经管道不需要发布锁。
 
 | # | 判据 | 变异（必须红） |
 | --- | --- | --- |
-| A4 | **跨进程 W2**：进程 A 持有 `dev`（真读一次证明活着），进程 B `workspace_open(dev)` 得到 typed `WorkspaceInUse`；**删除挂载记录后**仍拒绝（证明锁层独立于记录层）；A 退出后 B 成功（阴性对照） | 去掉 `locking_mode=EXCLUSIVE`；或把 open 改成不触发首次加锁 |
-| A5 | 同一 `(store, workspace)` 第二次 mount 被拒，错误指出第一个挂载点（关闭 B-22） | 去掉记录层检查（此时 A4 仍拦，但错误文本不含挂载点 ⇒ 本条红） |
+| A4 | **跨进程 W2**：进程 A 持有 `dev`（真读一次证明活着），进程 B `workspace_open(dev)` 得到 typed `WorkspaceInUse`；**删除挂载记录后**仍拒绝（锁层独立于记录层）；A 退出后 B 成功（阴性对照） | 去掉 `locking_mode=EXCLUSIVE`；或把 open 改成不触发首次加锁 |
+| A5 | 同一 `(store, workspace)` 第二次 mount 被拒，错误指出第一个挂载点（关闭 B-22） | 去掉记录层检查（A4 仍拦，但错误文本不含挂载点 ⇒ 本条红） |
 | A6 | §4.2 组合表 7 行各一用例；"`--store S` 与发现的 store 不同"必须丢弃发现并报 C2 消息 | 拆开混用（取 S 加 M.workspace） |
-| A7 | 陈旧记录（持有进程已死）⇒ 不进入挂载语境（需要 workspace 的命令报 C2 消息），stderr 提示陈旧记录；记录被下一个读者清理 | 判活改为"文件存在即活" |
-| A8 | §6 表每类至少一条命令的用例（照常 / 拒绝带去路 / 拒绝） | 任一类别常量改错 |
+| A7 | 陈旧记录（持有进程已死，含 `taskkill /F`）⇒ 不进入挂载语境，stderr 提示；记录被下一个读者清理；`umount --force` 对**活**记录拒绝 | 判活改为"文件存在即活" |
+| A8 | §6 表每一行至少一条命令的用例 | 任一类别常量改错 |
 | A9 | `cli_path()`：`//a/b`≡`/a/b`、`\a\b`≡`/a/b`、`/a//b` 拒绝、MSYS 改写形态拒绝且提示含 `MSYS_NO_PATHCONV` | 任一条去掉 |
-| A10 | Ctrl-C 后：卷卸载、记录删除、Ctrl-C 前的写入在重新挂载后可读 | 去掉控制台处理器（行为退化为 M7 残留） |
+| A10 | Ctrl-C 后：卷卸载、记录删除、Ctrl-C 前的写入在重新挂载后可读 | 去掉控制台处理器（退化为 M7 残留） |
+| A11 | 管道：`hello` 返回与记录一致；`v:2` 请求 ⇒ `ProtocolVersion`；超限帧 ⇒ `FrameTooLarge` 且服务端继续服务下一个请求；`unmount` 的响应在记录删除之后到达 | 响应提前发送；或帧错误后不再 accept |
+| A12 | 有打开句柄时 `umount` ⇒ `Timeout{handles≥1}`，卷仍挂、记录仍在；关闭句柄后再 `umount` 成功 | 超时后仍删记录 |
+| A13a | 文件级经挂载点：应用以 `FILE_SHARE_READ`（无 write share）打开 `/a` 时，`fs-cli put x /a` 失败且为共享冲突；`fs-cli rm /d`（非空目录）失败为目录非空；`put` 后不卸载直接 `taskkill /F` 挂载进程，重挂后内容在（`sync_all` 生效） | `put` 改为经管道直写 overlay（share 检查消失 ⇒ 第一条红）；去掉 `sync_all` |
+| A14 | `status` 经管道：挂载中写一个文件后 `status.dirty = true`、`handles` 与实际一致 | — （读值核对，三态带红值） |
 
-### S2（需 owner 裁决 D2；开工前先补 §10.3 的判据）
+### S2（依赖 S1；改核心 API）
 
-A11 代理 commit 的句柄身份判据（§10.3）；A12 `unmount` 经管道且超时返回句柄数；A13（若 D3 批准）有句柄时 `switch` 拒绝、无句柄时换挂成功且记录更新。
+范围：发布锁与签名（§10.3）、op `commit/snapshot`、句柄语义（§10.6）。
 
-## 14. 需要 owner 裁决
-
-| # | 问题 | 推荐 |
+| # | 判据 | 变异（必须红） |
 | --- | --- | --- |
-| D1 | `cli/current` 的去留 | **已裁（owner 2026-10-26）：去掉**；cwd 不在挂载内时必须显式 |
-| D2 | 挂载期间的 `commit/status/snapshot`：S2 代理是否进入当前阶段，还是以 S1"拒绝并指路"收口 | 先 S1 收口；S2 在 §10.3 判据写出后再排 |
-| D3 | 挂载语境下 `checkout <b>` = 换挂（无句柄时）？还是永远要求 `umount`+`mount` | S1 两步；S2 随 D2 一起定 |
-| D4 | 后台挂载（`mount --detach` / 服务化） | 不在本 ADR；若要，另立 ADR（涉及会话、登录、服务账户） |
-| D5 | 退出码分档（§8.3）是否作为对外承诺 | 接受（项目未上线，现在定成本最低） |
-| D6 | `init` 是否仍顺带创建同名 workspace `main`（不写任何 CLI 状态） | **保留**：它是真实对象而非隐藏状态，使 `init` 之后 `--workspace main put …` 立即可用。manager 转述为"init 只建 store + main branch"——若意在连 workspace 也不建，则 `init` 后需先 `checkout main`；请确认 |
+| A15 | **L1 丢写复现**（不需要挂载）：N 条线程持续 `write_at` 不同文件、每次写后记录"已返回"，同时另一线程循环 `commit`；结束后每个"已返回"的写都出现在**最后一次 commit 的树或当前 overlay** 中，二者之一，不得两者皆无 | 去掉写锁（commit 不取 `base.write()`）⇒ 必须出现丢写；若 1000 轮内未出现 ⇒ **空转**，须加注入点（materialise 与 adopt 之间的 `crash_point` 换成可配置的停顿）后重跑 |
+| A16 | commit 期间文件操作的最长等待 vs 视图大小（1k/10k/100k 条目）记录出档，带红值；与 `IrpTimeout` 默认值对照 | — （度量） |
+| A17 | **句柄身份（L2，真挂载）**：`open(h)` → `write(h,"a")` → 管道 `commit` → `read(h) == "a"` 且 `FileIndex(h)` 不变 → `write(h,"b")` → `status.dirty` → 第二次 `commit` 成功；目录句柄在 commit 前后 `ReadDirectory` 结果一致 | `adopt` 后重新分配 serial（模拟"身份不稳"）|
+| A18 | `commit` 经管道的 `BranchMoved` / `NothingToCommit` 原样到达 CLI，渲染 §8.2 去路 | 客户端自行判断语义 |
+
+### S3（依赖 S2；替换视图类）
+
+范围：op `restore/switch`（§6.2、§7.3；句柄数已在 S1）。
+
+| # | 判据 | 变异（必须红） |
+| --- | --- | --- |
+| A19 | 有句柄时 `restore`/`switch` ⇒ `HandlesOpen{handles}` 且视图/挂载不变 | 去掉句柄检查 |
+| A20 | 无句柄时 `restore` 后重新打开文件读到**新**内容（同时验证 V6：`FileInfoTimeout=0` 下无数据缓存） | — （若读到旧内容 ⇒ 失败带红值，S3 停卡，设计回到"需 `FspFileSystemNotify` 失效"，依赖 U9） |
+| A21 | `switch` 到被别处持有的 workspace ⇒ `WorkspaceInUse`，且原 workspace 已挂回、记录未变 | 失败时不挂回 |
+| A22 | `switch` 成功后记录 `workspace/branch` 更新，判活不间断（另一进程在 switch 全程判活均为"活"） | 换挂时关闭并重开记录句柄 |
+
+### 依赖总览
+
+```text
+S0 ──► S1 ──► S2 ──► S3
+        │       └─ 依赖 C12 发布锁（fs-workspace + fs-api 签名）
+        └─ 管道骨架在 S1（不是 S0）：S0 只做"去掉 current"这一件语义变化，判据影响已是"改变"，不再夹带新机制
+```
+
+## 14. owner 裁决记录（2026-10-26，全部已裁）
+
+| # | 问题 | 裁决 |
+| --- | --- | --- |
+| D1 | `cli/current` 的去留 | **去掉**；cwd 不在挂载内时必须显式（C1） |
+| D2 | 挂载期间的工作区级命令 | **代理**：CLI 把必要的工作交给挂载进程，尽量不打扰用户（C4、§10） |
+| D3 | 挂载期间 status 等只读操作、挂载语境下 checkout | **同样代理**；checkout = 无句柄时换挂（C10、§7.3） |
+| D4 | Ctrl-C | **视为正常 umount**（C7） |
+| D5 | 二次挂载 | **两层防护**：记录层先拒 + W2 锁层兜底（C8） |
+| D6 | `init` 是否顺带建 workspace `main` | **保留**（真实对象，非隐藏状态） |
+
+注：本稿初版的 D4（后台挂载）与 D5（退出码分档）与 manager 转达时的编号不同。后台挂载已移出本 ADR（§7.1）；
+**退出码分档（§8.3）按 architect 推荐采纳，待 owner 追认**——它是对脚本的对外承诺，若 owner 不同意，只回退 §8.3 一节，其余不受影响。
 
 ## 15. 未验证清单
 
@@ -415,7 +563,9 @@ A11 代理 commit 的句柄身份判据（§10.3）；A12 `unmount` 经管道且
 | V2 | WinFsp 目录挂载点下 `GetVolumePathNameW` 的返回值；`subst`/网络盘 | S1 L2 |
 | V3 | `%TEMP%` 清扫是否会删除活记录（决定 §9.1 迁移的紧迫度，不决定方向） | 不必验证：方向已定 |
 | V4 | `CTRL_CLOSE_EVENT` 的约 5 s 内 flush 是否总能完成（大 overlay） | S1 A10 加大 overlay 变体 |
-| V5 | 代理 commit 前后 FileId / 句柄有效性 | S2 A11 |
+| V5 | 代理 commit 前后 FileId / 句柄有效性（§10.6 从代码推出） | S2 A17 |
+| V6 | `FileInfoTimeout = 0` 时 WinFsp 不启用数据缓存（决定 restore 无句柄代理是否安全） | S3 A20 |
+| V7 | commit 持写锁的最长时长相对 `IrpTimeout`（5 min 默认）的余量 | S2 A16 |
 
 ## 修订记录
 
@@ -423,3 +573,6 @@ A11 代理 commit 的句柄身份判据（§10.3）；A12 `unmount` 经管道且
 - 2026-10-26 按 owner 裁决 D1 修订：**去掉 `cli/current`**（C1）；workspace 来源 = `--workspace` > 路径发现 > 报错（C2，消息逐字固定）；
   `mount` 必须显式 `--workspace`（C3，删除缺省 `"main"`）；`checkout` 改为无副作用的创建/恢复（C10、§7.3）；新增 §4.3 分支来源；
   S0 判据增 A0/A0b/A3b、改写 A1/A2，判据影响 = 改变（`cli_defaults.rs::init_leaves_a_workspace_ready_to_use`）；新增 D6。
+- 2026-10-26 终稿（Accepted）：owner 裁决 D2–D6。挂载期不再拒绝——文件级命令经挂载点执行（§6.1），工作区级经管道代理（§10）；
+  §10 由草案升为正式设计：管道通道/帧/版本/超时、8 个 op、发布锁 C12（`&mut` → `&self` + `RwLock`，并写明它防的丢写窗口 §3.4）、
+  线程结构 C11（选 B）、句柄语义 §10.6；分期改为 S0–S3（管道骨架在 S1），判据 A4–A22。
