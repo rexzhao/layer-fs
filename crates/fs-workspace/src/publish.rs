@@ -59,6 +59,8 @@ impl Workspace {
     ///
     /// Materialisation, overlay or main-database failures.
     pub fn snapshot(&mut self) -> WorkspaceResult<PublishOutcome> {
+        let gate = std::sync::Arc::clone(&self.gate);
+        let _gate = gate.write();
         let root = self.materialise()?;
         crash_point("after-materialise");
         // Step 2, then step 3, then step 4.
@@ -94,6 +96,11 @@ impl Workspace {
     /// [`WorkspaceError::NothingToCommit`] when the view already equals `root(base_commit)`,
     /// [`WorkspaceError::BranchMoved`] when the branch moved.
     pub fn commit(&mut self, message: &str, force: bool) -> WorkspaceResult<PublishOutcome> {
+        // **The publication gate, held for writing across the whole sequence** (ADR-010 §10.3): materialise reads the view, adopt moves the base, and a write
+        // that slipped between the two would be in neither. Taking it here — before the first step, released after the last — is what makes G1 a property
+        // rather than a hope.
+        let gate = std::sync::Arc::clone(&self.gate);
+        let _gate = gate.write();
         let root = self.materialise()?;
         crash_point("after-materialise");
         if root == self.repo.commit_root(&self.base_commit)? {

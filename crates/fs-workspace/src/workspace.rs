@@ -235,7 +235,10 @@ impl Workspace {
     /// be ordered against it. Everything a caller needs is a method on `Workspace` that takes the gate — `set_times` and `set_attributes` were the last two that
     /// did not, and they are here now, which is why nothing outside this crate calls this any more.
     #[must_use]
-    #[allow(dead_code, reason = "kept as the crate-internal accessor the gate-protected methods share")]
+    #[allow(
+        dead_code,
+        reason = "kept as the crate-internal accessor the gate-protected methods share"
+    )]
     pub(crate) fn overlay(&self) -> &OverlayStore {
         &self.overlay
     }
@@ -382,6 +385,8 @@ impl Workspace {
     /// [`WorkspaceError::WorkspaceDirty`] when the overlay is not empty and `discard` is
     /// false, [`WorkspaceError::NotFound`] when the commit is unknown.
     pub fn restore(&mut self, commit: &str, discard: bool) -> WorkspaceResult<()> {
+        let gate = std::sync::Arc::clone(&self.gate);
+        let _gate = gate.write();
         let root = self.repo.commit_root(commit)?;
         if !discard && self.is_dirty()? {
             return Err(WorkspaceError::WorkspaceDirty);
@@ -407,6 +412,8 @@ impl Workspace {
     /// commit — rebinding is only allowed onto an unchanged branch, because merging is not
     /// part of P2.
     pub fn rebind(&mut self, branch: &str) -> WorkspaceResult<()> {
+        let gate = std::sync::Arc::clone(&self.gate);
+        let _gate = gate.write();
         self.repo.workspace_rebind(&self.name, branch)?;
         self.branch = branch.to_owned();
         Ok(())
