@@ -142,6 +142,15 @@ impl<B: WorkspaceOps> Adapter<B> {
         self.handles.lock().expect("handle table").len()
     }
 
+    /// **File** handles open on this adapter, and directory handles (S3 card §3.2).
+    ///
+    /// Exposed as a pair on purpose: `restore`/`switch` block on the first and merely report the second, and a caller that could ask for only one of them
+    /// would be free to forget the other half of the rule.
+    #[must_use]
+    pub fn open_handle_kinds(&self) -> (usize, usize) {
+        self.handles.lock().expect("handle table").handle_kinds()
+    }
+
     /// The backend, borrowed: the callbacks need `read_dir`/`get_info` directly, and going through the adapter's handle semantics
     /// would be the wrong question for a listing (there is no handle — the directory id is already known).
     #[must_use]
