@@ -99,7 +99,10 @@ impl std::ops::Deref for ReadGuard<'_> {
 
 impl std::fmt::Debug for ReadGuard<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ReadGuard").field("held", &self.guard.is_some()).finish()
+        formatter
+            .debug_struct("ReadGuard")
+            .field("held", &self.guard.is_some())
+            .finish()
     }
 }
 
