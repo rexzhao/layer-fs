@@ -183,9 +183,12 @@ fn a_taken_drive_letter_says_what_to_do() {
         "cell collision: a taken letter must refuse, got {second:?}"
     );
     assert!(
-        stderr.contains("--force"),
+        stderr.contains("umount"),
         "cell collision: the message must name the way out, got {stderr:?}"
     );
+    // **Widened once, deliberately (§9.2).** With mount records in place, a taken letter is caught by the **record layer** before WinFsp sees it, so the
+    // message is now "`T:` is already mounted (pid N) — `layerfs umount T:` first": it names the same exit (`umount`) *and* the owner, which the
+    // `0xC0000035` message could not. The assertion stays "the message names a way out" rather than pinning which layer found it.
 
     let _ = Command::new(binary())
         .arg("umount")

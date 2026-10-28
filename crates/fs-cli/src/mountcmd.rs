@@ -59,16 +59,28 @@ pub fn record_name(mount_point: &Path) -> String {
     }
 }
 
-fn runtime_dir() -> PathBuf {
-    std::env::temp_dir().join("layerfs-mounts")
+/// Where mount records live: `%LOCALAPPDATA%\layerfs\mounts`, overridable with `LAYERFS_MOUNTS_DIR` (tests only).
+///
+/// **One function computes it**, because the location is part of the interface (ADR-010 §9): a record two codepaths disagree about is a record nobody
+/// finds. The old `%TEMP%` directory is deliberately **not** searched or cleaned (A7b) — an older binary may still be running there, and deleting its
+/// records would strand its mounts.
+#[must_use]
+fn mounts_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("LAYERFS_MOUNTS_DIR") {
+        return PathBuf::from(path);
+    }
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("layerfs").join("mounts")
 }
 
 fn state_path(mount_point: &Path) -> PathBuf {
-    runtime_dir().join(format!("{}.mount", record_name(mount_point)))
+    mounts_dir().join(format!("{}.mount", record_name(mount_point)))
 }
 
 fn stop_path(mount_point: &Path) -> PathBuf {
-    runtime_dir().join(format!("{}.stop", record_name(mount_point)))
+    mounts_dir().join(format!("{}.stop", record_name(mount_point)))
 }
 
 /// `FspVersion`'s two halves. The calibration in `fs_winfsp::abi::measured::DLL_BUILD` is a full build string, so the gate compares the **major
@@ -222,19 +234,54 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     let workspace: &'static fs_workspace::Workspace = Box::leak(Box::new(workspace));
     let backend: DynOps = Box::new(ApiBackend::new(workspace));
 
-    std::fs::create_dir_all(runtime_dir())?;
+    std::fs::create_dir_all(mounts_dir())?;
     let state = state_path(&mount_point);
     let stop = stop_path(&mount_point);
     let _ = std::fs::remove_file(&stop);
-    std::fs::write(
-        &state,
-        format!(
-            "pid={}\nmount_point={}\nworkspace={name}\nstore={}\n",
-            std::process::id(),
-            mount_point.display(),
-            store.display()
-        ),
-    )?;
+    // **A record that is still held means this letter is already served** (§9.2): say who holds it instead of failing with `os error 80` from
+    // `create_new`. A **stale** record is the leftover of a dead owner (power cut) and is replaced — `DELETE_ON_CLOSE` already covers every ordinary death,
+    // so this branch is rare by construction.
+    match record_is_live(&state) {
+        Liveness::Live => {
+            let owner = std::fs::read_to_string(&state).unwrap_or_default();
+            let field = |key: &str| {
+                owner
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix(key)?
+                            .strip_prefix('=')
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default()
+            };
+            return Err(fs_cli::Failure::in_use(format!(
+                "{} is already mounted (pid {}) — `layerfs umount {}` first",
+                mount_point.display(),
+                field("pid"),
+                mount_point.display()
+            ))
+            .into());
+        }
+        Liveness::Stale => {
+            let _ = std::fs::remove_file(&state);
+        }
+        Liveness::Gone => {}
+    }
+    // **The record's life is the process's life** (ADR-010 §9.2): created with `DELETE_ON_CLOSE` and held open, so however this process dies —
+    // `taskkill /F` included — the kernel closes the handle and removes the file. A leftover record then means a power cut, which is the only case the
+    // reader's staleness check has to handle.
+    let record = format!(
+        "version=1\npid={}\nmount_point={}\nstore={}\nworkspace={name}\nbranch={}\npipe=\nstarted_at={}\n",
+        std::process::id(),
+        canonical(&mount_point),
+        canonical(&store),
+        branch_of(&repo, &name).unwrap_or_default(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+    );
+    let _record_handle = hold_record(&state, &record)?;
     println!(
         "mounting {} at {} (workspace {name}); stop with `layerfs umount {}`",
         store.display(),
@@ -308,7 +355,7 @@ pub fn umount(arguments: &[String]) -> Result<(), Error> {
     if !state.exists() {
         return Err(format!("no mount recorded for {}", mount_point.display()).into());
     }
-    std::fs::create_dir_all(runtime_dir())?;
+    std::fs::create_dir_all(mounts_dir())?;
     std::fs::write(&stop, b"stop\n")?;
     let started = Instant::now();
     while started.elapsed() < UNMOUNT_WAIT {
@@ -338,7 +385,7 @@ pub fn umount(arguments: &[String]) -> Result<(), Error> {
 
 /// `layerfs list` — every recorded mount, with the pid that is serving it.
 pub fn list() -> Result<(), Error> {
-    let directory = runtime_dir();
+    let directory = mounts_dir();
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -382,10 +429,159 @@ pub fn list() -> Result<(), Error> {
     Ok(())
 }
 
+/// The path as it goes **into a record**: canonical when possible, with the `\\?\` prefix removed.
+///
+/// Records are compared, not only displayed, so a path that canonicalises differently on two sides would never match. Normalising once at write time lets
+/// readers compare ordinary strings (ADR-010 §9.1).
+#[must_use]
+fn canonical(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = resolved.display().to_string();
+    text.strip_prefix("\\\\?\\").unwrap_or(&text).to_string()
+}
+
+fn branch_of(repo: &Repo, name: &str) -> Option<String> {
+    repo.workspace_list()
+        .ok()?
+        .into_iter()
+        .find(|workspace| workspace.name == name)
+        .map(|workspace| workspace.branch)
+}
+
+/// Whether a record's owner is still alive (**ADR-010 §9.2**).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Liveness {
+    /// The owner still holds the file: opening it for writing hits a sharing violation.
+    Live,
+    /// Nobody holds it any more: the process is gone and the record is a leftover.
+    Stale,
+    /// There is no record at all.
+    Gone,
+}
+
+/// The one implementation of "is this mount still alive".
+///
+/// The owner holds the record with `share_mode(READ | DELETE)` and **no write share**, so a reader that asks for write access gets
+/// `ERROR_SHARING_VIOLATION (32)` while the owner lives — the whole test, with no pid probing and no timestamp guessing.
+#[must_use]
+pub fn record_is_live(path: &Path) -> Liveness {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4; // READ | WRITE | DELETE
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(SHARE_ALL)
+            .open(path)
+        {
+            Ok(_) => Liveness::Stale,
+            Err(error) if error.raw_os_error() == Some(32) => Liveness::Live,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Liveness::Gone,
+            // Anything else (a permission problem, a locking tool) is **not** evidence of life: calling it stale is the conservative reading, because the
+            // alternative is refusing to work on a filesystem that is actually free.
+            Err(_) => Liveness::Stale,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if path.exists() {
+            Liveness::Stale
+        } else {
+            Liveness::Gone
+        }
+    }
+}
+
+/// Creates the record and **keeps it open** for the process's lifetime.
+///
+/// `DELETE_ON_CLOSE` is why a crashed mount leaves nothing behind: the kernel closes every handle when the process dies, `taskkill /F` included.
+#[cfg(windows)]
+fn hold_record(path: &Path, contents: &str) -> Result<std::fs::File, Error> {
+    use std::io::Write as _;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.flush()?;
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn hold_record(path: &Path, contents: &str) -> Result<std::fs::File, Error> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.flush()?;
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{calibrated_major, record_name, version_parts};
+    use super::{
+        calibrated_major, hold_record, mounts_dir, record_is_live, record_name, version_parts,
+        Liveness,
+    };
     use std::path::Path;
+
+    /// **A7 / §9.2**: a record held by its owner is `Live`, one nobody holds is `Stale`, and — because the owner uses `DELETE_ON_CLOSE` — the file is
+    /// **gone** once the handle is dropped, which is what makes a crashed mount leave nothing behind.
+    #[test]
+    fn a_record_is_live_while_held_and_gone_once_released() {
+        let directory = std::env::temp_dir().join(format!("fs-cli-record-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp");
+
+        let held = directory.join("held.mount");
+        let handle = hold_record(&held, "version=1\npid=1\n").expect("hold a record");
+        assert_eq!(
+            record_is_live(&held),
+            Liveness::Live,
+            "cell live: the owner still holds it"
+        );
+        drop(handle);
+        assert_eq!(
+            record_is_live(&held),
+            Liveness::Gone,
+            "cell gone: DELETE_ON_CLOSE removes the record when the owner dies"
+        );
+
+        // A record written the ordinary way is `Stale`: nobody holds it, so its owner is gone.
+        let stale = directory.join("stale.mount");
+        std::fs::write(&stale, b"version=1\n").expect("write");
+        assert_eq!(record_is_live(&stale), Liveness::Stale, "cell stale");
+
+        assert_eq!(
+            record_is_live(&directory.join("missing.mount")),
+            Liveness::Gone,
+            "cell missing"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The mounts directory is one function, and the override is what keeps tests from touching the real one.
+    #[test]
+    fn the_mounts_directory_can_be_redirected() {
+        let before = mounts_dir();
+        // SAFETY: single-threaded unit test; nothing else in this binary reads the variable concurrently.
+        unsafe { std::env::set_var("LAYERFS_MOUNTS_DIR", "C:\\layerfs-test-mounts") };
+        assert_eq!(mounts_dir(), Path::new("C:\\layerfs-test-mounts"));
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("LAYERFS_MOUNTS_DIR") };
+        assert_eq!(
+            mounts_dir(),
+            before,
+            "without the override the default comes back"
+        );
+    }
 
     #[test]
     fn a_mount_point_becomes_a_file_name() {
