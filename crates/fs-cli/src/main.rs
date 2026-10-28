@@ -85,11 +85,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("{USAGE}");
         return Ok(());
     }
-    let store = PathBuf::from(take_option(&mut arguments, "--store").unwrap_or_else(|| ".".into()));
+    let explicit_store = take_option(&mut arguments, "--store").map(PathBuf::from);
     // Read **before** the command name is taken: `--workspace` is a global option (ADR-010 §5), not a subcommand flag.
     let workspace_option = take_option(&mut arguments, "--workspace");
-    let _ = WORKSPACE.set(workspace_option.clone());
     let command = arguments.remove(0);
+
+    // **Path discovery happens here, once** (ADR-010 §4.2): a command run from inside a mount works without saying so, and a command that names both
+    // explicitly keeps what it named. The three verbs that do not need a repository keep their place *before* this, so discovery costs them nothing.
+    let needs_repository = !matches!(
+        command.as_str(),
+        "mount" | "umount" | "list" | "version" | "init" | "gc"
+    ) && !fs_cli::FILE_COMMANDS.contains(&command.as_str());
+    let (store, workspace_option) = if needs_repository {
+        let current = std::env::current_dir().ok();
+        let discovered = current.and_then(|cwd| {
+            fs_cli::discovery::discover(&cwd, fs_cli::winpaths::volume_root, mountcmd::live_records)
+        });
+        let target = fs_cli::discovery::resolve(
+            explicit_store.as_deref(),
+            workspace_option.as_deref(),
+            discovered.as_ref(),
+        );
+        (target.store, target.workspace)
+    } else {
+        (
+            explicit_store.unwrap_or_else(|| PathBuf::from(".")),
+            workspace_option,
+        )
+    };
+    let _ = WORKSPACE.set(workspace_option.clone());
 
     // **The removed file commands answer before the store is touched** (A0c): with a `--store` that does not exist, "store does not exist" would be a
     // true sentence about the wrong problem — the command is gone, and that is what the caller has to be told.

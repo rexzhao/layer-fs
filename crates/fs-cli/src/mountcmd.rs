@@ -687,6 +687,51 @@ impl fs_cli::pipe_win::Serving for PipeServing {
         !self.record.exists()
     }
 }
+/// Every live mount record, as `discovery::discover` wants them: the records and their liveness in one pass.
+///
+/// One reader for both the A3 message (`live_mount_of`) and path discovery, so a record that one of them considers live cannot be dead to the other.
+#[must_use]
+pub fn live_records() -> Vec<(fs_cli::discovery::Record, fs_cli::discovery::Liveness)> {
+    let Ok(entries) = std::fs::read_dir(mounts_dir()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "mount")
+        {
+            continue;
+        }
+        let liveness = match record_is_live(&path) {
+            Liveness::Live => fs_cli::discovery::Liveness::Live,
+            Liveness::Stale | Liveness::Gone => fs_cli::discovery::Liveness::Stale,
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let field = |key: &str| {
+            text.lines()
+                .find_map(|line| {
+                    line.strip_prefix(key)?
+                        .strip_prefix('=')
+                        .map(str::to_string)
+                })
+                .unwrap_or_default()
+        };
+        out.push((
+            fs_cli::discovery::Record {
+                store: PathBuf::from(field("store")),
+                workspace: field("workspace"),
+                mount_point: PathBuf::from(field("mount_point")),
+                pid: field("pid").parse().unwrap_or(0),
+                branch: field("branch"),
+            },
+            liveness,
+        ));
+    }
+    out
+}
+
 /// The live mount serving `workspace`, if there is one: `(mount_point, pid)`.
 ///
 /// Read from the records rather than guessed: the point of A3's message is that it names **which** mount and **which** process, and a generic "in use" would
