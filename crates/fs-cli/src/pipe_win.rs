@@ -32,6 +32,13 @@ pub trait Serving: Send + Sync {
     fn request_stop(&self) -> bool;
     /// Whether the stop sequence has begun.
     fn shutting_down(&self) -> bool;
+    /// How many file objects are open, **read now** (ADR-010 §7.2).
+    fn open_handles(&self) -> usize;
+    /// Whether the teardown has finished: unmounted, flushed, record removed.
+    ///
+    /// `unmount` must answer **after** this becomes true, not when the request is accepted: a client that gets `Unmounted` and then finds the record still
+    /// there has been told something false about the machine.
+    fn teardown_complete(&self) -> bool;
 }
 
 /// A control server for one mount: owns the pipe, answers until asked to stop.
@@ -89,7 +96,26 @@ impl Server {
         // `unmount` is intercepted here because it has to stop the mount, not describe it.
         let response = match serde_json::from_slice::<pipe::Request>(&frame) {
             Ok(request) if request.op == "unmount" && request.v == pipe::PROTOCOL => {
-                if self.serving.request_stop() {
+                // A **remote** `umount` refuses while a file is open (ADR-010 §7.2): the caller cannot see who has one, and unmounting under a live handle is
+                // the kind of surprise that loses data. The wait is the caller's, and when it expires the mount is left exactly as it was.
+                let wait_ms = request
+                    .args
+                    .get("wait_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+                while self.serving.open_handles() > 0 && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                let handles = self.serving.open_handles();
+                if handles > 0 {
+                    Response::HandlesOpen { handles }
+                } else if self.serving.request_stop() {
+                    // **Answer at once, not after the teardown** — and that is a defect, not a choice: the answer "unmounted" is true, but the record is still
+                    // there for a moment, so A12's second half ("the record is gone when the answer arrives") cannot pass yet. The reason is the thread
+                    // structure, not the pipe: the mount process exits as soon as `mount_serving` returns, which kills this thread before it could answer a
+                    // teardown-late reply. Fixing it needs the main thread to wait for this one (S1 §5.1's `DONE`), which is the next step.
                     Response::Unmounted {}
                 } else {
                     Response::ShuttingDown

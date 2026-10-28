@@ -105,6 +105,15 @@ impl Mounted {
     pub fn open_handles(&self) -> usize {
         self.adapter.open_handles()
     }
+
+    /// The adapter behind this mount.
+    ///
+    /// Handed out so a control channel can answer `status.handles` **after** the closure has started: the number has to be read at the moment of the ask, not
+    /// captured once, or every mount would report whatever was open when it booted.
+    #[must_use]
+    pub fn adapter(&self) -> std::sync::Arc<crate::DynAdapter> {
+        std::sync::Arc::clone(&self.adapter)
+    }
 }
 
 /// Mounts read-only at `mount_point` and runs `serve` **while the volume is up**, then unmounts and tears everything down.

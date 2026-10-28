@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use fs_api::winfsp_backend::ApiBackend;
 use fs_winfsp::abi::VolumeInfo;
 use fs_winfsp::loader::default_library;
-use fs_winfsp::mounted::mount_read_only;
+use fs_winfsp::mounted::mount_serving;
 use fs_winfsp::ops::DynOps;
 use fs_workspace::Repo;
 
@@ -247,12 +247,16 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
 
     // **The control channel starts before the volume does**: a `status` that arrives a millisecond after the drive appears must not race a pipe that is not
     // listening yet, and a serve loop that fails to start is worth knowing about before the mount commits.
+    let adapter_slot: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<fs_winfsp::DynAdapter>>> =
+        std::sync::Arc::new(std::sync::OnceLock::new());
     let serving: std::sync::Arc<dyn fs_cli::pipe_win::Serving> = std::sync::Arc::new(PipeServing {
         store: canonical(&store),
         workspace: name.clone(),
         branch: branch_of(&repo, &name).unwrap_or_default(),
         mount_point: canonical(&mount_point),
         workspace_handle: workspace,
+        record: state.clone(),
+        adapter: std::sync::Arc::clone(&adapter_slot),
     });
     let server = std::sync::Arc::new(fs_cli::pipe_win::Server::new(pipe, serving));
     if let Ok(started) = std::thread::Builder::new()
@@ -271,23 +275,32 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     let library = default_library();
     // Installed **before** mounting, so a Ctrl-C during the mount itself is already an orderly stop.
     install_console_handler();
-    let report = mount_read_only(&library, &mount_point, backend, volume(), |_path: &Path| {
-        // The probe **is** the command's lifetime: everything below happens while the volume is attached.
-        let started = Instant::now();
-        loop {
-            // **Three ways to be asked to stop**, all answering the same way: the stop file (until the pipe replaces it), the record disappearing, and a
-            // console control event. Ctrl-C lands here as an **orderly unmount** rather than a kill, which is the whole point of the handler.
-            // **Two ways to be asked to stop**, both answering the same way: the control pipe (through `request_stop`) and a console control event. The
-            // stop **file** is gone — A15s asserts that writing one no longer stops a mount, because a signal nobody can see the receipt of was the thing
-            // being replaced.
-            if stop_requested() {
-                println!("unmount requested after {:?}", started.elapsed());
-                break;
+    let report = mount_serving(
+        &library,
+        &mount_point,
+        backend,
+        volume(),
+        |mounted: &fs_winfsp::mounted::Mounted| {
+            // **`status.handles` reads the adapter at the moment of the ask**, so the control channel needs the adapter — not a number captured now.
+            // (Until this line runs, the channel answers 0, which is also the truth: nobody has opened a file yet.)
+            let _ = adapter_slot.set(mounted.adapter());
+            // The probe **is** the command's lifetime: everything below happens while the volume is attached.
+            let started = Instant::now();
+            loop {
+                // **Three ways to be asked to stop**, all answering the same way: the stop file (until the pipe replaces it), the record disappearing, and a
+                // console control event. Ctrl-C lands here as an **orderly unmount** rather than a kill, which is the whole point of the handler.
+                // **Two ways to be asked to stop**, both answering the same way: the control pipe (through `request_stop`) and a console control event. The
+                // stop **file** is gone — A15s asserts that writing one no longer stops a mount, because a signal nobody can see the receipt of was the thing
+                // being replaced.
+                if stop_requested() {
+                    println!("unmount requested after {:?}", started.elapsed());
+                    break;
+                }
+                std::thread::sleep(POLL);
             }
-            std::thread::sleep(POLL);
-        }
-        Ok(())
-    });
+            Ok(())
+        },
+    );
     // (the stop file is gone: the control pipe is the only stop signal — A15s)
     let _ = std::fs::remove_file(&state);
     match report {
@@ -596,6 +609,10 @@ struct PipeServing {
     branch: String,
     mount_point: String,
     workspace_handle: &'static fs_workspace::Workspace,
+    /// Where this mount's record lives: `teardown_complete` is "the record is gone".
+    record: std::path::PathBuf,
+    /// The mount's adapter, filled in by the mount closure: `status.handles` must be read at the moment of the ask.
+    adapter: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<fs_winfsp::DynAdapter>>>,
 }
 
 impl PipeServing {
@@ -627,7 +644,11 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                         branch: status.branch,
                         base_commit: status.base_commit,
                         dirty: status.dirty,
-                        handles: 0,
+                        handles: self
+                            .0
+                            .adapter
+                            .get()
+                            .map_or(0, |adapter| adapter.open_handles()),
                     },
                     Err(error) => fs_cli::pipe::Response::Failed {
                         detail: error.to_string(),
@@ -649,6 +670,18 @@ impl fs_cli::pipe_win::Serving for PipeServing {
 
     fn shutting_down(&self) -> bool {
         stop_requested()
+    }
+
+    fn open_handles(&self) -> usize {
+        self.adapter
+            .get()
+            .map_or(0, |adapter| adapter.open_handles())
+    }
+
+    fn teardown_complete(&self) -> bool {
+        // The record is removed by `DELETE_ON_CLOSE` when the mount's handle drops, which happens **after** the unmount and the flush — so its absence is the
+        // moment the whole stop sequence is done.
+        !self.record.exists()
     }
 }
 #[cfg(test)]
