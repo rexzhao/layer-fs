@@ -703,6 +703,11 @@ fn release_context(context: *const c_void) -> Release {
     };
     if remaining > 0 {
         // Another file object still refers to this context: nothing dies yet, and a read arriving now is legitimate.
+        // **The refs value is the reading that settles it** (`LAYERFS_DEBUG_HANDLES=1`): `1` means this release really was the last one and something else kept a
+        // stale reference; `2` means a second holder exists and never releases. Those have different fixes, so the number is printed, not guessed.
+        if std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some() {
+            eprintln!("release: id={id} still_shared refs={remaining}");
+        }
         return Release::StillShared;
     }
     let entry = table.remove(&id).map(|shared| shared.entry);
