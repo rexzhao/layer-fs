@@ -3204,3 +3204,13 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      A3/A3b（WorkspaceInUse 消息 / checkout 被持有）随 S1 做。
      fs_api::Repo::open(path) 1参 vs fs_workspace::Repo::open(path,bool) 2参——同名不同签名。
      下一站 S1（路径发现+Ctrl-C+管道骨架）——等 ADR-010 S1 判据表。
+
+582. 【★ S2 全部完成（b806270，23 提交合入 main）】
+     发布锁 Gate(RwLock) 七判据 G1-G7（互斥/隔离/完整/深度/无绕过/饥饿33ms/上界217ms）。
+     API 迁移 5 步（&mut→&self，Arc<Workspace> 并发调用，互斥只由 gate 提供）。
+     封绕过（overlay 降 pub(crate)，set_times/set_attributes 下沉）。
+     管道 commit/snapshot 走控制通道（挂载内不再 WorkspaceInUse）。
+     A17 句柄身份跨 commit 不变（FileIndex+内容+可继续写）。
+     A6e-A6g 目录挂载点 reparse point 判定（结构性事实比名字可靠——两种挂载点两道安全网）。
+     A6d 从未验证→读作工作。全量 710/711（唯一红已知族）。
+     S3（管道 restore/switch）是最后一个阶段。
