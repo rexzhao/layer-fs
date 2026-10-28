@@ -517,7 +517,7 @@ pub fn rebind(&self, branch: &str) -> …
 
 | # | 判据 | 变异（必须红） |
 | --- | --- | --- |
-| A15 | **L1 丢写复现**（不需要挂载）：N 条线程持续 `write_at` 不同文件、每次写后记录"已返回"，同时另一线程循环 `commit`；结束后每个"已返回"的写都出现在**最后一次 commit 的树或当前 overlay** 中，二者之一，不得两者皆无 | 去掉写锁（commit 不取 `base.write()`）⇒ 必须出现丢写；若 1000 轮内未出现 ⇒ **空转**，须加注入点（materialise 与 adopt 之间的 `crash_point` 换成可配置的停顿）后重跑 |
+| A15 | **L1 丢写复现**（不需要挂载）：N 条线程各自对**自己的文件**写递增序号（每次写成功返回后记下该序号），同时另一线程循环 `commit`；全部停止后，**当前视图**（= 最后一次 commit 的树 ⊕ overlay）里每个文件的内容 == 该文件最后一次成功返回的序号；再 commit 一次后从历史 `cat` 读到同样的值 | 去掉写锁（commit 不取 `base.write()`）⇒ 必须出现丢写；若 1000 轮内未出现 ⇒ **空转**，须加注入点（materialise 与 adopt 之间的 `crash_point` 换成可配置的停顿）后重跑 |
 | A16 | commit 期间文件操作的最长等待 vs 视图大小（1k/10k/100k 条目）记录出档，带红值；与 `IrpTimeout` 默认值对照 | — （度量） |
 | A17 | **句柄身份（L2，真挂载）**：`open(h)` → `write(h,"a")` → 管道 `commit` → `read(h) == "a"` 且 `FileIndex(h)` 不变 → `write(h,"b")` → `status.dirty` → 第二次 `commit` 成功；目录句柄在 commit 前后 `ReadDirectory` 结果一致 | `adopt` 后重新分配 serial（模拟"身份不稳"）|
 | A18 | `commit` 经管道的 `BranchMoved` / `NothingToCommit` 原样到达 CLI，渲染 §8.2 去路 | 客户端自行判断语义 |
