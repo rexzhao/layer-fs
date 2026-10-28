@@ -49,8 +49,11 @@ fn pause_point(name: &str) {
         return;
     }
     let directory = std::env::temp_dir();
-    let release = directory.join(format!("layerfs-pause-{name}.go"));
-    let marker = directory.join(format!("layerfs-pause-{name}.here"));
+    // **The tag keeps two paused tests apart**: the marker is a file in `%TEMP%`, and two processes paused at the same point would otherwise read each other's
+    // release file — one test's `go` would let the other's commit continue, which is the kind of interference that makes a concurrency criterion lie.
+    let tag = std::env::var("LAYERFS_PAUSE_TAG").unwrap_or_default();
+    let release = directory.join(format!("layerfs-pause-{name}{tag}.go"));
+    let marker = directory.join(format!("layerfs-pause-{name}{tag}.here"));
     let _ = std::fs::remove_file(&release);
     let _ = std::fs::write(&marker, std::process::id().to_string());
     let started = std::time::Instant::now();

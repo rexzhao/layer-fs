@@ -351,6 +351,7 @@ impl Workspace {
     ///
     /// Namespace rules.
     pub fn read_at(&self, path: &str, offset: u64, len: usize) -> WorkspaceResult<Vec<u8>> {
+        let _gate = self.gate.read();
         Ok(self.overlay.read_at(&parse_path(path)?, offset, len)?)
     }
 
@@ -360,6 +361,7 @@ impl Workspace {
     ///
     /// Namespace rules.
     pub fn content_size(&self, path: &str) -> WorkspaceResult<u64> {
+        let _gate = self.gate.read();
         Ok(self.overlay.content_state(&parse_path(path)?)?.size)
     }
 

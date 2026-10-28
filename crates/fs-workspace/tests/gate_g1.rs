@@ -20,7 +20,10 @@ fn temp_dir(label: &str) -> PathBuf {
 }
 
 fn marker(name: &str, suffix: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("layerfs-pause-{name}.{suffix}"))
+    std::env::temp_dir().join(format!(
+        "layerfs-pause-{name}{}.{suffix}",
+        std::env::var("LAYERFS_PAUSE_TAG").unwrap_or_default()
+    ))
 }
 
 fn wait_for(path: &std::path::Path, what: &str) {
@@ -47,6 +50,7 @@ fn a_write_during_a_commit_waits_and_survives() {
     // The pause is armed **for this process**, and released by a file rather than a sleep: "the commit is standing still" becomes a fact instead of a guess.
     // SAFETY: `set_var` is safe in edition 2021; the variable is read by the commit thread below.
     std::env::set_var("LAYERFS_PAUSE_AT", "after-materialise");
+    std::env::set_var("LAYERFS_PAUSE_TAG", "-g1");
     let release = marker("after-materialise", "go");
     let here = marker("after-materialise", "here");
     let _ = std::fs::remove_file(&release);
@@ -108,6 +112,7 @@ fn a_write_during_a_commit_waits_and_survives() {
 
     // SAFETY: as above; the test is finishing.
     std::env::remove_var("LAYERFS_PAUSE_AT");
+    std::env::remove_var("LAYERFS_PAUSE_TAG");
     let _ = std::fs::remove_file(&release);
     let _ = std::fs::remove_dir_all(&directory);
 }
