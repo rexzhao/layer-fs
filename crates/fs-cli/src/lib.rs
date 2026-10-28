@@ -308,4 +308,3 @@ mod tests {
         assert_eq!(record_name(Path::new("C:\\mnt\\x")), "C_mnt_x");
     }
 }
-

@@ -253,10 +253,13 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
         std::sync::Arc::new(std::sync::OnceLock::new());
     let serving: std::sync::Arc<dyn fs_cli::pipe_win::Serving> = std::sync::Arc::new(PipeServing {
         store: canonical(&store),
-        workspace: name.clone(),
-        branch: branch_of(&repo, &name).unwrap_or_default(),
+        current: std::sync::RwLock::new(Current {
+            workspace: name.clone(),
+            branch: branch_of(&repo, &name).unwrap_or_default(),
+            handle: workspace,
+        }),
         mount_point: canonical(&mount_point),
-        workspace_handle: workspace,
+
         record: state.clone(),
         adapter: std::sync::Arc::clone(&adapter_slot),
     });
@@ -629,22 +632,42 @@ fn hold_record(path: &Path, contents: &str) -> Result<std::fs::File, Error> {
 /// could disagree with it.
 struct PipeServing {
     store: String,
-    workspace: String,
-    branch: String,
+    /// The workspace being served **right now**, behind a lock because `switch` replaces it while the pipe keeps answering (S3 §5.2).
+    ///
+    /// A single `&'static Workspace` field would have made the switch impossible to implement without tearing the whole serving object down and rebuilding it,
+    /// and rebuilding it would have meant a window in which the pipe answers nothing — which is exactly what W3 measures against.
+    current: std::sync::RwLock<Current>,
     mount_point: String,
-    workspace_handle: &'static fs_workspace::Workspace,
     /// Where this mount's record lives: `teardown_complete` is "the record is gone".
     record: std::path::PathBuf,
     /// The mount's adapter, filled in by the mount closure: `status.handles` must be read at the moment of the ask.
     adapter: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<fs_winfsp::DynAdapter>>>,
 }
 
+/// What a `switch` changes, as one value: the name, the branch it publishes to, and the handle.
+///
+/// One record rather than three fields, for the reason S2 settled (566): a report must come from **one** snapshot, or `status` can print the old name with the new
+/// branch and be believed.
+struct Current {
+    workspace: String,
+    branch: String,
+    handle: &'static fs_workspace::Workspace,
+}
+
 impl PipeServing {
+    /// The workspace being served right now, for the duration of one answer.
+    fn current(&self) -> std::sync::RwLockReadGuard<'_, Current> {
+        self.current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn record_fields(&self) -> fs_cli::pipe::Response {
+        let current = self.current();
         fs_cli::pipe::Response::Hello {
             store: self.store.clone(),
-            workspace: self.workspace.clone(),
-            branch: self.branch.clone(),
+            workspace: current.workspace.clone(),
+            branch: current.branch.clone(),
             pid: std::process::id(),
             mount_point: self.mount_point.clone(),
             protocol: fs_cli::pipe::PROTOCOL,
@@ -662,7 +685,7 @@ impl fs_cli::pipe_win::Serving for PipeServing {
             }
 
             fn status(&self) -> fs_cli::pipe::Response {
-                match self.0.workspace_handle.status() {
+                match self.0.current().handle.status() {
                     Ok(status) => fs_cli::pipe::Response::Status {
                         workspace: status.name,
                         branch: status.branch,
@@ -686,7 +709,7 @@ impl fs_cli::pipe_win::Serving for PipeServing {
             fn commit(&self, message: &str, force: bool) -> fs_cli::pipe::Response {
                 // **The mount's own workspace publishes**, so the commit goes through the same gate the filesystem does — not through a second handle that would
                 // bypass it (that is what G5 is about, in the CLI's own layer).
-                match self.0.workspace_handle.commit(message, force) {
+                match self.0.current().handle.commit(message, force) {
                     Ok(outcome) => fs_cli::pipe::Response::Failed {
                         // Success is reported through the same shape with `kind: "committed"`, because the protocol's success variants are per-operation and
                         // the caller distinguishes them by kind — one place to look, one place to branch.
@@ -703,7 +726,7 @@ impl fs_cli::pipe_win::Serving for PipeServing {
             }
 
             fn snapshot(&self) -> fs_cli::pipe::Response {
-                match self.0.workspace_handle.snapshot() {
+                match self.0.current().handle.snapshot() {
                     Ok(outcome) => fs_cli::pipe::Response::Failed {
                         kind: "snapshotted".to_owned(),
                         detail: outcome.commit.clone().unwrap_or_default(),
@@ -763,7 +786,7 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                         // **R4's pause point**: the gate is closed and the view has not moved yet. An open arriving now must wait for the restore, not resolve against
                         // the view that is about to be replaced.
                         fs_cli::pause_point("restore-after-quiesce");
-                        let outcome = self.0.workspace_handle.restore(commit, discard);
+                        let outcome = self.0.current().handle.restore(commit, discard);
                         // Released whether the restore worked or not: a guard dropped only on success would leave the mount refusing opens after a failure.
                         drop(guard);
                         match outcome {
