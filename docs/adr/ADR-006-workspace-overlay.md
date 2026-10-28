@@ -470,7 +470,7 @@ Workspace
 - 不提供"自动 workspace + 立即 snapshot"的直写便利层（manager 与 architect 一致：组合语义只是多一条
   可走的路径）。
 
-CLI（owner 定的 git 式）——**本段已由 ADR-010（CLI 行为模式）取代**；下面保留为原设计记录（实现加了 `cli/current`，ADR-010 §3.2）：
+CLI（owner 定的 git 式）——**本段已由 ADR-010（CLI 行为模式）取代**；下面保留为原设计记录（实现曾加 `cli/current`，已按 ADR-010 C1 去掉，回到本段的显式风格）：
 
 ```text
 init
