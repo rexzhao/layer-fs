@@ -230,9 +230,47 @@ impl Workspace {
     }
 
     /// The overlay behind this workspace.
+    ///
+    /// **No longer a public door** (ADR-010 §10.3, G5): reaching the overlay directly skips the publication gate, so a write arriving during a `commit` would not
+    /// be ordered against it. Everything a caller needs is a method on `Workspace` that takes the gate — `set_times` and `set_attributes` were the last two that
+    /// did not, and they are here now, which is why nothing outside this crate calls this any more.
     #[must_use]
-    pub fn overlay(&self) -> &OverlayStore {
+    #[allow(dead_code, reason = "kept as the crate-internal accessor the gate-protected methods share")]
+    pub(crate) fn overlay(&self) -> &OverlayStore {
         &self.overlay
+    }
+
+    /// Sets file times by id, under the gate.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an absent inode, or a store failure.
+    pub fn set_times(
+        &self,
+        file_id: fs_namespace::FileId,
+        accessed: Option<i64>,
+        written: Option<i64>,
+        changed: Option<i64>,
+        created: Option<i64>,
+    ) -> WorkspaceResult<()> {
+        let _gate = self.gate.read();
+        Ok(self
+            .overlay
+            .set_times(file_id, accessed, written, changed, created)?)
+    }
+
+    /// Sets attribute bits by id, under the gate.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an absent inode, or a store failure.
+    pub fn set_attributes(
+        &self,
+        file_id: fs_namespace::FileId,
+        attributes: u32,
+    ) -> WorkspaceResult<()> {
+        let _gate = self.gate.read();
+        Ok(self.overlay.set_attributes(file_id, attributes)?)
     }
 
     /// Creates an empty regular file, reserving serials first if the workspace is low.

@@ -24,6 +24,14 @@ fn id(raw: u64) -> FileId {
 }
 
 /// Translates a namespace error into the adapter's vocabulary, via the **shared** failure table.
+/// Maps a workspace failure the way every other method in this file does: the namespace ones keep their variant, the rest become `Other`.
+fn to_workspace_ops(error: fs_workspace::WorkspaceError) -> OpsError {
+    match error {
+        fs_workspace::WorkspaceError::Namespace(error) => to_ops(error),
+        other => OpsError::Other(other.to_string()),
+    }
+}
+
 fn to_ops(error: NamespaceError) -> OpsError {
     // `InvalidRecord` is checked **before** the failure mapping: the core uses it for "your identity no longer names this
     // name", which the adapter must distinguish from a missing entry (they map to different actions: drop the handle vs
@@ -249,16 +257,14 @@ impl WorkspaceOps for ApiBackend<'_> {
         created: Option<i64>,
     ) -> OpsResult<()> {
         self.workspace
-            .overlay()
             .set_times(id(file_id), accessed, written, changed, created)
-            .map_err(to_ops)
+            .map_err(to_workspace_ops)
     }
 
     fn set_attributes(&self, file_id: u64, attributes: Attributes) -> OpsResult<()> {
         self.workspace
-            .overlay()
             .set_attributes(id(file_id), attributes.0)
-            .map_err(to_ops)
+            .map_err(to_workspace_ops)
     }
 
     fn rename(
