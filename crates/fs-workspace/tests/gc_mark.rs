@@ -119,7 +119,7 @@ fn head_root(repo: &Repo) -> ObjectId {
 #[test]
 fn mark_reaches_the_file_content_of_a_commit() {
     let (root, repo) = repository("content");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"the bytes that must survive");
     workspace.commit("one", false).expect("commit");
     drop(workspace);
@@ -216,7 +216,7 @@ fn a_root_that_references_nothing_is_still_marked() {
 #[cfg(feature = "gc-test-hooks")]
 fn a_skipped_root_marks_nothing_and_its_control_marks_something() {
     let (root, repo) = repository("skip");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"content that only a walked root reaches");
     workspace.commit("one", false).expect("commit");
     drop(workspace);
@@ -270,7 +270,7 @@ fn a_skipped_root_marks_nothing_and_its_control_marks_something() {
 #[test]
 fn a_damaged_object_aborts_the_mark_and_changes_nothing() {
     let (root, repo) = repository("damaged");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"still here");
     workspace.commit("one", false).expect("commit");
     drop(workspace);
@@ -396,7 +396,7 @@ fn a_stale_marker_is_replaced_not_inherited() {
 #[test]
 fn the_maintenance_source_answers_what_the_store_answers() {
     let (root, repo) = repository("source");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"bytes that both sources must read");
     workspace.commit("one", false).expect("commit");
     drop(workspace);

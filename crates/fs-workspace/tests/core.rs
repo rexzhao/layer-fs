@@ -204,7 +204,7 @@ fn lifecycle_failures_are_typed() {
 #[test]
 fn nothing_to_commit_when_the_view_equals_the_base() {
     let (_root, repo) = repository("nothing");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     let before = repo.branch_head("main").expect("head");
     assert!(matches!(
         workspace.commit("empty", false),
@@ -221,7 +221,7 @@ fn nothing_to_commit_when_the_view_equals_the_base() {
 #[test]
 fn two_snapshots_without_change_produce_the_same_root() {
     let (_root, repo) = repository("idempotent");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     Rules::new(workspace.store())
         .mkdir(&p("/a"))
         .expect("mkdir");
@@ -244,7 +244,7 @@ fn two_snapshots_without_change_produce_the_same_root() {
 fn commit_moves_the_branch_and_grows_history() {
     let (_root, repo) = repository("commit");
     let initial = repo.branch_head("main").expect("head");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"first");
 
     let published = workspace.commit("one", false).expect("commit");
@@ -273,7 +273,7 @@ fn commit_moves_the_branch_and_grows_history() {
 #[test]
 fn a_committed_tree_is_readable_after_the_workspace_is_gone() {
     let (_root, repo) = repository("zero-table");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/kept", b"payload");
     let commit = workspace.commit("keep", false).expect("commit").commit;
     workspace.close().expect("close");
@@ -305,8 +305,8 @@ fn a_committed_tree_is_readable_after_the_workspace_is_gone() {
 fn branch_moved_is_typed_and_force_records_the_displaced_head() {
     let (_root, repo) = repository("f1");
     let base = repo.branch_head("main").expect("head");
-    let mut first = repo.workspace_create("w1", "main").expect("create");
-    let mut second = repo.workspace_create("w2", "main").expect("create");
+    let first = repo.workspace_create("w1", "main").expect("create");
+    let second = repo.workspace_create("w2", "main").expect("create");
 
     put_file(&first, "/one", b"first");
     put_file(&second, "/two", b"second");
@@ -362,8 +362,8 @@ fn branch_moved_is_typed_and_force_records_the_displaced_head() {
 fn rebind_lets_the_loser_publish_on_another_branch() {
     let (_root, repo) = repository("rebind");
     let base = repo.branch_head("main").expect("head");
-    let mut first = repo.workspace_create("w1", "main").expect("create");
-    let mut second = repo.workspace_create("w2", "main").expect("create");
+    let first = repo.workspace_create("w1", "main").expect("create");
+    let second = repo.workspace_create("w2", "main").expect("create");
     put_file(&first, "/one", b"first");
     put_file(&second, "/two", b"second");
     first.commit("from w1", false).expect("commit");
@@ -389,7 +389,7 @@ fn rebind_lets_the_loser_publish_on_another_branch() {
 fn reset_moves_and_revert_grows() {
     let (_root, repo) = repository("history");
     let initial = repo.branch_head("main").expect("head");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"one");
     let first = workspace.commit("one", false).expect("commit").commit;
     let first = first.expect("id");
@@ -430,7 +430,7 @@ fn reset_moves_and_revert_grows() {
 #[test]
 fn restore_changes_the_view_but_not_the_base_commit() {
     let (_root, repo) = repository("restore");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"one");
     let first = workspace.commit("one", false).expect("commit").commit;
     let first = first.expect("id");
@@ -650,7 +650,7 @@ fn a_rejected_rule_leaves_the_view_unchanged() {
 #[test]
 fn a_blocked_cas_index_also_waits_boundedly() {
     let (_root, repo) = repository("cas-busy");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"x");
 
     let blocker = rusqlite::Connection::open(repo.metadata_path()).expect("second connection");
@@ -734,13 +734,13 @@ fn two_workspaces_publish_a_thousand_files_concurrently() {
     fill(&right, 'r', FILES);
 
     let left_thread = std::thread::spawn(move || {
-        let mut left = left;
+        let left = left;
         let started = Instant::now();
         let outcome = left.commit("left", false);
         (started.elapsed(), outcome)
     });
     let right_thread = std::thread::spawn(move || {
-        let mut right = right;
+        let right = right;
         let started = Instant::now();
         let outcome = right.commit("right", false);
         (started.elapsed(), outcome)
@@ -811,7 +811,7 @@ fn a_workspace_can_create_more_files_than_one_serial_segment() {
 #[test]
 fn a_publication_waits_for_the_write_lane_before_reading_the_head() {
     let (_root, repo) = repository("immediate");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"x");
 
     let blocker = rusqlite::Connection::open(repo.metadata_path()).expect("second connection");

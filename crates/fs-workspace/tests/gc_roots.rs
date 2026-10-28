@@ -783,7 +783,7 @@ fn fixture(label: &str) -> (TempRoot, PathBuf) {
     let dir = root.store();
     let repo = std::sync::Arc::new(Repo::open(&dir, true).expect("open"));
     repo.init().expect("init");
-    let mut workspace = repo.workspace_create("w1", "main").expect("workspace");
+    let workspace = repo.workspace_create("w1", "main").expect("workspace");
     workspace.create_file("/f").expect("create");
     workspace.write_at("/f", 0, b"tripwire").expect("write");
     workspace.snapshot().expect("snapshot");

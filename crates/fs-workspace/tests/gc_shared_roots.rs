@@ -83,7 +83,7 @@ fn a_shared_object_survives_dropping_one_root_and_is_freed_once_both_are_gone() 
     let root = TempRoot::new("shared");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
 
     // Two trees over the **same bytes**: the content object is shared by construction (content
     // addressing), which is what makes "drop one root" a real question.

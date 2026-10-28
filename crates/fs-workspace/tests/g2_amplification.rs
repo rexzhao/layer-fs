@@ -56,7 +56,7 @@ fn fixture(label: &str) -> Fixture {
 /// would measure the overlay rather than the format's block granularity.
 fn committed_file(fixture: &Fixture, name: &str, size: usize) -> FileId {
     let payload: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
-    let mut workspace = fixture
+    let workspace = fixture
         .repo
         .workspace_open("w1")
         .or_else(|_| fixture.repo.workspace_create("w1", "main"))

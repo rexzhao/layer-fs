@@ -415,7 +415,7 @@ impl OneAtATime {
 fn seed_committed(store: &OneAtATime, count: usize) -> FileId {
     let payload: Vec<u8> = (0..count).map(|index| (index % 251) as u8).collect();
     {
-        let mut workspace = store.open();
+        let workspace = store.open();
         let rules = Rules::new(workspace.store());
         let created = rules
             .create_or_open(&p("/f"), fs_semantics::disposition::Disposition::Create)

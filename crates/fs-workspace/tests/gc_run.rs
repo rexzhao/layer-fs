@@ -58,7 +58,7 @@ fn repo_with_one_orphan(label: &str) -> (TempRoot, cas_core::ObjectId, cas_core:
     let root = TempRoot::new(label);
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(
         &workspace,
         "/f",
@@ -224,7 +224,7 @@ fn the_report_reconciles_with_a_hand_counted_store() {
     let root = TempRoot::new("accounting");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"kept");
     workspace.commit("one", false).expect("commit");
     drop(workspace);
@@ -332,7 +332,7 @@ fn a_subtree_reached_from_two_roots_is_fetched_once() {
     let root = TempRoot::new("mark-dedupe");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"one tree, two labels");
     workspace.commit("one", false).expect("commit");
     // A second workspace on the same branch: its `base_root` is the same tree, so two labels name it.

@@ -91,7 +91,7 @@ fn committed(label: &str, files: &[(&str, &[u8])]) -> (TempRoot, String) {
     let root = TempRoot::new(label);
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     for (path, bytes) in files {
         put_file(&workspace, path, bytes);
     }

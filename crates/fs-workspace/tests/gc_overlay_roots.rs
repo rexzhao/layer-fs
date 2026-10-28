@@ -176,7 +176,7 @@ fn a_committed_workspace_contributes_no_pending_root() {
     let root = TempRoot::new("clean");
     let repo = Arc::new(Repo::open(root.store(), true).expect("open repo"));
     repo.init().expect("init");
-    let mut workspace = repo.workspace_create("w1", "main").expect("create");
+    let workspace = repo.workspace_create("w1", "main").expect("create");
     put_file(&workspace, "/f", b"committed bytes");
     workspace.commit("one", false).expect("commit");
     drop(workspace);

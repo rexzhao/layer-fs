@@ -33,7 +33,7 @@ fn generate_a_v2_store() {
 
     let repo = Arc::new(Repo::open(&store, true).expect("open"));
     repo.init().expect("init");
-    let mut workspace = repo
+    let workspace = repo
         .workspace_create("w1", "main")
         .expect("create workspace");
 

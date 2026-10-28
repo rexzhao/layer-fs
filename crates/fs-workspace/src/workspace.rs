@@ -22,9 +22,6 @@ use crate::tree::WorkspaceStore;
 pub struct Workspace {
     pub(crate) name: String,
     pub(crate) id: String,
-    pub(crate) branch: String,
-    pub(crate) base_commit: String,
-    pub(crate) base_root: ObjectId,
     pub(crate) overlay: Arc<OverlayStore>,
     pub(crate) repo: Arc<Repo>,
     pub(crate) store: std::sync::Mutex<Store>,
@@ -63,9 +60,6 @@ impl fmt::Debug for Workspace {
         f.debug_struct("Workspace")
             .field("name", &self.name)
             .field("id", &self.id)
-            .field("branch", &self.branch)
-            .field("base_commit", &self.base_commit)
-            .field("base_root", &self.base_root)
             .finish_non_exhaustive()
     }
 }
@@ -100,9 +94,6 @@ impl Workspace {
             }),
             name,
             id,
-            branch,
-            base_commit,
-            base_root,
             overlay,
             repo,
             store: std::sync::Mutex::new(store),
@@ -425,7 +416,7 @@ impl Workspace {
     ///
     /// [`WorkspaceError::WorkspaceDirty`] when the overlay is not empty and `discard` is
     /// false, [`WorkspaceError::NotFound`] when the commit is unknown.
-    pub fn restore(&mut self, commit: &str, discard: bool) -> WorkspaceResult<()> {
+    pub fn restore(&self, commit: &str, discard: bool) -> WorkspaceResult<()> {
         let gate = std::sync::Arc::clone(&self.gate);
         let _gate = gate.write();
         let root = self.repo.commit_root(commit)?;
@@ -441,7 +432,6 @@ impl Workspace {
             return Err(error);
         }
         self.overlay.adopt_base(root)?;
-        self.base_root = root;
         if let Ok(mut state) = self.state.lock() {
             state.base_root = root;
         }
@@ -455,11 +445,10 @@ impl Workspace {
     /// [`WorkspaceError::BranchMoved`] when the branch's head is not this workspace's base
     /// commit — rebinding is only allowed onto an unchanged branch, because merging is not
     /// part of P2.
-    pub fn rebind(&mut self, branch: &str) -> WorkspaceResult<()> {
+    pub fn rebind(&self, branch: &str) -> WorkspaceResult<()> {
         let gate = std::sync::Arc::clone(&self.gate);
         let _gate = gate.write();
         self.repo.workspace_rebind(&self.name, branch)?;
-        self.branch = branch.to_owned();
         if let Ok(mut state) = self.state.lock() {
             state.branch = branch.to_owned();
         }
@@ -484,14 +473,9 @@ impl Workspace {
     }
 
     /// Records the outcome of a publication in the main database and the handle.
-    pub(crate) fn adopt(&mut self, root: ObjectId, commit: Option<String>) -> WorkspaceResult<()> {
+    pub(crate) fn adopt(&self, root: ObjectId, commit: Option<String>) -> WorkspaceResult<()> {
         self.overlay.adopt_base(root)?;
-        self.base_root = root;
-        if let Some(commit) = commit.clone() {
-            self.base_commit = commit;
-        }
-        // **Step 2 of the `&self` migration**: the plain fields are still what everything reads; this writes the same values into the locked state as well, so
-        // step 3 can move the reads one at a time without any of them seeing a different world.
+        // **The locked state is now the only home for these values** (S2 step 3d): the plain fields are gone, so a publication moves the base in exactly one place.
         if let Ok(mut state) = self.state.lock() {
             state.base_root = root;
             if let Some(commit) = commit {

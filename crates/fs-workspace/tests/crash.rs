@@ -140,7 +140,7 @@ fn crash_child() {
     let repo = Arc::new(Repo::open(&dir, true).expect("open"));
     match mode {
         "commit" => {
-            let mut workspace = repo.workspace_open("w1").expect("open workspace");
+            let workspace = repo.workspace_open("w1").expect("open workspace");
             // Every crash point of a commit is inside this call.
             let _ = workspace.commit("from the child", false);
         }
@@ -148,7 +148,7 @@ fn crash_child() {
             repo.workspace_discard("w1").expect("discard");
         }
         "snapshot" => {
-            let mut workspace = repo.workspace_open("w1").expect("open workspace");
+            let workspace = repo.workspace_open("w1").expect("open workspace");
             let _ = workspace.snapshot();
         }
         other => panic!("unknown child mode {other}"),

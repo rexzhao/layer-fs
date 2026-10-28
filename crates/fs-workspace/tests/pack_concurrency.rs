@@ -322,7 +322,7 @@ fn concurrent_opens_wait_then_publish_correctly() {
                         let repo = Arc::new(Repo::open(&dir, false).expect("open"));
                         // The two opens overlap here: each reserves a serial segment.
                         match repo.workspace_open(name) {
-                            Ok(mut workspace) => workspace.commit("published", false).map(Some),
+                            Ok(workspace) => workspace.commit("published", false).map(Some),
                             Err(error) => Err(error),
                         }
                     })
