@@ -144,6 +144,39 @@ impl Workspace {
         self.base_root
     }
 
+    /// The branch, as a **snapshot** (S2 step 3a).
+    ///
+    /// The locked state cannot hand out a borrow — a `MutexGuard` does not outlive the method — and that is the semantics the gate wants anyway: a publication
+    /// moves the branch, so a caller holding a `&str` across one would be holding a value that has already stopped being true.
+    #[must_use]
+    #[allow(dead_code, reason = "S2 step 3a: added now, used from 3b on")]
+    pub fn branch_owned(&self) -> String {
+        self.state
+            .lock()
+            .map(|state| state.branch.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().branch.clone())
+    }
+
+    /// The base commit, as a **snapshot** (S2 step 3a).
+    #[must_use]
+    #[allow(dead_code, reason = "S2 step 3a: added now, used from 3b on")]
+    pub fn base_commit_owned(&self) -> String {
+        self.state
+            .lock()
+            .map(|state| state.base_commit.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().base_commit.clone())
+    }
+
+    /// The base root, as a **snapshot** (S2 step 3a).
+    #[must_use]
+    #[allow(dead_code, reason = "S2 step 3a: added now, used from 3b on")]
+    pub fn base_root_owned(&self) -> ObjectId {
+        self.state
+            .lock()
+            .map(|state| state.base_root)
+            .unwrap_or_else(|poisoned| poisoned.into_inner().base_root)
+    }
+
     /// The explicit security descriptor of `file_id`, if the store has one.
     ///
     /// **Separate from `stat` on purpose** (ADR-005-v3 draft, V6): a descriptor can be 64 KiB, and `GetFileInformation`
