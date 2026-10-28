@@ -48,6 +48,14 @@ fn an_open_file_handle_blocks_the_switch() {
         .args(["branch", "feat", "--from", "main"])
         .output()
         .expect("branch feat");
+    // **A branch is not a workspace** (A3b): `checkout <b>` creates the workspace row on first use, and that first call does **not** switch. Doing it here, from
+    // outside the mount, is what makes the checkout below the switch rather than a creation.
+    let (created, out, err) = cli_code(&store, &store, &["checkout", "feat"]);
+    assert_eq!(created, 0, "cell setup: the feat workspace row must exist: {out}{err}");
+    assert!(
+        out.contains("on feat"),
+        "cell setup: the first checkout creates the workspace, got {out:?}"
+    );
     let file = root.join("f");
     std::fs::write(&file, b"main content").expect("write");
 

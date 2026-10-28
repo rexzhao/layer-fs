@@ -813,7 +813,21 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                     };
                 };
                 // **Closing, not Paused** (S3 §3.2): a switch unmounts, and an open that waited would be waiting for a dispatcher that is about to exit.
-                let dirs = match adapter.quiesce(fs_winfsp::admission::QuiesceKind::Switch, WAIT) {
+                // **The count gets the same patience an unmount gives it** (SM3 §3.2, and R2's reading of 48 ms before it): `CloseHandle` returns before the FSD delivers
+                // `Close`, so a single check refuses a switch that is about to become legal.
+                let deadline = std::time::Instant::now() + WAIT;
+                let quiesce = loop {
+                    match adapter.quiesce(fs_winfsp::admission::QuiesceKind::Switch, WAIT) {
+                        fs_winfsp::admission::Quiesce::HandlesOpen { files, dirs } => {
+                            if std::time::Instant::now() >= deadline {
+                                break fs_winfsp::admission::Quiesce::HandlesOpen { files, dirs };
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        other => break other,
+                    }
+                };
+                let dirs = match quiesce {
                     fs_winfsp::admission::Quiesce::HandlesOpen { files, dirs } => {
                         return fs_cli::pipe::Response::RestoreRefused { files, dirs }
                     }
