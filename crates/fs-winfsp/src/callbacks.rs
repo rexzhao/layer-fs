@@ -597,7 +597,7 @@ fn entry_of(context: *const c_void) -> Option<EntryContext> {
 /// Releases a context from the direct tests, through the same table `close_shell` uses.
 #[doc(hidden)]
 pub fn release_context_for_test(context: *mut c_void) {
-    if release_context(context.cast_const()).is_none() {
+    if let Release::Unknown = release_context(context.cast_const()) {
         STALE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -674,10 +674,23 @@ fn is_closed(context: *const c_void) -> bool {
 ///
 /// Returns the entry when this was the final release (the adapter then performs the single `remove_at`), and `None` when other file objects still
 /// refer to it — which is the ordinary case the FSD's contract produces, not an error.
-fn release_context(context: *const c_void) -> Option<EntryContext> {
+/// What a release actually did — three outcomes, not two (the instrument's own lesson, 434).
+///
+/// `None` used to mean both "we never issued this id" and "this file object was not the last one", so `STALE_RELEASES` grew for the second kind too and was read
+/// as "the FSD is closing slots that were never ours". Those are different facts with different fixes, and one counter cannot carry both.
+enum Release {
+    /// The last reference went; the entry is gone (returned so the caller can close its handle).
+    Freed(EntryContext),
+    /// Another file object still refers to it (normal: one `FileId`, several opens).
+    StillShared,
+    /// An id we never issued — garbage from the FSD, refused by design.
+    Unknown,
+}
+
+fn release_context(context: *const c_void) -> Release {
     let id = context as usize as u64;
     if id == 0 {
-        return None;
+        return Release::Unknown;
     }
     let mut guard = CONTEXTS.lock().expect("contexts");
     let table = guard.get_or_insert_with(std::collections::BTreeMap::new);
@@ -686,11 +699,11 @@ fn release_context(context: *const c_void) -> Option<EntryContext> {
             shared.refs -= 1;
             shared.refs
         }
-        None => return None,
+        None => return Release::Unknown,
     };
     if remaining > 0 {
         // Another file object still refers to this context: nothing dies yet, and a read arriving now is legitimate.
-        return None;
+        return Release::StillShared;
     }
     let entry = table.remove(&id).map(|shared| shared.entry);
     drop(guard);
@@ -705,9 +718,10 @@ fn release_context(context: *const c_void) -> Option<EntryContext> {
             .expect("closed contexts")
             .get_or_insert_with(std::collections::BTreeSet::new)
             .insert(id);
-        return Some(entry);
+        return Release::Freed(entry);
     }
-    None
+    // Unreachable: `remaining == 0` and the map held the id (it was just borrowed), so `remove` returned it.
+    unreachable!("a context that reached zero references must still be in the table")
 }
 
 ///
@@ -1451,13 +1465,17 @@ pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_v
     // **Look the id up; never dereference the value.** A stale id — the FSD really does close slots that were never ours — finds nothing and
     // is counted as a refusal instead of freed. There is no double release to detect, because the map is the only owner and the entry leaves
     // it exactly once.
-    let Some(entry) = release_context(context) else {
-        // Either another file object still refers to this context (the ordinary case under the FSD's reference-counted contract — a read arriving
-        // now is legitimate), or the id was never ours. `release_context` returns `None` for the first; the second is what the counter is for.
-        if !is_closed(context) {
-            STALE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let entry = match release_context(context) {
+        Release::Freed(entry) => entry,
+        // Ordinary: one `FileId` can have several file objects, and only the last one frees.
+        Release::StillShared => return,
+        Release::Unknown => {
+            // A slot that was never ours. The FSD really does close those, and refusing them is the design, not a bug to explain away.
+            if !is_closed(context) {
+                STALE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
         }
-        return;
     };
     if let Some(adapter) = adapter {
         // The adapter performs the single `remove_at` (outside its table lock, see `Adapter::close`). A failure here is recorded by
@@ -1778,7 +1796,7 @@ pub unsafe fn close(context: *mut c_void) {
     if context.is_null() {
         return;
     }
-    if release_context(context).is_none() {
+    if let Release::Unknown = release_context(context) {
         STALE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     CONTEXTS_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
