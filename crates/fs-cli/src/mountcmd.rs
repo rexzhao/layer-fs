@@ -1022,6 +1022,24 @@ pub fn live_records() -> Vec<(fs_cli::discovery::Record, fs_cli::discovery::Live
 #[must_use]
 pub fn mount_of_cwd() -> Option<fs_cli::discovery::Record> {
     let cwd = std::env::current_dir().ok()?;
+    // **Three values before the verdict** (383/580): this function and `run`'s discovery are two callers of one rule, so when they disagree the disagreement has to be
+    // visible rather than argued about.
+    if std::env::var_os("LAYERFS_DEBUG_DISCOVERY").is_some() {
+        let records = live_records();
+        eprintln!(
+            "mount_of_cwd-values: cwd={:?} candidates={:?}",
+            cwd.display().to_string(),
+            records
+                .iter()
+                .map(|(record, liveness)| format!(
+                    "{} [{liveness:?}] prefix={} mount_point_is_mount={}",
+                    record.mount_point.display(),
+                    cwd.starts_with(&record.mount_point),
+                    fs_cli::winpaths::is_volume_mount_point(&record.mount_point)
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
     fs_cli::discovery::discover(
         &cwd,
         fs_cli::winpaths::volume_root,
