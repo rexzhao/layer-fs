@@ -536,6 +536,18 @@ pub fn acquire_release_counts() -> (usize, usize) {
     )
 }
 
+/// The table as `(id, refs)` pairs: the reading that says whether a zero-reference entry was left behind.
+#[must_use]
+pub fn context_table() -> Vec<(u64, usize)> {
+    CONTEXTS
+        .lock()
+        .expect("contexts")
+        .get_or_insert_with(std::collections::BTreeMap::new)
+        .iter()
+        .map(|(id, shared)| (*id, shared.refs))
+        .collect()
+}
+
 /// How many live references the table currently carries (the sum of every `refs`).
 #[must_use]
 pub fn live_reference_count() -> usize {
@@ -719,8 +731,9 @@ fn is_closed(context: *const c_void) -> bool {
 enum Release {
     /// The last reference went; the entry is gone (returned so the caller can close its handle).
     Freed(EntryContext),
-    /// Another file object still refers to it (normal: one `FileId`, several opens).
-    StillShared,
+    /// Another file object still refers to it (normal: one `FileId`, several opens). The entry travels back because **its handle must still be closed**:
+    /// one handle was registered per open, so one close per open has to come out (that asymmetry was the leak).
+    StillShared(EntryContext),
     /// An id we never issued — garbage from the FSD, refused by design.
     Unknown,
 }
@@ -732,10 +745,10 @@ fn release_context(context: *const c_void) -> Release {
     }
     let mut guard = CONTEXTS.lock().expect("contexts");
     let table = guard.get_or_insert_with(std::collections::BTreeMap::new);
-    let remaining = match table.get_mut(&id) {
+    let (remaining, shared_entry) = match table.get_mut(&id) {
         Some(shared) => {
             shared.refs -= 1;
-            shared.refs
+            (shared.refs, shared.entry.clone())
         }
         None => return Release::Unknown,
     };
@@ -746,7 +759,7 @@ fn release_context(context: *const c_void) -> Release {
         if std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some() {
             eprintln!("release: id={id} still_shared refs={remaining}");
         }
-        return Release::StillShared;
+        return Release::StillShared(shared_entry);
     }
     let entry = table.remove(&id).map(|shared| shared.entry);
     drop(guard);
@@ -1510,8 +1523,14 @@ pub unsafe fn close_shell(adapter: Option<&crate::DynAdapter>, context: *mut c_v
     // it exactly once.
     let entry = match release_context(context) {
         Release::Freed(entry) => entry,
-        // Ordinary: one `FileId` can have several file objects, and only the last one frees.
-        Release::StillShared => return,
+        // Ordinary: one `FileId` can have several file objects. **The handle still has to be closed**: `open_like` registers one handle per open, so the
+        // handles have to leave one per close. Closing only on the last one left the rest in the table forever (measured: +8 dir handles per `status`).
+        Release::StillShared(entry) => {
+            if let Some(adapter) = adapter {
+                let _ = adapter.close(entry.handle);
+            }
+            return;
+        }
         Release::Unknown => {
             // A slot that was never ours. The FSD really does close those, and refusing them is the design, not a bug to explain away.
             if !is_closed(context) {

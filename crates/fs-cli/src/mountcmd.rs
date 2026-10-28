@@ -337,6 +337,11 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                             fs_winfsp::callbacks::acquire_release_counts(),
                             fs_winfsp::callbacks::live_reference_count(),
                         );
+                        // **The whole table, when it is small enough to read**: nine entries with `refs=0` and nine with one reference are different defects.
+                        let table = fs_winfsp::callbacks::context_table();
+                        if table.len() <= 20 {
+                            eprintln!("timer: table-ids={table:?}");
+                        }
                     }
                     std::thread::sleep(POLL);
                 }
