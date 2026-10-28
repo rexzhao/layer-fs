@@ -85,7 +85,13 @@ fn two_phase_deletion_keeps_old_handles_and_removes_on_last_close() {
     let id = file(&backend, b"/f", b"payload");
     let mut table = HandleTable::new();
     let first = table
-        .open(id, mask(&[Term::Read, Term::Delete]), Mask::ALL_BITS, false, false)
+        .open(
+            id,
+            mask(&[Term::Read, Term::Delete]),
+            Mask::ALL_BITS,
+            false,
+            false,
+        )
         .expect("first handle");
     let second = table
         .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false, false)
@@ -148,7 +154,13 @@ fn delete_on_close_follows_the_file_id_across_a_rename() {
     let id = file(&backend, b"/f", b"body");
     let mut table = HandleTable::new();
     let handle = table
-        .open(id, mask(&[Term::Read, Term::Delete]), Mask::ALL_BITS, true, false)
+        .open(
+            id,
+            mask(&[Term::Read, Term::Delete]),
+            Mask::ALL_BITS,
+            true,
+            false,
+        )
         .expect("open with delete-on-close");
     assert!(
         table.is_pending(id),
@@ -313,7 +325,13 @@ fn the_last_close_removes_exactly_once() {
     let id = file(&backend, b"/f", b"body");
     let mut table = HandleTable::new();
     let first = table
-        .open(id, mask(&[Term::Read, Term::Delete]), Mask::ALL_BITS, false, false)
+        .open(
+            id,
+            mask(&[Term::Read, Term::Delete]),
+            Mask::ALL_BITS,
+            false,
+            false,
+        )
         .expect("handle one");
     let second = table
         .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false, false)

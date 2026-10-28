@@ -57,6 +57,10 @@ pub struct Adapter<B: WorkspaceOps> {
     /// several dispatcher threads at once. A `RefCell` here would be a data race with a tidy-looking API.
     handles: std::sync::Mutex<HandleTable>,
     config: AdapterConfig,
+    /// The admission gate (S3 card §3): `restore` / `switch` close it, and the three path-entering callbacks hold a ticket for their whole run.
+    ///
+    /// One per mount, like the handle table, and for the same reason: the decision is "may this mount change its view right now", not a process-wide policy.
+    admission: crate::admission::Gatekeeper,
     /// `FileContext` allocations and frees **for this mount**.
     ///
     /// Process-wide counters answered the question "did anything leak anywhere"; per-mount counters answer "did *this* mount
@@ -90,6 +94,7 @@ impl<B: WorkspaceOps> Adapter<B> {
             ops,
             handles: std::sync::Mutex::new(HandleTable::new()),
             config: AdapterConfig::default(),
+            admission: crate::admission::Gatekeeper::new(),
             contexts: (
                 std::sync::atomic::AtomicUsize::new(0),
                 std::sync::atomic::AtomicUsize::new(0),
@@ -103,6 +108,7 @@ impl<B: WorkspaceOps> Adapter<B> {
             ops,
             handles: std::sync::Mutex::new(HandleTable::new()),
             config,
+            admission: crate::admission::Gatekeeper::new(),
             contexts: (
                 std::sync::atomic::AtomicUsize::new(0),
                 std::sync::atomic::AtomicUsize::new(0),
@@ -149,6 +155,38 @@ impl<B: WorkspaceOps> Adapter<B> {
     #[must_use]
     pub fn open_handle_kinds(&self) -> (usize, usize) {
         self.handles.lock().expect("handle table").handle_kinds()
+    }
+
+    /// Takes a **ticket** for one path-entering callback (S3 card §3.2).
+    ///
+    /// The ticket must be held for the whole callback — resolve, backend call, handle registration — because that is the window a `restore` has to exclude: a
+    /// callback that resolved against the old view and registers afterwards would hand out a handle to an object that no longer exists.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::admission::Refused::Closing`] while a `switch` is running. The status this becomes is **not** decided here: it is the measured Win32 answer
+    /// for an open on a volume that is being dismounted, and it is filled in with the pipe step rather than guessed (429).
+    pub fn admit(&self) -> Result<crate::admission::Ticket<'_>, crate::admission::Refused> {
+        self.admission.admit()
+    }
+
+    /// What the admission gate says right now.
+    #[must_use]
+    pub fn admission_kind(&self) -> crate::admission::Admission {
+        self.admission.admission()
+    }
+
+    /// Stops new opens and waits for the ones in flight; the file/directory split comes from **this** adapter's table.
+    ///
+    /// The counts are read here rather than passed in, so a caller cannot hand `quiesce` a different table's numbers — the rule and the table belong to the
+    /// same mount.
+    pub fn quiesce(
+        &self,
+        kind: crate::admission::QuiesceKind,
+        wait: std::time::Duration,
+    ) -> crate::admission::Quiesce<'_> {
+        self.admission
+            .quiesce(kind, || self.open_handle_kinds(), wait)
     }
 
     /// The backend, borrowed: the callbacks need `read_dir`/`get_info` directly, and going through the adapter's handle semantics

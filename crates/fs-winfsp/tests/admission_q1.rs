@@ -178,3 +178,38 @@ fn a_quiesce_that_never_drains_times_out() {
     );
     drop(ticket);
 }
+
+#[test]
+fn the_adapter_quiesces_on_its_own_handle_table() {
+    // The counts `quiesce` judges on must come from the **same** adapter: a caller that passed somebody else's numbers would be applying the rule to the wrong
+    // mount, and the mistake would look like "restore refused for no reason".
+    let adapter = fs_winfsp::Adapter::new(fs_winfsp::mock::MockBackend::new());
+    match adapter.quiesce(
+        fs_winfsp::admission::QuiesceKind::Restore,
+        Duration::from_secs(5),
+    ) {
+        Quiesce::Quiesced(guard) => drop(guard),
+        other => panic!("cell Q1: an idle adapter must quiesce, got {other:?}"),
+    }
+    // One file handle, opened through the **public** door, is enough to refuse — and the table it is counted in is this adapter's.
+    let id = adapter
+        .open_handle(1, None, false)
+        .expect("register a file handle");
+    let outcome = adapter.quiesce(
+        fs_winfsp::admission::QuiesceKind::Restore,
+        Duration::from_secs(5),
+    );
+    match outcome {
+        Quiesce::HandlesOpen { files, dirs } => {
+            println!("adapter quiesce reading: files={files} dirs={dirs}");
+            assert_eq!(files, 1, "cell Q1: the file handle is counted");
+        }
+        other => panic!("cell Q1: a file handle must refuse, got {other:?}"),
+    }
+    assert_eq!(
+        adapter.admission_kind(),
+        Admission::Open,
+        "cell Q1: the adapter gate comes back"
+    );
+    let _ = id;
+}
