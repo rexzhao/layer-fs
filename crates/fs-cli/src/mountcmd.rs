@@ -739,6 +739,19 @@ impl fs_cli::pipe_win::Serving for PipeServing {
             }
 
             fn status(&self) -> fs_cli::pipe::Response {
+                // **Counters on every ask** (`LAYERFS_DEBUG_HANDLES=1`): the question is which side grows when a command runs from inside the mount, and only the
+                // mount can see its own table.
+                if std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some() {
+                    if let Some(adapter) = self.0.adapter.get() {
+                        eprintln!(
+                            "handles-after-status: table={:?} open_entries={} contexts={:?} cleanup={}",
+                            adapter.open_handle_kinds(),
+                            fs_winfsp::callbacks::open_entry_count(),
+                            fs_winfsp::callbacks::context_counts(),
+                            fs_winfsp::callbacks::cleanup_call_count(),
+                        );
+                    }
+                }
                 match self.0.current().handle.status() {
                     Ok(status) => fs_cli::pipe::Response::Status {
                         workspace: status.name,
