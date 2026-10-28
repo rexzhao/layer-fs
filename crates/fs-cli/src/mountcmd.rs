@@ -30,6 +30,8 @@ const UNMOUNT_WAIT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(50);
 /// `STATUS_OBJECT_NAME_COLLISION` — the drive letter is taken (`ntstatus.h`; the same value `callbacks` uses for a taken *name*).
 const OURS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
+/// `STATUS_ACCESS_DENIED` — what WinFsp answers when the mount point exists as a real volume (`ntstatus.h:4392`).
+const OURS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 
 /// A drive letter or directory, reduced to something usable as a file name: `V:` -> `V`, `C:\mnt\x` -> `C_mnt_x`.
 #[must_use]
@@ -254,10 +256,19 @@ pub fn mount(store: &Path, arguments: &[String]) -> Result<(), Error> {
         // **Say what to do next**, not only what went wrong. `0xC0000035` is `OBJECT_NAME_COLLISION`: the drive letter is already taken, usually by a
         // mount whose process died. The status alone leaves the user with "mounting failed" and no next step.
         Ok(report) if report.mount == OURS_OBJECT_NAME_COLLISION => Err(format!(
-            "{} is already in use (0x{:#010X}); a previous mount may still hold it — try `layerfs umount {} --force`, or pick another letter",
+            "{} is already in use ({:#010X}); a previous mount may still hold it — try `layerfs umount {} --force`, or pick another letter",
             mount_point.display(),
             report.mount,
             mount_point.display()
+        )
+        .into()),
+        // `0xC0000022` is `STATUS_ACCESS_DENIED`, which is what WinFsp answers for a mount point that **exists as a real volume** (`F:`, a partition):
+        // mounting over an existing drive is not a permission problem a user can fix, it is the wrong slot. Same rule as above — the message has to
+        // name the next step, not only the status.
+        Ok(report) if report.mount == OURS_ACCESS_DENIED => Err(format!(
+            "cannot mount at {} ({:#010X}): the slot is not free — use a drive letter that has no volume, or a directory that does not exist yet",
+            mount_point.display(),
+            report.mount
         )
         .into()),
         Ok(report) => Err(format!(
