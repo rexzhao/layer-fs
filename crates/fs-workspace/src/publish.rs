@@ -133,7 +133,7 @@ impl Workspace {
         crash_point("after-materialise");
         // **The window G1 is about**: materialise has read the view, adopt has not moved the base yet. A write here would be in neither tree.
         pause_point("after-materialise");
-        if root == self.repo.commit_root(&self.base_commit)? {
+        if root == self.repo.commit_root(&self.base_commit_owned())? {
             return Err(WorkspaceError::NothingToCommit);
         }
         self.overlay.set_pending_root(Some(root))?;
@@ -205,9 +205,10 @@ impl Workspace {
         force: bool,
     ) -> WorkspaceResult<String> {
         let created = now_ns();
+        let branch = self.branch_owned();
         let parent = self.parent_commit();
         let id = commit_id(root, Some(parent), created, message);
-        let expected = self.base_commit.clone();
+        let expected = self.base_commit_owned();
         let mut connection = self.repo.db().lock();
         // BEGIN IMMEDIATE, not a deferred transaction that reads first and writes second:
         // under WAL a deferred transaction upgrades its read snapshot to a write lock, and
@@ -219,17 +220,17 @@ impl Workspace {
         let head: String = transaction
             .query_row(
                 "SELECT head_commit FROM branch WHERE name = ?1",
-                [&self.branch],
+                [branch.as_str()],
                 |row| row.get::<_, String>(0),
             )
             .map_err(|_| WorkspaceError::NotFound {
-                what: format!("branch {}", self.branch),
+                what: format!("branch {}", branch),
             })?;
         if !force && head != expected {
             // Dropping the transaction rolls it back: no commit row, no head move, no log
             // entry, and the workspace row still points at the old base.
             return Err(WorkspaceError::BranchMoved {
-                branch: self.branch.clone(),
+                branch: branch.clone(),
                 expected,
                 actual: head,
             });
@@ -241,7 +242,7 @@ impl Workspace {
         )?;
         transaction.execute(
             "UPDATE branch SET head_commit = ?1 WHERE name = ?2",
-            (&id, &self.branch),
+            (&id, branch.as_str()),
         )?;
         // A forced commit displaces whatever the head was, so the log records the displaced
         // commit: it is still a GC root even though it left the parent chain (§10.3).
@@ -254,7 +255,7 @@ impl Workspace {
         transaction.execute(
             "INSERT INTO branch_log (seq, branch, old_commit, new_commit, op, created_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            (seq, &self.branch, &head, &id, op, created),
+            (seq, branch.as_str(), &head, &id, op, created),
         )?;
         transaction.execute(
             "UPDATE workspace SET base_commit = ?1, base_root = ?2 WHERE name = ?3",
