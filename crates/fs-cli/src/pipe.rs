@@ -28,7 +28,7 @@ pub struct Request {
 }
 
 /// What the mount answers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     /// `hello`: everything the record says about this mount.

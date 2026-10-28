@@ -79,10 +79,6 @@ fn state_path(mount_point: &Path) -> PathBuf {
     mounts_dir().join(format!("{}.mount", record_name(mount_point)))
 }
 
-fn stop_path(mount_point: &Path) -> PathBuf {
-    mounts_dir().join(format!("{}.stop", record_name(mount_point)))
-}
-
 /// `FspVersion`'s two halves. The calibration in `fs_winfsp::abi::measured::DLL_BUILD` is a full build string, so the gate compares the **major
 /// version** it starts with — the layout was measured against 2.x, and a 3.x DLL may renumber the slots again.
 #[must_use]
@@ -236,8 +232,9 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
 
     std::fs::create_dir_all(mounts_dir())?;
     let state = state_path(&mount_point);
-    let stop = stop_path(&mount_point);
-    let _ = std::fs::remove_file(&stop);
+    // **The pipe name is part of the record** (ADR-010 §9.1): a reader that has the record can reach the mount without asking anyone, and `umount` is exactly
+    // that reader.
+    let pipe = fs_cli::pipe_win::pipe_name(&record_name(&mount_point), std::process::id());
     // **A record that is still held means this letter is already served** (§9.2): say who holds it instead of failing with `os error 80` from
     // `create_new`. A **stale** record is the leftover of a dead owner (power cut) and is replaced — `DELETE_ON_CLOSE` already covers every ordinary death,
     // so this branch is rare by construction.
@@ -271,11 +268,12 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     // `taskkill /F` included — the kernel closes the handle and removes the file. A leftover record then means a power cut, which is the only case the
     // reader's staleness check has to handle.
     let record = format!(
-        "version=1\npid={}\nmount_point={}\nstore={}\nworkspace={name}\nbranch={}\npipe=\nstarted_at={}\n",
+        "version=1\npid={}\nmount_point={}\nstore={}\nworkspace={name}\nbranch={}\npipe={}\nstarted_at={}\n",
         std::process::id(),
         canonical(&mount_point),
         canonical(&store),
         branch_of(&repo, &name).unwrap_or_default(),
+        pipe,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
@@ -289,6 +287,29 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
         mount_point.display()
     );
 
+    // **The control channel starts before the volume does**: a `status` that arrives a millisecond after the drive appears must not race a pipe that is not
+    // listening yet, and a serve loop that fails to start is worth knowing about before the mount commits.
+    let serving: std::sync::Arc<dyn fs_cli::pipe_win::Serving> = std::sync::Arc::new(PipeServing {
+        store: canonical(&store),
+        workspace: name.clone(),
+        branch: branch_of(&repo, &name).unwrap_or_default(),
+        mount_point: canonical(&mount_point),
+        workspace_handle: workspace,
+    });
+    let server = std::sync::Arc::new(fs_cli::pipe_win::Server::new(pipe, serving));
+    if let Ok(started) = std::thread::Builder::new()
+        .name("layerfs-control".to_owned())
+        .spawn({
+            let server = std::sync::Arc::clone(&server);
+            move || {
+                let _ = server.run();
+            }
+        })
+    {
+        // The thread is joined by process exit; keeping the handle would only be a place to forget it.
+        std::mem::forget(started);
+    }
+
     let library = default_library();
     // Installed **before** mounting, so a Ctrl-C during the mount itself is already an orderly stop.
     install_console_handler();
@@ -298,7 +319,10 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
         loop {
             // **Three ways to be asked to stop**, all answering the same way: the stop file (until the pipe replaces it), the record disappearing, and a
             // console control event. Ctrl-C lands here as an **orderly unmount** rather than a kill, which is the whole point of the handler.
-            if stop.exists() || !state.exists() || stop_requested() {
+            // **Two ways to be asked to stop**, both answering the same way: the control pipe (through `request_stop`) and a console control event. The
+            // stop **file** is gone — A15s asserts that writing one no longer stops a mount, because a signal nobody can see the receipt of was the thing
+            // being replaced.
+            if !state.exists() || stop_requested() {
                 println!("unmount requested after {:?}", started.elapsed());
                 break;
             }
@@ -306,7 +330,7 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
         }
         Ok(())
     });
-    let _ = std::fs::remove_file(&stop);
+    // (the stop file is gone: the control pipe is the only stop signal — A15s)
     let _ = std::fs::remove_file(&state);
     match report {
         Ok(report) if report.looked_like_a_mount => {
@@ -355,12 +379,49 @@ pub fn umount(arguments: &[String]) -> Result<(), Error> {
     let mount_point = PathBuf::from(mount_point);
     let force = arguments.iter().any(|argument| argument == "--force");
     let state = state_path(&mount_point);
-    let stop = stop_path(&mount_point);
     if !state.exists() {
         return Err(format!("no mount recorded for {}", mount_point.display()).into());
     }
-    std::fs::create_dir_all(mounts_dir())?;
-    std::fs::write(&stop, b"stop\n")?;
+    // **Ask the mount, do not write a file it might never read** (ADR-010 §10.2): the answer is the mount's own, which is also what lets `unmount` report
+    // handles it refuses on. The stop file is gone — its absence is what A15s asserts.
+    let record_text = std::fs::read_to_string(&state).unwrap_or_default();
+    let pipe = record_text
+        .lines()
+        .find_map(|line| line.strip_prefix("pipe=").map(str::to_string))
+        .unwrap_or_default();
+    if pipe.is_empty() {
+        return Err(fs_cli::Failure::in_use(format!(
+            "{} has no control pipe recorded (a mount from an older build?); end the mounting process",
+            mount_point.display()
+        ))
+        .into());
+    }
+    let request = fs_cli::pipe::Request {
+        v: fs_cli::pipe::PROTOCOL,
+        op: "unmount".to_owned(),
+        args: serde_json::json!({ "wait_ms": UNMOUNT_WAIT.as_millis() as u64 }),
+    };
+    let answer = fs_cli::pipe_win::call(&pipe, &request, fs_cli::pipe_win::CONNECT_WAIT_MS);
+    match answer {
+        Ok(fs_cli::pipe::Response::Unmounted {}) => {}
+        Ok(fs_cli::pipe::Response::HandlesOpen { handles }) => {
+            return Err(fs_cli::Failure::in_use(format!(
+                "{} still has {handles} open handle(s); close them and try again — the mount was left as it was",
+                mount_point.display()
+            ))
+            .into())
+        }
+        Ok(other) => {
+            return Err(format!("{} refused to unmount: {other:?}", mount_point.display()).into())
+        }
+        Err(error) => {
+            return Err(fs_cli::Failure::in_use(format!(
+                "{} is not answering ({error}); the mounting process may be wedged",
+                mount_point.display()
+            ))
+            .into())
+        }
+    }
     let started = Instant::now();
     while started.elapsed() < UNMOUNT_WAIT {
         if !state.exists() {
@@ -372,7 +433,6 @@ pub fn umount(arguments: &[String]) -> Result<(), Error> {
     if force {
         // Honest about what this can and cannot do: the WinFsp handle lives in the other process, so a forced unmount here would be a claim, not an
         // action. What *is* removed is the record, so a crashed mount does not block the next one.
-        let _ = std::fs::remove_file(&stop);
         let _ = std::fs::remove_file(&state);
         return Err(format!(
             "{} did not release within {UNMOUNT_WAIT:?}; removed the stale record, the volume may still be attached (end the mounting process)",
@@ -568,6 +628,71 @@ fn hold_record(path: &Path, contents: &str) -> Result<std::fs::File, Error> {
     Ok(file)
 }
 
+/// What the control pipe answers for one mount: the three S1 operations, computed from the mount itself.
+///
+/// It holds the **leaked** workspace the backend already serves, so `status` reports the same view the filesystem is serving — not a second connection that
+/// could disagree with it.
+struct PipeServing {
+    store: String,
+    workspace: String,
+    branch: String,
+    mount_point: String,
+    workspace_handle: &'static fs_workspace::Workspace,
+}
+
+impl PipeServing {
+    fn record_fields(&self) -> fs_cli::pipe::Response {
+        fs_cli::pipe::Response::Hello {
+            store: self.store.clone(),
+            workspace: self.workspace.clone(),
+            branch: self.branch.clone(),
+            pid: std::process::id(),
+            mount_point: self.mount_point.clone(),
+            protocol: fs_cli::pipe::PROTOCOL,
+        }
+    }
+}
+
+impl fs_cli::pipe_win::Serving for PipeServing {
+    fn answer(&self, frame: &[u8]) -> fs_cli::pipe::Response {
+        // A tiny adapter: the protocol module wants a `Context`, and everything it needs is right here.
+        struct Ctx<'a>(&'a PipeServing);
+        impl fs_cli::pipe::Context for Ctx<'_> {
+            fn hello(&self) -> fs_cli::pipe::Response {
+                self.0.record_fields()
+            }
+
+            fn status(&self) -> fs_cli::pipe::Response {
+                match self.0.workspace_handle.status() {
+                    Ok(status) => fs_cli::pipe::Response::Status {
+                        workspace: status.name,
+                        branch: status.branch,
+                        base_commit: status.base_commit,
+                        dirty: status.dirty,
+                        handles: 0,
+                    },
+                    Err(error) => fs_cli::pipe::Response::Failed {
+                        detail: error.to_string(),
+                    },
+                }
+            }
+
+            fn shutting_down(&self) -> bool {
+                stop_requested()
+            }
+        }
+        fs_cli::pipe::dispatch(frame, &Ctx(self))
+    }
+
+    fn request_stop(&self) -> bool {
+        request_stop();
+        true
+    }
+
+    fn shutting_down(&self) -> bool {
+        stop_requested()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::{

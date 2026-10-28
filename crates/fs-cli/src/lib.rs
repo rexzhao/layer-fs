@@ -5,6 +5,8 @@
 
 pub mod discovery;
 pub mod pipe;
+#[cfg(windows)]
+pub mod pipe_win;
 
 /// Printed when a command needs a workspace and none was given.
 ///

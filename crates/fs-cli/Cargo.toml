@@ -26,3 +26,16 @@ serde_json.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
+
+# The control pipe (ADR-010 §10.2): named pipes, the current user's SID for the DACL, and the console handler live behind these.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+] }
