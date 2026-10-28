@@ -131,6 +131,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "mount" | "umount" | "list" | "version" | "init" | "gc"
     ) && !fs_cli::FILE_COMMANDS.contains(&command.as_str());
     let (store, workspace_option) = if needs_repository {
+        // **Three values, printed before any logic changes** (383/580): what the process thinks its directory is, what the record says the mount point is, and
+        // whether one starts with the other. The difference between them is the whole question — short (8.3) name, case, or a trailing separator.
+        if std::env::var_os("LAYERFS_DEBUG_DISCOVERY").is_some() {
+            if let Ok(cwd) = std::env::current_dir() {
+                let canonical = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+                eprintln!(
+                    "discover-values: cwd={:?} canonical={:?} matches_in_records={:?}",
+                    cwd.display().to_string(),
+                    canonical.display().to_string(),
+                    mountcmd::live_records()
+                        .into_iter()
+                        .map(|(record, _)| format!(
+                            "{}->{}",
+                            record.mount_point.display(),
+                            cwd.starts_with(&record.mount_point)
+                        ))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
         let current = std::env::current_dir().ok();
         let discovered = current.and_then(|cwd| {
             fs_cli::discovery::discover(&cwd, fs_cli::winpaths::volume_root, mountcmd::live_records)
