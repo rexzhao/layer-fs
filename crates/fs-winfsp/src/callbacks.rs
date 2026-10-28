@@ -1014,7 +1014,7 @@ unsafe fn open_like(
     // `Cleanup`/`Close` will act on. Coming last also means the earlier refusal paths need no undo.
     // The binding travels as a pair from here on: `open_handle` and `remove_at` both take `(parent, name)`, and the identity half has already
     // been checked against the door's answer above.
-    let Ok(handle) = adapter.open_handle(file_id, binding.map(|outcome| outcome.binding)) else {
+    let Ok(handle) = adapter.open_handle(file_id, binding.map(|outcome| outcome.binding), node.kind == crate::ops::Kind::Directory) else {
         OPEN_EXITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
     };

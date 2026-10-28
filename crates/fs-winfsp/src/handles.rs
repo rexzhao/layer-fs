@@ -49,6 +49,12 @@ pub struct Handle {
     pub share: Mask,
     /// `FILE_FLAG_DELETE_ON_CLOSE`: the entry goes away when the **last** handle closes.
     pub delete_on_close: bool,
+    /// Whether the entry this handle names is a **directory** (S3 card §3.2).
+    ///
+    /// Needed because `restore` / `switch` block on **file** handles only (D8 = B): the shell that starts the command holds a directory handle on the volume
+    /// itself, so counting those would make "`checkout` from inside the mount" impossible forever. A directory handle that outlives a restore is the NTFS
+    /// "volume was dismounted" case — the view goes stale, no data is lost.
+    pub is_dir: bool,
 }
 
 /// What the adapter must do after a [`HandleTable::close`].
@@ -137,6 +143,7 @@ impl HandleTable {
         desired: Mask,
         share: Mask,
         delete_on_close: bool,
+        is_dir: bool,
     ) -> Result<HandleId, OpsError> {
         if self.pending.contains(&file_id) {
             // Two-phase deletion (card §3 criterion 3): once an entry is delete-pending, a **new** open is refused.
@@ -161,6 +168,7 @@ impl HandleTable {
                 desired,
                 share,
                 delete_on_close,
+                is_dir,
             },
         );
         if delete_on_close {
@@ -195,9 +203,41 @@ impl HandleTable {
     ///
     /// This is the number `status.handles` reports and the number a **remote** `umount` refuses on (ADR-010 §7.2): the caller that asks over the pipe cannot
     /// see who has a file open, so the answer has to come from the mount that can.
+    ///
+    /// **All** handles, directories included — `umount` must wait for those too, because unmounting destroys the volume the directory lives on. Only
+    /// `restore` / `switch` draw the line the other way; see [`Self::file_handles`].
     #[must_use]
     pub fn len(&self) -> usize {
         self.handles.len()
+    }
+
+    /// How many **file** handles are open, and how many directory handles (S3 card §3.2, D8 = B).
+    ///
+    /// The split is the admission rule for `restore` / `switch`: a file handle blocks, because the object under it may vanish; a directory handle is reported
+    /// and let through, because the view going stale is not lost data.
+    #[must_use]
+    pub fn handle_kinds(&self) -> (usize, usize) {
+        self.handles
+            .values()
+            .fold((0, 0), |(files, dirs), handle| {
+                if handle.is_dir {
+                    (files, dirs + 1)
+                } else {
+                    (files + 1, dirs)
+                }
+            })
+    }
+
+    /// File handles only — the number that makes `restore` wait (§3.2).
+    #[must_use]
+    pub fn file_handles(&self) -> usize {
+        self.handle_kinds().0
+    }
+
+    /// Directory handles only — reported, never blocking (§3.2, D8 = B).
+    #[must_use]
+    pub fn dir_handles(&self) -> usize {
+        self.handle_kinds().1
     }
 
     /// Whether no handle is open.

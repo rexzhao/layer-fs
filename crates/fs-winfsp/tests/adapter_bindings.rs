@@ -13,7 +13,7 @@ use fs_winfsp::{HandleId, HandleTable};
 
 fn open(table: &mut HandleTable, file_id: u64, parent: u64, name: &[u8]) -> HandleId {
     let handle = table
-        .open(file_id, Mask::ALL_BITS, Mask::ALL_BITS, false)
+        .open(file_id, Mask::ALL_BITS, Mask::ALL_BITS, false, false)
         .expect("open");
     table.remember_binding(file_id, parent, name.to_vec());
     handle

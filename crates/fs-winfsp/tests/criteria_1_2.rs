@@ -45,7 +45,7 @@ fn a_handle_survives_a_rename_of_its_own_entry() {
     backend.write(id, 0, b"payload").expect("write");
     let mut table = HandleTable::new();
     let handle = table
-        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false)
+        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false, false)
         .expect("open");
 
     let outcome = backend
@@ -102,7 +102,7 @@ fn a_directory_handle_survives_a_rename_and_a_reused_path() {
     }
     let mut table = HandleTable::new();
     let handle = table
-        .open(d1, mask(&[Term::Read]), Mask::ALL_BITS, false)
+        .open(d1, mask(&[Term::Read]), Mask::ALL_BITS, false, false)
         .expect("open d1");
 
     backend
@@ -147,7 +147,7 @@ fn a_supersede_is_visible_through_every_handle() {
     backend.write(id, 0, b"original").expect("write");
     let mut table = HandleTable::new();
     let before = table
-        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false)
+        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false, false)
         .expect("handle opened before the supersede");
 
     let outcome = backend
@@ -157,7 +157,7 @@ fn a_supersede_is_visible_through_every_handle() {
     assert_eq!(outcome.replaced, None, "cell replaced: nothing lost a name");
 
     let after = table
-        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false)
+        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false, false)
         .expect("handle opened after the supersede");
     for handle in [before, after] {
         let bound = table.get(handle).expect("open").file_id;

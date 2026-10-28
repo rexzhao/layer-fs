@@ -207,6 +207,9 @@ impl<B: WorkspaceOps> Adapter<B> {
             desired,
             share,
             delete_on_close,
+            // The kind comes from the **backend's own answer**, not from the disposition: a `FILE_OPEN` can land on either, and this field is what
+            // `restore`/`switch` count when deciding whether a file handle is in the way (S3 §3.2).
+            outcome.kind == crate::ops::Kind::Directory,
         )?;
         Ok((handle, outcome.file_id, outcome.kind))
     }
@@ -227,6 +230,7 @@ impl<B: WorkspaceOps> Adapter<B> {
         &self,
         file_id: u64,
         binding: Option<(u64, Vec<u8>)>,
+        is_dir: bool,
     ) -> OpsResult<HandleId> {
         let mut table = self.handles.lock().expect("handle table");
         if table.is_pending(file_id) {
@@ -242,6 +246,7 @@ impl<B: WorkspaceOps> Adapter<B> {
             fs_windows::share::Mask::ALL_BITS,
             fs_windows::share::Mask::ALL_BITS,
             false,
+            is_dir,
         )
     }
 

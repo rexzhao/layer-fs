@@ -176,10 +176,10 @@ fn alloc(context: EntryContext) -> *mut c_void {
 fn cleanup_marks_and_the_last_close_deletes_exactly_once() {
     let (adapter, removed, ids) = fixture();
     let first = adapter
-        .open_handle(3, Some((0, b"victim".to_vec())))
+        .open_handle(3, Some((0, b"victim".to_vec())), false)
         .expect("first handle");
     let second = adapter
-        .open_handle(3, Some((0, b"victim".to_vec())))
+        .open_handle(3, Some((0, b"victim".to_vec())), false)
         .expect("second handle");
     let a = alloc(context(3, first));
     let b = alloc(context(3, second));
@@ -219,7 +219,7 @@ fn cleanup_marks_and_the_last_close_deletes_exactly_once() {
 fn a_close_without_the_delete_flag_never_deletes() {
     let (adapter, removed, _ids) = fixture();
     let handle = adapter
-        .open_handle(3, Some((0, b"victim".to_vec())))
+        .open_handle(3, Some((0, b"victim".to_vec())), false)
         .expect("handle");
     let a = alloc(context(3, handle));
 
@@ -242,7 +242,7 @@ fn a_closed_handle_cannot_be_closed_twice() {
     // no-op — otherwise ids could be reused silently and the second close would delete somebody else's entry.
     let (adapter, removed, _ids) = fixture();
     let handle = adapter
-        .open_handle(3, Some((0, b"victim".to_vec())))
+        .open_handle(3, Some((0, b"victim".to_vec())), false)
         .expect("handle");
     adapter.set_delete(handle).expect("mark");
     adapter

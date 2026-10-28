@@ -53,11 +53,11 @@ fn sharing_admits_and_refuses_all_nine_cells() {
             let existing_share = mask(&[shared]);
             let mut table = table.borrow_mut();
             table
-                .open(1, existing_desired, existing_share, false)
+                .open(1, existing_desired, existing_share, false, false)
                 .expect("the first open always succeeds");
             for requested in all {
                 let admitted = table
-                    .open(1, mask(&[requested]), Mask::ALL_BITS, false)
+                    .open(1, mask(&[requested]), Mask::ALL_BITS, false, false)
                     .is_ok();
                 let expected =
                     mask(&[requested]).bits() & existing_share.bits() == mask(&[requested]).bits();
@@ -85,17 +85,17 @@ fn two_phase_deletion_keeps_old_handles_and_removes_on_last_close() {
     let id = file(&backend, b"/f", b"payload");
     let mut table = HandleTable::new();
     let first = table
-        .open(id, mask(&[Term::Read, Term::Delete]), Mask::ALL_BITS, false)
+        .open(id, mask(&[Term::Read, Term::Delete]), Mask::ALL_BITS, false, false)
         .expect("first handle");
     let second = table
-        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false)
+        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false, false)
         .expect("second handle");
 
     table.set_delete(first).expect("mark delete-pending");
     assert!(table.is_pending(id), "cell state: the entry is pending");
 
     assert_eq!(
-        table.open(id, mask(&[Term::Read]), Mask::ALL_BITS, false),
+        table.open(id, mask(&[Term::Read]), Mask::ALL_BITS, false, false),
         Err(OpsError::DeletePending),
         "cell (i): a new open of a delete-pending entry is refused"
     );
@@ -148,7 +148,7 @@ fn delete_on_close_follows_the_file_id_across_a_rename() {
     let id = file(&backend, b"/f", b"body");
     let mut table = HandleTable::new();
     let handle = table
-        .open(id, mask(&[Term::Read, Term::Delete]), Mask::ALL_BITS, true)
+        .open(id, mask(&[Term::Read, Term::Delete]), Mask::ALL_BITS, true, false)
         .expect("open with delete-on-close");
     assert!(
         table.is_pending(id),
@@ -252,10 +252,10 @@ fn admitting_everything_disagrees_with_the_real_rule_on_the_grid() {
             for requested in all {
                 let mut table = HandleTable::new();
                 table
-                    .open(1, mask(&[held]), mask(&[shared]), false)
+                    .open(1, mask(&[held]), mask(&[shared]), false, false)
                     .expect("first open");
                 let real = table
-                    .open(1, mask(&[requested]), Mask::ALL_BITS, false)
+                    .open(1, mask(&[requested]), Mask::ALL_BITS, false, false)
                     .is_ok();
                 real_admitted += usize::from(real);
                 // The wrong policy in one line: it never looks at the share masks at all.
@@ -283,7 +283,7 @@ fn set_delete_requires_delete_access() {
     let id = file(&backend, b"/f", b"x");
     let mut table = HandleTable::new();
     let handle = table
-        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false)
+        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false, false)
         .expect("open read-only");
     assert_eq!(
         table.set_delete(handle),
@@ -296,7 +296,7 @@ fn set_delete_requires_delete_access() {
     );
     assert!(
         table
-            .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false)
+            .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false, false)
             .is_ok(),
         "cell state: the entry is still openable"
     );
@@ -313,10 +313,10 @@ fn the_last_close_removes_exactly_once() {
     let id = file(&backend, b"/f", b"body");
     let mut table = HandleTable::new();
     let first = table
-        .open(id, mask(&[Term::Read, Term::Delete]), Mask::ALL_BITS, false)
+        .open(id, mask(&[Term::Read, Term::Delete]), Mask::ALL_BITS, false, false)
         .expect("handle one");
     let second = table
-        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false)
+        .open(id, mask(&[Term::Read]), Mask::ALL_BITS, false, false)
         .expect("handle two");
     table.set_delete(first).expect("mark pending");
 
