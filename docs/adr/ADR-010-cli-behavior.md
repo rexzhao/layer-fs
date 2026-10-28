@@ -244,7 +244,7 @@ CLI 作为入口，在**唯一一个函数**（`cli_path()`）里做以下三条
 | store 目录不存在 | "store directory X does not exist"（`cas-store/src/layout.rs:121`） | 同；加 "`fs-cli init X` 创建" |
 | 目录存在但不是仓库 | `NotInitialised` | "X 不是 layer-fs 仓库（没有主库）" |
 | 主库由别的构建写 | `SchemaMismatch` | 原文 + "本构建不迁移旧库（ADR-009 §10.1）" |
-| **未指定 workspace** | 读 current；缺失时 "no current workspace; run checkout <branch>" | **`no workspace specified; use --workspace <name>, or cd into a mount point`**（逐字固定，A0 按此断言） |
+| **未指定 workspace** | 读 current；缺失时 "no current workspace; run checkout <branch>" | **`no workspace specified; use --workspace <name>, or cd into a mount point`**（逐字固定于一个常量 `NO_WORKSPACE`，A0 断言该常量；S0 尚无路径发现，常量暂不含 `, or cd into a mount point`，S1 补上——不提前承诺一条还走不通的出路） |
 | workspace 不存在 | `NotFound{workspace X}` | "没有 workspace X；`fs-cli checkout <branch>` 创建"（来源只可能是 `--workspace` 或挂载记录；后者说明记录与主库不一致，按 `Inconsistent` 报） |
 | branch 不存在 | `NotFound{branch}` | "没有分支 b；`fs-cli branch b --from main`" |
 | 路径不存在 | `NotFound{path}` | 原样（带 workspace 名） |
@@ -347,12 +347,13 @@ CLI 作为入口，在**唯一一个函数**（`cli_path()`）里做以下三条
 | `fs-cli/src/main.rs:465-485` `current_path/read_current/write_current` | **删除**；`init`（`:86`）与 `checkout`（`:359`）不再写；`with_workspace`（`:448`）、`snapshot create`（`:273`）改用解析器（§4.2） | S0 |
 | `fs-cli/src/main.rs:344-360` `checkout` | 存在性改走 `workspace_list()`；无副作用；输出下一步 | S0 |
 | `fs-cli/src/main.rs` `log/reset/revert` | 分支来源按 §4.3（加 `<branch>` / `--branch`） | S0 |
+| 新增全局 `--workspace` 与解析器（§4.2 的显式部分；发现部分 S1 接入同一解析器） | 去掉 current 后它是唯一来源，必须与删除同批 | S0 |
+| 消息常量 `NO_WORKSPACE` | S0：`no workspace specified; use --workspace <name>`；S1 接入路径发现时**同一常量**追加 `, or cd into a mount point` | S0/S1 |
 | `fs-cli/src/mountcmd.rs:178` | 删除缺省 `"main"`，`--workspace` 必填 | S0 |
 | `fs-cli/tests/cli.rs`、`cli_defaults.rs` | 依赖 current 的用例改为显式 `--workspace`；`cli_defaults.rs::init_leaves_a_workspace_ready_to_use`（`init` 后不 checkout 直接 `put/ls`）**判据翻转**：无 `--workspace` 必须报 C2 消息；`cli.rs::failures_are_reported` 里删除 `cli/current` 的那段（`:195`）随之改写 | S0 |
 | `WorkspaceInUse` / `StoreInUse` 渲染 | 查记录，带挂载点与 pid | S0 |
 | `fs-cli/src/mountcmd.rs:62-72` 记录目录 | `%LOCALAPPDATA%\layerfs\mounts\` + 句柄判活 | S1 |
 | 新增 `cli_path()` | §5.1 三条 | S1 |
-| 新增全局 `--workspace`、解析器（§4.3） | | S1 |
 | 路径发现（§4.4） | Win32 两个调用 + 记录扫描 | S1 |
 | §6 分流 | 每条命令一个类别常量，表驱动 | S1 |
 | Ctrl-C 处理（§7.1） | `SetConsoleCtrlHandler` | S1 |
@@ -372,7 +373,7 @@ CLI 作为入口，在**唯一一个函数**（`cli_path()`）里做以下三条
 
 | # | 判据 | 变异（必须红） |
 | --- | --- | --- |
-| A0 | 夹具 store 里**故意放一个** `cli/current`（内容 `main`），cwd 不在挂载内、不给 `--workspace`：`put/get/ls/stat/commit/status` 全部失败，stderr **逐字**含 `no workspace specified; use --workspace <name>, or cd into a mount point`，退出码 2 | 恢复读取 current（任一条命令）；或改写消息 |
+| A0 | 夹具 store 里**故意放一个** `cli/current`（内容 `main`），cwd 不在挂载内、不给 `--workspace`：`put/get/ls/stat/commit/status` 全部失败，stderr **逐字**含常量 `NO_WORKSPACE`（§8.2；断言引用常量，不在测试里另写字面量），退出码 2 | 恢复读取 current（任一条命令）；或改写消息 |
 | A0b | `init` 与 `checkout` 之后 store 里**不存在** `cli/` 目录 | 恢复 `write_current` |
 | A1 | workspace `dev` 被另一进程持有时，`log dev`、`reset <c> --branch dev --expect <c>`、`revert --branch dev`、`--workspace dev log` 成功（取分支不打开 overlay） | 分支来源改回 `workspace_open` |
 | A2 | `mount <mp>` 不带 `--workspace` ⇒ 失败，消息含 `--workspace`，**且未挂载**（盘符仍空、无记录） | 缺省改回 `"main"` |
