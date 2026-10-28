@@ -775,3 +775,135 @@ fn an_open_file_handle_blocks_the_switch() {
     );
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// **W3** — a switch to a workspace another process holds is **busy** (4), the mount keeps serving what it served, and the control channel **recovers** as soon as
+/// the attempt is over.
+///
+/// The control channel is **serial on purpose** (ruling 丙): one request at a time, so during the attempt `hello` is unanswered. That is not a defect to explain
+/// away — the mount really is in transition, and answering "alive" would be the lie. What must hold is the **recovery**, and it is measured here with a bound
+/// rather than assumed.
+#[test]
+fn a_switch_to_a_held_workspace_is_busy_and_the_channel_recovers() {
+    common::strict_gate();
+    let (store, _child, root) = mount_at_directory("switch-held");
+    Command::new(binary())
+        .arg("--store")
+        .arg(&store)
+        .args(["branch", "feat", "--from", "main"])
+        .output()
+        .expect("branch feat");
+    let (created, out, err) = cli_code(&store, &store, &["checkout", "feat"]);
+    assert_eq!(
+        created, 0,
+        "cell setup: the feat workspace row must exist: {out}{err}"
+    );
+
+    // Hold `feat` from another process: a second mount of the same workspace, at a mount point of its own.
+    let other_point = store.join("other");
+    let mut holder = MountChild(
+        Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("mount")
+            .arg(&other_point)
+            .arg("--workspace")
+            .arg("feat")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the holder mount"),
+    );
+    let held_record =
+        fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&other_point)));
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(15)
+        && !std::fs::read_to_string(&held_record)
+            .unwrap_or_default()
+            .contains("pipe=")
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        std::fs::read_to_string(&held_record)
+            .unwrap_or_default()
+            .contains("pipe="),
+        "cell setup: the holder mount must be serving feat"
+    );
+    let pipe = std::fs::read_to_string(
+        fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&root))),
+    )
+    .unwrap_or_default()
+    .lines()
+    .find_map(|line| line.strip_prefix("pipe=").map(str::to_string))
+    .unwrap_or_default();
+    assert!(
+        !pipe.is_empty(),
+        "cell setup: the mount must have a control pipe"
+    );
+
+    let (code, out, err) = cli_code(&store, &root, &["checkout", "feat"]);
+    let ask = |pipe: &str| {
+        let request = fs_cli::pipe::Request {
+            v: fs_cli::pipe::PROTOCOL,
+            op: "hello".to_owned(),
+            args: serde_json::json!({}),
+        };
+        fs_cli::pipe_win::call(pipe, &request, 2_000).is_ok()
+    };
+    // **Recovery, measured**: from the moment the command returns, how long until the channel answers again.
+    let recovered_at = Instant::now();
+    let mut recovered = ask(&pipe);
+    let deadline = recovered_at + Duration::from_millis(2_000);
+    while !recovered && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+        recovered = ask(&pipe);
+    }
+    let recovery = recovered_at.elapsed();
+    println!(
+        "W3 reading: code={code} recovered={recovered} after={recovery:?} stdout={:?} stderr={:?}",
+        out.trim(),
+        err.trim()
+    );
+    assert_eq!(
+        code, 4,
+        "cell W3: a workspace another process holds is busy (4), got {code}: {out}{err}"
+    );
+    assert!(recovered, "cell W3: the control channel must answer again");
+    assert!(
+        recovery <= Duration::from_millis(100),
+        "cell W3: the channel must recover within 100 ms of the attempt ending, took {recovery:?}"
+    );
+    // Spawned by hand with a bounded retry: a directory mount point can be briefly unusable as a working directory (267), which is not this criterion's subject.
+    let mut attempt = 0;
+    let (code, out, _) = loop {
+        attempt += 1;
+        match Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("status")
+            .current_dir(&root)
+            .output()
+        {
+            Ok(output) => {
+                break (
+                    output.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                )
+            }
+            Err(_) if attempt < 20 => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(error) => break (1, String::new(), error.to_string()),
+        }
+    };
+    assert_eq!(code, 0, "cell W3: status must answer");
+    assert!(
+        out.contains("workspace: main"),
+        "cell W3: the mount still serves main, got {out:?}"
+    );
+    let _ = holder.0.kill();
+    let _ = holder.0.wait();
+    let _ = std::fs::remove_dir_all(&store);
+}
