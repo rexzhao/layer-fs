@@ -355,6 +355,7 @@ pub fn rebind(&self, branch: &str) -> …
   必须远小于 WinFsp 的 `IrpTimeout`（`VolumeParams` 置零 ⇒ 默认 `FspFsctlIrpTimeoutDefault = 300000` ms，SDK `fsctl.h:184-186,202`），
   超过则内核取消挂起的 IRP。S2 判据 A16 记录"commit 期间文件操作的最长等待"与视图大小的关系（带红值出档，不设通过线前先测）。
 - `fs-api::Workspace` 同步改为 `&self`（`fs-api/src/workspace.rs:180,193,206`）；CLI 进程内（未挂载语境）调用不受影响。
+- **实际落位（S2 收口 `e1632e1`）**：`fs-workspace` 内的 `Gate`（`RwLock<()>`，`gate.rs:23-26`）由 `Workspace` 与它发出的 `WorkspaceStore` 共享；可变的 base 字段收进 `BaseState`，另用 `Mutex`（`workspace.rs:49`）。读锁取在 `WorkspaceStore::read/write` 与 `Workspace` 直接碰 overlay 的公共数据方法，写锁取在 `commit/snapshot/restore/rebind`；绕过入口（`overlay()`、`Deref`）已封（S2 G5）。**一条调用链只取一次读锁**：G4 的深度仪器在 S2 中空转（深度只增不减、环境开关无人读取），由 S3 卡 §2 修复并在全量测试中以严格模式验证。
 
 ### 10.4 op 规范
 
@@ -590,8 +591,12 @@ D7 的后果（记录，不另需裁决）：CLI 不再能读历史文件。需�
 
 - 2026-10-28 随 S1 卡（`docs/process/adr010-s1-card.md`）澄清：停止顺序改为"卸载 → flush → 删记录"（§7.1）；远程 umount 有句柄时 `HandlesOpen` 且不改状态、控制台停止不看句柄（§7.2）；记录以 `DELETE_ON_CLOSE` + `READ|DELETE` 共享打开（§9.2）；`unmount` 错误统一名为 `HandlesOpen`（§10.4）。判据影响：无（澄清）。
 
-### §4.4 补充：目录挂载点不支持路径发现（A6d 读数，2026-10-28）
+### §4.4 补充：目录挂载点的路径发现（2026-10-28，S2 `b806270` 后改写）
 
-目录挂载点的卷根是宿主卷（如 `F:\`），卷标不是 `layerfs` ⇒ `discover` 永远不认。
-用户 `cd` 进目录挂载点后 `status` 等命令仍需显式 `--store`/`--workspace`。
-修法（`VOLUME_NAME_GUID` 匹配挂载记录的卷 GUID）留 S2。
+- ~~目录挂载点不支持路径发现~~（`951fa78` 的结论，已被 `b806270` 推翻）。
+- 读数：WinFsp 的目录挂载点不是"卷挂载点"：`GetVolumeNameForVolumeMountPointW` 答的是**宿主卷**的 GUID，卷标也是宿主卷的（`7e5d99c`），
+  所以"卷标 = layerfs"这道检查对目录挂载点的前提不成立。
+- 现行方法：两种挂载点，两道结构不同的检查——**盘符挂载点**看卷标（`layerfs`）；**目录挂载点**看该目录带 `FILE_ATTRIBUTE_REPARSE_POINT`
+  （"这块目录确实是某个卷的挂载点"）。两者都还要求记录为 Live、cwd 以记录的 `mount_point` 为前缀。指向 `C:\` 的记录仍被拒（`C:\` 不是 reparse point）。
+- 进入方式：`SetCurrentDirectory` 对目录挂载点返回 `ERROR_DIRECTORY`（267）；bash 的 `cd` 可以进入。cmd / PowerShell 待 S3 卡 V12 测定后补写于此。
+- 2026-10-28 随 S3 卡（`docs/process/adr010-s3-card.md`）：§4.4 目录挂载点发现改写为现行方法（推翻 `951fa78`）；§10.3 按实际实现写闸的落位并记 G4 空转；补入 S2 卡。判据影响：无（澄清）。§6.2 / §7.3 / §10.4 待 D8 裁决后修订。
