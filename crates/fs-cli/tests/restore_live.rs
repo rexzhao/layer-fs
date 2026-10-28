@@ -1140,3 +1140,205 @@ fn a_failed_remount_rolls_back_and_says_so() {
     let _ = child.0.wait();
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// **W4** — the window in which the mount point is not usable during a **successful** switch, measured rather than assumed.
+///
+/// A remount cannot be instantaneous, and the card accepts a short gap: what it does not accept is a gap nobody measured. The bound is 2000 ms; the reading is
+/// printed either way (573: the number first, then the judgement).
+#[test]
+fn the_switch_window_is_measured() {
+    common::strict_gate();
+    let (store, _child, root) = mount_at_directory("switch-window");
+    Command::new(binary())
+        .arg("--store")
+        .arg(&store)
+        .args(["branch", "feat", "--from", "main"])
+        .output()
+        .expect("branch feat");
+    let (created, out, err) = cli_code(&store, &store, &["checkout", "feat"]);
+    assert_eq!(
+        created, 0,
+        "cell setup: the feat workspace row must exist: {out}{err}"
+    );
+    // One write so the volume is really serving (a record with a pipe is not the same thing).
+    let file = root.join("f.txt");
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match std::fs::write(&file, b"x") {
+            Ok(()) => break,
+            Err(_) if attempt < 50 => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => panic!("cell setup: write through the mount failed: {error:?}"),
+        }
+    }
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let window = std::sync::Arc::new(std::sync::Mutex::new(W4Window::default()));
+    let poller = {
+        let stop = std::sync::Arc::clone(&stop);
+        let window = std::sync::Arc::clone(&window);
+        let root = root.clone();
+        std::thread::spawn(move || {
+            let mut state = window.lock().expect("window");
+            let started = Instant::now();
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let usable = std::fs::read_dir(&root).is_ok();
+                state.record(usable, started.elapsed());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // **Close the window that is still open**: a gap that had not ended when polling stopped is still a gap, and leaving it open reported `0ns` for a
+            // run in which the mount point was unusable for several samples (the instrument, not the product — 434).
+            state.finish(started.elapsed());
+        })
+    };
+
+    let (code, out, err) = cli_code(&store, &root, &["checkout", "feat"]);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    poller.join().expect("the poller finishes");
+    let window = window.lock().expect("window");
+    println!(
+        "W4 reading: code={code} samples={} unusable={} longest_gap={:?} stdout={:?}",
+        window.samples,
+        window.unusable,
+        window.longest,
+        out.trim()
+    );
+    assert_eq!(code, 0, "cell W4: the switch must succeed: {out}{err}");
+    assert!(
+        window.longest <= Duration::from_millis(2000),
+        "cell W4: the mount point must not be unusable for more than 2000 ms, longest gap was {:?}",
+        window.longest
+    );
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+/// The longest continuous stretch in which the mount point was not usable, as the poller saw it.
+#[derive(Default)]
+struct W4Window {
+    samples: usize,
+    unusable: usize,
+    longest: Duration,
+    current_start: Option<Duration>,
+}
+
+impl W4Window {
+    fn record(&mut self, usable: bool, at: Duration) {
+        self.samples += 1;
+        if usable {
+            if let Some(start) = self.current_start.take() {
+                let gap = at.saturating_sub(start);
+                if gap > self.longest {
+                    self.longest = gap;
+                }
+            }
+        } else {
+            self.unusable += 1;
+            self.current_start.get_or_insert(at);
+        }
+    }
+
+    /// Ends the run, closing any gap that was still open.
+    fn finish(&mut self, at: Duration) {
+        if let Some(start) = self.current_start.take() {
+            let gap = at.saturating_sub(start);
+            if gap > self.longest {
+                self.longest = gap;
+            }
+        }
+    }
+}
+
+/// **W8 / V13** — what a shell whose cwd was inside the **old** volume says after the switch, and after `cd .`.
+///
+/// This is a **reading**, not a criterion: three shells behave differently, and the point is to know how rather than to require a particular answer. Each shell is
+/// started inside the mount, sleeps through the switch, then lists, then runs `cd .` and lists again.
+#[test]
+fn what_a_shell_inside_the_old_volume_sees_after_a_switch() {
+    common::strict_gate();
+    let (store, _child, root) = mount_at_directory("switch-shells");
+    Command::new(binary())
+        .arg("--store")
+        .arg(&store)
+        .args(["branch", "feat", "--from", "main"])
+        .output()
+        .expect("branch feat");
+    let (created, out, err) = cli_code(&store, &store, &["checkout", "feat"]);
+    assert_eq!(
+        created, 0,
+        "cell setup: the feat workspace row must exist: {out}{err}"
+    );
+    let file = root.join("f.txt");
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match std::fs::write(&file, b"x") {
+            Ok(()) => break,
+            Err(_) if attempt < 50 => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => panic!("cell setup: write through the mount failed: {error:?}"),
+        }
+    }
+
+    let mount_path = root.display().to_string();
+    let shells: Vec<(&str, Vec<String>)> = vec![
+        (
+            "bash",
+            vec![
+                "-c".to_owned(),
+                format!("cd '{mount_path}'; sleep 3; echo PHASE1; ls; echo rc1=$?; cd .; echo PHASE2; ls; echo rc2=$?"),
+            ],
+        ),
+        (
+            "cmd",
+            vec![
+                "/c".to_owned(),
+                format!("cd /d \"{mount_path}\" & timeout /t 3 >nul & echo PHASE1 & dir & echo rc1=%errorlevel% & cd . & echo PHASE2 & dir"),
+            ],
+        ),
+        (
+            "powershell",
+            vec![
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                format!(
+                    "Set-Location '{mount_path}'; Start-Sleep -Seconds 3; Write-Output PHASE1; Get-ChildItem; Set-Location .; Write-Output PHASE2; Get-ChildItem"
+                ),
+            ],
+        ),
+    ];
+    let mut readings = Vec::new();
+    for (name, arguments) in shells {
+        let executable = match name {
+            "bash" => "C:/Program Files/Git/bin/bash.exe".to_owned(),
+            other => other.to_owned(),
+        };
+        let child = Command::new(&executable)
+            .args(&arguments)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        match child {
+            Ok(child) => readings.push((name, child)),
+            Err(error) => println!("W8 reading: {name} could not be started ({error})"),
+        }
+    }
+    // Let the shells reach their `cd`, then switch under them.
+    std::thread::sleep(Duration::from_millis(800));
+    let (code, out, err) = cli_code(&store, &root, &["checkout", "feat"]);
+    println!(
+        "W8 reading: switch code={code} stdout={:?} stderr={:?}",
+        out.trim(),
+        err.trim()
+    );
+    for (name, child) in readings {
+        let output = child.wait_with_output().expect("the shell finishes");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let first = stdout.lines().next().unwrap_or_default();
+        println!(
+            "W8 reading: {name} exit={:?} first_line={:?} lines={}",
+            output.status.code(),
+            first.trim(),
+            stdout.lines().count()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&store);
+}
