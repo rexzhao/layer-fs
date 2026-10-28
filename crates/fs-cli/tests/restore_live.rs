@@ -530,3 +530,115 @@ fn an_open_during_a_parked_restore_waits_and_then_finds_the_new_view() {
     drop(child);
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// **W1** — `checkout <b>` from inside a mount switches it, and the record is never seen as `Gone` while it happens.
+#[test]
+fn a_checkout_inside_the_mount_switches_it_and_the_record_stays_live() {
+    common::strict_gate();
+    let (store, _child, root) = mount_at("B:");
+    let _ = &root;
+    let mount_point = PathBuf::from("B:");
+    // A branch the mount is not serving, with one file of its own.
+    Command::new(binary())
+        .arg("--store")
+        .arg(&store)
+        .arg("branch")
+        .arg("feat")
+        .arg("--from")
+        .arg("main")
+        .output()
+        .expect("branch feat");
+
+    let record_path =
+        fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&mount_point)));
+    // Poll liveness for the whole switch: `Gone` would mean the record was deleted and recreated (W1's mutation), `Stale` that nobody holds it.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readings = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let poller = {
+        let stop = std::sync::Arc::clone(&stop);
+        let readings = std::sync::Arc::clone(&readings);
+        let record_path = record_path.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                // The mount.s own liveness question, asked the way it asks it: open for **write**; a sharing violation (32) means the owner still holds it.
+                let reading = match std::fs::OpenOptions::new().write(true).open(&record_path) {
+                    Err(error) if error.raw_os_error() == Some(32) => "live",
+                    Ok(_) => "stale",
+                    Err(_) => "unreadable",
+                };
+                let exists = record_path.exists();
+                readings
+                    .lock()
+                    .expect("readings")
+                    .push(if exists { reading } else { "gone" });
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+
+    let (code, out, err) = cli_code(&store, &mount_point, &["checkout", "feat"]);
+    let failed = std::process::Command::new(binary())
+        .arg("--store")
+        .arg(&store)
+        .args(["checkout", "feat"])
+        .current_dir(&mount_point)
+        .output()
+        .expect("checkout from inside the mount");
+    let _ = (code, out, err);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    poller.join().expect("the poller finishes");
+    let readings = readings.lock().expect("readings");
+    let gone = readings
+        .iter()
+        .filter(|reading| **reading == "gone")
+        .count();
+    let stale = readings
+        .iter()
+        .filter(|reading| **reading == "stale")
+        .count();
+    println!(
+        "W1 reading: {} samples, gone={gone}, stale={stale}, checkout exit={:?} stdout={:?} stderr={:?}",
+        readings.len(),
+        failed.status.code(),
+        String::from_utf8_lossy(&failed.stdout).trim(),
+        String::from_utf8_lossy(&failed.stderr).trim()
+    );
+    assert_eq!(gone, 0, "cell W1: the record must never read as gone");
+    assert_eq!(stale, 0, "cell W1: the record must stay held by the mount");
+    assert!(
+        failed.status.success(),
+        "cell W1: checkout inside the mount must succeed"
+    );
+    // The mount now serves `feat`, and the volume is still there. The root path is used as the cwd here: right after a remount `K:` (a bare letter) is briefly not
+    // a valid directory to set as a working directory, and that transient is not what this criterion is about.
+    let mut attempt = 0;
+    let (ok, out, err) = loop {
+        // Spawned by hand, not through `cli`: `cli` panics on a failed spawn, and the transient above **is** a failed spawn.
+        let answer = match Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("status")
+            .current_dir("B:\\")
+            .output()
+        {
+            Ok(output) => (
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ),
+            Err(error) => (false, String::new(), error.to_string()),
+        };
+        attempt += 1;
+        if answer.0 || attempt >= 20 {
+            break answer;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    println!("W1 status after the switch: {out}");
+    assert!(ok, "cell W1: status must answer after the switch: {err}");
+    assert!(
+        out.contains("branch:    feat") || out.contains("workspace: feat"),
+        "cell W1: the mount must serve feat now, got {out:?}"
+    );
+    let _ = std::fs::remove_dir_all(&store);
+}

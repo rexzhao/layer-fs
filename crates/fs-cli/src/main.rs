@@ -598,17 +598,11 @@ fn checkout(
     };
 
     // The workspace exists. If it is **mounted**, say so and keep the mount: `checkout` is not a request to unmount anything (A3b).
-    // **A3b's third case**: run from inside another workspace's mount, `checkout` must not disturb that mount — it says which two steps would switch it.
+    // **A3b's third case, now a switch** (S3 §5.2): run from inside a mount, `checkout <b>` asks that mount to serve `b`. The CLI's own message used to be
+    // "unmount and mount again"; the mount can now do it without the user knowing the two steps.
     if let Some(here) = mountcmd::mount_of_cwd() {
         if here.workspace != existing.name {
-            println!(
-                "this directory is inside the mount of {} at {}; to switch it:\n  layerfs umount {}\n  layerfs mount {} --workspace {}",
-                here.workspace,
-                here.mount_point.display(),
-                here.mount_point.display(),
-                here.mount_point.display(),
-                existing.name
-            );
+            return switch_mounted(&here, &existing.name);
         }
     }
 
@@ -823,5 +817,58 @@ fn one(arguments: &[String], usage: &str) -> Result<String, Box<dyn std::error::
     match arguments {
         [first, ..] if !first.starts_with("--") => Ok(first.clone()),
         _ => Err(format!("expected {usage}").into()),
+    }
+}
+
+/// Asks the mount that contains the current directory to serve `workspace` instead (S3 §5.2).
+///
+/// Two steps before the ask, both required:
+///
+/// 1. **this process must leave the volume**: the CLI's own cwd is a directory handle on `U:` once it is inside, and a switch would then find a handle it can
+///    never get rid of. The cwd is moved to the store first;
+/// 2. the ask goes over the **control pipe**, because the mount is what owns the volume.
+fn switch_mounted(
+    here: &fs_cli::discovery::Record,
+    workspace: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Step 1: out of the volume. The store directory is on a normal volume and always exists (the record names it).
+    std::env::set_current_dir(&here.store).map_err(|error| {
+        fs_cli::Failure::in_use(format!(
+            "cannot step out of {} ({error}); run this from outside the mount",
+            here.mount_point.display()
+        ))
+    })?;
+    let request = fs_cli::pipe::Request {
+        v: fs_cli::pipe::PROTOCOL,
+        op: "switch".to_owned(),
+        args: serde_json::json!({ "workspace": workspace }),
+    };
+    match fs_cli::pipe_win::call(&here.pipe, &request, fs_cli::pipe_win::CONNECT_WAIT_MS) {
+        Ok(fs_cli::pipe::Response::Switched {
+            workspace,
+            branch,
+            dirs_invalidated,
+        }) => {
+            println!(
+                "switched {} to {workspace} (branch {branch})",
+                here.mount_point.display()
+            );
+            if dirs_invalidated > 0 {
+                println!("{}", fs_cli::dirs_invalidated(dirs_invalidated));
+            }
+            Ok(())
+        }
+        Ok(fs_cli::pipe::Response::RestoreRefused { files, dirs }) => {
+            Err(fs_cli::Failure::in_use(fs_cli::switch_refusal(files, dirs)).into())
+        }
+        Ok(fs_cli::pipe::Response::Failed { kind, detail, .. }) => {
+            Err(fs_cli::Failure::from_pipe_kind(&kind, detail).into())
+        }
+        Ok(other) => Err(format!("the mount answered {other:?}").into()),
+        Err(error) => Err(fs_cli::Failure::in_use(format!(
+            "the mount at {} is not answering ({error})",
+            here.mount_point.display()
+        ))
+        .into()),
     }
 }

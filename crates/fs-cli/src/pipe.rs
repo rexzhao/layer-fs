@@ -87,6 +87,15 @@ pub enum Response {
         /// How many were open when the wait expired.
         handles: usize,
     },
+    /// The mount now serves another workspace: the answer to `switch` (S3 card §5.2).
+    Switched {
+        /// The workspace it serves now.
+        workspace: String,
+        /// The branch that workspace publishes to.
+        branch: String,
+        /// Directory handles that were pointing at the old view.
+        dirs_invalidated: usize,
+    },
     /// A remote `restore` was refused because **file** handles were open (D8 = B): the objects under them could vanish.
     ///
     /// Its own variant rather than `HandlesOpen` because the two answer different questions: `unmount` needs **every** handle closed (the volume goes away),
@@ -123,6 +132,9 @@ pub trait Context {
     fn commit(&self, message: &str, force: bool) -> Response;
     /// Takes a snapshot, for `snapshot`.
     fn snapshot(&self) -> Response;
+    /// Makes the mount serve `workspace` instead, for `switch` (S3 card §5).
+    fn switch(&self, workspace: &str) -> Response;
+
     /// Moves the mount's workspace back to `commit`, for `restore` (S3 card §4).
     ///
     /// Goes through the mount because the mount is the only thing that can (a) quiesce its own opens and (b) hold the publication gate: a second handle opened
@@ -175,6 +187,14 @@ pub fn dispatch(frame: &[u8], context: &impl Context) -> Response {
             context.commit(message, force)
         }
         "snapshot" => context.snapshot(),
+        "switch" => {
+            let workspace = request
+                .args
+                .get("workspace")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            context.switch(workspace)
+        }
         "restore" => {
             let commit = request
                 .args
@@ -255,6 +275,14 @@ mod tests {
                 kind: "snapshotted".to_owned(),
                 detail: String::new(),
                 fields: serde_json::json!({}),
+            }
+        }
+
+        fn switch(&self, workspace: &str) -> Response {
+            Response::Switched {
+                workspace: workspace.to_owned(),
+                branch: format!("branch-of-{workspace}"),
+                dirs_invalidated: 1,
             }
         }
 

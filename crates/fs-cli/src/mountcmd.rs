@@ -188,7 +188,6 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     // `DynOps` carries no lifetime, and this process exists to serve one mount: leaking the workspace is the honest way to say "this outlives every
     // borrow", rather than pretending with a `Box::leak` hidden behind an abstraction.
     let workspace: &'static fs_workspace::Workspace = Box::leak(Box::new(workspace));
-    let backend: DynOps = Box::new(ApiBackend::new(workspace));
 
     std::fs::create_dir_all(mounts_dir())?;
     let state = state_path(&mount_point);
@@ -239,7 +238,8 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0)
     );
-    let _record_handle = hold_record(&state, &record)?;
+    // The handle is kept: a `switch` rewrites this file **in place** through it (S3 §5.2, and W1 polls liveness across the whole switch).
+    let mut record_handle = hold_record(&state, &record)?;
     println!(
         "mounting {} at {} (workspace {name}); stop with `layerfs umount {}`",
         store.display(),
@@ -251,7 +251,7 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     // listening yet, and a serve loop that fails to start is worth knowing about before the mount commits.
     let adapter_slot: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<fs_winfsp::DynAdapter>>> =
         std::sync::Arc::new(std::sync::OnceLock::new());
-    let serving: std::sync::Arc<dyn fs_cli::pipe_win::Serving> = std::sync::Arc::new(PipeServing {
+    let pipe_serving: std::sync::Arc<PipeServing> = std::sync::Arc::new(PipeServing {
         store: canonical(&store),
         current: std::sync::RwLock::new(Current {
             workspace: name.clone(),
@@ -263,7 +263,9 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
         record: state.clone(),
         adapter: std::sync::Arc::clone(&adapter_slot),
     });
-    let server = std::sync::Arc::new(fs_cli::pipe_win::Server::new(pipe, serving));
+    let serving: std::sync::Arc<dyn fs_cli::pipe_win::Serving> =
+        std::sync::Arc::clone(&pipe_serving) as _;
+    let server = std::sync::Arc::new(fs_cli::pipe_win::Server::new(pipe.clone(), serving));
     if let Ok(started) = std::thread::Builder::new()
         .name("layerfs-control".to_owned())
         .spawn({
@@ -280,40 +282,92 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     let library = default_library();
     // Installed **before** mounting, so a Ctrl-C during the mount itself is already an orderly stop.
     install_console_handler();
-    let report = mount_serving(
-        &library,
-        &mount_point,
-        backend,
-        volume(),
-        |mounted: &fs_winfsp::mounted::Mounted| {
-            // **`status.handles` reads the adapter at the moment of the ask**, so the control channel needs the adapter — not a number captured now.
-            // (Until this line runs, the channel answers 0, which is also the truth: nobody has opened a file yet.)
-            let _ = adapter_slot.set(mounted.adapter());
-            // The probe **is** the command's lifetime: everything below happens while the volume is attached.
-            let started = Instant::now();
-            loop {
-                // **Three ways to be asked to stop**, all answering the same way: the stop file (until the pipe replaces it), the record disappearing, and a
-                // console control event. Ctrl-C lands here as an **orderly unmount** rather than a kill, which is the whole point of the handler.
-                // **Two ways to be asked to stop**, both answering the same way: the control pipe (through `request_stop`) and a console control event. The
-                // stop **file** is gone — A15s asserts that writing one no longer stops a mount, because a signal nobody can see the receipt of was the thing
-                // being replaced.
-                if stop_requested() {
-                    // **A console stop does not wait for handles** (ADR-010 §7.2): the user in front of the window asked for it, so the mount unmounts and the
-                    // handles die — but it says how many, because "my editor lost the file" is much easier to understand with a number attached.
-                    let open = adapter_slot
-                        .get()
-                        .map_or(0, |adapter| adapter.open_handles());
-                    if open > 0 {
-                        println!("{open} open handle(s) will be invalidated");
+    // **The loop is here, not in `mount_serving`** (manager's ruling, S3 §5.2 revised): every iteration mounts through the same path S1 verified, and the
+    // remount that a `switch` needs is simply the next iteration. The FFI setup stays single-shot, which is where it belongs.
+    let mut current_handle = workspace;
+    let mut report;
+    loop {
+        let backend: DynOps = Box::new(ApiBackend::new(current_handle));
+        let mounted_report = mount_serving(
+            &library,
+            &mount_point,
+            backend,
+            volume(),
+            |mounted: &fs_winfsp::mounted::Mounted| {
+                // **`status.handles` reads the adapter at the moment of the ask**, so the control channel needs the adapter — not a number captured now.
+                // (Until this line runs, the channel answers 0, which is also the truth: nobody has opened a file yet.)
+                let _ = adapter_slot.set(mounted.adapter());
+                // The probe **is** the command's lifetime: everything below happens while the volume is attached.
+                let started = Instant::now();
+                loop {
+                    // **Three ways to be asked to stop**, all answering the same way: the stop file (until the pipe replaces it), the record disappearing, and a
+                    // console control event. Ctrl-C lands here as an **orderly unmount** rather than a kill, which is the whole point of the handler.
+                    // **Two ways to be asked to stop**, both answering the same way: the control pipe (through `request_stop`) and a console control event. The
+                    // stop **file** is gone — A15s asserts that writing one no longer stops a mount, because a signal nobody can see the receipt of was the thing
+                    // being replaced.
+                    if stop_requested() {
+                        // **A console stop does not wait for handles** (ADR-010 §7.2): the user in front of the window asked for it, so the mount unmounts and the
+                        // handles die — but it says how many, because "my editor lost the file" is much easier to understand with a number attached.
+                        let open = adapter_slot
+                            .get()
+                            .map_or(0, |adapter| adapter.open_handles());
+                        if open > 0 {
+                            println!("{open} open handle(s) will be invalidated");
+                        }
+                        println!("unmount requested after {:?}", started.elapsed());
+                        break;
                     }
-                    println!("unmount requested after {:?}", started.elapsed());
+                    std::thread::sleep(POLL);
+                }
+                Ok(())
+            },
+        );
+        report = mounted_report;
+        // **Nothing to switch? Then this was a stop.**
+        let Some(next) = take_switch_target() else {
+            break;
+        };
+        match repo.workspace_open(&next) {
+            Ok(next_workspace) => {
+                let next_handle: &'static fs_workspace::Workspace =
+                    Box::leak(Box::new(next_workspace));
+                let next_branch = branch_of(&repo, &next).unwrap_or_default();
+                let text = switched_record(
+                    &canonical(&store),
+                    &canonical(&mount_point),
+                    &next,
+                    &next_branch,
+                    &pipe,
+                );
+                if let Err(error) = fs_cli::rewrite_record(&mut record_handle, &text) {
+                    // The record is how the world finds this mount; a switch that cannot describe itself must not look successful.
+                    publish_switch(Err(format!("the record could not be rewritten: {error}")));
                     break;
                 }
-                std::thread::sleep(POLL);
+                {
+                    let mut current = pipe_serving
+                        .current
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *current = Current {
+                        workspace: next.clone(),
+                        branch: next_branch.clone(),
+                        handle: next_handle,
+                    };
+                }
+                current_handle = next_handle;
+                // The stop flag was set by the switch request; clearing it is what lets the **new** serve loop run.
+                STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+                publish_switch(Ok((next, next_branch)));
             }
-            Ok(())
-        },
-    );
+            Err(error) => {
+                // **6b**: the new workspace could not be opened, so this iteration ends and the loop remounts the **old** one. The client is told the truth
+                // *after* the rollback is on its way, not instead of it.
+                publish_switch(Err(format!("RemountFailed: {error}")));
+                STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
     // (the stop file is gone: the control pipe is the only stop signal — A15s)
     let _ = std::fs::remove_file(&state);
     // **The teardown is done; the pending `unmount` answer may leave now** (ADR-010 §5.1). This must happen before the process exits, or the client reads a
@@ -740,6 +794,75 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                 }
             }
 
+            fn switch(&self, workspace: &str) -> fs_cli::pipe::Response {
+                // Asking for what is already served is not an error: `checkout` of the current branch is a no-op everywhere else too.
+                if self.0.current().workspace == workspace {
+                    let current = self.0.current();
+                    return fs_cli::pipe::Response::Switched {
+                        workspace: current.workspace.clone(),
+                        branch: current.branch.clone(),
+                        dirs_invalidated: 0,
+                    };
+                }
+                const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+                let Some(adapter) = self.0.adapter.get() else {
+                    return fs_cli::pipe::Response::Failed {
+                        kind: "switch".to_owned(),
+                        detail: "the mount is not serving yet".to_owned(),
+                        fields: serde_json::json!({}),
+                    };
+                };
+                // **Closing, not Paused** (S3 §3.2): a switch unmounts, and an open that waited would be waiting for a dispatcher that is about to exit.
+                let dirs = match adapter.quiesce(fs_winfsp::admission::QuiesceKind::Switch, WAIT) {
+                    fs_winfsp::admission::Quiesce::HandlesOpen { files, dirs } => {
+                        return fs_cli::pipe::Response::RestoreRefused { files, dirs }
+                    }
+                    fs_winfsp::admission::Quiesce::TimedOut { in_flight } => {
+                        return fs_cli::pipe::Response::Failed {
+                            kind: "switch".to_owned(),
+                            detail: format!(
+                                "{in_flight} open(s) did not finish within {}s",
+                                WAIT.as_secs()
+                            ),
+                            fields: serde_json::json!({"in_flight": in_flight}),
+                        }
+                    }
+                    fs_winfsp::admission::Quiesce::Quiesced(guard) => {
+                        let dirs = adapter.open_handle_kinds().1;
+                        drop(guard);
+                        dirs
+                    }
+                };
+                // **The answer is cleared before the ask**, so a stale one from an earlier attempt cannot be read as this attempt's outcome.
+                {
+                    let outcome = switch_outcome();
+                    *outcome
+                        .result
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                }
+                set_switch_target(workspace);
+                // The serve loop exits on this flag; the mount loop then remounts and clears it before the next iteration's serve loop starts.
+                request_stop();
+                match await_switch(std::time::Duration::from_secs(120)) {
+                    Some(Ok((workspace, branch))) => fs_cli::pipe::Response::Switched {
+                        workspace,
+                        branch,
+                        dirs_invalidated: dirs,
+                    },
+                    Some(Err(detail)) => fs_cli::pipe::Response::Failed {
+                        kind: "remount-failed".to_owned(),
+                        detail,
+                        fields: serde_json::json!({}),
+                    },
+                    None => fs_cli::pipe::Response::Failed {
+                        kind: "switch".to_owned(),
+                        detail: "the mount did not finish switching".to_owned(),
+                        fields: serde_json::json!({}),
+                    },
+                }
+            }
+
             fn restore(&self, commit: &str, discard: bool) -> fs_cli::pipe::Response {
                 // **Admission first, then the publication gate** (S3 §3.2): the mount stops new opens, waits for the ones in flight, and only then decides. A
                 // restore that ran before this would leave a callback that had just resolved an old path about to register a handle on a vanished object.
@@ -940,6 +1063,91 @@ pub fn live_mount_of(workspace: &str) -> Option<(String, u32)> {
         }
     }
     None
+}
+
+fn switched_record(
+    store: &str,
+    mount_point: &str,
+    workspace: &str,
+    branch: &str,
+    pipe: &str,
+) -> String {
+    format!(
+        "version=1\npid={}\nmount_point={mount_point}\nstore={store}\nworkspace={workspace}\nbranch={branch}\npipe={pipe}\nstarted_at={}\n",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+    )
+}
+/// Where a `switch` records the workspace it wants, and where the answer is left for the waiting pipe.
+///
+/// Two slots rather than one channel because the two halves are in different threads and neither may block the other's critical section: the pipe thread
+/// **asks** (target slot) and then **waits** (outcome slot + condvar); the mount loop takes the target and publishes the outcome after the remount. A channel
+/// would work too, but it would need a lifetime that outlives both, which is what these statics are.
+static SWITCH_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+struct SwitchOutcome {
+    result: std::sync::Mutex<Option<Result<(String, String), String>>>,
+    changed: std::sync::Condvar,
+}
+
+static SWITCH_OUTCOME: std::sync::OnceLock<SwitchOutcome> = std::sync::OnceLock::new();
+
+fn switch_outcome() -> &'static SwitchOutcome {
+    SWITCH_OUTCOME.get_or_init(|| SwitchOutcome {
+        result: std::sync::Mutex::new(None),
+        changed: std::sync::Condvar::new(),
+    })
+}
+
+/// Asks the mount loop to serve `workspace` from now on. Returns the workspace that was **already** pending, if any.
+fn set_switch_target(workspace: &str) -> Option<String> {
+    let mut target = SWITCH_TARGET
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    target.replace(workspace.to_owned())
+}
+
+/// Takes the pending target, if a switch is waiting for one.
+fn take_switch_target() -> Option<String> {
+    SWITCH_TARGET
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+/// Leaves the remount's answer for the waiting pipe thread.
+fn publish_switch(result: Result<(String, String), String>) {
+    let outcome = switch_outcome();
+    *outcome
+        .result
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+    outcome.changed.notify_all();
+}
+
+/// Waits (bounded) for the remount's answer.
+fn await_switch(wait: std::time::Duration) -> Option<Result<(String, String), String>> {
+    let outcome = switch_outcome();
+    let deadline = std::time::Instant::now() + wait;
+    let mut slot = outcome
+        .result
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while slot.is_none() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let (next, _) = outcome
+            .changed
+            .wait_timeout(slot, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot = next;
+    }
+    slot.take()
 }
 
 #[cfg(test)]

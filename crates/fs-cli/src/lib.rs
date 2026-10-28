@@ -262,6 +262,17 @@ pub fn hold_record_for_test(
         Ok(file)
     }
 }
+#[must_use]
+pub fn switch_refusal(files: usize, dirs: usize) -> String {
+    let files = if files == 1 {
+        "1 file".to_owned()
+    } else {
+        format!("{files} files")
+    };
+    format!(
+        "switch: {files} still open ({dirs} directory handle(s) do not block); close the files and try again — the mount still serves the old workspace"
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::{
