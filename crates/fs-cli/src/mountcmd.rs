@@ -367,7 +367,10 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                 );
                 if let Err(error) = fs_cli::rewrite_record(&mut record_handle, &text) {
                     // The record is how the world finds this mount; a switch that cannot describe itself must not look successful.
-                    publish_switch(Err(format!("the record could not be rewritten: {error}")));
+                    publish_switch(Err((
+                        "switch".to_owned(),
+                        format!("the record could not be rewritten: {error}"),
+                    )));
                     break;
                 }
                 {
@@ -389,7 +392,15 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
             Err(error) => {
                 // **6b**: the new workspace could not be opened, so this iteration ends and the loop remounts the **old** one. The client is told the truth
                 // *after* the rollback is on its way, not instead of it.
-                publish_switch(Err(format!("RemountFailed: {error}")));
+                // **The kind is classified where the error type still exists**: a workspace another process holds is "in use" (exit 4), a missing one is
+                // "not found" (3), anything else is a remount failure (1). One string for all three is what made the local and pipe paths disagree before (R5).
+                let kind = match &error {
+                    fs_workspace::WorkspaceError::StoreInUse { .. }
+                    | fs_workspace::WorkspaceError::Busy { .. } => "in-use",
+                    fs_workspace::WorkspaceError::NotFound { .. } => "not-found",
+                    _ => "remount-failed",
+                };
+                publish_switch(Err((kind.to_owned(), error.to_string())));
                 STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -915,8 +926,8 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                         branch,
                         dirs_invalidated: dirs,
                     },
-                    Some(Err(detail)) => fs_cli::pipe::Response::Failed {
-                        kind: "remount-failed".to_owned(),
+                    Some(Err((kind, detail))) => fs_cli::pipe::Response::Failed {
+                        kind,
                         detail,
                         fields: serde_json::json!({}),
                     },
@@ -1171,8 +1182,11 @@ fn switched_record(
 /// would work too, but it would need a lifetime that outlives both, which is what these statics are.
 static SWITCH_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// The remount's answer as the loop leaves it and the pipe reads it: `Ok((workspace, branch))` or `Err((kind, detail))`.
+type SwitchAnswer = Result<(String, String), (String, String)>;
+
 struct SwitchOutcome {
-    result: std::sync::Mutex<Option<Result<(String, String), String>>>,
+    result: std::sync::Mutex<Option<SwitchAnswer>>,
     changed: std::sync::Condvar,
 }
 
@@ -1202,7 +1216,7 @@ fn take_switch_target() -> Option<String> {
 }
 
 /// Leaves the remount's answer for the waiting pipe thread.
-fn publish_switch(result: Result<(String, String), String>) {
+fn publish_switch(result: SwitchAnswer) {
     let outcome = switch_outcome();
     *outcome
         .result
@@ -1212,7 +1226,7 @@ fn publish_switch(result: Result<(String, String), String>) {
 }
 
 /// Waits (bounded) for the remount's answer.
-fn await_switch(wait: std::time::Duration) -> Option<Result<(String, String), String>> {
+fn await_switch(wait: std::time::Duration) -> Option<SwitchAnswer> {
     let outcome = switch_outcome();
     let deadline = std::time::Instant::now() + wait;
     let mut slot = outcome

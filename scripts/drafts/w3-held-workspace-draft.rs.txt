@@ -1,0 +1,96 @@
+/// **W3** — if another process holds the target workspace, the switch is **busy** (4) and the mount is never interrupted.
+///
+/// "Never interrupted" is the half that matters: an implementation that unmounted first and then failed to open the new workspace would leave the user with no
+/// volume at all. So the mount point is polled every 10 ms for the whole attempt.
+#[test]
+fn a_switch_to_a_held_workspace_is_busy_and_the_mount_never_disappears() {
+    common::strict_gate();
+    let (store, _child, root) = mount_at_directory("switch-held");
+    Command::new(binary())
+        .arg("--store")
+        .arg(&store)
+        .args(["branch", "feat", "--from", "main"])
+        .output()
+        .expect("branch feat");
+    let (created, out, err) = cli_code(&store, &store, &["checkout", "feat"]);
+    assert_eq!(created, 0, "cell setup: the feat workspace row must exist: {out}{err}");
+
+    // **Hold `feat` from another process**: a second mount of the same workspace is exactly the "another process has it" case, and it holds the lock for as long
+    // as it runs. Its mount point is a directory of its own, so the letter pool is untouched.
+    let other_point = store.join("other");
+    let mut holder = MountChild(
+        Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("mount")
+            .arg(&other_point)
+            .arg("--workspace")
+            .arg("feat")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the holder mount"),
+    );
+    let held_record =
+        fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&other_point)));
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(15)
+        && !std::fs::read_to_string(&held_record).unwrap_or_default().contains("pipe=")
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        std::fs::read_to_string(&held_record).unwrap_or_default().contains("pipe="),
+        "cell setup: the holder mount must be serving feat"
+    );
+
+    // Poll the mount point for the whole attempt.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let missing = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let samples = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let poller = {
+        let stop = std::sync::Arc::clone(&stop);
+        let missing = std::sync::Arc::clone(&missing);
+        let samples = std::sync::Arc::clone(&samples);
+        let root = root.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if std::fs::metadata(&root).is_err() {
+                    missing.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+
+    let (code, out, err) = cli_code(&store, &root, &["checkout", "feat"]);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    poller.join().expect("the poller finishes");
+    let missing = missing.load(std::sync::atomic::Ordering::SeqCst);
+    let samples = samples.load(std::sync::atomic::Ordering::SeqCst);
+    println!(
+        "W3 reading: code={code} samples={samples} missing={missing} stdout={:?} stderr={:?}",
+        out.trim(),
+        err.trim()
+    );
+    assert_eq!(
+        code, 4,
+        "cell W3: a workspace held by another process is busy (4), got {code}: {out}{err}"
+    );
+    assert_eq!(
+        missing, 0,
+        "cell W3: the mount point must never be absent during a refused switch ({missing} of {samples} samples)"
+    );
+    // And it still serves what it served.
+    let (code, out, _) = cli_code(&store, &root, &["status"]);
+    assert_eq!(code, 0, "cell W3: status must answer");
+    assert!(
+        out.contains("workspace: main"),
+        "cell W3: the mount still serves main, got {out:?}"
+    );
+
+    let _ = holder.0.kill();
+    let _ = holder.0.wait();
+    let _ = std::fs::remove_dir_all(&store);
+}
