@@ -332,6 +332,9 @@ impl Workspace {
     /// Namespace rules or allocator failures.
     pub fn write_at(&self, path: &str, offset: u64, bytes: &[u8]) -> WorkspaceResult<()> {
         let _gate = self.gate.read();
+        // **G3's instrument**: a write can be parked *inside* the gate, so a commit that starts afterwards has to wait for it. Without this, "a write that began
+        // before the commit is included" could only be tested by racing two threads and hoping.
+        crate::publish::pause_point("inside-write");
         Ok(self.overlay.write_at(&parse_path(path)?, offset, bytes)?)
     }
 

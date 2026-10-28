@@ -41,7 +41,7 @@ pub(crate) const PAUSE_AT: &str = "LAYERFS_PAUSE_AT";
 /// from a race nobody can schedule into an experiment: the test starts a commit, waits for the `.here` marker, and only then writes.
 ///
 /// Deliberately **not** a crash point: crashing tests recovery, pausing tests **ordering**, and a pause that could abort would conflate the two.
-fn pause_point(name: &str) {
+pub(crate) fn pause_point(name: &str) {
     let Ok(requested) = std::env::var(PAUSE_AT) else {
         return;
     };
