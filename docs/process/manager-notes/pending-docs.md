@@ -3196,3 +3196,11 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      提交事故：git add -A 卷进 manager 的 docs 改动；第一次修（rm --cached + amend）更糟
      （变成 3184 行删除）；正确修法=reset --soft + restore --staged + 按路径 add。
      教训：git add -A 在共享分支上是危险动作——以后只按路径 add。
+
+542. 【S0 收口（f2e301a）：CLI 重构——去文件命令 + 去 current + 全局 --workspace】
+     fs-cli 22/22 + clippy 0 + 锁内 674/675（白名单）。
+     三条变更：8 文件命令 exit 2 在 store 前 / cli/current 全删 / log 不开 overlay。
+     11 行判据处置逐行落地（作废1→拆2 / 改写2+7 / 新增2），每条带变异。
+     A3/A3b（WorkspaceInUse 消息 / checkout 被持有）随 S1 做。
+     fs_api::Repo::open(path) 1参 vs fs_workspace::Repo::open(path,bool) 2参——同名不同签名。
+     下一站 S1（路径发现+Ctrl-C+管道骨架）——等 ADR-010 S1 判据表。
