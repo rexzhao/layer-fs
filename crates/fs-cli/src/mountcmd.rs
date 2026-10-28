@@ -886,6 +886,9 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                         other => break other,
                     }
                 };
+                // **W5's pause point**: the gate is Closing and the volume is about to go away. An open arriving now must fail **immediately** — waiting would deadlock the
+                // unmount that is waiting for the dispatcher.
+                fs_cli::pause_point("switch-after-quiesce");
                 let dirs = match quiesce {
                     fs_winfsp::admission::Quiesce::HandlesOpen { files, dirs } => {
                         // **Three counters at the moment of the refusal** (607, the Q2 method): "a file handle is open" can mean our table still holds one, or that the

@@ -907,3 +907,116 @@ fn a_switch_to_a_held_workspace_is_busy_and_the_channel_recovers() {
     let _ = holder.0.wait();
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// **W5** — while a switch is between "closed the gate" and "unmounted", an open **fails immediately** instead of waiting.
+///
+/// Waiting there would deadlock: the switch is about to unmount, and the unmount waits for the dispatcher, which is running the very callback that would be
+/// waiting. The mount is parked at that point with `WCAS_CLI_PAUSE_AT=switch-after-quiesce=…`.
+#[test]
+fn an_open_during_a_closing_switch_fails_instead_of_waiting() {
+    common::strict_gate();
+    let store = temp_dir("switch-closing");
+    Command::new(binary())
+        .arg("init")
+        .arg(&store)
+        .output()
+        .expect("init");
+    Command::new(binary())
+        .arg("--store")
+        .arg(&store)
+        .args(["branch", "feat", "--from", "main"])
+        .output()
+        .expect("branch feat");
+    let (created, out, err) = cli_code(&store, &store, &["checkout", "feat"]);
+    assert_eq!(
+        created, 0,
+        "cell setup: the feat workspace row must exist: {out}{err}"
+    );
+
+    let mount_point = store.join("mnt");
+    let mut child = MountChild(
+        Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("mount")
+            .arg(&mount_point)
+            .arg("--workspace")
+            .arg("main")
+            .env("WCAS_CLI_PAUSE_AT", "switch-after-quiesce=3000")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mount"),
+    );
+    let record = fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&mount_point)));
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(15)
+        && !std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .contains("pipe=")
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .contains("pipe="),
+        "cell setup: the mount must be serving"
+    );
+    let file = mount_point.join("f.txt");
+    // **The record appears before the volume is attached**, so readiness here is "a write works", retried with a bound (the A6d lesson, one step further).
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match std::fs::write(&file, b"content") {
+            Ok(()) => break,
+            Err(error) if attempt < 50 => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("write through the mount: {error:?}"),
+        }
+    }
+
+    // Ask for the switch, then open while it is parked inside the gate.
+    let checkout = {
+        let store = store.clone();
+        let mount_point = mount_point.clone();
+        std::thread::spawn(move || cli_code(&store, &mount_point, &["checkout", "feat"]))
+    };
+    std::thread::sleep(Duration::from_millis(700));
+    let opened_at = Instant::now();
+    let outcome = std::fs::File::open(&file);
+    let waited = opened_at.elapsed();
+    let (code, out, err) = checkout.join().expect("the checkout finishes");
+    println!(
+        "W5 reading: open during closing -> {outcome:?} after {waited:?}; checkout code={code} stdout={:?} stderr={:?}",
+        out.trim(),
+        err.trim()
+    );
+    match outcome {
+        Err(error) => {
+            let raw = error.raw_os_error();
+            println!("W5 reading: raw_os_error={raw:?} kind={:?}", error.kind());
+            // **The measured value, pinned** (card §5.3: "按实测值写入判据"): 21 is `ERROR_NOT_READY`, which is what Win32 makes of the
+            // `STATUS_VOLUME_DISMOUNTED` this frontend answers while the volume is going away.
+            assert_eq!(
+                raw,
+                Some(21),
+                "cell W5: the refusal must be the measured one (ERROR_NOT_READY), got {raw:?}"
+            );
+            assert!(
+                waited < Duration::from_secs(1),
+                "cell W5: the open must fail immediately, took {waited:?}"
+            );
+        }
+        Ok(_) => panic!("cell W5: an open must not succeed while the volume is being replaced"),
+    }
+    assert_eq!(
+        code, 0,
+        "cell W5: the switch itself must still succeed: {out}{err}"
+    );
+    let _ = child.0.kill();
+    let _ = child.0.wait();
+    let _ = std::fs::remove_dir_all(&store);
+}
