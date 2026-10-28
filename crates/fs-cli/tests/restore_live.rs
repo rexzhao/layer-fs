@@ -642,3 +642,136 @@ fn a_checkout_inside_the_mount_switches_it_and_the_record_stays_live() {
     );
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// Mounts a store at a **directory** mount point (the letter pool is exhausted by the other cases, and a directory is the other supported shape).
+fn mount_at_directory(label: &str) -> (PathBuf, MountChild, PathBuf) {
+    let store = temp_dir(label);
+    Command::new(binary())
+        .arg("init")
+        .arg(&store)
+        .output()
+        .expect("init");
+    let mount_point = store.join("mnt");
+    let child = MountChild(
+        Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("mount")
+            .arg(&mount_point)
+            .arg("--workspace")
+            .arg("main")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mount"),
+    );
+    // **Ready means the record exists with a pipe**, not that the directory does: a directory mount point is on the host volume and exists before the volume is
+    // attached (the A6d lesson), so `metadata` here would let the first command run against a mount that is not there yet.
+    let record = fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&mount_point)));
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(15)
+        && !std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .contains("pipe=")
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .contains("pipe="),
+        "cell setup: the mount must be recorded and listening"
+    );
+    (store, child, mount_point)
+}
+
+/// **W2** — an open **file** handle blocks a switch, the mount keeps serving what it served, and a later attempt succeeds.
+#[test]
+fn an_open_file_handle_blocks_the_switch() {
+    common::strict_gate();
+    let (store, _child, root) = mount_at_directory("switch-blocked");
+    Command::new(binary())
+        .arg("--store")
+        .arg(&store)
+        .args(["branch", "feat", "--from", "main"])
+        .output()
+        .expect("branch feat");
+    // **A branch is not a workspace** (A3b): the first `checkout` creates the workspace row and does not switch. Doing it here, from outside, is what makes the
+    // checkout below the switch rather than a creation.
+    let (created, out, err) = cli_code(&store, &store, &["checkout", "feat"]);
+    assert_eq!(
+        created, 0,
+        "cell setup: the feat workspace row must exist: {out}{err}"
+    );
+    assert!(
+        out.contains("on feat"),
+        "cell setup: the first checkout creates it, got {out:?}"
+    );
+
+    let file = root.join("f");
+    std::fs::write(&file, b"main content").expect("write");
+
+    let held = std::fs::File::open(&file).expect("hold the file open");
+    let (code, out, err) = cli_code(&store, &root, &["checkout", "feat"]);
+    println!("W2 reading: blocked -> code={code} stderr={:?}", err.trim());
+    assert_eq!(
+        code, 4,
+        "cell W2: an open file handle must make the switch busy (4), got {code}: {out}{err}"
+    );
+    assert!(
+        err.contains("1 file"),
+        "cell W2: the refusal names the **file** count, got {err:?}"
+    );
+    drop(held);
+    assert_eq!(
+        std::fs::read(&file).expect("the mount still reads its file"),
+        b"main content",
+        "cell W2: the view did not move"
+    );
+
+    let (code, out, err) = cli_code(&store, &root, &["checkout", "feat"]);
+    println!(
+        "W2 reading: after closing -> code={code} stdout={:?}",
+        out.trim()
+    );
+    assert_eq!(
+        code, 0,
+        "cell W2: with no handle held the switch must succeed: {out}{err}"
+    );
+    // **Bounded retry, not a retry of the assertion**: right after a remount the mount point is briefly unusable as a working directory (267), which is not what
+    // this criterion is about. The assertion stays zero-tolerance once the answer arrives.
+    let mut attempt = 0;
+    let (code, out, _) = loop {
+        attempt += 1;
+        match Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("status")
+            .current_dir(&root)
+            .output()
+        {
+            Ok(output) => {
+                break (
+                    output.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                )
+            }
+            Err(_) if attempt < 20 => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(error) => break (1, String::new(), error.to_string()),
+        }
+    };
+    println!(
+        "W2 reading: status after the switch -> code={code} stdout={:?}",
+        out.trim()
+    );
+    assert_eq!(code, 0, "cell W2: status must answer");
+    assert!(
+        out.contains("workspace: feat") || out.contains("branch:    feat"),
+        "cell W2: the mount must serve feat now, got {out:?}"
+    );
+    let _ = std::fs::remove_dir_all(&store);
+}
