@@ -1,11 +1,12 @@
 # ADR-010：CLI 行为模式（workspace 定位、路径、挂载生命周期、多挂载、错误）
 
-- 状态：**Accepted（设计定稿）**——architect 起草，2026-10-26；owner 已裁 D1–D6（§14）；worker 落地核对后加"落地核对完成 <日期/commit>"
+- 状态：**Accepted（设计定稿）**——architect 起草，2026-10-26；owner 已裁 D1–D7（§14）；worker 落地核对后加"落地核对完成 <日期/commit>"
 - 日期：2026-10-26
 - 起草：architect
 - 依据：owner 2026-10-26 两条意见（"mount 后 current 应跟着变"、"应能从当前路径所属挂载点反查 workspace/branch，
   不需要 CLI 自存 `cli/current`"）、owner 裁决 D1（"去掉 cli/current，如果 cwd 不在活的挂载内，必须显式指定 workspace
-  或者目标路径，就像 git 一样"）与总原则（**用起来与普通文件系统的真实行为一致**）；ADR-006 §2 W2、§10、§11、§13；
+  或者目标路径，就像 git 一样"）、owner 裁决 D7（"通过 cli 直接修改文件意义不大，应该去掉这些功能，我们只提供文件挂载映射功能，
+  修改属于文件系统本身工作"）与总原则（**用起来与普通文件系统的真实行为一致**）；ADR-006 §2 W2、§10、§11、§13；
   ADR-009 W2 / §5.4；P3-4 收口报告（M1–M9、B-22/B-23/B-24）；backlog B-14
 - 事实基线：所有代码引用以 `origin/main` **`25479a5`** 为准（行号与该 SHA 绑定，流程 243）
 - 修订：本 ADR **取代 ADR-006 §13 的 CLI 部分**（API 部分不变）；不改 ADR-009
@@ -29,15 +30,16 @@ CLI（`fs-cli`）现在用 `<store>/cli/current` 记录"当前 workspace"，文�
 
 | # | 决策 |
 | --- | --- |
+| C0 | **CLI = 生命周期管理 + 挂载服务（owner 裁决 D7）**：去掉全部文件级命令 `put/get/ls/stat/mkdir/rm/mv/cat`（含历史读 `cat/ls <commit>:<path>`）；文件的读写与浏览只经挂载后的文件系统（资源管理器、shell、任何程序）。CLI 不接受任何 workspace 内路径 |
 | C1 | **去掉 `cli/current`（owner 裁决 D1）**：CLI 不保存任何"当前 workspace"状态；不读、不写、不作回落。workspace 只来自显式参数或路径发现 |
 | C2 | **定位优先级**：`--workspace` 显式 > **路径发现**（cwd 在一个活的挂载内）> **无默认：报错** `no workspace specified; use --workspace <name>, or cd into a mount point`；store：`--store` > 路径发现 > `.`。路径发现给出的是 **(store, workspace) 二元组**，不与显式 `--store` 拆开混用（§4.2） |
 | C3 | **`mount` 必须显式 `--workspace`**：挂载前 cwd 不可能在"这个"挂载内，路径发现不适用；现硬编码的缺省 `"main"` 是隐式默认，与 C1 同类，删除 |
-| C4 | **挂载期间不打扰用户（owner 裁决 D2/D3）**：按命令类别分流（§6 表）——仓库级命令照常；**文件级命令经挂载点执行**（CLI 把 workspace 路径翻译成挂载点下的宿主路径，走文件系统本身，FSD 的 share/delete-pending/缓存语义一并生效）；**工作区级命令经管道交给挂载进程执行**（§10）。没有一条命令因"正在挂载"而要求用户先 umount，唯一例外是 `workspace discard` 与 `gc` |
-| C5 | **路径**：CLI 的 workspace 路径是 ADR-003 §3.1 的绝对路径 `/a/b`；CLI 入口唯一一处归一化：前导 `//` 折叠为 `/`、`\` 视为 `/`；识别 Git Bash 把 `/a` 改写成 `C:/…/Git/a` 的形态并给出去路；相对路径**只在挂载语境**下有锚点（§5） |
+| C4 | **挂载期间不打扰用户（owner 裁决 D2/D3）**：按命令类别分流（§6 表）——仓库级命令照常（CLI 进程内）；**工作区级命令经管道交给挂载进程执行**（§10）。没有一条命令因"正在挂载"而要求用户先 umount，唯一例外是 `workspace discard` 与 `gc` |
+| C5 | **路径**：CLI 只接受**宿主路径**（`--store` 目录、挂载点），由 OS 解析；不接受 workspace 内路径（C0），因此 `//path`、相对路径锚点、Git Bash 路径改写等问题**整类消失**（§5） |
 | C6 | **挂载记录**：一条记录、一个位置（`%LOCALAPPDATA%\layerfs\mounts\`），由挂载进程**持有不可写共享的句柄**作为存活证明，记录里写管道名；**不在 store 目录另存一份**（§9） |
 | C7 | **mount 生命周期（owner 裁决 D4）**：前台进程；Ctrl-C / Ctrl-Break / 关闭控制台 = 一次正常 umount 请求（flush → 卸载 → 删记录）；`umount` 经管道（正常 / 超时报句柄数 / `--force` 只清陈旧记录并如实说明） |
 | C8 | **同一 workspace 不得被两个打开者持有（owner 裁决 D5）**：两层——记录层（友好错误，指出已挂在哪里）+ 锁层（W2，真正的保证）；跨进程锁层**目前无判据**（B-14b / B-22），本 ADR 把它列为 S1 判据 |
-| C9 | **错误**：按"用户下一步做什么"分类并带去路；区分 store / workspace / branch / path 四种"不存在"；退出码分档（§8.3） |
+| C9 | **错误**：按"用户下一步做什么"分类并带去路；区分 store / workspace / branch / commit 四种"不存在"；退出码分档（§8.3） |
 | C10 | **`checkout <b>` = 创建或恢复名为 `<b>` 的 workspace，无副作用**（不再"切换"任何东西）；在挂载语境里（cwd 在 U: 内）`checkout <b>` 额外请求挂载进程**换挂**到 `<b>`（管道 `switch`，要求无打开句柄，§7.3） |
 | C11 | **挂载进程的线程结构**：WinFsp 回调本来就在 WinFsp 自己的分发线程上（`mounted.rs:901` 起 2 个）；主线程只管生命周期；**管道服务一个独立线程**，与主线程用一条 channel 通信（§10.5，选 B） |
 | C12 | **发布锁**：`Workspace` 增一把读写锁——所有视图操作取读锁，`commit/snapshot/restore/rebind` 取写锁并改为 `&self`；把 ADR-006 §9.1 第 0 步"发布期间写操作阻塞"从借用规则搬到运行时（§10.3） |
@@ -93,7 +95,7 @@ CLI（`fs-cli`）现在用 `<store>/cli/current` 记录"当前 workspace"，文�
   - 命令的含义只由**命令行 + cwd** 决定，不由一个看不见的文件决定；脚本在任何机器、任何先后顺序下行为相同；
   - 从根上消除了"current 要不要随挂载变"这一整类问题（初稿的三条：W2 下有害、历史依赖、崩溃不一致）——没有状态就没有同步；
   - 回到 ADR-006 §13 的显式设计（§3.2）。
-- 代价（接受）：未挂载时每条 workspace 命令都要 `--workspace`。交互便利由路径发现承担：`cd U:\` 之后不需要任何参数。
+- 代价（接受）：未挂载时每条工作区命令（`commit/status/restore/snapshot create`）都要 `--workspace`。交互便利由路径发现承担：`cd U:\` 之后不需要任何参数。
 - 遗留文件：既有 store 里的 `<store>/cli/current` **被忽略**（不读、不删、不报错）。项目未上线，不做迁移提示；
   CLI 也不再创建 `<store>/cli/` 目录。
 
@@ -131,7 +133,6 @@ CLI（`fs-cli`）现在用 `<store>/cli/current` 记录"当前 workspace"，文�
 | `log` | `log [<branch>] [limit]` | 报错（C2 的消息，并提示可给 `<branch>`） |
 | `reset` | `reset <commit> [--branch <b>] [--expect <c>]` | 报错 |
 | `revert` | `revert [--branch <b>]` | 报错 |
-| `cat` / `ls <commit>:<path>` | 历史读，commit 已显式 | **不需要**分支或 workspace（owner 原话里的"或者目标路径"） |
 | `branch`、`stats`、`verify`、`gc`、`snapshot list/drop`、`list`、`version` | 仓库级 | 不需要 |
 
 ADR-006 §13 原设计即 `log <b>`、`reset <b> <commit>`、`revert <b>`；这里允许省略 `<b>` 仅在 workspace 已解析时。
@@ -147,41 +148,24 @@ ADR-006 §13 原设计即 `log <b>`、`reset <b> <commit>`、`revert <b>`；这�
      取卷 GUID，与记录里的卷 GUID 比对（记录需增一字段）。
 2. **卷根 → 记录**：扫描记录目录（挂载数个位数，扫描无成本），取 `mount_point` 规范化后等于卷根的那条，
    并做**存活校验**（§9.2）；不存活 ⇒ 视为不在挂载语境，并在 stderr 提示 `umount <mp> --force` 清陈旧记录。
-3. cwd 在卷内的**相对位置**（`U:\docs\a` ⇒ `/docs/a`）同时得出，供 §5.3 的相对路径使用。
 
 ## 5. 路径规则（C5）
 
-### 5.1 一种规范形
+D7 之后 CLI **没有 workspace 内路径参数**。剩下的路径参数只有两类，都是宿主路径，交给 OS：
 
-CLI 的 workspace 路径 = ADR-003 §3.1 的绝对路径：`/`、`/a`、`/a/b`。核心不做归一化（`fs-namespace/src/path.rs:1-5`）；
-CLI 作为入口，在**唯一一个函数**（`cli_path()`）里做以下三条，之后原样交给核心：
-
-| 输入 | 处理 | 理由 |
+| 参数 | 例 | 解析 |
 | --- | --- | --- |
-| 前导 `//a/b` | 折叠为 `/a/b`（只折叠前导，内部 `//` 仍按核心规则拒绝） | Git Bash 用 `//` 逃避路径改写，MSYS 会去掉一个 `/`；在 cmd/PowerShell 里同一脚本会把 `//a` 原样交来 → 核心报 `EmptySegment`。折叠后两种 shell 行为一致 |
-| `\a\b` | 视为 `/a/b` | Windows 名字不能含 `\`（fs-semantics 拒绝）；与挂载适配器在 FFI 边界的 `\`→`/`（P3-4 §6）同一规则，同一文件两种入口不该有两种拼写规则 |
-| 形如 `C:/Program Files/Git/a` 且环境变量 `MSYSTEM` 已设置 | **拒绝**并提示："Git Bash 把 `/a` 改写成了 Windows 路径；用 `//a` 或 `MSYS_NO_PATHCONV=1`" | 现状是核心报 `NotAbsolute`，用户看不出原因 |
+| store 目录 | `--store F:\repo`、`init <path>` | OS（相对 cwd）；比较时 `canonicalize` 并去掉 `\\?\` 前缀（§4.2） |
+| 挂载点 | `mount U:`、`mount C:\mnt\x`、`umount U:` | OS；记录名用 `record_name()`（`mountcmd.rs:38`） |
 
-`//path` **不是 CLI 语法**，是 shell 的逃逸写法；文档与 `--help` 以 `/path` 为准，并给出 Git Bash 注记。
+因此初稿 §5 讨论的三件事**不再存在**，记录在此以免被重新引入：
 
-### 5.2 两个命名空间，不混用
+- `//path`：是 Git Bash 逃避路径改写的写法，从来不是 CLI 语法；没有 workspace 路径参数后无从出现；
+- 相对 workspace 路径与"挂载内锚点"：无参数可锚；
+- 同一文件"挂载点宿主路径 vs workspace 路径"两种拼写：只剩宿主路径一种，经文件系统访问。
 
-| 参数 | 命名空间 | 解析者 |
-| --- | --- | --- |
-| `put <local> …`、`get … [local]` 的 local | **宿主路径** | OS（相对 cwd） |
-| 其余 `<path>` | **workspace 路径** | `cli_path()` |
-| `<commit>:<path>` 的 path | workspace 路径（历史树内） | `cli_path()` |
-
-同一个文件在挂载时有两种访问方式：`U:\a\b`（宿主路径，经 WinFsp）与 `/a/b`（workspace 路径，经 CLI）。
-**S1 不接受把挂载点内的宿主路径当 workspace 路径**（`fs-cli stat U:\a\b` 报"这是宿主路径"并给出 `/a/b`）；
-自动翻译列为可选（§12 A5）。
-
-### 5.3 相对路径
-
-- **未挂载语境**：workspace 路径没有锚点 ⇒ 相对路径拒绝："workspace 路径是绝对的（/a/b）"。
-- **挂载语境**：锚点 = cwd 在卷内的位置（§4.4 第 3 步）；`U:\docs> fs-cli cat HEAD:a.txt` ⇒ `/docs/a.txt`。
-  只用于挂载语境允许的命令（§6 表中"照常"的历史读）——文件级命令在挂载语境本来就拒绝。
-- `.`/`..` 段：相对路径解析时按词法处理一次（不跨越卷根），结果再交核心；绝对路径里的 `.`/`..` 仍由核心拒绝。
+**不得重新引入 workspace 内路径参数**（例如为了"方便"加回 `cat`）：那会重新打开第二条读写路径与上述三个问题；
+如需在 CLI 里查看历史，见 §14 D7 的替代（挂载一个提交）。
 
 ## 6. 挂载期间的命令分流（C4）
 
@@ -190,9 +174,8 @@ CLI 从挂载记录得到挂载点 `M.mount_point` 与管道名 `M.pipe`。
 
 | 类别 | 命令 | 挂载期间 | 实现要点 |
 | --- | --- | --- | --- |
-| 仓库级、只读、不需要 overlay | `log`、`branch`（列出）、`cat <c>:<p>`、`ls <c>:<p>`、`stats`、`verify`、`list`、`version`、`snapshot list` | **照常**（CLI 进程内） | `log/reset/revert` 取分支按 §4.3，走 `workspace_list()` |
+| 仓库级、只读、不需要 overlay | `log`、`branch`（列出）、`stats`、`verify`、`list`、`version`、`snapshot list` | **照常**（CLI 进程内） | `log/reset/revert` 取分支按 §4.3，走 `workspace_list()` |
 | 仓库级、写主库、不碰该 overlay | `branch <new>`、`branch delete`（另一分支）、`reset`、`revert`、`snapshot drop` | **照常**（CLI 进程内）；`reset/revert` 作用于被挂载 workspace 的分支时打印：挂载侧下次 commit 会按 ADR-006 §10.3 得到 `BranchMoved` | 不新增语义 |
-| 文件级 | `put/get/ls/stat/mkdir/rm/mv`（无 `<commit>:`） | **经挂载点执行**：workspace 路径 `/a/b` ⇒ 宿主路径 `M.mount_point\a\b`，用 `std::fs` 完成；`put` 结束前 `File::sync_all`（⇒ `FlushFileBuffers` ⇒ 适配器 `Flush` ⇒ `Workspace::flush`，与未挂载时"每条命令退出前 flush"同一保证） | 走 FSD：share mode、delete-pending、目录非空、大小写折叠全部由同一条路径裁决（§6.1） |
 | 工作区级 | `status`、`commit`、`snapshot create` | **经管道交给挂载进程**（§10.4 `status/commit/snapshot`） | `status` 只读（S1）；`commit/snapshot` 需 C12 发布锁（S2） |
 | 工作区级、替换视图 | `restore` | **经管道**，**仅当挂载上无打开句柄**；否则拒绝并报句柄数（§10.4 `restore`） | §6.2 |
 | 生命周期 | `umount` | **经管道**（§10.4 `unmount`） | 取代 stop 文件 |
@@ -201,14 +184,12 @@ CLI 从挂载记录得到挂载点 `M.mount_point` 与管道名 `M.pipe`。
 | 生命周期 | `workspace discard dev` | **拒绝**：先 umount | 删一个正在服务的 workspace 等于从挂载下抽走存储（`branch delete` 在 workspace 仍在该分支上时本就拒绝） |
 | 同一 workspace 再挂 | `mount V: --workspace dev` | **拒绝**：`dev 已挂载在 U:` | C8 |
 
-### 6.1 为什么文件级命令走挂载点而不走管道
+### 6.1 文件操作不在 CLI 里（C0，owner 裁决 D7）
 
-- **一条写路径**：经挂载点 = 与任何应用程序完全相同的路径；FSD 的 share 检查、delete-pending、`FileNode` 缓存、通知都自然一致。
-  经管道直接调 `Workspace::write_at` 会**绕过 FSD**：应用以 deny-write 打开的文件会被 CLI 改写，FSD 的 `FileNode` 里缓存的大小
-  不会更新——正是 ADR-009 W6/W7 要防的两套状态。
-- **零新协议**：不需要为 9 个文件命令各设计一个 op。
-- 代价：`stat` 的输出字段来自 Win32（`GetFileInformationByHandle`：`FileIndex` 即 FileId、大小、时间），与未挂载时的 `Stat` 字段同名同义，
-  实现时在一处做映射；`ls` 的顺序按 `read_dir` 返回顺序（与未挂载时一致：核心按名字排序，ADR-009 U15）。
+- 文件的读、写、浏览、改名、删除**只**经挂载后的文件系统。这不是"挂载期间的分流规则"，而是 CLI 的边界：未挂载时也没有文件命令。
+- 由此成立的性质：workspace 内容**只有一条写路径**（WinFsp → 适配器 → `Workspace`），FSD 的 share mode、delete-pending、`FileNode` 缓存、
+  大小写折叠永远由同一处裁决；初稿担心的"CLI 写路径绕过 FSD"（经管道直写 overlay 会改写被应用 deny-write 打开的文件）**从结构上不可能**。
+- 管道协议因此**不含任何文件 op**（§10.4）。
 
 ### 6.2 为什么 restore 只在无句柄时代理
 
@@ -279,7 +260,7 @@ CLI 从挂载记录得到挂载点 `M.mount_point` 与管道名 `M.pipe`。
 | **未指定 workspace** | 读 current；缺失时 "no current workspace; run checkout <branch>" | **`no workspace specified; use --workspace <name>, or cd into a mount point`**（逐字固定于一个常量 `NO_WORKSPACE`，A0 断言该常量；S0 尚无路径发现，常量暂不含 `, or cd into a mount point`，S1 补上——不提前承诺一条还走不通的出路） |
 | workspace 不存在 | `NotFound{workspace X}` | "没有 workspace X；`fs-cli checkout <branch>` 创建"（来源只可能是 `--workspace` 或挂载记录；后者说明记录与主库不一致，按 `Inconsistent` 报） |
 | branch 不存在 | `NotFound{branch}` | "没有分支 b；`fs-cli branch b --from main`" |
-| 路径不存在 | `NotFound{path}` | 原样（带 workspace 名） |
+| commit 不存在 | `NotFound{commit}` | 原样 + "`fs-cli log <branch>` 查看可用提交" |
 | workspace 被占用 | `WorkspaceInUse` | 查记录：有挂载 ⇒ "挂载在 U:（pid N）"+ §6 对应去路；无挂载 ⇒ "另一个进程正打开它（另一条 fs-cli？）" |
 | 主库忙 | `Busy{waited_ms}` | 原文 + "已等待 N ms；稍后重试"（ADR-006 §11.1：不自动重试） |
 | GC 拒绝 | `StoreInUse` | 原文 + 列出活的挂载 |
@@ -287,7 +268,7 @@ CLI 从挂载记录得到挂载点 `M.mount_point` 与管道名 `M.pipe`。
 | mount：盘符被占 0xC0000035 | 已有（`mountcmd.rs`） | 保持 |
 | mount：挂载点是真实卷 0xC0000022 | 已有（e545089） | 保持 |
 | mount：其它 | 打印四个码 | 保持 |
-| Git Bash 路径改写 | 核心报 `NotAbsolute` | §5.1 第 3 行 |
+| 已移除的文件命令（`put/get/ls/stat/mkdir/rm/mv/cat`） | — | 常量 `FILE_COMMAND_REMOVED`：`<cmd>: file operations go through the mounted file system; fs-cli mount <mount_point> --workspace <name>`，退出码 2 |
 
 ### 8.3 退出码
 
@@ -297,8 +278,8 @@ CLI 从挂载记录得到挂载点 `M.mount_point` 与管道名 `M.pipe`。
 | --- | --- |
 | 0 | 成功 |
 | 1 | 其它失败 |
-| 2 | 用法错误（参数、路径形态、**未指定 workspace**） |
-| 3 | 不存在（store / workspace / branch / path / commit） |
+| 2 | 用法错误（参数、**未指定 workspace**、已移除的文件命令） |
+| 3 | 不存在（store / workspace / branch / commit） |
 | 4 | 被占用或忙（`WorkspaceInUse`、`Busy`、`StoreInUse`、挂载语境拒绝） |
 | 5 | 冲突（`BranchMoved`、`NothingToCommit`、`WorkspaceDirty`、`AlreadyExists`） |
 
@@ -344,7 +325,7 @@ CLI 从挂载记录得到挂载点 `M.mount_point` 与管道名 `M.pipe`。
 | 常量 | 值 | 用途 |
 | --- | --- | --- |
 | `PIPE_CONNECT_WAIT` | 2 s | `WaitNamedPipeW`；超时 ⇒ 判活：活 ⇒ `Busy`（"挂载进程正在处理另一个请求"）；陈旧 ⇒ 按 §7.2 |
-| `PIPE_REPLY_WAIT_QUICK` | 30 s | `hello/status/flush` |
+| `PIPE_REPLY_WAIT_QUICK` | 30 s | `hello/status` |
 | 无上限 | — | `commit/snapshot/restore/switch/unmount`：它们是原子的，客户端放弃等待不改变结果。客户端被 Ctrl-C 时打印"请求已发出，结果未知；用 `fs-cli status` 查看"并退出 |
 
 ### 10.3 发布锁（C12，API 改动）
@@ -375,6 +356,8 @@ pub fn rebind(&self, branch: &str) -> …
 
 ### 10.4 op 规范
 
+**op 只有 7 个，且没有文件 op**（C0）：初稿的 `flush` 已删除——没有任何 CLI 命令映射到它（`commit` 第 0 步自带 flush，`unmount` 的停止序列也 flush）。
+
 所有响应：成功 `{"v":1,"ok":true, …}`；失败 `{"v":1,"ok":false,"error":{"kind":"<类型名>","message":"<人读>", …字段}}`。
 `kind` 取核心错误的类型名（`WorkspaceError` / `ApiError` 变体名）或下表的代理自有错误；**CLI 按 `kind` 渲染 §8.2 的去路，不在客户端重新判断语义**。
 
@@ -382,7 +365,6 @@ pub fn rebind(&self, branch: &str) -> …
 | --- | --- | --- | --- |
 | `hello` | `{}` | `{store, workspace, branch, pid, mount_point, protocol:1}` | — |
 | `status` | `{}` | `{workspace, branch, base_commit, dirty, handles}` | — |
-| `flush` | `{}` | `{}` | — |
 | `snapshot` | `{}` | `{root}` | — |
 | `commit` | `{message, force}` | `{commit, root}` | — |
 | `restore` | `{commit, discard}` | `{}` | `HandlesOpen{handles}` |
@@ -440,7 +422,9 @@ pub fn rebind(&self, branch: &str) -> …
 | 挂载记录写进 store 目录 | §9.1：查询方向不对 + 第二份真相 |
 | 只用 pid 判活 | pid 复用；需比对启动时间且仍有竞态。句柄判活（§9.2）严格更强且更简单 |
 | 挂载期间 CLI 文件命令"绕过"挂载直接写 overlay | 违反 W2；即便锁允许，也是同一 workspace 的第二条写路径，挂载侧缓存（FileNode、size 缓存）不会知道 |
-| 挂载期间 CLI 文件命令经管道代理 | 绕过 FSD（share、delete-pending、`FileNode` 缓存），造出第二条写路径；§6.1。改为经挂载点执行 |
+| 挂载期间 CLI 文件命令经管道代理 | 绕过 FSD（share、delete-pending、`FileNode` 缓存），造出第二条写路径 |
+| 挂载期间 CLI 文件命令经挂载点执行（上一稿方案） | 可行且语义一致，但 **owner 裁决 D7：CLI 不做文件操作**——用户直接在挂载点上用任何工具即可，CLI 再包一层没有增量 |
+| 保留历史读 `cat/ls <commit>:<path>` | D7 一并去掉；需要看历史时挂载一个提交（§14 D7 注） |
 | 挂载期间文件/工作区命令一律拒绝、要求先 umount（初稿 S1 方案） | **owner 否决（D2/D3）**：打扰用户；代理与经挂载点执行都可做到语义一致 |
 | 挂载进程事件循环 A（主线程轮询管道）/ C（async） | §10.5 |
 | 代理期间暂停 WinFsp 分发（不加锁） | WinFsp 无暂停原语，需在每个回调入口自己挡——就是一把锁，只是放在了更远、更难论证的位置 |
@@ -450,6 +434,7 @@ pub fn rebind(&self, branch: &str) -> …
 
 | 位置 | 变化 | 期 |
 | --- | --- | --- |
+| `fs-cli/src/main.rs:117-187` 文件命令 `put/get/ls/cat/stat/mkdir/rm/mv` 的分支，及只为它们存在的辅助函数（`read_all`、`print_entries`、`print_stat`、`split_commit`、`one_or_two`、`two` 中不再被用到的那些） | **删除**；命令名改为返回 `FILE_COMMAND_REMOVED`（§8.2）；`USAGE`（`main.rs:19-52`）同步删去 | S0 |
 | `fs-cli/src/main.rs:460` `current_branch` | 改走 `workspace_list()` | S0 |
 | `fs-cli/src/main.rs:465-485` `current_path/read_current/write_current` | **删除**；`init`（`:86`）与 `checkout`（`:359`）不再写；`with_workspace`（`:448`）、`snapshot create`（`:273`）改用解析器（§4.2） | S0 |
 | `fs-cli/src/main.rs:344-360` `checkout` | 存在性改走 `workspace_list()`；无副作用；输出下一步 | S0 |
@@ -457,36 +442,57 @@ pub fn rebind(&self, branch: &str) -> …
 | 新增全局 `--workspace` 与解析器（§4.2 的显式部分；发现部分 S1 接入同一解析器） | 去掉 current 后它是唯一来源，必须与删除同批 | S0 |
 | 消息常量 `NO_WORKSPACE` | S0：`no workspace specified; use --workspace <name>`；S1 接入路径发现时**同一常量**追加 `, or cd into a mount point` | S0/S1 |
 | `fs-cli/src/mountcmd.rs:178` | 删除缺省 `"main"`，`--workspace` 必填 | S0 |
-| `fs-cli/tests/cli.rs`、`cli_defaults.rs` | 依赖 current 的用例改为显式 `--workspace`；`cli_defaults.rs::init_leaves_a_workspace_ready_to_use`（`init` 后不 checkout 直接 `put/ls`）**判据翻转**：无 `--workspace` 必须报 C2 消息；`cli.rs::failures_are_reported` 里删除 `cli/current` 的那段（`:195`）随之改写 | S0 |
+| `fs-cli/tests/cli.rs`、`cli_defaults.rs` | 见 §13 S0 的"测试处置表" | S0 |
 | `WorkspaceInUse` / `StoreInUse` 渲染 | 查记录，带挂载点与 pid | S0 |
 | `fs-cli/src/mountcmd.rs:62-72` 记录目录 | `%LOCALAPPDATA%\layerfs\mounts\` + 句柄判活 | S1 |
-| 新增 `cli_path()` | §5.1 三条 | S1 |
 | 路径发现（§4.4） | Win32 两个调用 + 记录扫描 | S1 |
 | §6 分流 | 每条命令一个类别常量，表驱动 | S1 |
 | Ctrl-C 处理（§7.1） | `SetConsoleCtrlHandler` | S1 |
 | 退出码（§8.3） | | S1 |
 | `fs-cli/src/mountcmd.rs:217-245` stop 文件与"记录消失即停止" | 删除；改为 channel + 管道 `unmount`（§10.1、§10.5） | S1 |
-| 管道服务（`hello/status/flush/unmount`）与客户端；管道线程 + channel | §10 | S1 |
-| 文件级命令经挂载点执行（§6.1） | workspace 路径 → 宿主路径；`stat` 字段映射一处 | S1 |
+| 管道服务（`hello/status/unmount`）与客户端；管道线程 + channel | §10 | S1 |
 | `fs-workspace::Workspace` 发布锁、`BaseState`、`commit/snapshot/restore/rebind(&self)`；`fs-api` 同步 | §10.3 | S2 |
 | 管道 `commit/snapshot` | §10.4 | S2 |
 | 适配器暴露打开句柄数（注册表计数） | `status.handles`、`unmount` 的 `Timeout{handles}` 用 | S1 |
 | 管道 `restore/switch` | §6.2、§7.3 | S3 |
 | ADR-006 §13 CLI 段 | 标"已由 ADR-010 取代" | 本 ADR 合入时（已在本分支） |
-| A5（可选）：挂载点内宿主路径自动翻译为 workspace 路径 | | 不排期 |
+| ADR-006 §13 的 `ls|get|stat --at <commit|root>`（I1 验收入口） | 已随 D7 去掉；I1 的验收由 fs-api 层的 `ReadView` 测试承担（不经 CLI） | 本 ADR 合入时记录 |
 
 ## 13. 分期与判据
 
 判据形态沿用 criteria-and-acceptance：三态（通过 / 失败带红值 / 空转）、每条带能把它弄红的单点变异。
 
-### S0（可马上派 worker：去掉 current + 修三处不一致 + 去路）
+### S0（可马上派 worker：CLI 收窄——去掉文件命令与 current、修三处不一致、去路）
 
-**判据影响：改变**——`cli_defaults.rs::init_leaves_a_workspace_ready_to_use` 由"`init` 后直接 `put/ls` 成功"变为"无 `--workspace` 必须失败并给出 C2 消息"；其余依赖 current 的用例改为显式（不改判据，只改调用形状）。
+**判据影响：改变**——
+- `cli_defaults.rs::init_leaves_a_workspace_ready_to_use`：原判据"`init` 后直接 `put/ls` 成功"**作废**（命令已不存在），由 A0c 取代；
+- `cli.rs::the_full_command_sequence_round_trips`：原判据含 `put/get/ls/cat` 往返，**改写**为"内容经 fs-api 写入、经 CLI 生命周期命令发布、经 fs-api `ReadView` 读回"（见下表）；
+- 其余依赖 current 或文件命令**做准备**的用例：准备步骤改为 fs-api 库调用，被测的 CLI 行为判据不变。
+
+测试处置表（逐个用例，不得漏项；"准备"指只为构造场景而调用的文件命令）：
+
+| 用例（`fs-cli/tests/`） | 原来用文件命令做什么 | 处置 |
+| --- | --- | --- |
+| `cli_defaults.rs::init_leaves_a_workspace_ready_to_use` | 被测行为本身 | **作废**，由 A0c + A0 取代（判据改变） |
+| `cli_defaults.rs::a_taken_drive_letter_says_what_to_do` | 不用 | 加 `--workspace main`（A2） |
+| `cli.rs::the_full_command_sequence_round_trips` | 往返的一半 | 改写：fs-api 写 → `fs-cli commit/log/status/restore` → fs-api `ReadView` 读（判据改变：读写两端从 CLI 换到库） |
+| `cli.rs::failures_are_reported` | 部分失败形态（不存在的路径等） | 保留 workspace/branch/commit 三种不存在；路径不存在一项**删除**（命令已无） |
+| `cli.rs::restore_refuses_to_drop_uncommitted_work` | 准备脏改动 | 准备改用 fs-api |
+| `cli.rs::a_branch_can_start_from_a_commit` | 准备内容、验证内容 | 准备与验证改用 fs-api |
+| `cli.rs::gc_dry_run_and_real_run_are_different_commands` | 准备垃圾 | 准备改用 fs-api |
+| `cli.rs::an_impossible_repack_threshold_is_reported_and_not_acted_on` | 准备 | 准备改用 fs-api |
+| `cli.rs::dropping_a_snapshot_frees_only_what_nothing_else_reaches` | 准备、`cat` 验证 | 准备与验证改用 fs-api |
+| `cli.rs::deleting_a_branch_keeps_its_objects_alive` | 准备、`cat` 验证 | 同上 |
+| `cli.rs::verify_deep_checks_snapshot_roots` | 准备 | 准备改用 fs-api |
+
+处置的约束：**被测的 CLI 行为判据一条不少**（gc 的两种模式、repack 阈值拒绝、snapshot drop 的可达性、branch delete 保留对象、verify --deep、restore 拒绝脏改动）；
+准备与验证换成库调用后，每条仍须能被它原来的变异弄红（提交说明逐条列"变异 → 红"）。
 
 | # | 判据 | 变异（必须红） |
 | --- | --- | --- |
-| A0 | 夹具 store 里**故意放一个** `cli/current`（内容 `main`），cwd 不在挂载内、不给 `--workspace`：`put/get/ls/stat/commit/status` 全部失败，stderr **逐字**含常量 `NO_WORKSPACE`（§8.2；断言引用常量，不在测试里另写字面量），退出码 2 | 恢复读取 current（任一条命令）；或改写消息 |
+| A0 | 夹具 store 里**故意放一个** `cli/current`（内容 `main`），cwd 不在挂载内、不给 `--workspace`：`commit/status/restore/snapshot create` 全部失败，stderr 含常量 `NO_WORKSPACE`（§8.2；断言引用常量，不在测试里另写字面量），退出码 2 | 恢复读取 current（任一条命令）；或改写消息 |
 | A0b | `init` 与 `checkout` 之后 store 里**不存在** `cli/` 目录 | 恢复 `write_current` |
+| A0c | `put/get/ls/stat/mkdir/rm/mv/cat` 每一个都失败，stderr 含常量 `FILE_COMMAND_REMOVED`、退出码 2，且**未打开 store**（对一个不存在的 `--store` 也给同一消息，而不是"store 不存在"） | 恢复任一文件命令；或在判命令之前先打开 store |
 | A1 | workspace `dev` 被另一进程持有时，`log dev`、`reset <c> --branch dev --expect <c>`、`revert --branch dev`、`--workspace dev log` 成功（取分支不打开 overlay） | 分支来源改回 `workspace_open` |
 | A2 | `mount <mp>` 不带 `--workspace` ⇒ 失败，消息含 `--workspace`，**且未挂载**（盘符仍空、无记录） | 缺省改回 `"main"` |
 | A3 | 撞 `WorkspaceInUse` 且有该 workspace 的活挂载时，错误含挂载点与 pid | 渲染不查记录 |
@@ -494,8 +500,8 @@ pub fn rebind(&self, branch: &str) -> …
 
 ### S1（依赖 S0；不改核心，只动 CLI 与挂载进程）
 
-范围：记录迁移与句柄判活（§9）、路径发现（§4.4）、`cli_path()`（§5.1）、Ctrl-C（§7.1）、退出码（§8.3）、适配器句柄数、**管道骨架**（线程结构 §10.5、
-帧/版本/超时 §10.2、op `hello/status/flush/unmount`）、**文件级命令经挂载点**（§6.1）。`status` 进入 S1：它只读，经管道不需要发布锁。
+范围：记录迁移与句柄判活（§9）、路径发现（§4.4）、Ctrl-C（§7.1）、退出码（§8.3）、适配器句柄数、**管道骨架**（线程结构 §10.5、
+帧/版本/超时 §10.2、op `hello/status/unmount`）。`status` 进入 S1：它只读，经管道不需要发布锁。
 
 | # | 判据 | 变异（必须红） |
 | --- | --- | --- |
@@ -504,11 +510,9 @@ pub fn rebind(&self, branch: &str) -> …
 | A6 | §4.2 组合表 7 行各一用例；"`--store S` 与发现的 store 不同"必须丢弃发现并报 C2 消息 | 拆开混用（取 S 加 M.workspace） |
 | A7 | 陈旧记录（持有进程已死，含 `taskkill /F`）⇒ 不进入挂载语境，stderr 提示；记录被下一个读者清理；`umount --force` 对**活**记录拒绝 | 判活改为"文件存在即活" |
 | A8 | §6 表每一行至少一条命令的用例 | 任一类别常量改错 |
-| A9 | `cli_path()`：`//a/b`≡`/a/b`、`\a\b`≡`/a/b`、`/a//b` 拒绝、MSYS 改写形态拒绝且提示含 `MSYS_NO_PATHCONV` | 任一条去掉 |
 | A10 | Ctrl-C 后：卷卸载、记录删除、Ctrl-C 前的写入在重新挂载后可读 | 去掉控制台处理器（退化为 M7 残留） |
 | A11 | 管道：`hello` 返回与记录一致；`v:2` 请求 ⇒ `ProtocolVersion`；超限帧 ⇒ `FrameTooLarge` 且服务端继续服务下一个请求；`unmount` 的响应在记录删除之后到达 | 响应提前发送；或帧错误后不再 accept |
 | A12 | 有打开句柄时 `umount` ⇒ `Timeout{handles≥1}`，卷仍挂、记录仍在；关闭句柄后再 `umount` 成功 | 超时后仍删记录 |
-| A13a | 文件级经挂载点：应用以 `FILE_SHARE_READ`（无 write share）打开 `/a` 时，`fs-cli put x /a` 失败且为共享冲突；`fs-cli rm /d`（非空目录）失败为目录非空；`put` 后不卸载直接 `taskkill /F` 挂载进程，重挂后内容在（`sync_all` 生效） | `put` 改为经管道直写 overlay（share 检查消失 ⇒ 第一条红）；去掉 `sync_all` |
 | A14 | `status` 经管道：挂载中写一个文件后 `status.dirty = true`、`handles` 与实际一致 | — （读值核对，三态带红值） |
 
 ### S2（依赖 S1；改核心 API）
@@ -551,6 +555,9 @@ S0 ──► S1 ──► S2 ──► S3
 | D4 | Ctrl-C | **视为正常 umount**（C7） |
 | D5 | 二次挂载 | **两层防护**：记录层先拒 + W2 锁层兜底（C8） |
 | D6 | `init` 是否顺带建 workspace `main` | **保留**（真实对象，非隐藏状态） |
+| D7 | CLI 的文件级命令 | **全部去掉**（`put/get/ls/stat/mkdir/rm/mv/cat`）；CLI 只管生命周期与挂载服务，文件操作属于挂载后的文件系统（C0） |
+
+D7 的后果（记录，不另需裁决）：CLI 不再能读历史文件。需要查看某个提交的内容时：`restore` 到一个 workspace 后挂载它；若将来要"不动 workspace 直接看历史"，形态应是**只读挂载一个提交**（`mount <mp> --at <commit>`），仍经文件系统——不加回 `cat`（§5 末段）。不排期。
 
 注：本稿初版的 D4（后台挂载）与 D5（退出码分档）与 manager 转达时的编号不同。后台挂载已移出本 ADR（§7.1）；
 **退出码分档（§8.3）按 architect 推荐采纳，待 owner 追认**——它是对脚本的对外承诺，若 owner 不同意，只回退 §8.3 一节，其余不受影响。
@@ -576,3 +583,5 @@ S0 ──► S1 ──► S2 ──► S3
 - 2026-10-26 终稿（Accepted）：owner 裁决 D2–D6。挂载期不再拒绝——文件级命令经挂载点执行（§6.1），工作区级经管道代理（§10）；
   §10 由草案升为正式设计：管道通道/帧/版本/超时、8 个 op、发布锁 C12（`&mut` → `&self` + `RwLock`，并写明它防的丢写窗口 §3.4）、
   线程结构 C11（选 B）、句柄语义 §10.6；分期改为 S0–S3（管道骨架在 S1），判据 A4–A22。
+- 2026-10-26 按 owner 裁决 D7 修订：**去掉全部文件级命令**（C0）；§5 收为"只剩宿主路径"，初稿的 `//path`/相对路径/双拼写问题整类消失；
+  §6.1 改为"文件操作不在 CLI 里"；管道 op 去掉 `flush`（7 个，无文件 op）；S0 增 A0c 与逐用例的测试处置表，删 A9、A13a；新增 D7。
