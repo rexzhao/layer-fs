@@ -748,7 +748,7 @@ fn release_context(context: *const c_void) -> Release {
     let (remaining, shared_entry) = match table.get_mut(&id) {
         Some(shared) => {
             shared.refs -= 1;
-            (shared.refs, shared.entry.clone())
+            (shared.refs, shared.entry)
         }
         None => return Release::Unknown,
     };
