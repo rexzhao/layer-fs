@@ -6,6 +6,8 @@
 
 mod common;
 
+use std::os::windows::fs::OpenOptionsExt;
+
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -278,6 +280,151 @@ fn an_open_file_handle_blocks_the_restore_and_nothing_moves() {
         std::fs::read(&file).expect("read after the restore"),
         b"1",
         "cell R2: and it really moved the view"
+    );
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+/// **R3** — directory handles do **not** block (D8 = B), and the count is reported so the user knows their shell's view just went stale.
+#[test]
+fn directory_handles_do_not_block_and_are_reported() {
+    common::strict_gate();
+    let (store, _child, root) = mount_at("R:");
+    let mount_point = PathBuf::from("R:");
+    let file = root.join("f");
+
+    std::fs::write(&file, b"1").expect("write 1");
+    let (ok, out, err) = cli(&store, &mount_point, &["commit", "-m", "c1"]);
+    assert!(ok, "cell R3: commit c1: {out}{err}");
+    let c1 = out
+        .trim()
+        .strip_prefix("commit ")
+        .unwrap_or_default()
+        .to_owned();
+    std::fs::write(&file, b"2").expect("write 2");
+    let (ok, out, err) = cli(&store, &mount_point, &["commit", "-m", "c2"]);
+    assert!(ok, "cell R3: commit c2: {out}{err}");
+
+    // Two directory handles of different kinds, because both are the case the rule is about:
+    // 1. a **child shell whose cwd is the mount** — the one that would make a restore impossible if directories counted;
+    let mut shell = Command::new("C:/Program Files/Git/bin/bash.exe")
+        .arg("-c")
+        .arg("cd /r && sleep 6")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn a shell with its cwd inside the mount");
+    std::thread::sleep(Duration::from_millis(500));
+    // 2. an explicit directory handle held by this process (`FILE_FLAG_BACKUP_SEMANTICS` is what lets `OpenOptions` open a directory at all).
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0200_0000)
+        .open(&root)
+        .expect("hold a directory handle on the mount root");
+
+    let (ok, out, err) = cli(&store, &mount_point, &["restore", &c1]);
+    println!(
+        "R3 reading: exit_ok={ok} stdout={:?} stderr={:?}",
+        out.trim(),
+        err.trim()
+    );
+    assert!(
+        ok,
+        "cell R3: directory handles must not block the restore (D8 = B): {out}{err}"
+    );
+    assert!(
+        out.contains("directory handle"),
+        "cell R3: the report must say the directory views went stale, got {out:?}"
+    );
+    let reported: usize = out
+        .split_whitespace()
+        .find_map(|word| word.parse::<usize>().ok())
+        .unwrap_or(0);
+    println!("R3 reading: dirs_invalidated reported = {reported}");
+    assert!(
+        reported >= 2,
+        "cell R3: at least the shell's cwd and the explicit handle must be counted, got {reported}"
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("read after the restore"),
+        b"1",
+        "cell R3: and the view really moved"
+    );
+
+    drop(directory);
+    let _ = shell.kill();
+    let _ = shell.wait();
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+/// The exit code as well as the text: `restore` in a mount has to keep the same codes as everywhere else (ADR-010 §8.3), or a script cannot tell "discard your
+/// changes" from "that commit does not exist".
+fn cli_code(
+    store: &std::path::Path,
+    cwd: &std::path::Path,
+    arguments: &[&str],
+) -> (i32, String, String) {
+    let output = Command::new(binary())
+        .arg("--store")
+        .arg(store)
+        .args(arguments)
+        .current_dir(cwd)
+        .output()
+        .expect("run fs-cli");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// **R5** — the error kinds travel: dirty without `--discard` is a **conflict** (5), an unknown commit is **not found** (3), and `--discard` succeeds.
+#[test]
+fn a_refused_restore_keeps_its_exit_code() {
+    common::strict_gate();
+    let (store, _child, root) = mount_at("G:");
+    let mount_point = PathBuf::from("G:");
+    let file = root.join("f");
+
+    std::fs::write(&file, b"1").expect("write 1");
+    let (ok, out, err) = cli(&store, &mount_point, &["commit", "-m", "c1"]);
+    assert!(ok, "cell R5: commit c1: {out}{err}");
+    let c1 = out
+        .trim()
+        .strip_prefix("commit ")
+        .unwrap_or_default()
+        .to_owned();
+    // Leave an uncommitted change behind, which is what `WorkspaceDirty` is about.
+    std::fs::write(&file, b"2").expect("write 2");
+
+    let (code, out, err) = cli_code(&store, &mount_point, &["restore", &c1]);
+    println!("R5 reading: dirty -> code={code} stderr={:?}", err.trim());
+    assert_eq!(
+        code, 5,
+        "cell R5: a dirty workspace is a conflict (5), got {code}: {out}{err}"
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("read after the refusal"),
+        b"2",
+        "cell R5: the refusal left the change in place"
+    );
+
+    let (code, out, err) = cli_code(&store, &mount_point, &["restore", "0000000000000000"]);
+    println!("R5 reading: unknown -> code={code} stderr={:?}", err.trim());
+    assert_eq!(
+        code, 3,
+        "cell R5: an unknown commit is not found (3), got {code}: {out}{err}"
+    );
+
+    let (code, out, err) = cli_code(&store, &mount_point, &["restore", &c1, "--discard"]);
+    println!("R5 reading: discard -> code={code}");
+    assert_eq!(
+        code, 0,
+        "cell R5: with --discard it succeeds, got {code}: {out}{err}"
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("read after the discard restore"),
+        b"1",
+        "cell R5: and the discarded change is gone"
     );
     let _ = std::fs::remove_dir_all(&store);
 }

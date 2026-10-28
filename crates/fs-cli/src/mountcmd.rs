@@ -769,8 +769,11 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                                 detail: commit.to_owned(),
                                 fields: serde_json::json!({"commit": commit, "dirs_invalidated": dirs}),
                             },
+                            // **The failure kind travels** (S3 card R5): the CLI maps a kind to an exit code, and a single `kind: "restore"` collapses
+                            // "discard your changes" (5) and "that commit does not exist" (3) into "something went wrong" (1) — a script cannot tell them
+                            // apart, which is the whole point of the codes existing.
                             Err(error) => fs_cli::pipe::Response::Failed {
-                                kind: "restore".to_owned(),
+                                kind: restore_kind(&error),
                                 detail: error.to_string(),
                                 fields: serde_json::json!({}),
                             },
@@ -800,11 +803,21 @@ impl fs_cli::pipe_win::Serving for PipeServing {
             .get()
             .map_or(0, |adapter| adapter.open_handles())
     }
-
     fn teardown_complete(&self) -> bool {
         // The record is removed by `DELETE_ON_CLOSE` when the mount's handle drops, which happens **after** the unmount and the flush — so its absence is the
         // moment the whole stop sequence is done.
         !self.record.exists()
+    }
+}
+
+/// The **kind** of a failed `restore`, as the protocol carries it (S3 card R5): the CLI turns a kind into an exit code, so this has to keep the distinctions
+/// the rest of the CLI already makes (2 usage / 3 not found / 4 busy / 5 conflict).
+fn restore_kind(error: &fs_workspace::WorkspaceError) -> String {
+    match error {
+        fs_workspace::WorkspaceError::NotFound { .. } => "not-found".to_owned(),
+        fs_workspace::WorkspaceError::WorkspaceDirty => "workspace-dirty".to_owned(),
+        fs_workspace::WorkspaceError::StoreInUse { .. } => "in-use".to_owned(),
+        _ => "restore".to_owned(),
     }
 }
 /// Every live mount record, as `discovery::discover` wants them: the records and their liveness in one pass.

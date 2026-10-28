@@ -80,6 +80,33 @@ impl Failure {
             code: 4,
         }
     }
+
+    /// The request would lose something the user has not asked to lose (a dirty workspace, a branch that moved).
+    #[must_use]
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: 5,
+        }
+    }
+
+    /// A failure the **mount** reported over the pipe, turned into the same code the local path would have produced.
+    ///
+    /// This is the whole reason the protocol carries a `kind`: the mount classifies its failure where the error type still exists, and the CLI maps that
+    /// classification to an exit code in one place. Falling back to a message means a script cannot tell "discard your changes" (5) from "that commit does not
+    /// exist" (3) — the distinction the codes were introduced for.
+    #[must_use]
+    pub fn from_pipe_kind(kind: &str, detail: String) -> Self {
+        match kind {
+            "not-found" => Self::not_found(detail),
+            "workspace-dirty" => Self::conflict(detail),
+            "in-use" => Self::in_use(detail),
+            _ => Self {
+                message: format!("the mount refused the command ({kind}): {detail}"),
+                code: 1,
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for Failure {

@@ -340,7 +340,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         Err(fs_cli::Failure::in_use(fs_cli::restore_refusal(files, dirs)).into())
                     }
                     Ok(fs_cli::pipe::Response::Failed { kind, detail, .. }) => {
-                        Err(format!("the mount refused `restore` ({kind}): {detail}").into())
+                        Err(fs_cli::Failure::from_pipe_kind(&kind, detail).into())
                     }
                     Ok(other) => Err(format!("the mount answered {other:?}").into()),
                     Err(error) => Err(fs_cli::Failure::in_use(format!(
