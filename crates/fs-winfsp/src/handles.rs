@@ -217,15 +217,13 @@ impl HandleTable {
     /// and let through, because the view going stale is not lost data.
     #[must_use]
     pub fn handle_kinds(&self) -> (usize, usize) {
-        self.handles
-            .values()
-            .fold((0, 0), |(files, dirs), handle| {
-                if handle.is_dir {
-                    (files, dirs + 1)
-                } else {
-                    (files + 1, dirs)
-                }
-            })
+        self.handles.values().fold((0, 0), |(files, dirs), handle| {
+            if handle.is_dir {
+                (files, dirs + 1)
+            } else {
+                (files + 1, dirs)
+            }
+        })
     }
 
     /// File handles only — the number that makes `restore` wait (§3.2).

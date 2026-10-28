@@ -1,0 +1,259 @@
+//! **Q2** — a real mount counts **file** handles and **directory** handles apart, and both come back down.
+//!
+//! This is the rule D8 = B turned on: `restore` / `switch` block on file handles and merely report directory ones, because the shell that starts the command
+//! holds a directory handle on the mount itself. Two things must therefore be true of the counter, and each is asserted below:
+//!
+//! 1. the two kinds move **independently** — opening a directory must not look like opening a file;
+//! 2. both return to where they started when the handle closes — a count that only grows makes the rule unusable a second time.
+//!
+//! The mount form is `mount_serving`, whose closure is handed `&Mounted` with the adapter behind it; `mount_read_only` only hands a path, which is enough for
+//! "does the chain work" but not for "what does the table say".
+
+use std::path::PathBuf;
+
+use fs_winfsp::abi::VolumeInfo;
+use fs_winfsp::loader::{default_library, resolve_library, LoadError};
+use fs_winfsp::mounted::mount_serving;
+use fs_winfsp::{Attributes, Kind, NodeInfo};
+
+fn node(file_id: u64) -> NodeInfo {
+    // id 0 is the root and id 2 is `beta`, a **directory**: the whole point of the criterion is that the table can tell it from a file.
+    let kind = if file_id == 0 || file_id == 2 {
+        Kind::Directory
+    } else {
+        Kind::File
+    };
+    NodeInfo {
+        file_id,
+        kind,
+        size: 0,
+        times: fs_winfsp::file_info::times(
+            1_793_000_000_000_000_000,
+            1_793_000_000_000_000_000,
+            1_793_000_000_000_000_000,
+            1_793_000_000_000_000_000,
+        ),
+        attributes: Attributes(if kind == Kind::Directory { 0x10 } else { 0x80 }),
+    }
+}
+
+fn list(dir_id: u64) -> Vec<(Vec<u16>, NodeInfo)> {
+    if dir_id != 0 {
+        return Vec::new();
+    }
+    vec![
+        ("alpha.txt".encode_utf16().collect(), node(1)),
+        ("beta".encode_utf16().collect(), node(2)),
+    ]
+}
+
+fn lookup(file_id: u64) -> Option<NodeInfo> {
+    (file_id == 0 || file_id == 1 || file_id == 2).then(|| node(file_id))
+}
+
+fn resolve_path(path: &str) -> Option<u64> {
+    match path.trim_start_matches('/') {
+        "" => Some(0),
+        "alpha.txt" => Some(1),
+        "beta" => Some(2),
+        _ => None,
+    }
+}
+
+use fs_semantics::disposition::Disposition;
+use fs_winfsp::ops::Path;
+use fs_winfsp::ops::{DirEntry, OpenOutcome, OpsError, OpsResult, RenameOutcome, WorkspaceOps};
+
+pub struct FixtureOps {
+    pub lookup: fn(u64) -> Option<NodeInfo>,
+    pub list: fn(u64) -> Vec<(Vec<u16>, NodeInfo)>,
+    pub resolve: fn(&str) -> Option<u64>,
+}
+
+impl WorkspaceOps for FixtureOps {
+    fn create_or_open(&self, path: &Path<'_>, disposition: Disposition) -> OpsResult<OpenOutcome> {
+        // Only `Open`: this mount is read-only, and a silent "created nothing" is the failure mode the write batch exists to avoid.
+        if disposition != Disposition::Open {
+            return Err(OpsError::ReadOnly);
+        }
+        let text = String::from_utf8_lossy(path.display());
+        let file_id = (self.resolve)(text.as_ref()).ok_or(OpsError::NotFound)?;
+        let info = (self.lookup)(file_id).ok_or(OpsError::NotFound)?;
+        Ok(OpenOutcome {
+            file_id,
+            kind: info.kind,
+            action: fs_semantics::disposition::Action::Open,
+            size: info.size,
+            times: info.times,
+            attributes: info.attributes,
+            binding: (file_id, Vec::new()),
+            replaced: None,
+        })
+    }
+
+    fn mkdir(&self, _path: &Path<'_>) -> OpsResult<u64> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn read(&self, _file_id: u64, _offset: u64, _len: usize) -> OpsResult<Vec<u8>> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn write(&self, _file_id: u64, _offset: u64, _bytes: &[u8]) -> OpsResult<usize> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn set_size(&self, _file_id: u64, _len: u64) -> OpsResult<()> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn read_dir(&self, dir_id: u64) -> OpsResult<Vec<DirEntry>> {
+        Ok((self.list)(dir_id)
+            .into_iter()
+            .map(|(name, info)| DirEntry {
+                name: String::from_utf16_lossy(&name).into_bytes(),
+                kind: info.kind,
+                file_id: info.file_id,
+            })
+            .collect())
+    }
+
+    fn get_info(&self, file_id: u64) -> OpsResult<NodeInfo> {
+        (self.lookup)(file_id).ok_or(OpsError::NotFound)
+    }
+
+    fn set_times(
+        &self,
+        _file_id: u64,
+        _accessed: Option<i64>,
+        _written: Option<i64>,
+        _changed: Option<i64>,
+        _created: Option<i64>,
+    ) -> OpsResult<()> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn set_attributes(&self, _file_id: u64, _attributes: Attributes) -> OpsResult<()> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn rename(&self, _from: &Path<'_>, _to: &Path<'_>, _replace: bool) -> OpsResult<RenameOutcome> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn remove_at(&self, _parent: u64, _name: &[u8], _expected_id: u64) -> OpsResult<()> {
+        Err(OpsError::ReadOnly)
+    }
+
+    fn flush(&self) -> OpsResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_file_handle_and_a_directory_handle_are_counted_apart_and_both_come_back_down() {
+    let library = default_library();
+    if let Err(LoadError::NotFound { path }) = resolve_library(&library) {
+        eprintln!(
+            "SKIP: winfsp library not installed at {} — mount not exercised (skip, not pass)",
+            path.display()
+        );
+        return;
+    }
+    let backend: fs_winfsp::ops::DynOps = Box::new(FixtureOps {
+        lookup,
+        list,
+        resolve: resolve_path,
+    });
+    let volume = VolumeInfo {
+        total_size: 1 << 20,
+        free_size: 1 << 19,
+        // **Bytes, not characters** (`fsctl.h:274`, measured in S1: 7 made `vol J:` read "lay").
+        volume_label_length: 14,
+        volume_label: {
+            let mut label = [0u16; 32];
+            for (slot, unit) in label.iter_mut().zip("layerfs".encode_utf16()) {
+                *slot = unit;
+            }
+            label
+        },
+    };
+    // **Q2 is a distinct letter** so it cannot collide with the read-only (`Z:`), write (`X:`) or CLI mounts running in the same session. `P:` because the
+    // first choice (`E:`) turned out to be this machine's optical drive — the precondition below is what said so instead of a puzzling mount failure.
+    let mount_point: PathBuf = std::env::var_os("LAYER_FS_MNT_Q2")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("P:"));
+    if mount_point.to_string_lossy().ends_with(':') {
+        assert_eq!(
+            fs_winfsp::mounted::drive_present(&mount_point),
+            Some(false),
+            "cell precondition: {} must be free before mounting — an existing letter silently invalidates the run",
+            mount_point.display()
+        );
+    }
+
+    let mut readings: Vec<String> = Vec::new();
+    let report = mount_serving(&library, &mount_point, backend, volume, |mounted| {
+        let adapter = mounted.adapter();
+        let root = {
+            let text = mounted.path().to_string_lossy().to_string();
+            if text.ends_with(':') {
+                PathBuf::from(format!("{text}\\"))
+            } else {
+                mounted.path().to_path_buf()
+            }
+        };
+        let baseline = adapter.open_handle_kinds();
+        readings.push(format!("baseline              files={} dirs={}", baseline.0, baseline.1));
+
+        let file = std::fs::File::open(root.join("alpha.txt")).expect("open the file through the mount");
+        let with_file = adapter.open_handle_kinds();
+        readings.push(format!("with a file open      files={} dirs={}", with_file.0, with_file.1));
+        assert!(
+            with_file.0 > baseline.0,
+            "cell Q2: opening a file must raise the FILE count (baseline {}, now {})",
+            baseline.0,
+            with_file.0
+        );
+
+        let listing = std::fs::read_dir(root.join("beta")).expect("open the directory through the mount");
+        // Enumerate, not just open: `read_dir` returns a lazy iterator, so the directory is only really walked once something asks for an entry.
+        let walked = listing.flatten().count();
+        let with_dir = adapter.open_handle_kinds();
+        readings.push(format!("with a directory open files={} dirs={}", with_dir.0, with_dir.1));
+        assert!(
+            with_dir.1 > with_file.1,
+            "cell Q2: a directory handle must raise the DIRECTORY count, not the file count (dirs {} -> {})",
+            with_file.1,
+            with_dir.1
+        );
+
+        drop(walked);
+        drop(file);
+        // `Close` can arrive after `CloseHandle` returns (the cache manager keeps a file object for a moment), so the reading is taken in a bounded loop and
+        // printed before it is judged (573).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut after = adapter.open_handle_kinds();
+        while (after.0 > baseline.0 || after.1 > baseline.1) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            after = adapter.open_handle_kinds();
+        }
+        readings.push(format!("after closing both    files={} dirs={}", after.0, after.1));
+        assert!(
+            after.0 <= baseline.0 && after.1 <= baseline.1,
+            "cell Q2: closed handles must come back down (baseline {baseline:?}, after {after:?})"
+        );
+        Ok(())
+    })
+    .expect("the mount must come up and down");
+
+    println!("Q2 READINGS:");
+    for reading in &readings {
+        println!("  {reading}");
+    }
+    assert_eq!(readings.len(), 4, "cell Q2: four readings were taken");
+    eprintln!(
+        "Q2 dispatcher result = 0x{:08X}",
+        report.dispatcher_result as u32
+    );
+}
