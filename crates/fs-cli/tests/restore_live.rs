@@ -428,3 +428,105 @@ fn a_refused_restore_keeps_its_exit_code() {
     );
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// **R4** — the admission window. The restore is parked **between** closing the gate and moving the view; an open that arrives in that window must wait for the
+/// restore and then meet the **new** view.
+///
+/// The discriminator is the name: `/g` exists only in `c2`. Without an admission ticket the parked open resolves `/g` against the old view and succeeds —
+/// handing out a handle to an object the restore is about to remove. With the ticket it waits, and then finds that `/g` is gone.
+#[test]
+fn an_open_during_a_parked_restore_waits_and_then_finds_the_new_view() {
+    common::strict_gate();
+    let store = temp_dir("window");
+    Command::new(binary())
+        .arg("init")
+        .arg(&store)
+        .output()
+        .expect("init");
+    let mount_point = PathBuf::from("H:");
+    assert_eq!(
+        fs_winfsp::mounted::drive_present(&mount_point),
+        Some(false),
+        "cell precondition: H: must be free"
+    );
+    // The pause is set on the **mount's** environment: the restore runs in the mount process, so that is where the point has to fire.
+    let pause = std::env::var("LAYER_FS_CLI_MNT_R4_PAUSE").unwrap_or_else(|_| "3000".to_owned());
+    let child = MountChild(
+        Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("mount")
+            .arg(&mount_point)
+            .arg("--workspace")
+            .arg("main")
+            .env(
+                "WCAS_CLI_PAUSE_AT",
+                format!("restore-after-quiesce={pause}"),
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mount"),
+    );
+    let root = PathBuf::from("H:\\");
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(15) && std::fs::metadata(&root).is_err() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        std::fs::metadata(&root).is_ok(),
+        "cell R4: the mount must serve"
+    );
+
+    let f = root.join("f");
+    let g = root.join("g");
+    std::fs::write(&f, b"1").expect("write f=1");
+    let (ok, out, err) = cli(&store, &mount_point, &["commit", "-m", "c1"]);
+    assert!(ok, "cell R4: commit c1: {out}{err}");
+    let c1 = out
+        .trim()
+        .strip_prefix("commit ")
+        .unwrap_or_default()
+        .to_owned();
+    std::fs::write(&f, b"2").expect("write f=2");
+    std::fs::write(&g, b"only in c2").expect("write g");
+    let (ok, out, err) = cli(&store, &mount_point, &["commit", "-m", "c2"]);
+    assert!(ok, "cell R4: commit c2: {out}{err}");
+
+    // Start the restore and let it reach the pause; then open `/g` from another thread.
+    let restore = {
+        let store = store.clone();
+        let mount_point = mount_point.clone();
+        let c1 = c1.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let (ok, out, err) = cli(&store, &mount_point, &["restore", &c1]);
+            (ok, out, err, started.elapsed())
+        })
+    };
+    std::thread::sleep(Duration::from_millis(700));
+    let opener = std::thread::spawn(move || {
+        let started = Instant::now();
+        let outcome = std::fs::read_to_string(&g);
+        (outcome, started.elapsed())
+    });
+
+    let (restore_ok, out, err, restore_waited) = restore.join().expect("the restore finishes");
+    let (outcome, open_waited) = opener.join().expect("the opener finishes");
+    println!(
+        "R4 reading: restore ok={restore_ok} waited={restore_waited:?} ; open waited={open_waited:?} outcome={outcome:?}"
+    );
+    assert!(restore_ok, "cell R4: the restore must succeed: {out}{err}");
+    assert!(
+        outcome.is_err(),
+        "cell R4: `/g` exists only in c2 — an open that met the new view must not find it, got {outcome:?}"
+    );
+    // **It waited**: the open was parked while the restore was parked, and the restore itself had to wait out the pause.
+    assert!(
+        open_waited >= Duration::from_millis(1000),
+        "cell R4: the open must wait for the restore to finish, waited only {open_waited:?}"
+    );
+
+    drop(child);
+    let _ = std::fs::remove_dir_all(&store);
+}

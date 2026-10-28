@@ -184,6 +184,28 @@ pub fn dirs_invalidated(dirs: usize) -> String {
     };
     format!("{handles} (a shell's cwd or an Explorer window) now point at the old view; run `cd .` in them to refresh")
 }
+/// Holds the calling thread at a **named** point for a moment, when a criterion asks for it (`WCAS_CLI_PAUSE_AT=<point>=<ms>`).
+///
+/// Not a crash point (that is `WCAS_WORKSPACE_CRASH_AT`, which tests recovery): a pause tests **ordering** — that something which arrives while the mount is
+/// half-way through a change waits for the change rather than racing it. Off unless the variable names this exact point, so production never sleeps.
+///
+/// The variable form is `<point>=<milliseconds>`, and several points can be listed with commas; a bare `<point>` means 1000 ms.
+pub fn pause_point(point: &str) {
+    let Some(spec) = std::env::var_os("WCAS_CLI_PAUSE_AT") else {
+        return;
+    };
+    let spec = spec.to_string_lossy().into_owned();
+    for entry in spec.split(',') {
+        let (name, milliseconds) = match entry.split_once('=') {
+            Some((name, value)) => (name.trim(), value.trim().parse::<u64>().unwrap_or(1000)),
+            None => (entry.trim(), 1000),
+        };
+        if name == point {
+            std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+            return;
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::{
@@ -230,3 +252,4 @@ mod tests {
         assert_eq!(record_name(Path::new("C:\\mnt\\x")), "C_mnt_x");
     }
 }
+

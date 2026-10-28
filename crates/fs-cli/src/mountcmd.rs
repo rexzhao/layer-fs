@@ -760,6 +760,9 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                     }
                     fs_winfsp::admission::Quiesce::Quiesced(guard) => {
                         let dirs = adapter.open_handle_kinds().1;
+                        // **R4's pause point**: the gate is closed and the view has not moved yet. An open arriving now must wait for the restore, not resolve against
+                        // the view that is about to be replaced.
+                        fs_cli::pause_point("restore-after-quiesce");
                         let outcome = self.0.workspace_handle.restore(commit, discard);
                         // Released whether the restore worked or not: a guard dropped only on success would leave the mount refusing opens after a failure.
                         drop(guard);
