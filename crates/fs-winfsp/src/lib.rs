@@ -9,6 +9,7 @@
 
 pub mod abi;
 pub mod adapter;
+pub mod admission;
 pub mod boundary;
 pub mod callbacks;
 pub mod debuglog;
