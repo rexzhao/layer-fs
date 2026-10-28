@@ -428,9 +428,9 @@ impl Workspace {
         Ok(WorkspaceStatus {
             name: self.name.clone(),
             id: self.id.clone(),
-            branch: self.branch.clone(),
-            base_commit: self.base_commit.clone(),
-            base_root: self.base_root.to_string(),
+            branch: self.branch_owned(),
+            base_commit: self.base_commit_owned(),
+            base_root: self.base_root_owned().to_string(),
             dirty: self.is_dirty()?,
         })
     }
@@ -502,7 +502,7 @@ impl Workspace {
 
     /// The commit id a publication must have as its parent.
     pub(crate) fn parent_commit(&self) -> ObjectId {
-        parse_oid(&self.base_commit).expect("the stored base commit is a commit id")
+        parse_oid(&self.base_commit_owned()).expect("the stored base commit is a commit id")
     }
 
     /// Records the outcome of a publication in the main database and the handle.
