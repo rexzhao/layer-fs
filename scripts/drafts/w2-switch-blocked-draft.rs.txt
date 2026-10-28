@@ -15,8 +15,11 @@ fn mount_at_directory(label: &str) -> (PathBuf, MountChild, PathBuf, PathBuf) {
             .arg(&mount_point)
             .arg("--workspace")
             .arg("main")
+            // **The mount's own stderr, inherited**: the counters that separate "our table still holds it" from "the kernel has not delivered Close yet" are
+            // printed by the mount, and piping them would hide exactly the numbers this criterion is being debugged with.
+            .env("LAYERFS_DEBUG_SWITCH", "1")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn mount"),
     );

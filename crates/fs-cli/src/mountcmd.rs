@@ -829,7 +829,17 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                 };
                 let dirs = match quiesce {
                     fs_winfsp::admission::Quiesce::HandlesOpen { files, dirs } => {
-                        return fs_cli::pipe::Response::RestoreRefused { files, dirs }
+                        // **Three counters at the moment of the refusal** (607, the Q2 method): "a file handle is open" can mean our table still holds one, or that the
+                        // kernel has not delivered the `Close` yet. The numbers are printed from the **mount**, which is the only process that can see them.
+                        if std::env::var_os("LAYERFS_DEBUG_SWITCH").is_some() {
+                            eprintln!(
+                                "switch-refused: table={:?} open_entries={} contexts={:?}",
+                                adapter.open_handle_kinds(),
+                                fs_winfsp::callbacks::open_entry_count(),
+                                fs_winfsp::callbacks::context_counts(),
+                            );
+                        }
+                        return fs_cli::pipe::Response::RestoreRefused { files, dirs };
                     }
                     fs_winfsp::admission::Quiesce::TimedOut { in_flight } => {
                         return fs_cli::pipe::Response::Failed {
