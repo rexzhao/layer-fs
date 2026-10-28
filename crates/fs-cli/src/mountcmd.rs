@@ -833,10 +833,12 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                         // kernel has not delivered the `Close` yet. The numbers are printed from the **mount**, which is the only process that can see them.
                         if std::env::var_os("LAYERFS_DEBUG_SWITCH").is_some() {
                             eprintln!(
-                                "switch-refused: table={:?} open_entries={} contexts={:?}",
+                                "switch-refused: table={:?} open_entries={} contexts={:?} cleanup={} stale_releases={}",
                                 adapter.open_handle_kinds(),
                                 fs_winfsp::callbacks::open_entry_count(),
                                 fs_winfsp::callbacks::context_counts(),
+                                fs_winfsp::callbacks::cleanup_call_count(),
+                                fs_winfsp::callbacks::stale_release_count(),
                             );
                         }
                         return fs_cli::pipe::Response::RestoreRefused { files, dirs };
