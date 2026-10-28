@@ -286,46 +286,70 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     // remount that a `switch` needs is simply the next iteration. The FFI setup stays single-shot, which is where it belongs.
     let mut current_handle = workspace;
     let mut report;
+    // What 6b would go back to, and whether a switch is waiting for its mount to come up.
+    let mut previous_workspace = name.clone();
+    let mut previous_branch = branch_of(&repo, &name).unwrap_or_default();
+    let mut previous_handle = workspace;
+    // **Answered from inside the new mount** (S3 §5.2 step 6a): the switch is a success the moment the volume is serving, not when the loop comes back around —
+    // that would be after the *next* unmount, i.e. never for a caller waiting on the answer.
+    let pending_switch: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut injected_mount_failure = false;
     loop {
         let backend: DynOps = Box::new(ApiBackend::new(current_handle));
-        let mounted_report = mount_serving(
-            &library,
-            &mount_point,
-            backend,
-            volume(),
-            |mounted: &fs_winfsp::mounted::Mounted| {
-                // **`status.handles` reads the adapter at the moment of the ask**, so the control channel needs the adapter — not a number captured now.
-                // (Until this line runs, the channel answers 0, which is also the truth: nobody has opened a file yet.)
-                let _ = adapter_slot.set(mounted.adapter());
-                // The probe **is** the command's lifetime: everything below happens while the volume is attached.
-                let started = Instant::now();
-                let mut last_reading = Instant::now();
-                loop {
-                    // **Three ways to be asked to stop**, all answering the same way: the stop file (until the pipe replaces it), the record disappearing, and a
-                    // console control event. Ctrl-C lands here as an **orderly unmount** rather than a kill, which is the whole point of the handler.
-                    // **Two ways to be asked to stop**, both answering the same way: the control pipe (through `request_stop`) and a console control event. The
-                    // stop **file** is gone — A15s asserts that writing one no longer stops a mount, because a signal nobody can see the receipt of was the thing
-                    // being replaced.
-                    if stop_requested() {
-                        // **A console stop does not wait for handles** (ADR-010 §7.2): the user in front of the window asked for it, so the mount unmounts and the
-                        // handles die — but it says how many, because "my editor lost the file" is much easier to understand with a number attached.
-                        let open = adapter_slot
-                            .get()
-                            .map_or(0, |adapter| adapter.open_handles());
-                        if open > 0 {
-                            println!("{open} open handle(s) will be invalidated");
-                        }
-                        println!("unmount requested after {:?}", started.elapsed());
-                        break;
-                    }
-                    // **A timer reading, not an on-demand one** (`LAYERFS_DEBUG_HANDLES=1`): asking over the pipe adds handles by itself, so the only way to see
-                    // whether the table decays **without** new commands is to print from the mount on its own clock.
-                    if std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some()
-                        && started.elapsed().as_secs() % 5 == 0
-                        && last_reading.elapsed().as_secs() >= 5
+        // **W6's injection**: one failed mount, then the flag clears so the rollback can mount normally.
+        let injected = std::mem::replace(&mut injected_mount_failure, false);
+        let mounted_report = if injected {
+            Err(fs_winfsp::loader::LoadError::NotFound {
+                path: mount_point.clone(),
+            })
+        } else {
+            mount_serving(
+                &library,
+                &mount_point,
+                backend,
+                volume(),
+                |mounted: &fs_winfsp::mounted::Mounted| {
+                    // **`status.handles` reads the adapter at the moment of the ask**, so the control channel needs the adapter — not a number captured now.
+                    // (Until this line runs, the channel answers 0, which is also the truth: nobody has opened a file yet.)
+                    let _ = adapter_slot.set(mounted.adapter());
+                    // The volume is up: the switch this iteration was for has succeeded.
+                    if let Some(done) = pending_switch
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
                     {
-                        last_reading = Instant::now();
-                        eprintln!(
+                        publish_switch(Ok(done));
+                    }
+                    // The probe **is** the command's lifetime: everything below happens while the volume is attached.
+                    let started = Instant::now();
+                    let mut last_reading = Instant::now();
+                    loop {
+                        // **Three ways to be asked to stop**, all answering the same way: the stop file (until the pipe replaces it), the record disappearing, and a
+                        // console control event. Ctrl-C lands here as an **orderly unmount** rather than a kill, which is the whole point of the handler.
+                        // **Two ways to be asked to stop**, both answering the same way: the control pipe (through `request_stop`) and a console control event. The
+                        // stop **file** is gone — A15s asserts that writing one no longer stops a mount, because a signal nobody can see the receipt of was the thing
+                        // being replaced.
+                        if stop_requested() {
+                            // **A console stop does not wait for handles** (ADR-010 §7.2): the user in front of the window asked for it, so the mount unmounts and the
+                            // handles die — but it says how many, because "my editor lost the file" is much easier to understand with a number attached.
+                            let open = adapter_slot
+                                .get()
+                                .map_or(0, |adapter| adapter.open_handles());
+                            if open > 0 {
+                                println!("{open} open handle(s) will be invalidated");
+                            }
+                            println!("unmount requested after {:?}", started.elapsed());
+                            break;
+                        }
+                        // **A timer reading, not an on-demand one** (`LAYERFS_DEBUG_HANDLES=1`): asking over the pipe adds handles by itself, so the only way to see
+                        // whether the table decays **without** new commands is to print from the mount on its own clock.
+                        if std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some()
+                            && started.elapsed().as_secs() % 5 == 0
+                            && last_reading.elapsed().as_secs() >= 5
+                        {
+                            last_reading = Instant::now();
+                            eprintln!(
                             "timer: elapsed={:?} table={:?} contexts={:?} cleanup={} stale={} acq_rel={:?} live_refs={}",
                             started.elapsed(),
                             adapter_slot
@@ -337,18 +361,63 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                             fs_winfsp::callbacks::acquire_release_counts(),
                             fs_winfsp::callbacks::live_reference_count(),
                         );
-                        // **The whole table, when it is small enough to read**: nine entries with `refs=0` and nine with one reference are different defects.
-                        let table = fs_winfsp::callbacks::context_table();
-                        if table.len() <= 20 {
-                            eprintln!("timer: table-ids={table:?}");
+                            // **The whole table, when it is small enough to read**: nine entries with `refs=0` and nine with one reference are different defects.
+                            let table = fs_winfsp::callbacks::context_table();
+                            if table.len() <= 20 {
+                                eprintln!("timer: table-ids={table:?}");
+                            }
                         }
+                        std::thread::sleep(POLL);
                     }
-                    std::thread::sleep(POLL);
-                }
-                Ok(())
-            },
-        );
+                    Ok(())
+                },
+            )
+        };
         report = mounted_report;
+        // **A switch is answered only once the new mount is serving** (S3 §5.2, step 6). Publishing `Switched` before the remount would tell the caller it worked
+        // while the volume was in fact gone — the exact failure W6 injects.
+        if let Some(pending) = pending_switch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            {
+                // Reaching here means the iteration never got as far as publishing it: the mount it was for did not come up. 6b.
+                // **6b**: the new mount did not come up. Put the record and the serving view back to what they were, remount it, and answer only then — with a
+                // failure, never a success followed by silence.
+                let why = match &report {
+                    Ok(report) => format!(
+                        "the volume for {} never looked mounted (create={:#010X} mount={:#010X})",
+                        pending.0, report.create, report.mount
+                    ),
+                    Err(error) => format!("the mount for {} failed: {error:?}", pending.0),
+                };
+                let text = switched_record(
+                    &canonical(&store),
+                    &canonical(&mount_point),
+                    &previous_workspace,
+                    &previous_branch,
+                    &pipe,
+                );
+                let _ = fs_cli::rewrite_record(&mut record_handle, &text);
+                {
+                    let mut current = pipe_serving
+                        .current
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *current = Current {
+                        workspace: previous_workspace.clone(),
+                        branch: previous_branch.clone(),
+                        handle: previous_handle,
+                    };
+                }
+                current_handle = previous_handle;
+                STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+                publish_switch(Err(("remount-failed".to_owned(), why)));
+                // The rollback mount is the next iteration: the loop must not exit with the volume down.
+                continue;
+            }
+        }
         // **Nothing to switch? Then this was a stop.**
         let Some(next) = take_switch_target() else {
             break;
@@ -378,6 +447,10 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                         .current
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // What 6b would go back to.
+                    previous_workspace = current.workspace.clone();
+                    previous_branch = current.branch.clone();
+                    previous_handle = current.handle;
                     *current = Current {
                         workspace: next.clone(),
                         branch: next_branch.clone(),
@@ -387,12 +460,17 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                 current_handle = next_handle;
                 // The stop flag was set by the switch request; clearing it is what lets the **new** serve loop run.
                 STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-                publish_switch(Ok((next, next_branch)));
+                *pending_switch
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((next, next_branch));
+                // **W6's injection** (`WCAS_CLI_FAIL_AT=switch-mount-new`): the *next* mount is made to fail, which is the only way to exercise 6b.
+                if std::env::var_os("WCAS_CLI_FAIL_AT")
+                    .is_some_and(|value| value.to_string_lossy().contains("switch-mount-new"))
+                {
+                    injected_mount_failure = true;
+                }
             }
             Err(error) => {
-                // **6b**: the new workspace could not be opened, so this iteration ends and the loop remounts the **old** one. The client is told the truth
-                // *after* the rollback is on its way, not instead of it.
-                // **The kind is classified where the error type still exists**: a workspace another process holds is "in use" (exit 4), a missing one is
                 // "not found" (3), anything else is a remount failure (1). One string for all three is what made the local and pipe paths disagree before (R5).
                 // **The kind is classified where the error type still exists** (S3 W3): a workspace another process holds is "busy" (exit 4). The overlay lock
                 // surfaces as `StoreInUse`, but the same situation can surface from the store's own connection as "database is locked" — to the user those are

@@ -1020,3 +1020,123 @@ fn an_open_during_a_closing_switch_fails_instead_of_waiting() {
     let _ = child.0.wait();
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// **W6** — when the new mount cannot come up, the switch **rolls back**: exit 1, the old workspace is serving again, and its content is still there.
+///
+/// The failure is injected (`WCAS_CLI_FAIL_AT=switch-mount-new`), because there is no honest way to make WinFsp refuse one mount and accept the next.
+#[test]
+fn a_failed_remount_rolls_back_and_says_so() {
+    common::strict_gate();
+    let store = temp_dir("switch-rollback");
+    Command::new(binary())
+        .arg("init")
+        .arg(&store)
+        .output()
+        .expect("init");
+    Command::new(binary())
+        .arg("--store")
+        .arg(&store)
+        .args(["branch", "feat", "--from", "main"])
+        .output()
+        .expect("branch feat");
+    let (created, out, err) = cli_code(&store, &store, &["checkout", "feat"]);
+    assert_eq!(
+        created, 0,
+        "cell setup: the feat workspace row must exist: {out}{err}"
+    );
+
+    let mount_point = store.join("mnt");
+    let mut child = MountChild(
+        Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("mount")
+            .arg(&mount_point)
+            .arg("--workspace")
+            .arg("main")
+            .env("WCAS_CLI_FAIL_AT", "switch-mount-new")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mount"),
+    );
+    let record = fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&mount_point)));
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(15)
+        && !std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .contains("pipe=")
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let file = mount_point.join("f.txt");
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match std::fs::write(&file, b"still here") {
+            Ok(()) => break,
+            Err(_) if attempt < 50 => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => panic!("cell setup: write through the mount failed: {error:?}"),
+        }
+    }
+
+    let (code, out, err) = cli_code(&store, &mount_point, &["checkout", "feat"]);
+    println!(
+        "W6 reading: code={code} stdout={:?} stderr={:?}",
+        out.trim(),
+        err.trim()
+    );
+    assert_eq!(
+        code, 1,
+        "cell W6: a failed remount is not a success, got {code}: {out}{err}"
+    );
+    assert!(
+        err.contains("remount") || err.contains("mount"),
+        "cell W6: the refusal says what failed, got {err:?}"
+    );
+
+    // **Rolled back**: the mount is there again and still serves `main` with its content.
+    // The rollback mount is the loop's next iteration, so it is not instant: poll with a bound. A rollback that never comes back is a failure, and the retry must not
+    // hide it — the message at the end says how long it waited.
+    let wait_started = Instant::now();
+    let mut last_error = String::new();
+    let status = loop {
+        let attempt = std::process::Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("status")
+            .current_dir(&mount_point)
+            .output();
+        if let Ok(output) = &attempt {
+            if output.status.success() {
+                break Ok(output.stdout.clone());
+            }
+            last_error = String::from_utf8_lossy(&output.stderr).into_owned();
+        } else if let Err(error) = &attempt {
+            last_error = error.to_string();
+        }
+        if wait_started.elapsed() > Duration::from_secs(15) {
+            break Err(last_error);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let status = status.map(|stdout| String::from_utf8_lossy(&stdout).into_owned());
+    match status {
+        Ok(text) => {
+            println!("W6 reading: status after the rollback -> {text}");
+            assert!(
+                text.contains("workspace: main"),
+                "cell W6: the rollback must serve main again, got {text:?}"
+            );
+        }
+        Err(error) => panic!("cell W6: the mount must be serving again: {error:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&file).expect("the content survived the rollback"),
+        b"still here",
+        "cell W6: what was written before the switch is still there"
+    );
+    let _ = child.0.kill();
+    let _ = child.0.wait();
+    let _ = std::fs::remove_dir_all(&store);
+}
