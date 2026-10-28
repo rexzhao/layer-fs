@@ -210,7 +210,7 @@ CLI 从挂载记录得到挂载点 `M.mount_point` 与管道名 `M.pipe`。
 5. 写记录并**持有其句柄**（§9.2）；挂载；前台阻塞；
 6. 停止条件：管道 `unmount` 请求、**Ctrl-C / Ctrl-Break / 控制台关闭**（`SetConsoleCtrlHandler`；现状无处理，Ctrl-C 直接结束进程 ≈ M7 的残留形态）、
    `switch` 请求（停止后用新 workspace 重挂，§7.3）——三者都只是往主线程的 channel 发一条消息（§10.5）；
-7. 停止序列：`flush`（W3/W4：使挂载期全部写入持久）→ 卸载 → 关闭并删除记录。第二次 Ctrl-C（5 s 内）= 立即退出，
+7. 停止序列：**卸载 → `flush` → 关闭并删除记录**（W3/W4：卸载后不再有回调，此时的 flush 覆盖挂载期全部写入；先 flush 再卸载会漏掉两者之间到达的写——S1 卡 §5.1 修订）。第二次 Ctrl-C（5 s 内）= 立即退出，
    打印"未 flush 的写入可能丢失（最后一次 flush 之前的都在）"。
    - `CTRL_CLOSE_EVENT` 系统只给约 5 s：flush 是一次 `synchronous=FULL` 提交，正常远小于此；**未验证**大 overlay 下的上界。
 
@@ -221,10 +221,11 @@ CLI 从挂载记录得到挂载点 `M.mount_point` 与管道名 `M.pipe`。
 | 情形 | 行为 |
 | --- | --- |
 | 正常 | 管道 `unmount{wait_ms: UNMOUNT_WAIT}`（10 s，`mountcmd.rs:28` 的常量保留为唯一来源）⇒ 挂载进程 flush、卸载、删记录后回 `ok` ⇒ "unmounted" |
-| 超时（通常是有打开句柄，M5） | 回 `Timeout{handles}`；CLI 报"未在 10 s 内卸载，N 个打开的句柄"，**不改任何状态**（关闭 B-26 的"持有者打印"一半：给出数量，不给进程名——WinFsp 用户态拿不到打开者进程） |
+| 有打开句柄（M5） | 挂载进程最多等 `wait_ms` 让句柄归零；仍不为零 ⇒ 回 `HandlesOpen{handles}`，**不发停止**；CLI 报"未在 10 s 内卸载，N 个打开的句柄"，**不改任何状态**（关闭 B-26 的"持有者打印"一半：给出数量，不给进程名——WinFsp 用户态拿不到打开者进程） |
 | 管道连不上，记录判活为陈旧 | "挂载进程已不在；`umount <mp> --force` 清理记录" |
 | `--force` | 只删陈旧记录，并如实说明"卷可能仍挂着，结束挂载进程"（WinFsp 句柄在对方进程里——`mountcmd.rs:1-12` 的诚实原则保留）；记录判活为**活**时 `--force` 拒绝（不删活记录） |
 | 无参数且 cwd 在挂载内 | 卸载该挂载（显式参数优先） |
+| 控制台 Ctrl-C / Break / 关闭 | **不看句柄**，照常卸载并打印"N 个打开的句柄将失效"：用户在挂载窗口前明确要求停止；远程 `umount` 的发起方未必知道有文件开着，所以它拒绝（S1 卡 §5.3） |
 
 ### 7.3 checkout 与挂载（C10）
 
@@ -297,7 +298,8 @@ CLI 从挂载记录得到挂载点 `M.mount_point` 与管道名 `M.pipe`。
 
 ### 9.2 存活证明：挂载进程持有的句柄
 
-- 挂载进程以 `FILE_SHARE_READ`（**不给** `FILE_SHARE_WRITE | FILE_SHARE_DELETE`）打开自己的记录文件并持有到退出。
+- 挂载进程以 `FILE_SHARE_READ | FILE_SHARE_DELETE`（**不给** `FILE_SHARE_WRITE`）加 `FILE_FLAG_DELETE_ON_CLOSE` 打开自己的记录文件并持有到退出。
+  `DELETE_ON_CLOSE`：进程无论怎么结束（含 `taskkill /F`），内核关句柄时删除文件——陈旧记录只剩断电/蓝屏一种来源；`FILE_SHARE_DELETE`：读者打开带 delete-on-close 持有者的文件时必须声明 delete 共享，持有者须允许（S1 卡 §2.1 修订；初稿只给 READ，读者打不开）。
 - 读者：能读内容；判活 = 尝试以写权限打开——**共享冲突 ⇒ 活**，成功 ⇒ 陈旧（持有者已死，内核在进程结束时必关句柄，
   `taskkill /F` 也一样）。比 `pid` 校验强：不受 pid 复用影响，不需要比对进程启动时间。
 - 陈旧记录由**下一个读者**清理（能以写权限打开即可删除），并在 stderr 说明；`umount --force` 仍保留作显式清理。
@@ -369,7 +371,7 @@ pub fn rebind(&self, branch: &str) -> …
 | `commit` | `{message, force}` | `{commit, root}` | — |
 | `restore` | `{commit, discard}` | `{}` | `HandlesOpen{handles}` |
 | `switch` | `{workspace}` | `{workspace, branch}` | `HandlesOpen{handles}`；`WorkspaceInUse`（已挂回原 workspace） |
-| `unmount` | `{wait_ms}` | `{}`（响应在卸载与删记录**之后**才发） | `Timeout{handles}` |
+| `unmount` | `{wait_ms}` | `{}`（响应在卸载、flush 与删记录**之后**才发） | `HandlesOpen{handles}`（等满 `wait_ms` 句柄仍不为零；未发停止，状态不变） |
 
 通用代理错误：`ProtocolVersion{supported}`、`FrameTooLarge`、`BadRequest{detail}`、`ShuttingDown`（停止序列已开始后到达的请求）。
 核心错误照传，例：`{"kind":"BranchMoved","branch":"dev","expected":"…","actual":"…"}`、`{"kind":"NothingToCommit"}`。
@@ -453,7 +455,7 @@ pub fn rebind(&self, branch: &str) -> …
 | 管道服务（`hello/status/unmount`）与客户端；管道线程 + channel | §10 | S1 |
 | `fs-workspace::Workspace` 发布锁、`BaseState`、`commit/snapshot/restore/rebind(&self)`；`fs-api` 同步 | §10.3 | S2 |
 | 管道 `commit/snapshot` | §10.4 | S2 |
-| 适配器暴露打开句柄数（注册表计数） | `status.handles`、`unmount` 的 `Timeout{handles}` 用 | S1 |
+| 适配器暴露打开句柄数（注册表计数） | `status.handles`、`unmount` 的 `HandlesOpen{handles}` 用 | S1 |
 | 管道 `restore/switch` | §6.2、§7.3 | S3 |
 | ADR-006 §13 CLI 段 | 标"已由 ADR-010 取代" | 本 ADR 合入时（已在本分支） |
 | ADR-006 §13 的 `ls|get|stat --at <commit|root>`（I1 验收入口） | 已随 D7 去掉；I1 的验收由 fs-api 层的 `ReadView` 测试承担（不经 CLI） | 本 ADR 合入时记录 |
@@ -512,7 +514,7 @@ pub fn rebind(&self, branch: &str) -> …
 | A8 | §6 表每一行至少一条命令的用例 | 任一类别常量改错 |
 | A10 | Ctrl-C 后：卷卸载、记录删除、Ctrl-C 前的写入在重新挂载后可读 | 去掉控制台处理器（退化为 M7 残留） |
 | A11 | 管道：`hello` 返回与记录一致；`v:2` 请求 ⇒ `ProtocolVersion`；超限帧 ⇒ `FrameTooLarge` 且服务端继续服务下一个请求；`unmount` 的响应在记录删除之后到达 | 响应提前发送；或帧错误后不再 accept |
-| A12 | 有打开句柄时 `umount` ⇒ `Timeout{handles≥1}`，卷仍挂、记录仍在；关闭句柄后再 `umount` 成功 | 超时后仍删记录 |
+| A12 | 有打开句柄时 `umount` ⇒ `HandlesOpen{handles≥1}`，卷仍挂、记录仍在；关闭句柄后再 `umount` 成功（细化见 S1 卡 §5.4） | 超时后仍发停止 |
 | A14 | `status` 经管道：挂载中写一个文件后 `status.dirty = true`、`handles` 与实际一致 | — （读值核对，三态带红值） |
 
 ### S2（依赖 S1；改核心 API）
@@ -585,3 +587,4 @@ D7 的后果（记录，不另需裁决）：CLI 不再能读历史文件。需�
   线程结构 C11（选 B）、句柄语义 §10.6；分期改为 S0–S3（管道骨架在 S1），判据 A4–A22。
 - 2026-10-26 按 owner 裁决 D7 修订：**去掉全部文件级命令**（C0）；§5 收为"只剩宿主路径"，初稿的 `//path`/相对路径/双拼写问题整类消失；
   §6.1 改为"文件操作不在 CLI 里"；管道 op 去掉 `flush`（7 个，无文件 op）；S0 增 A0c 与逐用例的测试处置表，删 A9、A13a；新增 D7。
+- 2026-10-28 随 S1 卡（`docs/process/adr010-s1-card.md`）澄清：停止顺序改为"卸载 → flush → 删记录"（§7.1）；远程 umount 有句柄时 `HandlesOpen` 且不改状态、控制台停止不看句柄（§7.2）；记录以 `DELETE_ON_CLOSE` + `READ|DELETE` 共享打开（§9.2）；`unmount` 错误统一名为 `HandlesOpen`（§10.4）。判据影响：无（澄清）。
