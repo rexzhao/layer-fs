@@ -85,8 +85,13 @@ pub enum Response {
     },
     /// The operation itself failed.
     Failed {
+        /// **Which kind of failure** — a script can branch on this, where a message can only be read (ADR-010 §10.4).
+        kind: String,
         /// Message for the human on the other end.
         detail: String,
+        /// Structured fields, so the caller does not have to parse `detail` for the one value it needs.
+        #[serde(default)]
+        fields: serde_json::Value,
     },
 }
 
@@ -96,6 +101,13 @@ pub trait Context {
     fn hello(&self) -> Response;
     /// The workspace's current state, for `status`.
     fn status(&self) -> Response;
+    /// Publishes the workspace, for `commit`.
+    ///
+    /// The server calls this **outside** the pipe's own bookkeeping: a commit can take as long as the tree is big, and the answer has to be the publish's own
+    /// outcome (`BranchMoved`, `NothingToCommit`) rather than a generic failure.
+    fn commit(&self, message: &str, force: bool) -> Response;
+    /// Takes a snapshot, for `snapshot`.
+    fn snapshot(&self) -> Response;
     /// Whether the stop sequence has begun.
     fn shutting_down(&self) -> bool;
 }
@@ -129,6 +141,20 @@ pub fn dispatch(frame: &[u8], context: &impl Context) -> Response {
     match request.op.as_str() {
         "hello" => context.hello(),
         "status" => context.status(),
+        "commit" => {
+            let message = request
+                .args
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let force = request
+                .args
+                .get("force")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            context.commit(message, force)
+        }
+        "snapshot" => context.snapshot(),
         // `unmount` is answered by the server loop itself (it has to stop the mount), so reaching here means the loop forgot to intercept it.
         "unmount" => Response::BadRequest {
             detail: "unmount is handled by the server, not the dispatcher".to_owned(),
@@ -178,6 +204,23 @@ mod tests {
                 base_commit: "00".to_owned(),
                 dirty: false,
                 handles: 0,
+            }
+        }
+
+        fn commit(&self, message: &str, force: bool) -> Response {
+            // The fake answers **something identifiable**, so a dispatch test can tell "routed to commit" from "fell through to an error".
+            Response::Failed {
+                kind: "committed".to_owned(),
+                detail: format!("{message}|{force}"),
+                fields: serde_json::json!({}),
+            }
+        }
+
+        fn snapshot(&self) -> Response {
+            Response::Failed {
+                kind: "snapshotted".to_owned(),
+                detail: String::new(),
+                fields: serde_json::json!({}),
             }
         }
 
@@ -237,6 +280,48 @@ mod tests {
             ),
             Response::Status { .. }
         ));
+    }
+
+    /// **P1**: `commit` and `snapshot` are routed to the context — and the routing is **not** a fall-through.
+    ///
+    /// The fake answers with an identifiable `kind`, so "the dispatcher sent it to `commit`" is a fact about this function rather than a guess from a message.
+    /// A dispatcher that quietly answered `BadRequest` would make every client look like it had sent the wrong op.
+    #[test]
+    fn commit_and_snapshot_are_routed() {
+        let context = Fake {
+            shutting_down: false,
+        };
+        match dispatch(
+            &frame_of(
+                serde_json::json!({"v": 1, "op": "commit", "args": {"message": "m", "force": true}}),
+            ),
+            &context,
+        ) {
+            Response::Failed { kind, detail, .. } => {
+                assert_eq!(kind, "committed", "cell P1: routed to commit");
+                assert_eq!(detail, "m|true", "cell P1: message and force arrive");
+            }
+            other => panic!("cell P1: expected the commit route, got {other:?}"),
+        }
+        match dispatch(
+            &frame_of(serde_json::json!({"v": 1, "op": "snapshot"})),
+            &context,
+        ) {
+            Response::Failed { kind, .. } => {
+                assert_eq!(kind, "snapshotted", "cell P1: routed to snapshot")
+            }
+            other => panic!("cell P1: expected the snapshot route, got {other:?}"),
+        }
+        // The default message is empty, not an error: `commit` without a message is a caller's choice, and the CLI passes one.
+        match dispatch(
+            &frame_of(serde_json::json!({"v": 1, "op": "commit"})),
+            &context,
+        ) {
+            Response::Failed { detail, .. } => {
+                assert_eq!(detail, "|false", "cell P1: absent args default")
+            }
+            other => panic!("cell P1: got {other:?}"),
+        }
     }
 
     /// **A11c**: once the stop sequence has begun, every op answers `ShuttingDown` — including the ones that would otherwise work.

@@ -675,7 +675,43 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                             .map_or(0, |adapter| adapter.open_handles()),
                     },
                     Err(error) => fs_cli::pipe::Response::Failed {
+                        kind: "status".to_owned(),
                         detail: error.to_string(),
+                        fields: serde_json::json!({}),
+                    },
+                }
+            }
+
+            fn commit(&self, message: &str, force: bool) -> fs_cli::pipe::Response {
+                // **The mount's own workspace publishes**, so the commit goes through the same gate the filesystem does — not through a second handle that would
+                // bypass it (that is what G5 is about, in the CLI's own layer).
+                match self.0.workspace_handle.commit(message, force) {
+                    Ok(outcome) => fs_cli::pipe::Response::Failed {
+                        // Success is reported through the same shape with `kind: "committed"`, because the protocol's success variants are per-operation and
+                        // the caller distinguishes them by kind — one place to look, one place to branch.
+                        kind: "committed".to_owned(),
+                        detail: outcome.commit.clone().unwrap_or_default(),
+                        fields: serde_json::json!({"commit": outcome.commit, "root": outcome.root}),
+                    },
+                    Err(error) => fs_cli::pipe::Response::Failed {
+                        kind: "commit".to_owned(),
+                        detail: error.to_string(),
+                        fields: serde_json::json!({}),
+                    },
+                }
+            }
+
+            fn snapshot(&self) -> fs_cli::pipe::Response {
+                match self.0.workspace_handle.snapshot() {
+                    Ok(outcome) => fs_cli::pipe::Response::Failed {
+                        kind: "snapshotted".to_owned(),
+                        detail: outcome.commit.clone().unwrap_or_default(),
+                        fields: serde_json::json!({"root": outcome.root}),
+                    },
+                    Err(error) => fs_cli::pipe::Response::Failed {
+                        kind: "snapshot".to_owned(),
+                        detail: error.to_string(),
+                        fields: serde_json::json!({}),
                     },
                 }
             }
