@@ -326,7 +326,7 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                     {
                         last_reading = Instant::now();
                         eprintln!(
-                            "timer: elapsed={:?} table={:?} contexts={:?} cleanup={} stale={}",
+                            "timer: elapsed={:?} table={:?} contexts={:?} cleanup={} stale={} acq_rel={:?} live_refs={}",
                             started.elapsed(),
                             adapter_slot
                                 .get()
@@ -334,6 +334,8 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                             fs_winfsp::callbacks::context_counts(),
                             fs_winfsp::callbacks::cleanup_call_count(),
                             fs_winfsp::callbacks::stale_release_count(),
+                            fs_winfsp::callbacks::acquire_release_counts(),
+                            fs_winfsp::callbacks::live_reference_count(),
                         );
                     }
                     std::thread::sleep(POLL);

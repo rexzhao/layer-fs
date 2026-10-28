@@ -521,6 +521,33 @@ static CONTEXT_BY_FILE: std::sync::Mutex<Option<std::collections::BTreeMap<u64, 
 /// The next id to hand out. Never reused, so a stale id can never be mistaken for a fresh one.
 static NEXT_CONTEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// How many acquisitions were made (a fresh context or a `refs + 1`), next to how many releases happened.
+///
+/// `acquires - releases` is the number of live references the table should be carrying; comparing it with the sum of `refs` inside the table says whether the
+/// accounting is self-consistent (then the bug is *who* acquired) or whether an acquisition never reached the table at all.
+static ACQUIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `(acquires, releases)` since process start.
+#[must_use]
+pub fn acquire_release_counts() -> (usize, usize) {
+    (
+        ACQUIRES.load(std::sync::atomic::Ordering::Relaxed),
+        CONTEXTS_FREED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// How many live references the table currently carries (the sum of every `refs`).
+#[must_use]
+pub fn live_reference_count() -> usize {
+    CONTEXTS
+        .lock()
+        .expect("contexts")
+        .get_or_insert_with(std::collections::BTreeMap::new)
+        .values()
+        .map(|shared| shared.refs)
+        .sum()
+}
+
 /// How many releases arrived for an id that was never handed out.
 ///
 /// This is the class the old witness could not name: the FSD does close context slots that were never ours (17 of them in one mounted run),
@@ -535,6 +562,7 @@ pub fn stale_release_count() -> usize {
 
 /// Stores a context and returns the id the OS will carry for it.
 fn register_context(entry: EntryContext) -> u64 {
+    ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let id = NEXT_CONTEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     CONTEXTS
         .lock()
@@ -568,6 +596,16 @@ fn acquire_context(entry: EntryContext) -> u64 {
     match table.get_mut(&id) {
         Some(shared) => {
             shared.refs += 1;
+            ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some()
+                && ACQUIRES.load(std::sync::atomic::Ordering::Relaxed) <= 40
+            {
+                // **Which caller acquires twice** can only be seen with the id and the file id side by side.
+                eprintln!(
+                    "acquire: id={id} file_id={} refs={}",
+                    entry.file_id, shared.refs
+                );
+            }
             id
         }
         // The index pointed at a context that is gone: fall back to a fresh one rather than inventing a live entry.
