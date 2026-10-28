@@ -44,8 +44,8 @@ fs-cli [--store <dir>] <command> [args]
   verify [--deep]                 check objects and references
   stats                           object and repository counts
   gc [--dry-run]                  collect unreachable objects (offline: refuses while a writer holds the store)
-  mount <store> <mount_point> [--workspace <name>] [--no-version-gate]
-                                  serve a workspace over WinFsp until `umount` asks it to stop
+  mount <mount_point> [--workspace <name>] [--no-version-gate]
+                                  serve a workspace over WinFsp until `umount` asks it to stop (store from --store)
   umount <mount_point> [--force]  ask a running mount to unmount (--force clears a stale record too)
   list                            the mounts recorded in %TEMP%/layerfs-mounts
   version                         the WinFsp DLL's version versus the layout this build was measured on
@@ -77,7 +77,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_or_else(|| store.clone(), PathBuf::from);
         let repo = Repo::create(&path)?;
         let head = repo.branch_head("main")?;
-        println!("initialised {} (main = {})", path.display(), short(&head));
+        // **`init` leaves the repository usable**, not merely created: a fresh store with no workspace makes the very next `put`/`ls` fail with
+        // "no current workspace", which is a step the user cannot see a reason for. Creating `main` and recording it is the same thing `checkout
+        // main` does, done once at the moment it is obviously wanted.
+        let workspace = std::sync::Arc::new(repo).workspace_create("main", "main")?;
+        let name = workspace.name().to_owned();
+        workspace.close()?;
+        write_current(&path, &name)?;
+        println!(
+            "initialised {} (main = {}, workspace {name})",
+            path.display(),
+            short(&head)
+        );
         return Ok(());
     }
 
@@ -90,7 +101,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The interactive entry points run **before** a `Repo` is opened: `mount` opens its own (it needs an `Arc` for the workspace), and
     // `list`/`umount`/`version` need no store at all — opening one first made them fail on a directory that is not a repository.
     match command.as_str() {
-        "mount" => return mountcmd::mount(&arguments),
+        "mount" => return mountcmd::mount(&store, &arguments),
         "umount" => return mountcmd::umount(&arguments),
         "list" => return mountcmd::list(),
         "version" => return mountcmd::version(),

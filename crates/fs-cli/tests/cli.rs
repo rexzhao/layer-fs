@@ -185,6 +185,15 @@ fn failures_are_reported() {
     let root = TempRoot::new("failures");
     root.init();
 
+    // **Inverted (538).** This used to assert that `ls` failed right after `init` — true while `init` left a store with no workspace, and the reason
+    // `put`/`ls` needed a `checkout` first. `init` now creates `main` and records it, so the useful assertions are: `ls` works and is empty, and the
+    // "no current workspace" message still exists when there genuinely is none (the record is what is removed here).
+    assert!(
+        root.ok(&["ls"]).trim().is_empty(),
+        "cell init: a fresh repository lists nothing, and does not need a checkout"
+    );
+    std::fs::remove_file(root.store().join("cli").join("current"))
+        .expect("drop the current record");
     assert!(root.fails(&["ls"]).contains("no current workspace"));
     root.ok(&["checkout", "main"]);
 

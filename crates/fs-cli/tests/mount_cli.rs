@@ -29,6 +29,20 @@ fn mount_point() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("U:"))
 }
 
+/// A spawned mount that is **killed on drop**.
+///
+/// Not tidiness: a failed test that leaves a `layerfs mount` alive keeps the volume attached *and* keeps the inherited pipes open, so the shell that
+/// ran the suite waits for a process it never started (observed: a test run that never returned). Both ends of the pipe are piped here for the same
+/// reason — nothing the child prints may hold the parent's pipe open.
+struct MountChild(Child);
+
+impl Drop for MountChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn root_of(mount_point: &Path) -> PathBuf {
     if mount_point.to_string_lossy().ends_with(':') {
         PathBuf::from(format!("{}\\", mount_point.display()))
@@ -77,18 +91,36 @@ fn mount_write_unmount_through_the_cli() {
         mount_point.display()
     );
 
-    let child: Child = Command::new(binary())
-        .arg("mount")
-        .arg(&store)
-        .arg(&mount_point)
-        .arg("--workspace")
-        .arg("main")
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn mount");
+    let mut child = MountChild(
+        Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("mount")
+            .arg(&mount_point)
+            .arg("--workspace")
+            .arg("main")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mount"),
+    );
 
-    // The volume is served once the OS can write through it — the same question the mount's own probe asks.
-    wait_until("the mount to serve", || std::fs::metadata(&root).is_ok());
+    // The volume is served once the OS can write through it — the same question the mount's own probe asks. The **child's own words** are collected on
+    // timeout: "the mount did not serve" alone cannot tell a refused version gate from a busy drive letter.
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(10) && std::fs::metadata(&root).is_err() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if std::fs::metadata(&root).is_err() {
+        let mut said = String::new();
+        if let Some(stderr) = child.0.stderr.as_mut() {
+            let _ = stderr.read_to_string(&mut said);
+        }
+        panic!(
+            "the mount did not serve {} within 10s; the child said: {said:?}",
+            root.display()
+        );
+    }
     std::fs::write(root.join("through-cli.txt"), b"hello layerfs")
         .expect("write through the mount");
 
@@ -111,12 +143,11 @@ fn mount_write_unmount_through_the_cli() {
         String::from_utf8_lossy(&unmount.stdout)
     );
 
-    let mut child = child;
     let mut output = String::new();
-    if let Some(stdout) = child.stdout.as_mut() {
+    if let Some(stdout) = child.0.stdout.as_mut() {
         let _ = stdout.read_to_string(&mut output);
     }
-    let _ = child.wait();
+    let _ = child.0.wait();
 
     // **The OS, not the CLI's own word** (452): the drive is gone, and the bytes are in the workspace.
     wait_until("the drive to disappear", || !mount_point.exists());

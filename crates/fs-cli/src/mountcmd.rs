@@ -28,6 +28,8 @@ pub type Error = Box<dyn std::error::Error>;
 const UNMOUNT_WAIT: Duration = Duration::from_secs(10);
 /// How often the mount looks for a stop request.
 const POLL: Duration = Duration::from_millis(50);
+/// `STATUS_OBJECT_NAME_COLLISION` — the drive letter is taken (`ntstatus.h`; the same value `callbacks` uses for a taken *name*).
+const OURS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 
 /// A drive letter or directory, reduced to something usable as a file name: `V:` -> `V`, `C:\mnt\x` -> `C_mnt_x`.
 #[must_use]
@@ -138,12 +140,38 @@ pub fn version() -> Result<(), Error> {
 }
 
 /// `layerfs mount <workspace> <mount_point> [--workspace <name>] [--no-version-gate]`
-pub fn mount(arguments: &[String]) -> Result<(), Error> {
-    // The card's first argument is the **repository** to serve (`mount <workspace_path> <mount_point>`); unlike the file verbs, there is no
-    // `--store` fallback, because mounting "the repository in the current directory" is a guess the caller cannot see.
-    let (store, mount_point) = match (arguments.first(), arguments.get(1)) {
-        (Some(store), Some(mount_point)) => (PathBuf::from(store), PathBuf::from(mount_point)),
-        _ => return Err("usage: layerfs mount <workspace_path> <mount_point>".into()),
+pub fn mount(store: &Path, arguments: &[String]) -> Result<(), Error> {
+    // **Positionals are what is left after the options are removed**, not "the first two arguments": with `mount U: --workspace main`, counting by
+    // position made `--workspace` the mount point and the store `U:` (measured: the child answered `store directory U: does not exist`).
+    let mut positional: Vec<&String> = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--workspace" => index += 2,
+            "--no-version-gate" => index += 1,
+            other if other.starts_with('-') => index += 1,
+            other => {
+                positional.push(&arguments[index]);
+                let _ = other;
+                index += 1;
+            }
+        }
+    }
+    // **One positional form**: `layerfs --store <dir> mount <mount_point>`, the same shape as every other verb (the store is a global option).
+    // The older `mount <store> <mount_point>` still works, with a warning: removing it silently would break the one command whose arguments a user
+    // is most likely to have scripted.
+    let (store, mount_point) = match (positional.first(), positional.get(1)) {
+        (Some(mount_point), None) => (store.to_path_buf(), PathBuf::from(mount_point.as_str())),
+        (Some(store_arg), Some(mount_point)) => {
+            eprintln!(
+                "layerfs: warning: `mount <store> <mount_point>` is the old form; use `--store <store> mount <mount_point>`"
+            );
+            (
+                PathBuf::from(store_arg.as_str()),
+                PathBuf::from(mount_point.as_str()),
+            )
+        }
+        _ => return Err("usage: layerfs --store <store> mount <mount_point>".into()),
     };
     let name = option(arguments, "--workspace").unwrap_or_else(|| "main".to_string());
     let skip_gate = arguments
@@ -216,13 +244,31 @@ pub fn mount(arguments: &[String]) -> Result<(), Error> {
     let _ = std::fs::remove_file(&stop);
     let _ = std::fs::remove_file(&state);
     match report {
-        Ok(report) => {
+        Ok(report) if report.looked_like_a_mount => {
             println!(
                 "unmounted (create={:#010X} mount={:#010X} start={:#010X})",
                 report.create, report.mount, report.start
             );
             Ok(())
         }
+        // **Say what to do next**, not only what went wrong. `0xC0000035` is `OBJECT_NAME_COLLISION`: the drive letter is already taken, usually by a
+        // mount whose process died. The status alone leaves the user with "mounting failed" and no next step.
+        Ok(report) if report.mount == OURS_OBJECT_NAME_COLLISION => Err(format!(
+            "{} is already in use (0x{:#010X}); a previous mount may still hold it — try `layerfs umount {} --force`, or pick another letter",
+            mount_point.display(),
+            report.mount,
+            mount_point.display()
+        )
+        .into()),
+        Ok(report) => Err(format!(
+            "the volume at {} never looked mounted (create={:#010X} mount={:#010X} start={:#010X} dispatcher={:#010X})",
+            mount_point.display(),
+            report.create,
+            report.mount,
+            report.start,
+            report.dispatcher_result
+        )
+        .into()),
         Err(error) => Err(format!("mount failed: {error:?}").into()),
     }
 }
