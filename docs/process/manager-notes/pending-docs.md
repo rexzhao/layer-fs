@@ -3182,3 +3182,10 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      CLI：layerfs mount/umount/list/version
      Backlog B-1~B-26 保留
      worker/QA/manager 三方收工
+
+539. 【CLI 三修复合入（afb2d26）】①init 自动 checkout（直接 ls 不需要手动 checkout）
+     ②mount 单一位置参数（--store 全局 + mount <mount_point>，旧形式保留带 deprecation）
+     ③盘符占用 0xC0000035 分支给出路（--force 提示）。管道挂死修复（spawn 的 stdout
+     继承导致外层等 EOF——Drop 守卫 kill 子进程）。
+     判据：+2 新例 +1 反转（init 后 ls 成功——前提被有意改掉，444 口径）。
+     F: 的 0xC0000022 是"不是空位"场景（锦上添花待做）。
