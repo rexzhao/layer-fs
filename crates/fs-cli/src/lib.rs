@@ -75,6 +75,39 @@ impl std::fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
+pub fn mounts_dir() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("LAYERFS_MOUNTS_DIR") {
+        return std::path::PathBuf::from(path);
+    }
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("layerfs").join("mounts")
+}
+
+/// The record name for a mount point: `V:` becomes `V`, `C:\mnt\x` becomes `C_mnt_x`.
+#[must_use]
+pub fn record_name(mount_point: &std::path::Path) -> String {
+    let text = mount_point.to_string_lossy();
+    let trimmed = text.trim_end_matches([':', '/', '\\']);
+    let mut flattened = String::new();
+    for character in trimmed.chars() {
+        let replacement = if matches!(character, ':' | '/' | '\\') {
+            '_'
+        } else {
+            character
+        };
+        if replacement == '_' && flattened.ends_with('_') {
+            continue;
+        }
+        flattened.push(replacement);
+    }
+    if flattened.is_empty() {
+        "root".to_string()
+    } else {
+        flattened.trim_matches('_').to_string()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::{file_command_removed, Failure, FILE_COMMANDS, NO_WORKSPACE};

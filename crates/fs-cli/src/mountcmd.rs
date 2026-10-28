@@ -33,55 +33,13 @@ const OURS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 /// `STATUS_ACCESS_DENIED` — what WinFsp answers when the mount point exists as a real volume (`ntstatus.h:4392`).
 const OURS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 
-/// A drive letter or directory, reduced to something usable as a file name: `V:` -> `V`, `C:\mnt\x` -> `C_mnt_x`.
-#[must_use]
-pub fn record_name(mount_point: &Path) -> String {
-    let text = mount_point.to_string_lossy();
-    let trimmed = text.trim_end_matches([':', '/', '\\']);
-    // Runs of separators collapse: `C:\mnt` is one boundary, not two, and a double underscore in a file name helps nobody.
-    let mut flattened = String::new();
-    for character in trimmed.chars() {
-        let replacement = if matches!(character, ':' | '/' | '\\') {
-            '_'
-        } else {
-            character
-        };
-        if replacement == '_' && flattened.ends_with('_') {
-            continue;
-        }
-        flattened.push(replacement);
-    }
-    // A drive letter is the common case and deserves a short name rather than `V_`.
-    if flattened.is_empty() {
-        "root".to_string()
-    } else {
-        flattened.trim_matches('_').to_string()
-    }
-}
-
-/// Where mount records live: `%LOCALAPPDATA%\layerfs\mounts`, overridable with `LAYERFS_MOUNTS_DIR` (tests only).
-///
-/// **One function computes it**, because the location is part of the interface (ADR-010 §9): a record two codepaths disagree about is a record nobody
-/// finds. The old `%TEMP%` directory is deliberately **not** searched or cleaned (A7b) — an older binary may still be running there, and deleting its
-/// records would strand its mounts.
-#[must_use]
-fn mounts_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("LAYERFS_MOUNTS_DIR") {
-        return PathBuf::from(path);
-    }
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("layerfs").join("mounts")
-}
-
+/// `V:` becomes `V`; `C:mntx` becomes `C_mnt_x` (ADR-010 §9.1). The implementation lives in the library so the criteria compute the same name.
 fn state_path(mount_point: &Path) -> PathBuf {
     mounts_dir().join(format!("{}.mount", record_name(mount_point)))
 }
 
-/// `FspVersion`'s two halves. The calibration in `fs_winfsp::abi::measured::DLL_BUILD` is a full build string, so the gate compares the **major
-/// version** it starts with — the layout was measured against 2.x, and a 3.x DLL may renumber the slots again.
-#[must_use]
+pub use fs_cli::{mounts_dir, record_name};
+
 pub fn version_parts(version: u32) -> (u16, u16) {
     (
         u16::try_from((version >> 16) & 0xFFFF).unwrap_or(0),
@@ -322,7 +280,7 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
             // **Two ways to be asked to stop**, both answering the same way: the control pipe (through `request_stop`) and a console control event. The
             // stop **file** is gone — A15s asserts that writing one no longer stops a mount, because a signal nobody can see the receipt of was the thing
             // being replaced.
-            if !state.exists() || stop_requested() {
+            if stop_requested() {
                 println!("unmount requested after {:?}", started.elapsed());
                 break;
             }

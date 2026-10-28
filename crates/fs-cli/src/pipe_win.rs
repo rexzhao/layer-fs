@@ -74,7 +74,18 @@ impl Server {
     }
 
     fn serve_one(&self, mut connection: std::fs::File) -> Result<(), String> {
-        let frame = read_frame(&mut connection)?;
+        // **An oversized frame is answered, then the connection ends.** Dropping it silently would leave the client waiting for a reply that never comes and
+        // calling it a timeout; the protocol has a name for this case, so it uses it — and the accept loop carries on with the next client (A11).
+        let frame = match read_frame(&mut connection) {
+            Ok(frame) => frame,
+            Err(over) if over == OVER_LIMIT => {
+                let _ = connection.write_all(&pipe::frame(&Response::FrameTooLarge {
+                    max: pipe::FRAME_MAX,
+                }));
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         // `unmount` is intercepted here because it has to stop the mount, not describe it.
         let response = match serde_json::from_slice::<pipe::Request>(&frame) {
             Ok(request) if request.op == "unmount" && request.v == pipe::PROTOCOL => {
@@ -97,6 +108,9 @@ impl Server {
     }
 }
 
+/// Marker returned by [`read_frame`] when a client sent more than the protocol allows.
+const OVER_LIMIT: &str = "over-limit";
+
 /// Reads one frame: up to the first newline, refusing anything longer than the protocol allows.
 fn read_frame(connection: &mut std::fs::File) -> Result<Vec<u8>, String> {
     let mut frame = Vec::new();
@@ -110,8 +124,8 @@ fn read_frame(connection: &mut std::fs::File) -> Result<Vec<u8>, String> {
                 }
                 frame.push(byte[0]);
                 if frame.len() > pipe::FRAME_MAX {
-                    // Answer with the protocol's own refusal rather than a silent drop: a client that sent too much should be told which limit it hit.
-                    return Err(format!("frame over {} bytes", pipe::FRAME_MAX));
+                    // The caller answers `FrameTooLarge` and closes **this** connection; the server keeps serving.
+                    return Err(OVER_LIMIT.to_owned());
                 }
             }
             Err(error) => return Err(format!("read: {error}")),
