@@ -28,6 +28,13 @@ pub fn volume_root(path: &Path) -> Option<(PathBuf, String)> {
     // **The root first, by two routes** (measured): `GetVolumePathNameW` works for ordinary volumes and fails with `ERROR_UNRECOGNIZED_VOLUME (1005)` on a
     // volume served by WinFsp — there the drive prefix *is* the root. `GetVolumeInformationW` then needs a **root**: handing it a directory path fails with
     // `ERROR_INVALID_NAME (123)`, which is why the label is asked last, of whichever root we managed to name.
+    // **A directory mount point is a *volume mount point*** (ADR-010 §4.4 / A6e–A6g): `GetVolumePathNameW` answers the *host* volume for anything under
+    // `C:\…\mnt`, whose label is not ours. `GetVolumeNameForVolumeMountPointW` asks the other question — "is this directory the root of a volume?" — and for a
+    // WinFsp directory mount the answer is the volume's GUID, which then carries the label `layerfs`. Deepest first, so `…\mnt\sub` finds `…\mnt`.
+    if let Some(found) = directory_mount_volume(path) {
+        return Some(found);
+    }
+
     let mut root_buffer = vec![0u16; 260];
     // SAFETY: the input is NUL-terminated and the buffer is sized for a volume path.
     let decomposed = unsafe {
@@ -89,6 +96,77 @@ pub fn volume_root(path: &Path) -> Option<(PathBuf, String)> {
 
     Some((root, String::from_utf16_lossy(&label[..label_length])))
 }
+/// The volume behind a **directory mount point**, if `path` is on one (A6e–A6g).
+///
+/// Walks from `path` up to its root asking each ancestor "are you the root of a volume?": the first that answers is where our mount is. The API returns a
+/// `\?\Volume{guid}\` path, which `GetVolumeInformationW` accepts — that is how a directory mount gets a label of its own.
+#[cfg(windows)]
+fn directory_mount_volume(path: &Path) -> Option<(PathBuf, String)> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+    };
+
+    let mut candidate = Some(path);
+    while let Some(directory) = candidate {
+        let mut with_separator = directory.as_os_str().to_os_string();
+        with_separator.push("\\");
+        let wide: Vec<u16> = with_separator
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut volume = vec![0u16; 260];
+        // SAFETY: both buffers are valid for the call; `wide` is NUL-terminated.
+        let named = unsafe {
+            GetVolumeNameForVolumeMountPointW(
+                wide.as_ptr(),
+                volume.as_mut_ptr(),
+                volume.len() as u32,
+            )
+        };
+        if named != 0 {
+            let length = volume
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(volume.len());
+            let volume = PathBuf::from(String::from_utf16_lossy(&volume[..length]));
+            let volume_wide: Vec<u16> = volume
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut label = vec![0u16; 260];
+            let mut serial: u32 = 0;
+            let mut maximum: u32 = 0;
+            let mut flags: u32 = 0;
+            let mut filesystem = vec![0u16; 260];
+            // SAFETY: as above.
+            let ok = unsafe {
+                GetVolumeInformationW(
+                    volume_wide.as_ptr(),
+                    label.as_mut_ptr(),
+                    label.len() as u32,
+                    &mut serial,
+                    &mut maximum,
+                    &mut flags,
+                    filesystem.as_mut_ptr(),
+                    filesystem.len() as u32,
+                )
+            };
+            if ok != 0 {
+                let label_length = label
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(label.len());
+                return Some((volume, String::from_utf16_lossy(&label[..label_length])));
+            }
+        }
+        candidate = directory.parent();
+    }
+    None
+}
+
 #[cfg(windows)]
 fn drive_prefix(path: &Path) -> Option<PathBuf> {
     let text = path.to_string_lossy();
