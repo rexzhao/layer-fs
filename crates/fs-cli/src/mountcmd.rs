@@ -303,6 +303,9 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     );
     // (the stop file is gone: the control pipe is the only stop signal — A15s)
     let _ = std::fs::remove_file(&state);
+    // **The teardown is done; the pending `unmount` answer may leave now** (ADR-010 §5.1). This must happen before the process exits, or the client reads a
+    // successful unmount as a dropped connection.
+    server.teardown_finished();
     match report {
         Ok(report) if report.looked_like_a_mount => {
             println!(

@@ -46,6 +46,11 @@ pub struct Server {
     name: String,
     serving: Arc<dyn Serving>,
     stopping: Arc<AtomicBool>,
+    /// `(teardown finished, answer sent)`: the handshake that lets an `unmount` reply arrive **after** the mount is gone (ADR-010 §5.1).
+    ///
+    /// Without it the reply can only be sent before the teardown, so "unmounted" and "the record is gone" would be two different instants and a client that
+    /// checks the second would see the first one's answer — A12's second half.
+    gate: Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>,
 }
 
 impl Server {
@@ -56,7 +61,54 @@ impl Server {
             name,
             serving,
             stopping: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new((
+                std::sync::Mutex::new((false, false)),
+                std::sync::Condvar::new(),
+            )),
         }
+    }
+
+    /// Tells the server that the teardown has finished, then waits for it to send the pending answer.
+    ///
+    /// Called by the **main thread after `mount_serving` returns** — that is the only moment the record is gone and the flush is done. The process must not exit
+    /// before this returns, or the answer is lost and the client reads an `unmount` that succeeded as a dropped connection.
+    pub fn teardown_finished(&self) {
+        let (lock, condvar) = &*self.gate;
+        let mut state = lock.lock().expect("gate");
+        state.0 = true;
+        condvar.notify_all();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state.1 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            let (next, _) = condvar.wait_timeout(state, remaining).expect("gate wait");
+            state = next;
+            if state.1 {
+                return;
+            }
+        }
+    }
+
+    fn wait_for_teardown(&self) {
+        let (lock, condvar) = &*self.gate;
+        let mut state = lock.lock().expect("gate");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            let (next, _) = condvar.wait_timeout(state, remaining).expect("gate wait");
+            state = next;
+        }
+    }
+
+    fn mark_answered(&self) {
+        let (lock, condvar) = &*self.gate;
+        lock.lock().expect("gate").1 = true;
+        condvar.notify_all();
     }
 
     /// The pipe name, for the mount record (`pipe=` field).
@@ -112,10 +164,10 @@ impl Server {
                 if handles > 0 {
                     Response::HandlesOpen { handles }
                 } else if self.serving.request_stop() {
-                    // **Answer at once, not after the teardown** — and that is a defect, not a choice: the answer "unmounted" is true, but the record is still
-                    // there for a moment, so A12's second half ("the record is gone when the answer arrives") cannot pass yet. The reason is the thread
-                    // structure, not the pipe: the mount process exits as soon as `mount_serving` returns, which kills this thread before it could answer a
-                    // teardown-late reply. Fixing it needs the main thread to wait for this one (S1 §5.1's `DONE`), which is the next step.
+                    // **Answer after the teardown, not when the request is accepted**: the main thread signals `teardown_finished()` once the volume is gone and
+                    // the record is deleted, and only then does this reply leave. That is what makes "unmounted" and "the record is gone" the same instant for
+                    // the client (A12), and it is why the main thread must not exit before this returns.
+                    self.wait_for_teardown();
                     Response::Unmounted {}
                 } else {
                     Response::ShuttingDown
@@ -130,6 +182,8 @@ impl Server {
         connection
             .flush()
             .map_err(|error| format!("flush: {error}"))?;
+        // The answer is on the wire; the main thread may now exit.
+        self.mark_answered();
         Ok(())
     }
 }

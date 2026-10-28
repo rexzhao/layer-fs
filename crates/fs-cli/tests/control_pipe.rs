@@ -221,6 +221,47 @@ fn status_reports_dirty_and_open_handles() {
     drop(held);
 }
 
+/// **A12**: a remote `unmount` with a file open is refused and changes nothing; after closing, it succeeds **and the record is gone when the answer arrives**.
+#[test]
+fn unmount_refuses_while_a_handle_is_open() {
+    let mount_point = mount_point("PIPE_C", "L:");
+    let _child = start_mount("unmount", &mount_point);
+    let root = root_of(&mount_point);
+    std::fs::write(root.join("held.txt"), b"x").expect("write");
+    let held = std::fs::File::open(root.join("held.txt")).expect("hold a handle");
+
+    match ask(&mount_point, "unmount") {
+        Response::HandlesOpen { handles } => assert!(handles >= 1, "cell A12: at least one handle"),
+        other => panic!("cell A12: with a file open the mount must refuse, got {other:?}"),
+    }
+    assert!(
+        mount_point.exists(),
+        "cell A12: a refusal leaves the volume attached"
+    );
+    assert!(
+        record_path(&mount_point).exists(),
+        "cell A12: and the record in place"
+    );
+
+    drop(held);
+    let started = Instant::now();
+    loop {
+        match ask(&mount_point, "unmount") {
+            Response::Unmounted {} => break,
+            Response::HandlesOpen { .. } if started.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => {
+                panic!("cell A12: expected Unmounted once the handle is closed, got {other:?}")
+            }
+        }
+    }
+    assert!(
+        !record_path(&mount_point).exists(),
+        "cell A12: the record is removed before the answer is sent"
+    );
+}
+
 /// **A15s**: the old stop **file** no longer stops a mount — the control channel is the only signal.
 #[test]
 fn the_old_stop_file_does_not_stop_a_mount() {
