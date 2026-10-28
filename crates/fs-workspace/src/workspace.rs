@@ -431,6 +431,9 @@ impl Workspace {
         }
         self.overlay.adopt_base(root)?;
         self.base_root = root;
+        if let Ok(mut state) = self.state.lock() {
+            state.base_root = root;
+        }
         Ok(())
     }
 
@@ -446,6 +449,9 @@ impl Workspace {
         let _gate = gate.write();
         self.repo.workspace_rebind(&self.name, branch)?;
         self.branch = branch.to_owned();
+        if let Ok(mut state) = self.state.lock() {
+            state.branch = branch.to_owned();
+        }
         Ok(())
     }
 
@@ -470,8 +476,16 @@ impl Workspace {
     pub(crate) fn adopt(&mut self, root: ObjectId, commit: Option<String>) -> WorkspaceResult<()> {
         self.overlay.adopt_base(root)?;
         self.base_root = root;
-        if let Some(commit) = commit {
+        if let Some(commit) = commit.clone() {
             self.base_commit = commit;
+        }
+        // **Step 2 of the `&self` migration**: the plain fields are still what everything reads; this writes the same values into the locked state as well, so
+        // step 3 can move the reads one at a time without any of them seeing a different world.
+        if let Ok(mut state) = self.state.lock() {
+            state.base_root = root;
+            if let Some(commit) = commit {
+                state.base_commit = commit;
+            }
         }
         Ok(())
     }
