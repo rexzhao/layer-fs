@@ -299,6 +299,7 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                 let _ = adapter_slot.set(mounted.adapter());
                 // The probe **is** the command's lifetime: everything below happens while the volume is attached.
                 let started = Instant::now();
+                let mut last_reading = Instant::now();
                 loop {
                     // **Three ways to be asked to stop**, all answering the same way: the stop file (until the pipe replaces it), the record disappearing, and a
                     // console control event. Ctrl-C lands here as an **orderly unmount** rather than a kill, which is the whole point of the handler.
@@ -316,6 +317,24 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                         }
                         println!("unmount requested after {:?}", started.elapsed());
                         break;
+                    }
+                    // **A timer reading, not an on-demand one** (`LAYERFS_DEBUG_HANDLES=1`): asking over the pipe adds handles by itself, so the only way to see
+                    // whether the table decays **without** new commands is to print from the mount on its own clock.
+                    if std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some()
+                        && started.elapsed().as_secs() % 5 == 0
+                        && last_reading.elapsed().as_secs() >= 5
+                    {
+                        last_reading = Instant::now();
+                        eprintln!(
+                            "timer: elapsed={:?} table={:?} contexts={:?} cleanup={} stale={}",
+                            started.elapsed(),
+                            adapter_slot
+                                .get()
+                                .map_or((0, 0), |adapter| adapter.open_handle_kinds()),
+                            fs_winfsp::callbacks::context_counts(),
+                            fs_winfsp::callbacks::cleanup_call_count(),
+                            fs_winfsp::callbacks::stale_release_count(),
+                        );
                     }
                     std::thread::sleep(POLL);
                 }
