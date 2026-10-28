@@ -212,7 +212,7 @@ fn workspace(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error
 
 fn snapshot(
     repo: &Repo,
-    store: &std::path::Path,
+    _store: &std::path::Path,
     arguments: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     match arguments.first().map(String::as_str) {
@@ -228,7 +228,7 @@ fn snapshot(
             Ok(())
         }
         Some("create") => {
-            let name = read_current(store)?;
+            let name = require_workspace()?;
             let mut workspace = repo.workspace_open(&name)?;
             let root = workspace.snapshot()?;
             workspace.close()?;
@@ -413,20 +413,21 @@ fn verify(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::E
 /// Runs `body` against the current workspace, opening and closing it around the call.
 fn with_workspace(
     repo: &Repo,
-    store: &Path,
+    _store: &Path,
     body: impl FnOnce(&mut Workspace) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let name = read_current(store)?;
+    let name = require_workspace()?;
     let mut workspace = repo.workspace_open(&name)?;
     let outcome = body(&mut workspace);
     workspace.close()?;
     outcome
 }
 
-/// The branch a command works on: **`--branch`, or the workspace's branch** (ADR-010 §13 A1).
+/// The branch a command works on: **`--branch`, or the workspace's branch** (ADR-010 §13 A1/A1b).
 ///
-/// With `--branch` no overlay is opened at all, so `log`/`reset`/`revert` keep working while another process has the workspace mounted — the whole point
-/// of A1. Without it the branch comes from the workspace, which is the case that genuinely needs the overlay.
+/// With `--branch` no overlay is opened at all, so `log`/`reset`/`revert` keep working while another process has the workspace mounted. The same has to
+/// be true of the fallback: `current_branch` reads the **workspace row** (via `workspaces()`), never the overlay, or `--workspace dev log` would fail
+/// exactly when `dev` is in use — which is the case that matters (A1b).
 fn branch_for(
     repo: &Repo,
     arguments: &[String],
@@ -442,17 +443,21 @@ fn branch_for(
 
 fn current_branch(repo: &Repo) -> Result<String, Box<dyn std::error::Error>> {
     let name = require_workspace()?;
-    Ok(repo.workspace_open(&name)?.branch().to_owned())
+    // **The row, not the overlay** (A1b): opening the workspace would fail while it is mounted, and answering "which branch am I on" must not require
+    // the lock that a mount holds. The row is what `workspace_list` reads.
+    match repo.workspaces()?.into_iter().find(|row| row.name == name) {
+        Some(row) => Ok(row.branch),
+        None => Err(fs_cli::Failure::not_found(format!(
+            "no workspace {name}; `fs-cli checkout <branch>` creates one"
+        ))
+        .into()),
+    }
 }
 
 /// The workspace this command runs against: **the `--workspace` option, or nothing** (ADR-010 §5).
 ///
 /// `cli/current` is gone: a file that remembers a name for you is a second source of truth, and it made every command's behaviour depend on a store
 /// nobody mentioned. The `store` parameter stays only so the call sites read unchanged while the S0 sweep removes them one by one.
-fn read_current(_store: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    require_workspace()
-}
-
 fn short(id: &str) -> &str {
     id.get(..12).unwrap_or(id)
 }
