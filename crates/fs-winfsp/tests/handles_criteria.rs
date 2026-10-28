@@ -370,3 +370,44 @@ fn the_last_close_removes_exactly_once() {
         "cell count: exactly one removal, and it names the id the caller believed in"
     );
 }
+
+/// **甲**: one entry, one handle, and a count that still means "how many opens".
+///
+/// The leak and the count are the same data, so a fix that only removes handles makes `status.handles` count *entries* — which is exactly what R3 caught
+/// (`dirs_invalidated` 24 → 0). This pins both halves at the table: two opens of one entry produce **one** handle id and a count of two, one close takes it
+/// back to one, the second to zero.
+#[test]
+fn two_opens_of_one_entry_are_one_handle_and_two_counts() {
+    let mut table = HandleTable::new();
+    let first = table
+        .open(7, mask(&[Term::Read]), Mask::ALL_BITS, false, false)
+        .expect("first open");
+    let second = table
+        .open(7, mask(&[Term::Read]), Mask::ALL_BITS, false, false)
+        .expect("second open");
+    assert_eq!(first, second, "cell 甲: one entry keeps one handle");
+    assert_eq!(
+        table.handle_kinds(),
+        (2, 0),
+        "cell 甲: and the count is opens"
+    );
+    assert_eq!(table.len(), 1, "cell 甲: the table holds one entry");
+
+    assert_eq!(
+        table.close(first).expect("first close"),
+        CloseEffect::Nothing,
+        "cell 甲: the entry survives its first close"
+    );
+    assert_eq!(table.handle_kinds(), (1, 0), "cell 甲: one open left");
+    assert_eq!(
+        table.close(second).expect("second close"),
+        CloseEffect::Nothing,
+        "cell 甲: nothing to remove (not delete-pending)"
+    );
+    assert_eq!(
+        table.handle_kinds(),
+        (0, 0),
+        "cell 甲: and now the entry is gone"
+    );
+    assert_eq!(table.len(), 0, "cell 甲: the table is empty");
+}

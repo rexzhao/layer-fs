@@ -19,16 +19,15 @@ fn open(table: &mut HandleTable, file_id: u64, parent: u64, name: &[u8]) -> Hand
     handle
 }
 
-/// Two handles on the same entry share **one** binding, and a rename moves it for both.
+/// One entry has **one** binding and (ruling 甲) **one handle**, and a rename moves that binding for every open of it.
 #[test]
 fn the_binding_belongs_to_the_file_id_not_the_handle() {
     let mut table = HandleTable::new();
     let first = open(&mut table, 7, 1, b"a");
     let second = open(&mut table, 7, 1, b"a");
-    assert_ne!(
-        first, second,
-        "cell setup: two distinct handles on one entry"
-    );
+    // **甲**: the second open borrows the first one's handle instead of registering another (a fresh handle per open was the leak). What must stay true is
+    // that there is one binding per entry and that both opens see it move.
+    assert_eq!(first, second, "cell 甲: one entry keeps one handle");
     assert_eq!(
         table.binding_of(7),
         Some((1, b"a".to_vec())),

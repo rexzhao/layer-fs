@@ -49,6 +49,8 @@ pub struct Handle {
     pub share: Mask,
     /// `FILE_FLAG_DELETE_ON_CLOSE`: the entry goes away when the **last** handle closes.
     pub delete_on_close: bool,
+    /// How many opens this handle stands for: one entry, many file objects.
+    pub refs: usize,
     /// Whether the entry this handle names is a **directory** (S3 card §3.2).
     ///
     /// Needed because `restore` / `switch` block on **file** handles only (D8 = B): the shell that starts the command holds a directory handle on the volume
@@ -159,6 +161,20 @@ impl HandleTable {
         if let Admission::Refuse(_) = admit(desired, share, &existing) {
             return Err(OpsError::SharingViolation);
         }
+        // **One entry, one handle, one count per open** (ruling 甲): a second open of the same `FileId` borrows the existing handle and bumps its reference
+        // count. A fresh handle per open is what leaked (`+8` directory handles per `status`); counting entries instead of opens is what R3 caught.
+        if let Some(existing_id) = self
+            .handles
+            .iter()
+            .find(|(_, handle)| handle.file_id == file_id)
+            .map(|(id, _)| *id)
+        {
+            self.handles.get_mut(&existing_id).expect("just found").refs += 1;
+            if delete_on_close {
+                self.pending.insert(file_id);
+            }
+            return Ok(existing_id);
+        }
         let id = HandleId(self.next);
         self.next += 1;
         self.handles.insert(
@@ -168,6 +184,7 @@ impl HandleTable {
                 desired,
                 share,
                 delete_on_close,
+                refs: 1,
                 is_dir,
             },
         );
@@ -218,10 +235,11 @@ impl HandleTable {
     #[must_use]
     pub fn handle_kinds(&self) -> (usize, usize) {
         self.handles.values().fold((0, 0), |(files, dirs), handle| {
+            // **Counted as `refs`**, because the table holds one entry per object while the report has to mean "how many opens".
             if handle.is_dir {
-                (files, dirs + 1)
+                (files, dirs + handle.refs)
             } else {
-                (files + 1, dirs)
+                (files + handle.refs, dirs)
             }
         })
     }
@@ -269,6 +287,13 @@ impl HandleTable {
     /// [`OpsError::NotFound`] for an unknown handle (a double close is a caller bug, not an idempotent no-op: the second
     /// close would otherwise be able to "close" a handle that a later open reused, if ids were ever reused).
     pub fn close(&mut self, handle_id: HandleId) -> Result<CloseEffect, OpsError> {
+        // **One close releases one open**, not the entry: the entry goes when its last open does.
+        if let Some(handle) = self.handles.get_mut(&handle_id) {
+            if handle.refs > 1 {
+                handle.refs -= 1;
+                return Ok(CloseEffect::Nothing);
+            }
+        }
         let handle = self.handles.remove(&handle_id).ok_or(OpsError::NotFound)?;
         let remaining = self.handles_of(handle.file_id).len();
         let should_remove = close_removes(remaining, self.pending.contains(&handle.file_id));
