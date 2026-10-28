@@ -687,6 +687,41 @@ impl fs_cli::pipe_win::Serving for PipeServing {
         !self.record.exists()
     }
 }
+/// The live mount serving `workspace`, if there is one: `(mount_point, pid)`.
+///
+/// Read from the records rather than guessed: the point of A3's message is that it names **which** mount and **which** process, and a generic "in use" would
+/// leave the user to hunt for the window.
+#[must_use]
+pub fn live_mount_of(workspace: &str) -> Option<(String, u32)> {
+    let entries = std::fs::read_dir(mounts_dir()).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "mount")
+        {
+            continue;
+        }
+        if record_is_live(&path) != Liveness::Live {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let field = |key: &str| {
+            text.lines()
+                .find_map(|line| {
+                    line.strip_prefix(key)?
+                        .strip_prefix('=')
+                        .map(str::to_string)
+                })
+                .unwrap_or_default()
+        };
+        if field("workspace") == workspace {
+            return Some((field("mount_point"), field("pid").parse().unwrap_or(0)));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

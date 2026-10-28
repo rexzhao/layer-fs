@@ -304,20 +304,53 @@ fn checkout(
     arguments: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let branch = arguments.first().ok_or("expected checkout <branch>")?;
-    // The workspace is named after its branch: one current workspace per branch, and a
-    // second `checkout` of the same branch resumes the first.
-    let workspace = match repo.workspace_open(branch) {
-        Ok(workspace) => workspace,
-        Err(ApiError::Workspace(fs_workspace::WorkspaceError::NotFound { .. })) => {
-            repo.workspace_create(branch, branch)?
-        }
-        Err(error) => return Err(error.into()),
+    // The workspace is named after its branch: one workspace per branch, and a second `checkout` of the same branch resumes the first.
+    //
+    // **Existence is asked of the workspace *list*, not of `workspace_open`** (A3b): opening is what a mount holds, so asking it would make `checkout dev`
+    // fail exactly when `dev` is mounted — the case where the user most needs to be told it is already there and where.
+    let existing = repo
+        .workspaces()?
+        .into_iter()
+        .find(|workspace| &workspace.name == branch)
+        .or_else(|| {
+            repo.workspaces()
+                .ok()?
+                .into_iter()
+                .find(|workspace| &workspace.branch == branch)
+        });
+    let Some(existing) = existing else {
+        // No row: create it (the branch must exist, or `workspace_create` says so).
+        let created = match repo.workspace_create(branch, branch) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return Err(fs_cli::Failure::not_found(format!(
+                    "cannot create a workspace on {branch}: {error}; \
+                     if that branch does not exist, create it with `fs-cli branch {branch} --from main`"
+                ))
+                .into())
+            }
+        };
+        println!("on {} (workspace {})", created.branch(), created.name());
+        created.close()?;
+        return Ok(());
     };
-    // `cli/current` is gone (ADR-010 §5): `checkout` still creates or resumes the workspace, and still reports it, but it no longer records a
-    // "current" that later commands would silently depend on.
-    println!("on {} (workspace {})", workspace.branch(), workspace.name());
-    workspace.close()?;
-    Ok(())
+
+    // The workspace exists. If it is **mounted**, say so and keep the mount: `checkout` is not a request to unmount anything (A3b).
+    match mountcmd::live_mount_of(&existing.name) {
+        Some((mount_point, pid)) => {
+            println!(
+                "on {} (workspace {}) — mounted at {mount_point} (pid {pid})",
+                existing.branch, existing.name
+            );
+            Ok(())
+        }
+        None => {
+            let workspace = repo.workspace_open(&existing.name)?;
+            println!("on {} (workspace {})", workspace.branch(), workspace.name());
+            workspace.close()?;
+            Ok(())
+        }
+    }
 }
 
 fn commit(
@@ -417,10 +450,42 @@ fn with_workspace(
     body: impl FnOnce(&mut Workspace) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let name = require_workspace()?;
-    let mut workspace = repo.workspace_open(&name)?;
+    let mut workspace = match repo.workspace_open(&name) {
+        Ok(workspace) => workspace,
+        Err(error) => return Err(open_refusal(&name, error, "open")),
+    };
     let outcome = body(&mut workspace);
     workspace.close()?;
     outcome
+}
+
+/// Turns "cannot open this workspace" into a message that says **why** (A3, ADR-010 §8.2).
+///
+/// Two different situations hide behind one error: a workspace this machine is serving (there is a record with a mount point and a pid) and one held by a
+/// process with no record (another `fs-cli`). The first tells the user which mount to unmount; the second says so plainly. Rendering both the same way would
+/// lose the only part of the message that is actionable.
+fn open_refusal(workspace: &str, error: ApiError, command: &str) -> Box<dyn std::error::Error> {
+    if let Some((mount_point, pid)) = mountcmd::live_mount_of(workspace) {
+        return fs_cli::Failure::in_use(fs_cli::mounted_refusal(
+            command,
+            workspace,
+            &mount_point,
+            pid,
+        ))
+        .into();
+    }
+    // Not found is not "in use": it keeps its own exit code and its own way out.
+    if matches!(
+        error,
+        ApiError::Workspace(fs_workspace::WorkspaceError::NotFound { .. })
+    ) {
+        return fs_cli::Failure::not_found(format!(
+            "no workspace {workspace}; `fs-cli checkout <branch>` creates one"
+        ))
+        .into();
+    }
+    // Anything else while such a workspace exists is the lock talking: another process has it open.
+    fs_cli::Failure::in_use(fs_cli::IN_USE_ELSEWHERE).into()
 }
 
 /// The branch a command works on: **`--branch`, or the workspace's branch** (ADR-010 §13 A1/A1b).
