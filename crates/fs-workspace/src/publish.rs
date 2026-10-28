@@ -133,7 +133,7 @@ impl Workspace {
         crash_point("after-materialise");
         // **The window G1 is about**: materialise has read the view, adopt has not moved the base yet. A write here would be in neither tree.
         pause_point("after-materialise");
-        if root == self.repo.commit_root(&self.base_commit_owned())? {
+        if root == self.repo.commit_root(&self.base_commit())? {
             return Err(WorkspaceError::NothingToCommit);
         }
         self.overlay.set_pending_root(Some(root))?;
@@ -205,10 +205,10 @@ impl Workspace {
         force: bool,
     ) -> WorkspaceResult<String> {
         let created = now_ns();
-        let branch = self.branch_owned();
+        let branch = self.branch();
         let parent = self.parent_commit();
         let id = commit_id(root, Some(parent), created, message);
-        let expected = self.base_commit_owned();
+        let expected = self.base_commit();
         let mut connection = self.repo.db().lock();
         // BEGIN IMMEDIATE, not a deferred transaction that reads first and writes second:
         // under WAL a deferred transaction upgrades its read snapshot to a write lock, and

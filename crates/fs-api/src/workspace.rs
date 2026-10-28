@@ -30,13 +30,13 @@ impl Workspace {
 
     /// The branch it publishes to.
     #[must_use]
-    pub fn branch(&self) -> &str {
+    pub fn branch(&self) -> String {
         self.inner.branch()
     }
 
     /// The commit its changes are based on.
     #[must_use]
-    pub fn base_commit(&self) -> &str {
+    pub fn base_commit(&self) -> String {
         self.inner.base_commit()
     }
 

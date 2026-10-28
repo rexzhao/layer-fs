@@ -371,7 +371,7 @@ fn every_commit_crash_point_recovers_to_a_clean_store_with_all_roots_readable() 
             roots.push(info.root.parse().expect("root id"));
         }
         let base = repo
-            .commit_info(workspace.base_commit())
+            .commit_info(&workspace.base_commit())
             .expect("base commit info");
         roots.push(base.root.parse().expect("root id"));
         let connection = rusqlite::Connection::open(repo.metadata_path()).expect("db");

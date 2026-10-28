@@ -123,54 +123,32 @@ impl Workspace {
         &self.id
     }
 
-    /// The branch this workspace publishes to.
-    #[must_use]
-    pub fn branch(&self) -> &str {
-        &self.branch
-    }
-
-    /// The commit this workspace's changes are based on (ADR-006 §10.3's expectation).
-    #[must_use]
-    pub fn base_commit(&self) -> &str {
-        &self.base_commit
-    }
-
-    /// The snapshot the view is composed over.
+    /// The branch this workspace publishes to, as a **snapshot**.
     ///
-    /// Normally `root(base_commit)`; after [`Workspace::restore`] or [`Workspace::snapshot`]
-    /// it can be a different tree without the base commit changing.
+    /// Owned, not `&str` (S2 step 3c): the value lives behind a mutex, and the semantics want it — a publication moves the branch, so a borrow that outlived
+    /// one would be a value that had already stopped being true.
     #[must_use]
-    pub fn base_root(&self) -> ObjectId {
-        self.base_root
-    }
-
-    /// The branch, as a **snapshot** (S2 step 3a).
-    ///
-    /// The locked state cannot hand out a borrow — a `MutexGuard` does not outlive the method — and that is the semantics the gate wants anyway: a publication
-    /// moves the branch, so a caller holding a `&str` across one would be holding a value that has already stopped being true.
-    #[must_use]
-    #[allow(dead_code, reason = "S2 step 3a: added now, used from 3b on")]
-    pub fn branch_owned(&self) -> String {
+    pub fn branch(&self) -> String {
         self.state
             .lock()
             .map(|state| state.branch.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().branch.clone())
     }
 
-    /// The base commit, as a **snapshot** (S2 step 3a).
+    /// The commit this workspace's changes are based on, as a **snapshot** (ADR-006 §10.3).
     #[must_use]
-    #[allow(dead_code, reason = "S2 step 3a: added now, used from 3b on")]
-    pub fn base_commit_owned(&self) -> String {
+    pub fn base_commit(&self) -> String {
         self.state
             .lock()
             .map(|state| state.base_commit.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().base_commit.clone())
     }
 
-    /// The base root, as a **snapshot** (S2 step 3a).
+    /// The snapshot the view is composed over, as a **snapshot**.
+    ///
+    /// Normally `root(base_commit)`; after [`Workspace::restore`] or [`Workspace::snapshot`] it can be a different tree without the base commit changing.
     #[must_use]
-    #[allow(dead_code, reason = "S2 step 3a: added now, used from 3b on")]
-    pub fn base_root_owned(&self) -> ObjectId {
+    pub fn base_root(&self) -> ObjectId {
         self.state
             .lock()
             .map(|state| state.base_root)
@@ -428,9 +406,9 @@ impl Workspace {
         Ok(WorkspaceStatus {
             name: self.name.clone(),
             id: self.id.clone(),
-            branch: self.branch_owned(),
-            base_commit: self.base_commit_owned(),
-            base_root: self.base_root_owned().to_string(),
+            branch: self.branch(),
+            base_commit: self.base_commit(),
+            base_root: self.base_root().to_string(),
             dirty: self.is_dirty()?,
         })
     }
@@ -502,7 +480,7 @@ impl Workspace {
 
     /// The commit id a publication must have as its parent.
     pub(crate) fn parent_commit(&self) -> ObjectId {
-        parse_oid(&self.base_commit_owned()).expect("the stored base commit is a commit id")
+        parse_oid(&self.base_commit()).expect("the stored base commit is a commit id")
     }
 
     /// Records the outcome of a publication in the main database and the handle.
