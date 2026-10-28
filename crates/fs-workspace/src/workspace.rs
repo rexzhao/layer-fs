@@ -29,6 +29,8 @@ pub struct Workspace {
     pub(crate) repo: Arc<Repo>,
     pub(crate) store: std::sync::Mutex<Store>,
     pub(crate) profile: Profile,
+    /// The publication gate (ADR-010 §10.3): read by every data operation, written by the publication steps.
+    pub(crate) gate: std::sync::Arc<crate::gate::Gate>,
 }
 
 impl fmt::Debug for Workspace {
@@ -75,6 +77,7 @@ impl Workspace {
             repo,
             store: std::sync::Mutex::new(store),
             profile: Profile::CURRENT,
+            gate: std::sync::Arc::new(crate::gate::Gate::new()),
         })
     }
 
@@ -146,6 +149,7 @@ impl Workspace {
         offset: u64,
         len: usize,
     ) -> WorkspaceResult<Vec<u8>> {
+        let _gate = self.gate.read();
         Ok(self.overlay.read_at_id(file_id, offset, len)?)
     }
 
@@ -163,6 +167,7 @@ impl Workspace {
         offset: u64,
         bytes: &[u8],
     ) -> WorkspaceResult<()> {
+        let _gate = self.gate.read();
         Ok(self.overlay.write_at_id(file_id, offset, bytes)?)
     }
 
@@ -242,6 +247,7 @@ impl Workspace {
     ///
     /// Namespace rules or allocator failures.
     pub fn create_file(&self, path: &str) -> WorkspaceResult<()> {
+        let _gate = self.gate.read();
         self.reserve_for_growth()?;
         Ok(self.overlay.create_file(&parse_path(path)?)?)
     }
@@ -252,6 +258,7 @@ impl Workspace {
     ///
     /// Namespace rules or allocator failures.
     pub fn write_at(&self, path: &str, offset: u64, bytes: &[u8]) -> WorkspaceResult<()> {
+        let _gate = self.gate.read();
         Ok(self.overlay.write_at(&parse_path(path)?, offset, bytes)?)
     }
 
@@ -261,6 +268,7 @@ impl Workspace {
     ///
     /// Namespace rules or allocator failures.
     pub fn truncate(&self, path: &str, size: u64) -> WorkspaceResult<()> {
+        let _gate = self.gate.read();
         Ok(self.overlay.truncate(&parse_path(path)?, size)?)
     }
 
@@ -294,6 +302,7 @@ impl Workspace {
     ///
     /// Overlay failures.
     pub fn flush(&self) -> WorkspaceResult<()> {
+        let _gate = self.gate.read();
         Ok(self.overlay.flush()?)
     }
 
