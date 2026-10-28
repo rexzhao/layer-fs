@@ -728,7 +728,22 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                         fields: serde_json::json!({}),
                     };
                 };
-                match adapter.quiesce(fs_winfsp::admission::QuiesceKind::Restore, WAIT) {
+                // **The handle count gets the same patience as an unmount** (S3 §3.2): an application's `CloseHandle` returns before the FSD delivers `Close` — the
+                // cache manager can keep a file object for a moment — so a count taken once would refuse a restore that is about to become legal. Measured
+                // before this loop existed: the refusal came in **48 ms**, which is exactly the spurious-refusal shape.
+                let deadline = std::time::Instant::now() + WAIT;
+                let quiesce = loop {
+                    match adapter.quiesce(fs_winfsp::admission::QuiesceKind::Restore, WAIT) {
+                        fs_winfsp::admission::Quiesce::HandlesOpen { files, dirs } => {
+                            if std::time::Instant::now() >= deadline {
+                                break fs_winfsp::admission::Quiesce::HandlesOpen { files, dirs };
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        other => break other,
+                    }
+                };
+                match quiesce {
                     fs_winfsp::admission::Quiesce::HandlesOpen { files, dirs } => {
                         // **Nothing moved**: the refusal happens before `restore` is called, so the view is exactly what it was.
                         fs_cli::pipe::Response::RestoreRefused { files, dirs }

@@ -24,7 +24,10 @@ fn binary() -> PathBuf {
 }
 
 fn temp_dir(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("fs-cli-r1-{label}-{}", std::process::id()));
+    // A label like `V:` is a **mount point**, not a path segment: it is sanitised here rather than at every call site, because a colon in a directory name is
+    // `ERROR_DIRECTORY (267)` and the failure would point at the fixture instead of at the mistake.
+    let label = label.replace(':', "_");
+    let path = std::env::temp_dir().join(format!("fs-cli-restore-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).expect("temp");
     path
@@ -173,4 +176,108 @@ fn a_restore_through_the_mount_shows_the_old_bytes() {
 /// Whether a drive letter is present, through the frontend that knows how to ask.
 fn fs_winfsp_mount_free(letter: &std::path::Path) -> Option<bool> {
     fs_winfsp::mounted::drive_present(letter)
+}
+
+/// Starts a store and mounts it, returning the pieces a case needs. Each case uses its **own letter**: the mounts in one session do not always come back
+/// cleanly, and a shared letter would make two cases blame each other.
+fn mount_at(letter: &str) -> (PathBuf, MountChild, PathBuf) {
+    let store = temp_dir(letter);
+    Command::new(binary())
+        .arg("init")
+        .arg(&store)
+        .output()
+        .expect("init");
+    let mount_point = PathBuf::from(letter);
+    assert_eq!(
+        fs_winfsp::mounted::drive_present(&mount_point),
+        Some(false),
+        "cell precondition: {letter} must be free before mounting"
+    );
+    let child = MountChild(
+        Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("mount")
+            .arg(&mount_point)
+            .arg("--workspace")
+            .arg("main")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mount"),
+    );
+    let root = PathBuf::from(format!("{letter}\\"));
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(15) && std::fs::metadata(&root).is_err() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        std::fs::metadata(&root).is_ok(),
+        "cell setup: {letter} must serve"
+    );
+    (store, child, root)
+}
+
+/// **R2** — an open **file** handle blocks the restore, the view does not move, and the mount is **not** left refusing opens.
+#[test]
+fn an_open_file_handle_blocks_the_restore_and_nothing_moves() {
+    common::strict_gate();
+    let (store, _child, root) = mount_at("V:");
+    let mount_point = PathBuf::from("V:");
+    let file = root.join("f");
+
+    std::fs::write(&file, b"1").expect("write 1");
+    let (ok, out, err) = cli(&store, &mount_point, &["commit", "-m", "c1"]);
+    assert!(ok, "cell R2: commit c1: {out}{err}");
+    let c1 = out
+        .trim()
+        .strip_prefix("commit ")
+        .unwrap_or_default()
+        .to_owned();
+    std::fs::write(&file, b"2").expect("write 2");
+    let (ok, out, err) = cli(&store, &mount_point, &["commit", "-m", "c2"]);
+    assert!(ok, "cell R2: commit c2: {out}{err}");
+
+    // The handle that must block: a **file**, held open for the whole attempt.
+    let held = std::fs::File::open(&file).expect("hold the file open");
+    let started = Instant::now();
+    let (ok, out, err) = cli(&store, &mount_point, &["restore", &c1]);
+    let waited = started.elapsed();
+    println!(
+        "R2 reading: exit_ok={ok} waited={waited:?} stdout={:?} stderr={:?}",
+        out.trim(),
+        err.trim()
+    );
+    assert!(
+        !ok,
+        "cell R2: an open file handle must make the restore fail"
+    );
+    assert!(
+        err.contains("1 file"),
+        "cell R2: the refusal names the **file** count, got {err:?}"
+    );
+    // Nothing moved: the bytes are still the second commit's.
+    drop(held);
+    assert_eq!(
+        std::fs::read(&file).expect("read after the refusal"),
+        b"2",
+        "cell R2: a refused restore must leave the view exactly as it was"
+    );
+
+    // **The gate came back**: an open still works (a refusal that left it Paused would hang here).
+    let reopened = std::fs::File::open(&file).expect("the mount still opens files after a refusal");
+    drop(reopened);
+
+    // And with no handle held, the same command succeeds.
+    let (ok, out, err) = cli(&store, &mount_point, &["restore", &c1]);
+    assert!(
+        ok,
+        "cell R2: after closing, the restore must succeed: {out}{err}"
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("read after the restore"),
+        b"1",
+        "cell R2: and it really moved the view"
+    );
+    let _ = std::fs::remove_dir_all(&store);
 }
