@@ -206,6 +206,62 @@ pub fn pause_point(point: &str) {
         }
     }
 }
+/// Rewrites a **held** mount record in place, for the `switch` that changes which workspace a mount serves (S3 card §5.2, step 6a).
+///
+/// The record's handle is held by the mount for its whole life, and that is the point: readers poll it (W1 does, every 10 ms) and must never see it `Gone` or
+/// `Stale` while a switch is happening. So the file is **truncated and rewritten through the same handle**, never deleted and recreated.
+///
+/// Two consequences, both deliberate:
+///
+/// - a reader can land in the middle and see an empty or half-written record, so [`record_is_live`] treats "cannot parse" as **retry once** rather than as
+///   something else (the liveness semantics themselves do not change);
+/// - the write is `SetEndOfFile(0)` followed by one `WriteFile` (what `set_len(0)` + `write_all` does here), because a shorter record would otherwise leave the
+///   tail of the old one behind and produce a line that parses but is wrong.
+///
+/// # Errors
+///
+/// Whatever the file system says. A failure here leaves the record as it was (truncate-then-write can leave it empty; the caller rewrites it), which is why this
+/// is called **before** the success is reported, not after.
+pub fn rewrite_record(record: &mut std::fs::File, contents: &str) -> std::io::Result<()> {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    record.set_len(0)?;
+    record.seek(SeekFrom::Start(0))?;
+    record.write_all(contents.as_bytes())?;
+    record.flush()?;
+    Ok(())
+}
+pub fn hold_record_for_test(
+    path: &std::path::Path,
+    contents: &str,
+) -> std::io::Result<std::fs::File> {
+    use std::io::Write as _;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_DELETE: u32 = 0x4;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        Ok(file)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::{

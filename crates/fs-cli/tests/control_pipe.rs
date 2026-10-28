@@ -287,3 +287,83 @@ fn the_old_stop_file_does_not_stop_a_mount() {
     );
     let _ = std::fs::remove_file(&stop);
 }
+
+/// **W1's mechanism, tested on its own** — a record rewritten through the held handle is never seen as `Gone` or `Stale` by a reader polling it.
+///
+/// The switch cannot delete and recreate the record: W1 polls liveness every 10 ms for the whole switch, and a recreate would show up as `Gone`. What a reader
+/// *can* see is an empty or half-written file, so the rule is "cannot parse ⇒ retry once", and that is asserted here rather than assumed.
+#[test]
+fn a_record_rewritten_in_place_never_reads_as_gone() {
+    let directory =
+        std::env::temp_dir().join(format!("fs-cli-record-rewrite-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("temp");
+    let path = directory.join("U.mount");
+    let first = "store=C:/repo\nworkspace=dev\nbranch=dev\npid=1\nmount=C:/mnt/u\n";
+    let second = "store=C:/repo\nworkspace=feat\nbranch=feat\npid=1\nmount=C:/mnt/u\n";
+    let mut record = fs_cli::hold_record_for_test(&path, first).expect("hold the record");
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poller = {
+        let seen = std::sync::Arc::clone(&seen);
+        let stop = std::sync::Arc::clone(&stop);
+        let path = path.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                // The card's rule: cannot parse ⇒ wait 50 ms and read once more, then judge.
+                let text = if text.contains("workspace=") {
+                    text
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::fs::read_to_string(&path).unwrap_or_default()
+                };
+                let reading = if text.is_empty() {
+                    "gone"
+                } else if text.contains("workspace=") {
+                    "live"
+                } else {
+                    "unparseable"
+                };
+                seen.lock().expect("seen").push(match reading {
+                    "gone" => "gone",
+                    "live" => "live",
+                    _ => "unparseable",
+                });
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        })
+    };
+    // **20 rounds with a pause between them**, so the poller gets dozens of samples instead of one: a reading of "1 sample, no `gone`" would prove almost nothing
+    // about the window this test is about.
+    for _ in 0..20 {
+        fs_cli::rewrite_record(&mut record, second).expect("rewrite");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs_cli::rewrite_record(&mut record, first).expect("rewrite back");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    poller.join().expect("the poller finishes");
+
+    let seen = seen.lock().expect("seen");
+    let gone = seen.iter().filter(|reading| **reading == "gone").count();
+    let unparseable = seen
+        .iter()
+        .filter(|reading| **reading == "unparseable")
+        .count();
+    println!(
+        "W1-mechanism reading: {} samples, gone={gone}, unparseable-after-retry={unparseable}",
+        seen.len()
+    );
+    assert!(!seen.is_empty(), "the poller must have sampled something");
+    assert_eq!(
+        gone, 0,
+        "cell W1: rewriting in place must never look like the record vanished"
+    );
+    assert_eq!(
+        unparseable, 0,
+        "cell W1: the retry must cover the window where the file is truncated"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
