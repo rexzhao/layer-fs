@@ -34,3 +34,7 @@ fs-api = { path = "crates/fs-api" }
 blake3 = "1.8.7"
 # Bundled SQLite: one version everywhere, no system-library dependency.
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# The CLI's control pipe speaks one line of JSON per request (ADR-010 §10.2). A hand-written parser would need its own criteria set for "what counts as
+# valid JSON" — escapes, duplicate keys, huge numbers, UTF-8 boundaries — which is why the ruling was the library (547).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

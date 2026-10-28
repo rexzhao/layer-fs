@@ -4,6 +4,7 @@
 //! criterion and the binary fail together, which is the point.
 
 pub mod discovery;
+pub mod pipe;
 
 /// Printed when a command needs a workspace and none was given.
 ///

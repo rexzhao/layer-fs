@@ -20,6 +20,9 @@ fs-api.workspace = true
 fs-workspace.workspace = true
 # The mount subcommands drive the WinFsp frontend directly (B-24); `fs-api` supplies the backend they hand it.
 fs-winfsp.workspace = true
+# One line of JSON per control request (ADR-010 §10.2); the ruling was the library, not a hand-written parser (547).
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
