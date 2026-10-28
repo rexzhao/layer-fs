@@ -216,6 +216,63 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // **Inside a mount, `status` asks the mount** (ADR-010 §6): the overlay is held by the mount process, so opening it here would be refused — the same
     // reason `checkout` asks the workspace *list*. The answer comes over the control pipe, which is also what makes it the mount's own view.
+    // **Inside a mount, `commit` and `snapshot` also ask the mount** (ADR-010 §10.3): the overlay is held by the mount process, so opening it here would be
+    // refused with `WorkspaceInUse` — and the answer has to come from the workspace that is actually serving the files.
+    if command == "commit" || command == "snapshot" {
+        if let Some(here) = mountcmd::mount_of_cwd() {
+            if !here.pipe.is_empty() {
+                let message = arguments
+                    .iter()
+                    .position(|argument| argument == "-m")
+                    .and_then(|index| arguments.get(index + 1))
+                    .cloned()
+                    .unwrap_or_default();
+                let force = arguments.iter().any(|argument| argument == "--force");
+                let request = fs_cli::pipe::Request {
+                    v: fs_cli::pipe::PROTOCOL,
+                    op: command.clone(),
+                    args: serde_json::json!({ "message": message, "force": force }),
+                };
+                return match fs_cli::pipe_win::call(
+                    &here.pipe,
+                    &request,
+                    fs_cli::pipe_win::CONNECT_WAIT_MS,
+                ) {
+                    Ok(fs_cli::pipe::Response::Failed {
+                        kind,
+                        detail,
+                        fields,
+                    }) if kind == "committed" || kind == "snapshotted" => {
+                        let named = fields
+                            .get("commit")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        let root = fields
+                            .get("root")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        if kind == "committed" {
+                            println!("commit {named}");
+                        } else {
+                            println!("snapshot {root}");
+                        }
+                        let _ = detail;
+                        Ok(())
+                    }
+                    Ok(fs_cli::pipe::Response::Failed { kind, detail, .. }) => {
+                        Err(format!("the mount refused `{command}` ({kind}): {detail}").into())
+                    }
+                    Ok(other) => Err(format!("the mount answered {other:?}").into()),
+                    Err(error) => Err(fs_cli::Failure::in_use(format!(
+                        "the mount at {} is not answering ({error})",
+                        here.mount_point.display()
+                    ))
+                    .into()),
+                };
+            }
+        }
+    }
+
     if command == "status" {
         if let Some(here) = mountcmd::mount_of_cwd() {
             if !here.pipe.is_empty() {
