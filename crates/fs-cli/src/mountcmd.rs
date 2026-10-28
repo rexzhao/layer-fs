@@ -293,6 +293,14 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                 // stop **file** is gone — A15s asserts that writing one no longer stops a mount, because a signal nobody can see the receipt of was the thing
                 // being replaced.
                 if stop_requested() {
+                    // **A console stop does not wait for handles** (ADR-010 §7.2): the user in front of the window asked for it, so the mount unmounts and the
+                    // handles die — but it says how many, because "my editor lost the file" is much easier to understand with a number attached.
+                    let open = adapter_slot
+                        .get()
+                        .map_or(0, |adapter| adapter.open_handles());
+                    if open > 0 {
+                        println!("{open} open handle(s) will be invalidated");
+                    }
                     println!("unmount requested after {:?}", started.elapsed());
                     break;
                 }
@@ -730,6 +738,16 @@ pub fn live_records() -> Vec<(fs_cli::discovery::Record, fs_cli::discovery::Live
         ));
     }
     out
+}
+
+/// The mount whose volume contains the current directory, if any (ADR-010 §4.4).
+///
+/// Same two queries as `run`'s discovery, exposed so a command can ask "am I being run from inside a mount" without re-implementing path discovery — A3b's
+/// third case is exactly that question.
+#[must_use]
+pub fn mount_of_cwd() -> Option<fs_cli::discovery::Record> {
+    let cwd = std::env::current_dir().ok()?;
+    fs_cli::discovery::discover(&cwd, fs_cli::winpaths::volume_root, live_records)
 }
 
 /// The live mount serving `workspace`, if there is one: `(mount_point, pid)`.

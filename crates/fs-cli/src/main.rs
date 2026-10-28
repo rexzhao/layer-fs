@@ -56,11 +56,9 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("layerfs: {error}");
-            // **Exit codes are part of the interface** (ADR-010 §8.3): a script has to tell "retry when the other process finishes" from "this command
-            // is wrong". Everything that is not a `Failure` keeps the old answer, so this changes nothing that did not opt in.
-            let code = error
-                .downcast_ref::<fs_cli::Failure>()
-                .map_or(1, |failure| failure.code);
+            // **Exit codes are part of the interface** (ADR-010 §8.3): a script has to tell "retry when the other process finishes" from "this command is
+            // wrong". Three layers can answer: a `Failure` from the CLI itself, an `ApiError` bubbled up from the core, and everything else (1).
+            let code = exit_code(&*error);
             ExitCode::from(code)
         }
     }
@@ -71,6 +69,41 @@ fn main() -> ExitCode {
 /// Replaceable (ADR-010 §5): with `cli/current` gone, every command that needs a workspace takes it from the option, and a command that needs one
 /// without having it fails with [`fs_cli::NO_WORKSPACE`] — never with a guessed name.
 static WORKSPACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The **exit code** a failure deserves (ADR-010 §8.3).
+///
+/// Collected in one function rather than sprinkled through the commands: a script's ability to tell "retry" from "fix your command" should not depend on which
+/// verb happened to translate the error. The distinction the ADR draws:
+///
+/// ```
+/// 2  usage        (a `Failure` the CLI raised itself)
+/// 3  not found    (store / workspace / branch / commit)
+/// 4  busy         (in use, waiting, offline maintenance)
+/// 5  conflict     (branch moved, nothing to commit, already exists)
+/// 1  anything else
+/// ```
+fn exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
+    if let Some(failure) = error.downcast_ref::<fs_cli::Failure>() {
+        return failure.code;
+    }
+    if let Some(api) = error.downcast_ref::<ApiError>() {
+        return match api {
+            ApiError::Workspace(fs_workspace::WorkspaceError::NotFound { .. }) => 3,
+            ApiError::Workspace(
+                fs_workspace::WorkspaceError::StoreInUse { .. }
+                | fs_workspace::WorkspaceError::Busy { .. },
+            ) => 4,
+            ApiError::Workspace(
+                fs_workspace::WorkspaceError::BranchMoved { .. }
+                | fs_workspace::WorkspaceError::NothingToCommit
+                | fs_workspace::WorkspaceError::AlreadyExists { .. }
+                | fs_workspace::WorkspaceError::WorkspaceDirty,
+            ) => 5,
+            _ => 1,
+        };
+    }
+    1
+}
 
 fn require_workspace() -> Result<String, Box<dyn std::error::Error>> {
     match WORKSPACE.get().and_then(Option::clone) {
@@ -360,6 +393,20 @@ fn checkout(
     };
 
     // The workspace exists. If it is **mounted**, say so and keep the mount: `checkout` is not a request to unmount anything (A3b).
+    // **A3b's third case**: run from inside another workspace's mount, `checkout` must not disturb that mount — it says which two steps would switch it.
+    if let Some(here) = mountcmd::mount_of_cwd() {
+        if here.workspace != existing.name {
+            println!(
+                "this directory is inside the mount of {} at {}; to switch it:\n  layerfs umount {}\n  layerfs mount {} --workspace {}",
+                here.workspace,
+                here.mount_point.display(),
+                here.mount_point.display(),
+                here.mount_point.display(),
+                existing.name
+            );
+        }
+    }
+
     match mountcmd::live_mount_of(&existing.name) {
         Some((mount_point, pid)) => {
             println!(
