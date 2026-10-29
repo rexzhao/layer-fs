@@ -3434,3 +3434,10 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      icacls SYSTEM/Administrators/Everyone (F)。全量 741/741。
      worker 重构时删掉 resolve_library 被 clippy 抓回——编译器做了一次描述与实物对账。
      已发 QA 验收（fix/volume-security @ d8998c0）。
+
+653. 【卷卡闭环（QA 通过+release 重建）】QA 验收：V:=F: 逐字节匹配、icacls 三行
+     精确、无提权 mkdir、回归全过、C1-C3 3/3、741/740/1（唯一红=1546 族单跑绿）。
+     流程偏差记账：卷卡三笔直接推 main、QA 事后验收——补救成功但顺序应为
+     分支→review→QA→合入（验收发现问题才不用在 main 上回滚；SD 两试两退是活例子）。
+     下次产品卡走分支，测试基础设施直接推授权不变。
+     release exe 重建于 1387296（14:01）。
