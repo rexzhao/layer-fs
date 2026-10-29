@@ -172,7 +172,7 @@ fn the_capacity_is_asked_for_on_every_call() {
     let status = unsafe {
         get_volume_info_for(
             Some(volume(1 << 20)),
-            Some(source),
+            Some(&source),
             std::ptr::addr_of_mut!(out).cast::<c_void>(),
             capacity,
         )
@@ -196,7 +196,7 @@ fn the_capacity_is_asked_for_on_every_call() {
     let status = unsafe {
         get_volume_info_for(
             Some(volume(1 << 20)),
-            Some(source),
+            Some(&source),
             std::ptr::addr_of_mut!(again).cast::<c_void>(),
             capacity,
         )
@@ -228,7 +228,7 @@ fn a_silent_capacity_source_keeps_the_configured_numbers() {
     let status = unsafe {
         get_volume_info_for(
             Some(volume(1 << 20)),
-            Some(silent),
+            Some(&silent),
             std::ptr::addr_of_mut!(out).cast::<c_void>(),
             capacity,
         )

@@ -49,32 +49,39 @@ fn a_rename_through_a_mounted_volume_moves_the_name() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("V:"));
     let backend: DynOps = Box::new(ApiBackend::new(workspace));
-    let _ = mount_read_only(&library, &mount_point, backend, volume(), |path: &Path| {
-        let root = if path.to_string_lossy().ends_with(':') {
-            PathBuf::from(format!("{}\\", path.display()))
-        } else {
-            path.to_path_buf()
-        };
-        std::fs::write(root.join("l2-file"), b"x").expect("write");
-        std::fs::rename(root.join("l2-file"), root.join("l2-renamed"))
-            .map_err(|e| format!("rename: {e}"))?;
-        if std::fs::symlink_metadata(root.join("l2-file")).is_ok() {
-            return Err("the old name is still bound after a successful rename".to_string());
-        }
-        if std::fs::symlink_metadata(root.join("l2-renamed")).is_err() {
-            return Err("the new name is not bound after a successful rename".to_string());
-        }
-        let names: Vec<String> = std::fs::read_dir(&root)
-            .map_err(|e| format!("list: {e}"))?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        if names != vec!["l2-renamed".to_string()] {
-            return Err(format!(
-                "the listing is {names:?}, not exactly the new name"
-            ));
-        }
-        Ok(())
-    });
+    let _ = mount_read_only(
+        &library,
+        &mount_point,
+        backend,
+        volume(),
+        None,
+        |path: &Path| {
+            let root = if path.to_string_lossy().ends_with(':') {
+                PathBuf::from(format!("{}\\", path.display()))
+            } else {
+                path.to_path_buf()
+            };
+            std::fs::write(root.join("l2-file"), b"x").expect("write");
+            std::fs::rename(root.join("l2-file"), root.join("l2-renamed"))
+                .map_err(|e| format!("rename: {e}"))?;
+            if std::fs::symlink_metadata(root.join("l2-file")).is_ok() {
+                return Err("the old name is still bound after a successful rename".to_string());
+            }
+            if std::fs::symlink_metadata(root.join("l2-renamed")).is_err() {
+                return Err("the new name is not bound after a successful rename".to_string());
+            }
+            let names: Vec<String> = std::fs::read_dir(&root)
+                .map_err(|e| format!("list: {e}"))?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            if names != vec!["l2-renamed".to_string()] {
+                return Err(format!(
+                    "the listing is {names:?}, not exactly the new name"
+                ));
+            }
+            Ok(())
+        },
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

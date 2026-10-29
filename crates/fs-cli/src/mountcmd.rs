@@ -309,6 +309,15 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                 &mount_point,
                 backend,
                 volume(),
+                // **The two capacity numbers are state**: asked from the host volume of the store on every `GetVolumeInfo`, so the reported free space and the
+                // moment a write fails come from the same measurement.
+                {
+                    let store = store.clone();
+                    Some(Box::leak(Box::new(move || {
+                        fs_winfsp::callbacks::host_capacity(&store)
+                    }))
+                        as fs_winfsp::callbacks::CapacitySource)
+                },
                 |mounted: &fs_winfsp::mounted::Mounted| {
                     // **`status.handles` reads the adapter at the moment of the ask**, so the control channel needs the adapter — not a number captured now.
                     // (Until this line runs, the channel answers 0, which is also the truth: nobody has opened a file yet.)

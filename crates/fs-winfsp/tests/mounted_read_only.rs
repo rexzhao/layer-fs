@@ -134,7 +134,7 @@ fn the_file_system_can_be_mounted_read_only_and_unmounted() {
     let before_contexts = callbacks::context_counts();
     // The mounted probe returns `Result<(), String>` to the library (which only cares whether it worked); the **names** are kept
     // here, because they are the evidence about semantics rather than about plumbing.
-    let report = mount_read_only(&library, &mount_point, backend, volume, |path: &std::path::Path| {
+    let report = mount_read_only(&library, &mount_point, backend, volume, None, |path: &std::path::Path| {
         // `Y:` alone means "the current directory on Y:", which a file system without directory state cannot answer; `Y:\`
         // is the volume root. This distinction is exactly the kind of thing that fails as ERROR_INVALID_FUNCTION rather than as
         // "not found".

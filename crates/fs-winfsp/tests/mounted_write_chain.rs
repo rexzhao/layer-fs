@@ -195,6 +195,7 @@ fn windows_can_write_through_the_mount_and_read_the_bytes_back() {
         &mount_point,
         backend,
         volume(),
+        None,
         |path: &std::path::Path| {
             // The outcome is recorded **whatever happens**, so a failure inside the probe is reported as itself instead of appearing as
             // "the probe never ran" (the two are different facts, and one of them is the one worth reading).
@@ -330,6 +331,7 @@ fn a_file_can_be_created_at_the_root() {
         &mount_point,
         backend,
         volume(),
+        None,
         |path: &std::path::Path| {
             let root = root_of(path);
             let file = root.join("created.txt");

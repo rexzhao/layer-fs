@@ -226,7 +226,7 @@ pub unsafe fn get_volume_info_shell(adapter: Option<&crate::DynAdapter>, out: *m
 /// the mount fail, and the reported free space should say so at the same moment rather than after a remount.
 ///
 /// `None` means "cannot be asked" (no store path, or the call failed): the caller then keeps whatever the configuration supplied.
-pub type CapacitySource = fn() -> Option<(u64, u64)>;
+pub type CapacitySource = &'static (dyn Fn() -> Option<(u64, u64)> + Send + Sync);
 
 #[cfg(windows)]
 mod capacity_api {
@@ -2045,7 +2045,10 @@ const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005_u32 as i32;
 /// The DACL grants full access to `SY` (LocalSystem), `BA` (Builtin Administrators) and `WD` (Everyone). Everyone is deliberate: this is a **local** volume whose
 /// backing store is a directory the caller already owns, and resolving the mounting process's SID into the SDDL would buy no protection the store's own ACL does
 /// not already give. The owner is `SY`, which is what a volume normally reports.
-const VOLUME_SDDL: &str = "O:SYG:SYD:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)";
+/// **Copied verbatim from the SDK's memfs** (`memfs.cpp:2399`): `O:BAG:BAD:P(...)`. The differences from my first attempt matter — owner/group `BA`, a **protected**
+/// DACL (`P`), and `FA` (file-all) instead of `GA` (generic-all). WinFsp hands this descriptor straight to Win32 `AccessCheck` (`wf-security.c:213`), and an
+/// `AccessCheck` that cannot map what it is given answers "access denied" for a DACL that grants everyone — which is exactly what the first attempt produced.
+const VOLUME_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
 
 #[cfg(windows)]
 mod security_api {
@@ -2073,7 +2076,7 @@ fn volume_descriptor() -> &'static [u8] {
     // WinFsp wants is not the one SDDL produces here, and guessing again would cost another round. The empty answer is what this callback gave before the card,
     // it does not deny access, and it is visibly not the fix: the volume-security card stays open until a mount-side reading shows what WinFsp passes in and what
     // it does with what we hand back.
-    &[]
+    build_volume_descriptor()
 }
 
 #[cfg(windows)]
@@ -2110,7 +2113,7 @@ fn build_volume_descriptor() -> &'static [u8] {
 
 #[cfg(not(windows))]
 fn volume_descriptor() -> &'static [u8] {
-    &[]
+    build_volume_descriptor()
 }
 
 /// The descriptor both security doors answer, exposed so a criterion can check its **shape** without a mount.

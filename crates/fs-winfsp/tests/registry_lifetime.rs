@@ -309,7 +309,7 @@ fn mount_serving_sees_its_own_open_handles() {
         },
     };
     let backend: DynOps = Box::new(MockBackend::new());
-    let report = mount_serving(&library, &mount_point, backend, volume, |mounted: &_| {
+    let report = mount_serving(&library, &mount_point, backend, volume, None, |mounted: &_| {
         let root = if mounted.path().to_string_lossy().ends_with(':') {
             PathBuf::from(format!("{}\\", mounted.path().display()))
         } else {

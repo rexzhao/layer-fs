@@ -76,12 +76,18 @@ pub fn mount_read_only(
     mount_point: &Path,
     backend: crate::ops::DynOps,
     volume: crate::abi::VolumeInfo,
+    capacity: Option<crate::callbacks::CapacitySource>,
     probe: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<MountReport, LoadError> {
     // A thin wrapper: the probe only ever wanted the path, and the existing criteria keep saying so (ADR-010 §10.5).
-    mount_serving(library, mount_point, backend, volume, |mounted| {
-        probe(mounted.path())
-    })
+    mount_serving(
+        library,
+        mount_point,
+        backend,
+        volume,
+        capacity,
+        |mounted: &Mounted| probe(mounted.path()),
+    )
 }
 
 /// A mount that is **serving**, as the closure of [`mount_serving`] sees it.
@@ -128,10 +134,12 @@ pub fn mount_serving(
     mount_point: &Path,
     backend: crate::ops::DynOps,
     volume: crate::abi::VolumeInfo,
+    capacity: Option<crate::callbacks::CapacitySource>,
     serve: impl FnOnce(&Mounted) -> Result<(), String>,
 ) -> Result<MountReport, LoadError> {
+    // **Fail before anything is created** when the DLL cannot be resolved: a version problem must not look like a mount problem.
     resolve_library(library)?;
-    platform::mount_serving(library, mount_point, backend, volume, serve)
+    platform::mount_serving(library, mount_point, backend, volume, capacity, serve)
 }
 
 #[cfg(windows)]
@@ -833,6 +841,7 @@ mod platform {
         mount_point: &Path,
         backend: crate::ops::DynOps,
         volume: crate::abi::VolumeInfo,
+        capacity: Option<crate::callbacks::CapacitySource>,
         serve: impl FnOnce(&super::Mounted) -> Result<(), String>,
     ) -> Result<super::MountReport, LoadError> {
         let module_path = wide(library.as_os_str());
@@ -940,6 +949,7 @@ mod platform {
                 backend,
                 crate::adapter::AdapterConfig {
                     volume: Some(volume),
+                    capacity,
                     ..crate::adapter::AdapterConfig::default()
                 },
             ));

@@ -194,7 +194,7 @@ fn a_file_handle_and_a_directory_handle_are_counted_apart_and_both_come_back_dow
     }
 
     let mut readings: Vec<String> = Vec::new();
-    let report = mount_serving(&library, &mount_point, backend, volume, |mounted| {
+    let report = mount_serving(&library, &mount_point, backend, volume, None, |mounted: &fs_winfsp::mounted::Mounted| {
         let adapter = mounted.adapter();
         let root = {
             let text = mounted.path().to_string_lossy().to_string();
