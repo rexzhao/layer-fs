@@ -212,6 +212,35 @@ fn fs_winfsp_mount_free(letter: &std::path::Path) -> Option<bool> {
 
 /// Starts a store and mounts it, returning the pieces a case needs. Each case uses its **own letter**: the mounts in one session do not always come back
 /// cleanly, and a shared letter would make two cases blame each other.
+/// Waits until **no volume is attached** at `mount_point` — the state a test must start from.
+///
+/// A previous case in the same session can leave a drive letter attached for a moment after its own `umount` returned (`StopDispatcher` returning is not the same as
+/// the device being gone), and the next case then mounts "successfully" onto a volume that is still being torn down. Measured: that is when a run shows one random
+/// failure in a different test each time. Waiting for the **state** (not a sleep) is what makes the precondition true rather than likely.
+fn wait_until_free(mount_point: &std::path::Path) {
+    let started = Instant::now();
+    let mut waited = Duration::ZERO;
+    loop {
+        if fs_winfsp::mounted::drive_present(mount_point) == Some(false) {
+            if waited > Duration::ZERO {
+                println!(
+                    "cell setup: {} became free after {waited:?}",
+                    mount_point.display()
+                );
+            }
+            return;
+        }
+        assert!(
+            started.elapsed() <= Duration::from_secs(20),
+            "cell setup: {} never became free (still present after {:?})",
+            mount_point.display(),
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        waited = started.elapsed();
+    }
+}
+
 fn mount_at(letter: &str) -> (PathBuf, MountChild, PathBuf) {
     let store = temp_dir(letter);
     Command::new(binary())
@@ -220,11 +249,7 @@ fn mount_at(letter: &str) -> (PathBuf, MountChild, PathBuf) {
         .output()
         .expect("init");
     let mount_point = PathBuf::from(letter);
-    assert_eq!(
-        fs_winfsp::mounted::drive_present(&mount_point),
-        Some(false),
-        "cell precondition: {letter} must be free before mounting"
-    );
+    wait_until_free(&mount_point);
     let child = MountChild(
         Command::new(binary())
             .arg("--store")

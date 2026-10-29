@@ -69,6 +69,32 @@ fn root_of(mount_point: &Path) -> PathBuf {
 }
 
 /// Starts a mount in another process and waits until the volume really serves.
+/// Waits until **no volume is attached** at `mount_point`.
+///
+/// A previous case can leave a letter attached for a moment after its own `umount` returned (`StopDispatcher` returning is not the same as the device being gone),
+/// and the next case then mounts onto a volume that is still being torn down — which shows up as one random failure in a different test each run. Waiting for the
+/// **state** is what makes the precondition true rather than likely.
+fn wait_until_free(mount_point: &Path) {
+    // Only a **drive letter** has a volume that can be "present": a directory mount point is a directory on the host volume, so `drive_present` cannot describe it
+    // (measured: it answers `None`, and a loop waiting for `Some(false)` would sit there for the whole bound).
+    if !mount_point.to_string_lossy().ends_with(':') {
+        return;
+    }
+    let started = Instant::now();
+    loop {
+        if fs_winfsp::mounted::drive_present(mount_point) == Some(false) {
+            return;
+        }
+        assert!(
+            started.elapsed() <= Duration::from_secs(20),
+            "cell setup: {} never became free (still present after {:?})",
+            mount_point.display(),
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn start_mount(label: &str, mount_point: &Path) -> MountChild {
     let store = temp_dir(label);
     Command::new(binary())
@@ -76,6 +102,7 @@ fn start_mount(label: &str, mount_point: &Path) -> MountChild {
         .arg(&store)
         .output()
         .expect("init");
+    wait_until_free(mount_point);
     let child = MountChild(
         Command::new(binary())
             .arg("--store")
