@@ -3507,3 +3507,11 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      处置：代码四步全过（746/746、C1-C7 齐），发 QA 事后验收（同 653 补救路径）。
      C5 函数级判据（volume_warning 纯函数正负两例）——\"读孩子 stderr 测的是
      夹具不是产品\"；C6 顺带真触发宿主警告与 C5 互证。
+
+663. 【流程·662 又犯一遍+机械化】662 的推送里 branch --show-current 输出
+     feat/virtual-volume 而我照推——检查跑了没人拦。处置：
+     ① 分支与 main 同点=已合入，删除；
+     ② 采纳 warning 级 pre-push 钩子（推 main 且非 main 分支 ⇒ 大字提醒不阻断
+       ——合并流程本身从 detached 临时 worktree 推 HEAD:main 是合法路径），worker 实现；
+     ③ manager 习惯改结构性：判据提交前看分支，在分支上就不动让判据随卡合入。
+     钩子是绊线不是锁，锁是自己的习惯。
