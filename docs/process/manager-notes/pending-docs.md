@@ -3515,3 +3515,9 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
        ——合并流程本身从 detached 临时 worktree 推 HEAD:main 是合法路径），worker 实现；
      ③ manager 习惯改结构性：判据提交前看分支，在分支上就不动让判据随卡合入。
      钩子是绊线不是锁，锁是自己的习惯。
+
+664. 【pre-push 钩子落地（c35ea0f）】.githooks/pre-push：从非 main 推 refs/heads/main
+     ⇒ 6 行大字警告（含判据号 653/662/663 可顺藤摸事故），exit 0 不阻断。
+     不阻断理由入注释：合并流程从 detached 临时 worktree 推 HEAD:main 是合法路径。
+     顺带发现：detached 时 git push origin main 推引用不含提交（钩子对 detached
+     只能提示空分支）——真正的锁仍是习惯（判据提交前看分支/合并时确认 HEAD 关系）。
