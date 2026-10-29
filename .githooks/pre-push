@@ -1,0 +1,29 @@
+#!/bin/sh
+# **A tripwire, not a lock** (record 663): pushing `main` from a branch other than `main` has swept a card's commits into `main` twice, and both times the
+# check had been *run* and then ignored. So this prints a warning nobody can miss and does **not** block.
+#
+# Why not block: pushing `HEAD:main` from a detached worktree is a legitimate merge path (that is how a card lands). A hook cannot tell "the merge I meant"
+# from "the branch I forgot", so it does the one thing it can do honestly — make the branch name impossible to miss.
+#
+# stdin: `<local ref> <local sha> <remote ref> <remote sha>` per line.
+
+remote_refs=$(sed -n 's/^[^ ]* [^ ]* \(refs\/heads\/main\) .*$/\1/p')
+[ -z "$remote_refs" ] && exit 0
+
+branch=$(git branch --show-current 2>/dev/null)
+[ "$branch" = "main" ] && exit 0
+
+big() {
+    printf '\n'
+    printf '%s\n' '########################################################################'
+    printf '###  PUSHING refs/heads/main FROM "%s"  \n' "${branch:-<detached>}"
+    printf '%s\n' '###'
+    printf '%s\n' '###  If this is a card being merged, carry on.'
+    printf '%s\n' '###  If you meant to push a record/判据 commit only, you are about to'
+    printf '%s\n' '###  sweep that branch into main.  (records 653 / 662 / 663)'
+    printf '%s\n' '########################################################################'
+    printf '\n'
+}
+
+big
+exit 0
