@@ -35,6 +35,10 @@ pub struct Workspace {
     /// mean a single commit that both adds and removes, which is the shape this project keeps refusing.
     #[allow(dead_code, reason = "S2 step 1: initialised now, read from step 3 on")]
     pub(crate) state: std::sync::Mutex<BaseState>,
+    /// The cached `view_logical_bytes` reading: (when it was taken, the number).
+    ///
+    /// The shell asks `GetVolumeInfo` many times per second and the answer costs a tree walk, so the walk is bounded to once per window rather than once per ask.
+    pub(crate) used: std::sync::Mutex<Option<(std::time::Instant, u64)>>,
 }
 
 /// What a publication moves: the commit the view is based on, its root, and the branch it publishes to.
@@ -97,6 +101,7 @@ impl Workspace {
             overlay,
             repo,
             store: std::sync::Mutex::new(store),
+            used: std::sync::Mutex::new(None),
             profile: Profile::CURRENT,
             gate: std::sync::Arc::new(crate::gate::Gate::new()),
         })
@@ -144,6 +149,42 @@ impl Workspace {
             .lock()
             .map(|state| state.base_root)
             .unwrap_or_else(|poisoned| poisoned.into_inner().base_root)
+    }
+    /// The **logical size of everything the view shows**, which is what the volume reports as "used".
+    ///
+    /// Files only (directories have no bytes of their own), and counted **per view**, not per object: two names pointing at the same content each count, because a
+    /// user reading "used" is reading about their files, not about deduplication. History is excluded for the same reason.
+    ///
+    /// # Cost
+    ///
+    /// This walks the view, so it is **cached for a quarter of a second**: the shell asks `GetVolumeInfo` many times per second, and a full tree walk per ask
+    /// would be a cost nobody asked for. 250 ms is short enough that a copy is visible on the next refresh (which is the owner's acceptance reading) and long
+    /// enough that a burst of shell queries costs one walk.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the view says (a corrupt overlay is reported, never guessed at).
+    pub fn view_logical_bytes(&self) -> WorkspaceResult<u64> {
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+        if let Ok(cache) = self.used.lock() {
+            if let Some((at, bytes)) = *cache {
+                if at.elapsed() < WINDOW {
+                    return Ok(bytes);
+                }
+            }
+        }
+        let bytes = self.overlay.read_tree(|view| -> WorkspaceResult<u64> {
+            let nodes = crate::materialize::collect(view)?;
+            Ok(nodes
+                .iter()
+                .filter(|node| !node.is_dir)
+                .map(|node| node.size)
+                .sum::<u64>())
+        })?;
+        if let Ok(mut cache) = self.used.lock() {
+            *cache = Some((std::time::Instant::now(), bytes));
+        }
+        Ok(bytes)
     }
 
     /// The explicit security descriptor of `file_id`, if the store has one.

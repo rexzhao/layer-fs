@@ -138,8 +138,8 @@ pub(crate) fn publish<T>(
 #[derive(Debug, Clone)]
 pub(crate) struct Node {
     serial: u64,
-    is_dir: bool,
-    size: u64,
+    pub(crate) is_dir: bool,
+    pub(crate) size: u64,
     created_ns: i64,
     modified_ns: i64,
     path: Path,
