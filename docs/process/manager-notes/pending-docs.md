@@ -3268,3 +3268,60 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      HandleTable 泄漏修复（619）：一个 file_id 一份 handle + refs 计数——泄漏消失且计数不变。
      准入状态机（Q1）：Open/Paused/Closing + 三回调持票。变异 116 秒=真实死锁路径。
      串行管道=过渡态的诚实（622）：switch 期间不答 hello，恢复 180µs。
+
+627. 【项目完成·S3 收口+复现索引】S3 材料合入（6ecae76）。复现入口：
+     restore_live 12例 / admission_q1 8例 / admission_handles_with_kinds Q2 /
+     handles_criteria 9例。仪器：LAYERFS_DEBUG_HANDLES/SWITCH/DISCOVERY + 
+     WCAS_CLI_PAUSE_AT。两个已知项进收口报告：①同会话多次挂载后半活（502/515族，
+     多条判据靠单跑绿）；②tail_constant 子串误报（建议收紧到标识符边界）。
+     worker 待命。
+
+628. 【流程·孤儿任务清理】qa-cov4-wt 的 llvm-cov（10:18:43 启动）为孤儿进程——发起
+     bash 父链已退出、结果无人接收；工作树干净 detached @ 6ecae76、无产物、无派卡记录
+     ⇒ 按 owner 指示清理（杀进程 + 删 worktree 461MB + 删 target 3.2GB）。
+     当前 qa 会话否认（全程未跑 llvm-cov）；qa2 未答复；归因存疑但无损失。
+     规矩重申：长跑任务不让发起 shell 先退；大任务先报备（共享机器）。
+     注：qa2 / dispatch / architect 会话在线——mailbox 会话比流程文档记载的多，收口时需盘点。
+
+629. 【流程·qa2 会话状态过时】qa2 认领孤儿 llvm-cov（第 4 轮覆盖率复跑），但称
+     "bc87371 = 当前 main，第 3 轮数字可沿用"——实测 bc87371 是 P2b-0 提交，
+     落后 main（6ecae76）598 个提交。qa2 会话状态疑似停在 P2a-8 时代。
+     已纠正：旧数字不得进任何收口报告；要测当前 main 须报备+约窗+写明 SHA。
+     教训：跨阶段存活的会话（DSH 迁移/重启）动笔前必须 fetch 对齐现实。
+
+630. 【流程·qa2 第 4 轮报告自相矛盾被退回】报告声称基线 bc87371（P2b-0，落后 main
+     598 提交）沿用第 3 轮数字，却又报告 fs-workspace 覆盖率——该 crate S2 才存在，
+     两个说法不能同真。已退回：数字必须标注 SHA；有价值部分（fs-winfsp 测试环境 4 项
+     观察）可独立成立但须写明观察于 6ecae76；nextest/串行+失败路径 unmount 兜底的
+     建议走 worker 评估。教训：一份看似完整的报告里混入一个时代错误的数字，
+     整份报告的可信度都赔进去——宁可三态（通过/待环境/未验证）也不要拼完整。
+
+631. 【流程·manager 认错】我指控 qa2 报告"内在矛盾"（bc87371 里没有 fs-workspace）——
+     错。fs-workspace 由 P2a-6（caf0600）创建，bc87371 里有（git ls-tree 复核）。
+     qa2 用 git 证据反驳成立。教训（对 manager 自己）：下断言前必须 git 复核——
+     这正是我要求别人的标准。qa2 修正后的三条结论全部成立；时间窗已批（≤20min
+     前台，测 6ecae76，--exclude fs-winfsp 注明原因，跳过项具名）。
+
+634. 【夹具·路径没替换干净】W1 红的这轮根因：sed 只替换单行写法，换行写法的
+     fs_cli::mounts_dir().join(...) 没被替换 ⇒ poller 读真实目录、mount 写隔离目录，
+     读数 gone=14/14 全是仪器路径分叉，非产品问题。退回，套件 12/12 绿。
+     下轮设计：records_dir(&store) 单一变量 + mount_prepared 返回记录目录，
+     调用方无法写错——把"靠替换一致"升级为"结构上无法分叉"。
+     （教训与 518 同族：批量改写后要用编译器/断言证明没有漏网，不能靠肉眼。）
+
+635. 【QA·6ecae76 首个覆盖率基线】行 82.81%（12414 行/missed 2134）、函数 82.98%、
+     区域 82.17%。fs-semantics 100%、fs-windows 88-100%、gc/apply.rs 73.20% 最低、
+     cdc 读路径 158 行未覆盖（P2b 观察点）、C6 Display 穷举缺口仍存。
+     口径：fs-winfsp --exclude（环境敏感 flake）+ 两个跳过具名 + 串行执行 + 隔离。
+     与 bc87371 的 85.63% 不可比（分母差 3 crate + CLI 重构 + gc）。
+     ★ 关键发现：live-mount/discovery flake 串行后全消 ⇒ 根因=并行挂载测试互相冲突，
+     与 worker 的\"一个 store 两条连接互相锁\"诊断收敛（两证据互证）。
+     教训：LAYERFS_MOUNTS_DIR 全局导出被 fs-cli 测试自身断言抓住——测试写得好。
+     纠正：qa2 两次引用\"manager 的 FFI UB 追查\"——不存在，已澄清。
+
+636. 【README 卡合入（main=c6cc17e）】QA 独立验收通过：C1–C5 5/5 + 真机抽查全通 +
+     README 走查全链通（init→mount→写→commit→branch→checkout 二次换挂→umount→内容持久）
+     + 零本卡引入缺陷。240 内容核对 0 差异，ff 合入。
+     QA 的好判断：overlay BUSY 场景 CLI 自然操作不触发，\"记为观测非缺陷\"——
+     df4527c 的映射在挂载服务+并发持有路径（W3 已验 exit 4）。
+     项目对使用者的入口齐了：README + help + help <command>。
