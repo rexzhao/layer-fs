@@ -3466,3 +3466,11 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      默认值 128GiB 归 CLI 不归 cas-store（产品决定与存取分层）。
      中途撞到：fs-cli 无 cas-store 依赖+编造不存在的函数 ⇒ 立即撤回不留半截；
      正确形状 Repo 访问器+fs-api 透传。741/741。
+
+658. 【虚拟卷 2b（180f79b）】init --size（128G/512GiB/256M/裸字节，GB 按 GiB 读
+     不静默拒绝）+ mount 读配置作 total + 宿主 free<total 警告 +
+     CapacitySource=(total, total−view_logical_bytes) 钳≥0。
+     真机：total=137438953472（128GiB）；写 5 字节 free 差 4096（分配粒度口径——
+     README 须写\"按分配粒度非精确字节\"，否则复核者以为算错）。
+     取舍：init 路径解析跳过 --size 及其值（否则 128G 被当路径）。
+     741/741。
