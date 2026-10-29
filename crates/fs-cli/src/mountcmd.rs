@@ -476,10 +476,12 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                 // surfaces as `StoreInUse`, but the same situation can surface from the store's own connection as "database is locked" — to the user those are
                 // one fact ("another process has it"), so they must be one kind. Matching on the message is only for that last case, and it is named here rather
                 // than left to the default arm.
-                let busy_by_message = error
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains("database is locked");
+                let message = error.to_string().to_ascii_lowercase();
+                // Two mechanisms, one fact: the overlay is opened `locking_mode=EXCLUSIVE`, so "the file is already open" is what BUSY means there, and a
+                // workspace held elsewhere surfaces as `StoreInUse`. To the caller these are the same: somebody else has it (exit 4).
+                let busy_by_message = message.contains("database is locked")
+                    || message.contains("overlay is already open")
+                    || message.contains("held by another process");
                 let kind = match &error {
                     fs_workspace::WorkspaceError::StoreInUse { .. }
                     | fs_workspace::WorkspaceError::Busy { .. } => "in-use",

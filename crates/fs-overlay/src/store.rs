@@ -103,7 +103,21 @@ impl OverlayStore {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        apply_pragmas(&connection)?;
+        // **A BUSY here means "another handle has this overlay open"** — the file is opened `locking_mode=EXCLUSIVE`, so the pragma fails before anything else can. Reporting
+        // rusqlite's "database is locked" instead would hide the rule behind the mechanism (measured: `checkout feat` from inside a mount answered the raw message).
+        if let Err(error) = apply_pragmas(&connection) {
+            if let OverlayError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) = &error {
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) {
+                    return Err(OverlayError::WorkspaceInUse {
+                        path: path.display().to_string(),
+                    });
+                }
+            }
+            return Err(error);
+        }
 
         let mut store = Self {
             connection: Mutex::new(connection),
