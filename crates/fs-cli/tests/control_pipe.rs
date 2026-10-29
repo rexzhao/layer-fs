@@ -294,8 +294,16 @@ fn the_old_stop_file_does_not_stop_a_mount() {
 /// *can* see is an empty or half-written file, so the rule is "cannot parse ⇒ retry once", and that is asserted here rather than assumed.
 #[test]
 fn a_record_rewritten_in_place_never_reads_as_gone() {
-    let directory =
-        std::env::temp_dir().join(format!("fs-cli-record-rewrite-{}", std::process::id()));
+    // **Unique per run, not per pid**: Windows recycles pids, and a leftover directory from an earlier run made this criterion start from the previous run's
+    // files. The stamp is what makes "already there" impossible rather than unlikely.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let directory = std::env::temp_dir().join(format!(
+        "fs-cli-record-rewrite-{}-{stamp}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).expect("temp");
     let path = directory.join("U.mount");

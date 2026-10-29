@@ -775,6 +775,18 @@ pub fn record_is_live(path: &Path) -> Liveness {
 
 /// Creates the record and **keeps it open** for the process's lifetime.
 ///
+/// A directory name for a test's own records: the pid **plus** a nanosecond stamp.
+///
+/// The pid alone is not unique across runs — Windows recycles it — and a leftover `fs-cli-record-<pid>` from an earlier run made a criterion fail with "already
+/// exists" when its fixture creates files with `create_new`. That failure looked like a concurrency problem and was not one.
+fn unique_record_dir(prefix: &str) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    format!("{prefix}-{}-{stamp}", std::process::id())
+}
+
 /// `DELETE_ON_CLOSE` is why a crashed mount leaves nothing behind: the kernel closes every handle when the process dies, `taskkill /F` included.
 #[cfg(windows)]
 fn hold_record(path: &Path, contents: &str) -> Result<std::fs::File, Error> {
@@ -1343,7 +1355,7 @@ fn await_switch(wait: std::time::Duration) -> Option<SwitchAnswer> {
 mod tests {
     use super::{
         calibrated_major, hold_record, mounts_dir, record_is_live, record_name, request_stop,
-        stop_requested, version_parts, Liveness,
+        stop_requested, unique_record_dir, version_parts, Liveness,
     };
     use std::path::Path;
 
@@ -1363,7 +1375,9 @@ mod tests {
     /// **gone** once the handle is dropped, which is what makes a crashed mount leave nothing behind.
     #[test]
     fn a_record_is_live_while_held_and_gone_once_released() {
-        let directory = std::env::temp_dir().join(format!("fs-cli-record-{}", std::process::id()));
+        // **A directory nobody else can be in**: the record is created with `create_new`, so a leftover from an earlier run under a recycled pid makes this
+        // criterion fail with "already exists" — a fixture problem that reads like a concurrency problem. A unique suffix removes the recycled name.
+        let directory = std::env::temp_dir().join(unique_record_dir("fs-cli-record"));
         std::fs::create_dir_all(&directory).expect("temp");
 
         let held = directory.join("held.mount");
