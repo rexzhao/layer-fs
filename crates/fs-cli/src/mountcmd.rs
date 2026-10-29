@@ -779,6 +779,7 @@ pub fn record_is_live(path: &Path) -> Liveness {
 ///
 /// The pid alone is not unique across runs — Windows recycles it — and a leftover `fs-cli-record-<pid>` from an earlier run made a criterion fail with "already
 /// exists" when its fixture creates files with `create_new`. That failure looked like a concurrency problem and was not one.
+#[cfg(test)]
 fn unique_record_dir(prefix: &str) -> String {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
