@@ -334,6 +334,52 @@ impl Store {
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }
+    /// The volume size this store advertises, when it has one.
+    ///
+    /// `None` for a store written before the key existed: the caller decides the default, because a default is a **product** decision (128 GiB today) and this
+    /// crate is the wrong place to hold one. Read through the same `store_policy` table as every other policy constant, so a store has one place to look.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures, and a value that is not a number (that is a corrupted store, not a default).
+    pub fn volume_size_bytes(&self) -> StoreResult<Option<u64>> {
+        let connection = &self.database.connection;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT value FROM store_policy WHERE key = 'volume_size'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        match value {
+            None => Ok(None),
+            Some(text) => match text.parse::<u64>() {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(_) => Err(StoreError::SchemaMismatch {
+                    what: "store_policy.volume_size",
+                }),
+            },
+        }
+    }
+
+    /// Records the volume size this store advertises.
+    ///
+    /// An **insert-or-replace** rather than an update: old stores do not have the row, and a store that cannot learn its own size is a store that reports a
+    /// default forever.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures (a read-only store refuses).
+    pub fn set_volume_size_bytes(&self, bytes: u64) -> StoreResult<()> {
+        let connection = &self.database.connection;
+        connection.execute(
+            "INSERT INTO store_policy (key, value) VALUES ('volume_size', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [bytes.to_string()],
+        )?;
+        Ok(())
+    }
+
 
     /// The identity a `put` of `role`/`value` would publish.
     ///
@@ -350,7 +396,6 @@ impl Store {
     pub fn pack_max_bytes(&self) -> u64 {
         self.pack_max_bytes
     }
-
     /// Starts a batch: many objects, one `fsync` per pack and one short transaction
     /// per pack (ADR-008 §5).
     #[must_use]
