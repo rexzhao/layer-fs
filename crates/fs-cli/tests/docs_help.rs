@@ -140,3 +140,40 @@ fn the_readme_does_not_teach_a_file_command() {
         );
     }
 }
+
+/// **C4** — every command `--help` lists has its own `help <command>` text, and `help` never invents one.
+///
+/// `command_help` is a second list of names next to the dispatch table, and two lists drift. This walks the advertised commands and asks the binary for each.
+#[test]
+fn every_command_has_a_help_entry() {
+    common::strict_gate();
+    for command in help_commands(&help()) {
+        let output = Command::new(binary())
+            .arg("help")
+            .arg(&command)
+            .output()
+            .expect("help runs");
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "cell C4: `help {command}` must succeed, got {:?} / {:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains(&command),
+            "cell C4: `help {command}` must describe it, got {text:?}"
+        );
+    }
+    // And an unknown name is a usage error, not a silent success.
+    let output = Command::new(binary())
+        .arg("help")
+        .arg("nonsense")
+        .output()
+        .expect("help runs");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "cell C4: `help nonsense` must be a usage error"
+    );
+}

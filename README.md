@@ -16,8 +16,8 @@ This is the user guide. Architecture and the reasoning behind the design live in
   you can go back to, and a workspace is where uncommitted edits sit.
 - **Is not**: a network share, a backup tool, or a replacement for `git`. It does not merge; two branches
   diverging is a situation you resolve by hand.
-- **Files are read and written through the mount.** The CLI has no file verbs at all — there is nothing
-  like `put`/`ls`/`cat` to learn.
+- **Files are read and written through the mount.** The CLI has no file verbs at all, so there is nothing to
+  learn beyond the lifecycle commands below.
 
 ## Requirements
 
@@ -114,6 +114,7 @@ directory exists" is *not* a sign the volume is up — `layerfs list` or a succe
 | `database is locked` (exit 4) | another process is using that workspace | close it, or `checkout` a different branch |
 | `workspace X is mounted at Y (pid N)` (exit 4) | the workspace is being served right now | use that mount, or unmount it first |
 | `no workspace specified` | the command is outside a mount and has no `--workspace` | add `--workspace <name>` or `cd` into a mount |
+| `mount needs a store: add --store <dir>` (exit 2) | `mount` was given no repository (it is not implied by the current directory) | add `--store`, or run it from inside a mount |
 | `refusing to mount: winfsp … was not the layout …` | the installed WinFsp differs from the measured ABI | install the version named in the message, or `--no-version-gate` if you know what you are doing |
 
 Mount records live in `%LOCALAPPDATA%\layerfs\mounts\` (override with `LAYERFS_MOUNTS_DIR`). A record is
@@ -144,8 +145,9 @@ held open by its mount and removed when the process dies, so a leftover record m
 | `list` | the recorded mounts |
 | `version` | the WinFsp DLL version versus the measured layout |
 
-`layerfs --help` is the single source of truth for this table; `layerfs <command> --help` describes the
-arguments a command takes.
+`layerfs --help` is the single source of truth for this table. `layerfs help <command>` describes one
+command's arguments and the notes that matter for it (what blocks a `restore`, what a switch does to open
+handles, and so on).
 
 ## Exit codes
 

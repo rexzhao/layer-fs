@@ -107,6 +107,34 @@ fn require_workspace() -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
+/// One command's help, or `None` when the name is not a command.
+///
+/// Kept next to the dispatch table so a renamed command cannot leave a stale entry behind: the criterion
+/// `docs_help::every_command_has_a_help_entry` walks the advertised commands and asks for each one.
+fn command_help(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "init" => "init <path>\n  Create a repository: a content-addressed store, a scope, the `main` branch and the\n  `main` workspace. Path defaults to --store.",
+        "branch" => "branch [<name>] [--from <src>]\n  With no name: list branches and their heads. With a name: create it from `main`\n  (or --from). `branch delete <name>` deletes the branch, never its history.",
+        "checkout" => "checkout <branch>\n  Create or resume the workspace named after <branch> (one workspace per branch). Run\n  from **inside a mount**, it switches that mount to the workspace — the first call for\n  a branch only creates the workspace; from then on it switches.",
+        "workspace" => "workspace discard <name>\n  Drop a workspace's overlay and its row. The branch is untouched.",
+        "commit" => "commit -m <message> [--force]\n  Publish what the workspace is serving as a commit on its branch. From inside a mount\n  the mount does the publishing, so the volume is not opened twice.",
+        "status" => "status\n  Workspace, branch, base commit, view root and dirty state. Inside a mount it is the\n  mount's own answer, over the control pipe.",
+        "log" => "log [branch] [limit]\n  Commit history. Naming a branch reads it without opening an overlay, so it works\n  while that branch is mounted.",
+        "reset" => "reset <commit> [--expect <head>]\n  Move the branch head, optionally refusing if the head is not what you expect.",
+        "restore" => "restore <commit> [--discard]\n  Replace the workspace's view with that commit's tree. Refused with exit 4 while\n  **files** are open on the mount; directory handles do not block. --discard allows\n  replacing uncommitted changes.",
+        "revert" => "revert [--branch <name>]\n  Undo the head with a new commit, so history grows instead of being rewritten.",
+        "verify" => "verify [--deep]\n  Check objects and references. --deep reads every object's bytes.",
+        "stats" => "stats\n  Object and repository counts.",
+        "gc" => "gc [--dry-run]\n  Collect unreachable objects. Offline: it refuses while a writer holds the store.",
+        "snapshot" => "snapshot [list | create | drop <root>]\n  Named roots keep a tree alive without moving a branch (useful before a restore).",
+        "mount" => "mount <mount_point> [--workspace <name>] [--no-version-gate]\n  Serve a workspace over WinFsp until `umount` asks it to stop. Needs --store.\n  <mount_point> is a drive letter (Z:) or a directory whose parent exists.\n  Ctrl-C in this console is an orderly stop (flush, unmount, remove the record).",
+        "umount" => "umount <mount_point> [--force]\n  Ask the mount to stop. Refuses (exit 4, with a count) while handles are open —\n  including a shell whose working directory is inside the mount. --force clears a\n  stale record of a mount whose process is gone.",
+        "list" => "list\n  The mounts recorded under %LOCALAPPDATA%\\layerfs\\mounts, with liveness.",
+        "version" => "version\n  The WinFsp DLL's version versus the layout this build was measured on.",
+        _ => return None,
+    })
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.is_empty() || arguments.iter().any(|a| a == "--help" || a == "-h") {
@@ -118,6 +146,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Read **before** the command name is taken: `--workspace` is a global option (ADR-010 §5), not a subcommand flag.
     let workspace_option = take_option(&mut arguments, "--workspace");
     let command = arguments.remove(0);
+    // **`help` is a command, not a flag** (owner's request): `help` gives the map, `help <command>` gives that command's paragraphs.
+    if command == "help" {
+        match arguments.first().map(String::as_str) {
+            None => print!("{USAGE}"),
+            Some(name) => match command_help(name) {
+                Some(text) => println!("{text}"),
+                None => {
+                    return Err(fs_cli::Failure::usage(format!(
+                        "no help for {name:?}; `layerfs help` lists the commands"
+                    ))
+                    .into())
+                }
+            },
+        }
+        return Ok(());
+    }
 
     // **Path discovery happens here, once** (ADR-010 §4.2): a command run from inside a mount works without saying so, and a command that names both
     // explicitly keeps what it named. The three verbs that do not need a repository keep their place *before* this, so discovery costs them nothing.
@@ -187,6 +231,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         && workspace_option.is_none()
     {
         return Err(fs_cli::Failure::usage(fs_cli::NO_WORKSPACE).into());
+    }
+
+    // **`mount` needs to be told a store** (README card follow-up): it is excluded from `needs_repository` because it *serves* a store rather than opening a
+    // repository, so the guard above never reached it — and a bare `mount Z:` fell through to `.` and answered "store directory .\objects does not exist",
+    // a true sentence about the wrong thing. Discovery still counts: from inside a mount, the store comes from the record.
+    if command == "mount" && !explicit_store_was_given && store.as_os_str() == "." {
+        return Err(fs_cli::Failure::usage(
+            "mount needs a store: add `--store <dir>` (the repository to serve)",
+        )
+        .into());
     }
 
     // **The removed file commands answer before the store is touched** (A0c): with a `--store` that does not exist, "store does not exist" would be a
