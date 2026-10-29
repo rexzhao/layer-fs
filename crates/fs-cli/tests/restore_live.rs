@@ -25,6 +25,15 @@ fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_fs-cli"))
 }
 
+/// Where **this test's** mount keeps its record: a directory inside the store, so the fixture never writes into the real
+/// `%LOCALAPPDATA%\layerfs\mounts` (a fixture must not disturb a running mount, and its own records must not be confused with one).
+///
+/// Used by the fixture *and* by every child it spawns (through `LAYERFS_MOUNTS_DIR`), from **one** function: the earlier version replaced the call sites with a
+/// text substitution and missed a line that wrapped, so the poller watched one directory while the mount wrote into another. One source, no chance to disagree.
+fn records_dir(store: &std::path::Path) -> PathBuf {
+    store.join("mounts")
+}
+
 fn temp_dir(label: &str) -> PathBuf {
     // A label like `V:` is a **mount point**, not a path segment: it is sanitised here rather than at every call site, because a colon in a directory name is
     // `ERROR_DIRECTORY (267)` and the failure would point at the fixture instead of at the mistake.
@@ -45,6 +54,8 @@ fn cli(
         .arg(store)
         .args(arguments)
         .current_dir(cwd)
+        // **One record directory for the whole fixture**: the mount writes into `records_dir(store)`, so every child must look there.
+        .env("LAYERFS_MOUNTS_DIR", records_dir(store))
         .output()
         .expect("run fs-cli");
     (
@@ -80,6 +91,7 @@ fn a_restore_through_the_mount_shows_the_old_bytes() {
             .arg(&mount_point)
             .arg("--workspace")
             .arg("main")
+            .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -203,6 +215,7 @@ fn mount_at(letter: &str) -> (PathBuf, MountChild, PathBuf) {
             .arg(&mount_point)
             .arg("--workspace")
             .arg("main")
+            .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -368,6 +381,8 @@ fn cli_code(
         .arg(store)
         .args(arguments)
         .current_dir(cwd)
+        // **One record directory for the whole fixture**: the mount writes into `records_dir(store)`, so every child must look there.
+        .env("LAYERFS_MOUNTS_DIR", records_dir(store))
         .output()
         .expect("run fs-cli");
     (
@@ -459,6 +474,7 @@ fn an_open_during_a_parked_restore_waits_and_then_finds_the_new_view() {
             .arg(&mount_point)
             .arg("--workspace")
             .arg("main")
+            .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .env(
                 "WCAS_CLI_PAUSE_AT",
                 format!("restore-after-quiesce={pause}"),
@@ -531,26 +547,126 @@ fn an_open_during_a_parked_restore_waits_and_then_finds_the_new_view() {
     let _ = std::fs::remove_dir_all(&store);
 }
 
+/// Mounts a fresh store **after** running `prepare` against it, and returns the record directory it used.
+///
+/// Two ordering facts, both measured:
+///
+/// - a workspace created while a mount is serving cannot be opened by that mount (its overlay is held `EXCLUSIVE`), so preparing first is what the product
+///   requires;
+/// - the process that created it releases the overlay when it **exits**, and that is not instantaneous — so the setup ends with a **bounded, verifiable wait**:
+///   another process must be able to open the workspace before the mount starts.
+fn mount_prepared(
+    label: &str,
+    letter: &str,
+    workspace: &str,
+    prepare: impl FnOnce(&std::path::Path),
+) -> (PathBuf, MountChild, PathBuf, PathBuf) {
+    let store = temp_dir(label);
+    let records = records_dir(&store);
+    Command::new(binary())
+        .arg("init")
+        .arg(&store)
+        .output()
+        .expect("init");
+    prepare(&store);
+    let started = Instant::now();
+    loop {
+        let attempt = Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .args(["checkout", workspace])
+            .env("LAYERFS_MOUNTS_DIR", &records)
+            .output()
+            .expect("checkout");
+        if attempt.status.success() {
+            break;
+        }
+        assert!(
+            started.elapsed() <= Duration::from_secs(10),
+            "cell setup: {workspace} never became openable: {}",
+            String::from_utf8_lossy(&attempt.stderr).trim()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mount_point = PathBuf::from(letter);
+    assert_eq!(
+        fs_winfsp::mounted::drive_present(&mount_point),
+        Some(false),
+        "cell precondition: {letter} must be free before mounting"
+    );
+    let child = MountChild(
+        Command::new(binary())
+            .arg("--store")
+            .arg(&store)
+            .arg("mount")
+            .arg(&mount_point)
+            .arg("--workspace")
+            .arg("main")
+            .env("LAYERFS_MOUNTS_DIR", &records)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mount"),
+    );
+    let root = PathBuf::from(format!("{letter}\\"));
+    let record = records.join(format!("{}.mount", fs_cli::record_name(&mount_point)));
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(15)
+        && !std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .contains("pipe=")
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .contains("pipe="),
+        "cell setup: the mount must be recorded and listening"
+    );
+    let probe = root.join("probe.txt");
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match std::fs::write(&probe, b"probe") {
+            Ok(()) => break,
+            Err(_) if attempt < 50 => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => panic!("cell setup: the volume never became writable: {error:?}"),
+        }
+    }
+    let _ = std::fs::remove_file(&probe);
+    (store, child, root, records)
+}
+
 /// **W1** — `checkout <b>` from inside a mount switches it, and the record is never seen as `Gone` while it happens.
 #[test]
 fn a_checkout_inside_the_mount_switches_it_and_the_record_stays_live() {
     common::strict_gate();
-    let (store, _child, root) = mount_at("B:");
+    // **Prepared before mounting** (see `mount_prepared`), and the record directory comes **back from the fixture** instead of being recomputed here.
+    let (store, _child, root, records) = mount_prepared("switch-w1", "B:", "feat", |store| {
+        Command::new(binary())
+            .arg("--store")
+            .arg(store)
+            .args(["branch", "feat", "--from", "main"])
+            .output()
+            .expect("branch feat");
+        let created = Command::new(binary())
+            .arg("--store")
+            .arg(store)
+            .args(["checkout", "feat"])
+            .env("LAYERFS_MOUNTS_DIR", records_dir(store))
+            .output()
+            .expect("checkout feat");
+        assert!(
+            created.status.success(),
+            "cell setup: the feat workspace row must exist: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+    });
     let _ = &root;
     let mount_point = PathBuf::from("B:");
-    // A branch the mount is not serving, with one file of its own.
-    Command::new(binary())
-        .arg("--store")
-        .arg(&store)
-        .arg("branch")
-        .arg("feat")
-        .arg("--from")
-        .arg("main")
-        .output()
-        .expect("branch feat");
+    let record_path = records.join(format!("{}.mount", fs_cli::record_name(&mount_point)));
 
-    let record_path =
-        fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&mount_point)));
     // Poll liveness for the whole switch: `Gone` would mean the record was deleted and recreated (W1's mutation), `Stale` that nobody holds it.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let readings = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
@@ -560,31 +676,35 @@ fn a_checkout_inside_the_mount_switches_it_and_the_record_stays_live() {
         let record_path = record_path.clone();
         std::thread::spawn(move || {
             while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                // The mount.s own liveness question, asked the way it asks it: open for **write**; a sharing violation (32) means the owner still holds it.
                 let reading = match std::fs::OpenOptions::new().write(true).open(&record_path) {
                     Err(error) if error.raw_os_error() == Some(32) => "live",
                     Ok(_) => "stale",
-                    Err(_) => "unreadable",
+                    Err(_) => {
+                        if record_path.exists() {
+                            "unreadable"
+                        } else {
+                            "gone"
+                        }
+                    }
                 };
-                let exists = record_path.exists();
-                readings
-                    .lock()
-                    .expect("readings")
-                    .push(if exists { reading } else { "gone" });
+                readings.lock().expect("readings").push(reading);
                 std::thread::sleep(Duration::from_millis(10));
             }
         })
     };
 
-    let (code, out, err) = cli_code(&store, &mount_point, &["checkout", "feat"]);
-    let failed = std::process::Command::new(binary())
+    // **One checkout, from inside the mount, with the fixture's record directory and its own discovery reading**: a child that looked in the real
+    // `%LOCALAPPDATA%` directory would find no mount and quietly fall back to "create the workspace" — which is what an earlier version of this test measured
+    // without noticing.
+    let failed = Command::new(binary())
         .arg("--store")
         .arg(&store)
         .args(["checkout", "feat"])
         .current_dir(&mount_point)
+        .env("LAYERFS_MOUNTS_DIR", &records)
+        .env("LAYERFS_DEBUG_DISCOVERY", "1")
         .output()
         .expect("checkout from inside the mount");
-    let _ = (code, out, err);
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     poller.join().expect("the poller finishes");
     let readings = readings.lock().expect("readings");
@@ -596,48 +716,32 @@ fn a_checkout_inside_the_mount_switches_it_and_the_record_stays_live() {
         .iter()
         .filter(|reading| **reading == "stale")
         .count();
+    let stdout = String::from_utf8_lossy(&failed.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&failed.stderr).into_owned();
     println!(
         "W1 reading: {} samples, gone={gone}, stale={stale}, checkout exit={:?} stdout={:?} stderr={:?}",
         readings.len(),
         failed.status.code(),
-        String::from_utf8_lossy(&failed.stdout).trim(),
-        String::from_utf8_lossy(&failed.stderr).trim()
+        stdout.trim(),
+        stderr.trim()
     );
-    assert_eq!(gone, 0, "cell W1: the record must never read as gone");
+    assert_eq!(
+        gone, 0,
+        "cell W1: the record must never read as gone (records dir {records:?})"
+    );
     assert_eq!(stale, 0, "cell W1: the record must stay held by the mount");
     assert!(
         failed.status.success(),
-        "cell W1: checkout inside the mount must succeed"
+        "cell W1: checkout inside the mount must succeed: {stderr}"
     );
-    // The mount now serves `feat`, and the volume is still there. The root path is used as the cwd here: right after a remount `K:` (a bare letter) is briefly not
-    // a valid directory to set as a working directory, and that transient is not what this criterion is about.
-    let mut attempt = 0;
-    let (ok, out, err) = loop {
-        // Spawned by hand, not through `cli`: `cli` panics on a failed spawn, and the transient above **is** a failed spawn.
-        let answer = match Command::new(binary())
-            .arg("--store")
-            .arg(&store)
-            .arg("status")
-            .current_dir("B:\\")
-            .output()
-        {
-            Ok(output) => (
-                output.status.success(),
-                String::from_utf8_lossy(&output.stdout).into_owned(),
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ),
-            Err(error) => (false, String::new(), error.to_string()),
-        };
-        attempt += 1;
-        if answer.0 || attempt >= 20 {
-            break answer;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let (code, out, err) = cli_code(&store, &root, &["status"]);
     println!("W1 status after the switch: {out}");
-    assert!(ok, "cell W1: status must answer after the switch: {err}");
+    assert_eq!(
+        code, 0,
+        "cell W1: status must answer after the switch: {err}"
+    );
     assert!(
-        out.contains("branch:    feat") || out.contains("workspace: feat"),
+        out.contains("workspace: feat") || out.contains("branch:    feat"),
         "cell W1: the mount must serve feat now, got {out:?}"
     );
     let _ = std::fs::remove_dir_all(&store);
@@ -660,6 +764,7 @@ fn mount_at_directory(label: &str) -> (PathBuf, MountChild, PathBuf) {
             .arg(&mount_point)
             .arg("--workspace")
             .arg("main")
+            .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -667,7 +772,7 @@ fn mount_at_directory(label: &str) -> (PathBuf, MountChild, PathBuf) {
     );
     // **Ready means the record exists with a pipe**, not that the directory does: a directory mount point is on the host volume and exists before the volume is
     // attached (the A6d lesson), so `metadata` here would let the first command run against a mount that is not there yet.
-    let record = fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&mount_point)));
+    let record = records_dir(&store).join(format!("{}.mount", fs_cli::record_name(&mount_point)));
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(15)
         && !std::fs::read_to_string(&record)
@@ -748,6 +853,7 @@ fn an_open_file_handle_blocks_the_switch() {
             .arg(&store)
             .arg("status")
             .current_dir(&root)
+            .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .output()
         {
             Ok(output) => {
@@ -808,13 +914,14 @@ fn a_switch_to_a_held_workspace_is_busy_and_the_channel_recovers() {
             .arg(&other_point)
             .arg("--workspace")
             .arg("feat")
+            .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn the holder mount"),
     );
     let held_record =
-        fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&other_point)));
+        records_dir(&store).join(format!("{}.mount", fs_cli::record_name(&other_point)));
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(15)
         && !std::fs::read_to_string(&held_record)
@@ -830,7 +937,7 @@ fn a_switch_to_a_held_workspace_is_busy_and_the_channel_recovers() {
         "cell setup: the holder mount must be serving feat"
     );
     let pipe = std::fs::read_to_string(
-        fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&root))),
+        records_dir(&store).join(format!("{}.mount", fs_cli::record_name(&root))),
     )
     .unwrap_or_default()
     .lines()
@@ -882,6 +989,7 @@ fn a_switch_to_a_held_workspace_is_busy_and_the_channel_recovers() {
             .arg(&store)
             .arg("status")
             .current_dir(&root)
+            .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .output()
         {
             Ok(output) => {
@@ -943,12 +1051,13 @@ fn an_open_during_a_closing_switch_fails_instead_of_waiting() {
             .arg("--workspace")
             .arg("main")
             .env("WCAS_CLI_PAUSE_AT", "switch-after-quiesce=3000")
+            .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn mount"),
     );
-    let record = fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&mount_point)));
+    let record = records_dir(&store).join(format!("{}.mount", fs_cli::record_name(&mount_point)));
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(15)
         && !std::fs::read_to_string(&record)
@@ -1055,12 +1164,13 @@ fn a_failed_remount_rolls_back_and_says_so() {
             .arg("--workspace")
             .arg("main")
             .env("WCAS_CLI_FAIL_AT", "switch-mount-new")
+            .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn mount"),
     );
-    let record = fs_cli::mounts_dir().join(format!("{}.mount", fs_cli::record_name(&mount_point)));
+    let record = records_dir(&store).join(format!("{}.mount", fs_cli::record_name(&mount_point)));
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(15)
         && !std::fs::read_to_string(&record)
@@ -1106,6 +1216,7 @@ fn a_failed_remount_rolls_back_and_says_so() {
             .arg(&store)
             .arg("status")
             .current_dir(&mount_point)
+            .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .output();
         if let Ok(output) = &attempt {
             if output.status.success() {
