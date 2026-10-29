@@ -3426,3 +3426,11 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      源码说\"答了之后它拿去干什么\"）。疑点供对照：ConvertString 产出 self-relative，
      Win32 AccessCheck 要 absolute——若 WinFsp 某路径没转换，Everyone-FULL 可在
      形态上整体失败（与症状吻合）。教训：不猜第三遍。
+
+652. 【卷卡 A+B 双落地（d8998c0）】真因读源码读出：wf-security.c:213——WinFsp 把
+     SD 直接交 Win32 AccessCheck；memfs.cpp:2399 的形态（O:BAG:BAD:P(A;;FA;;;SY)
+     (A;;FA;;;BA)(A;;FA;;;WD)）能过。第一版 GA+O:SY+非 P 拒绝所有人。
+     真机读数：W: total=499774394368 free=79762358272（=宿主 C:）；mkdir 无提权；
+     icacls SYSTEM/Administrators/Everyone (F)。全量 741/741。
+     worker 重构时删掉 resolve_library 被 clippy 抓回——编译器做了一次描述与实物对账。
+     已发 QA 验收（fix/volume-security @ d8998c0）。
