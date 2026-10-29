@@ -3417,3 +3417,12 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      \"授予所有人的 DACL 拒绝所有人\"= WinFsp 用不了这份描述符（形态问题非内容）。
      741/741（含新增 2 例）。教训：FSD↔WinFsp 黑盒边界，SDK 例子就是规格书，
      先读再动（先动手后读文档的代价=一轮）。
+
+651. 【SD 二试仍拒，停用待读数（9b0c340）】照 SDK 规格（两段 in/out + 
+     STATUS_BUFFER_OVERFLOW）抄了仍 Access denied(5)。显式停用（volume_descriptor
+     返回空=卡前行为），build 整段保留+dead_code+注释记录下一步读数。
+     裁 (甲)：挂载侧读数（size 初值/返回状态/WinFsp 行为 + 被拒打开的名字与
+     access mask + 读 WinFsp 源码 fsop.c 的 access check 路径——例子说\"怎么答\"，
+     源码说\"答了之后它拿去干什么\"）。疑点供对照：ConvertString 产出 self-relative，
+     Win32 AccessCheck 要 absolute——若 WinFsp 某路径没转换，Everyone-FULL 可在
+     形态上整体失败（与症状吻合）。教训：不猜第三遍。
