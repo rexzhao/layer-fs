@@ -16,26 +16,17 @@ use std::process::ExitCode;
 use fs_api::{ApiError, Repo, Workspace};
 
 const USAGE: &str = "\
-fs-cli [--store <dir>] <command> [args]
+layerfs [--store <dir>] [--workspace <name>] <command> [args]
 
-  init <path>                     create a repository (Store + scope + main branch)
+  init <path>                     create a repository (store + scope + main branch)
   branch [<name>] [--from <src>]  list branches, or create one
   branch delete <name>            delete a branch (its history stays a GC root)
-  checkout <branch>               make a workspace on a branch current
+  checkout <branch>               create or resume the workspace on a branch; from inside a mount, switch that mount
   workspace discard <name>        drop a workspace's overlay and row (its branch is untouched)
 
-  put   <local> <path>            write a host file's bytes
-  get   <path> [local]            read a file out (or to stdout)
-  ls    [path]                    list the current workspace, or <commit>:[path]
-  stat  <path>                    show metadata
-  mkdir <path>                    create a directory
-  rm    <path>                    remove a file or an empty directory
-  mv    <from> <to>               rename
-  cat   <commit>:<path>           read a file from history
-
   commit -m <message> [--force]   publish the workspace as a commit
-  status                          current workspace, base and dirty state
-  log   [limit]                   commit history of the current branch
+  status                          workspace, branch, base commit, view root and dirty state
+  log [branch] [limit]            commit history
   reset <commit> [--expect <c>]   move the branch head
   restore <commit> [--discard]    replace the view with a commit's tree
   revert                          undo the head with a new commit
@@ -43,13 +34,17 @@ fs-cli [--store <dir>] <command> [args]
   verify [--deep]                 check objects and references
   stats                           object and repository counts
   gc [--dry-run]                  collect unreachable objects (offline: refuses while a writer holds the store)
+  snapshot [list | create | drop <root>]
+                                  named roots that keep a tree alive without moving a branch
+
   mount <mount_point> [--workspace <name>] [--no-version-gate]
                                   serve a workspace over WinFsp until `umount` asks it to stop (store from --store)
   umount <mount_point> [--force]  ask a running mount to unmount (--force clears a stale record too)
-  list                            the mounts recorded in %TEMP%/layerfs-mounts
+  list                            the mounts recorded under %LOCALAPPDATA%\\layerfs\\mounts
   version                         the WinFsp DLL's version versus the layout this build was measured on
-  snapshot [list | create | drop <root>]
-                                  named roots that keep a tree alive without moving a branch";
+
+Files are read and written **through the mount**, not through commands: this CLI has no file verbs at all.
+Run `layerfs <command> --help` for the arguments a command accepts.";
 
 fn main() -> ExitCode {
     match run() {
