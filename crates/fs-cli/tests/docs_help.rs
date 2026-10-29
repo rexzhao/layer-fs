@@ -177,3 +177,37 @@ fn every_command_has_a_help_entry() {
         "cell C4: `help nonsense` must be a usage error"
     );
 }
+
+/// **C5** — every `docs/…` path the README mentions exists.
+///
+/// The card's review found exactly this: a link to `ADR-010-cli-without-current-workspace.md`, a file that does not exist (the ADR is `-cli-behavior.md`). A
+/// reader follows it and gets nothing, and no test noticed. This one walk the README's backticked paths and requires each to be on disk.
+#[test]
+fn every_docs_path_in_the_readme_exists() {
+    common::strict_gate();
+    let root = repository_root();
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("README.md exists");
+    let mut checked = Vec::new();
+    for line in readme.lines() {
+        for piece in line.split('`') {
+            let path = piece.trim();
+            if !path.starts_with("docs/") || path.ends_with('/') {
+                continue;
+            }
+            let full = root.join(path);
+            assert!(
+                full.exists(),
+                "cell C5: the README points at {path}, which does not exist"
+            );
+            checked.push(path.to_owned());
+        }
+    }
+    println!(
+        "C5 reading: {} docs paths checked: {checked:?}",
+        checked.len()
+    );
+    assert!(
+        checked.len() >= 4,
+        "cell C5: the README must link to the ADRs, found {checked:?}"
+    );
+}

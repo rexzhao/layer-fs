@@ -171,6 +171,9 @@ handles, and so on).
 
 ## Where to read more
 
-- `docs/adr/ADR-010-cli-without-current-workspace.md` — why the CLI looks the way it does.
+- `docs/adr/ADR-010-cli-behavior.md` — why the CLI looks the way it does (and what it no longer has).
+- `docs/adr/ADR-009-winfsp-frontend.md` — the WinFsp frontend the mount is built on.
+- `docs/adr/ADR-006-workspace-overlay.md` — what a workspace is, and how an overlay relates to a commit.
 - `docs/adr/ADR-008-pack-gc.md` — the store's pack format and garbage collection.
-- `docs/reports/` — what was measured, and what is known to be broken.
+- `docs/reports/known-issues.md` — what is known to be broken, with the evidence.
+- `docs/reports/` — everything else that was measured.
