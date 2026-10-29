@@ -57,6 +57,23 @@ pub fn calibrated_major() -> u16 {
         .unwrap_or(0)
 }
 
+/// The warning printed when the host volume cannot back the advertised size, or `None` when it can.
+///
+/// **A warning, not a refusal**: a write that cannot be satisfied fails on its own, and refusing to mount because a disk *might* fill would be guessing about
+/// the future. What the user needs is the two numbers side by side, so "the volume says 128 GiB but the disk has 79 GB" is one line away from being understood.
+fn volume_warning(store: &Path, advertised: u64) -> Option<String> {
+    let (_host_total, host_free) = fs_winfsp::callbacks::host_capacity(store)?;
+    if host_free >= advertised {
+        return None;
+    }
+    Some(format!(
+        "warning: {} advertises {} but the host volume has {} free; writes will fail before the volume reports full",
+        store.display(),
+        advertised,
+        host_free
+    ))
+}
+
 fn volume() -> VolumeInfo {
     VolumeInfo {
         total_size: 1 << 30,
@@ -189,15 +206,8 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     let volume_total = repo
         .volume_size_bytes()?
         .unwrap_or(fs_cli::DEFAULT_VOLUME_SIZE_BYTES);
-    if let Some((_host_total, host_free)) = fs_winfsp::callbacks::host_capacity(&store) {
-        if host_free < volume_total {
-            eprintln!(
-                "warning: {} advertises {} but the host volume has {} free; writes will fail before the volume reports full",
-                store.display(),
-                volume_total,
-                host_free
-            );
-        }
+    if let Some(warning) = volume_warning(&store, volume_total) {
+        eprintln!("{warning}");
     }
     let workspace = repo.workspace_open(&name)?;
     // `DynOps` carries no lifetime, and this process exists to serve one mount: leaking the workspace is the honest way to say "this outlives every
@@ -1461,5 +1471,37 @@ mod tests {
     fn the_version_is_decoded_into_its_two_halves() {
         assert_eq!(version_parts(0x0002_0001), (2, 1));
         assert_eq!(calibrated_major(), 2);
+    }
+}
+
+#[cfg(test)]
+mod volume_warning_tests {
+    use super::volume_warning;
+
+    /// **C5** — the warning appears exactly when the host cannot back the advertised size, and it carries both numbers.
+    ///
+    /// Tested on the function rather than through a mount: the alternative is reading a child's stderr while it is still running, which is a test of the harness.
+    #[test]
+    fn the_host_warning_appears_only_when_the_host_is_too_small() {
+        let store = std::env::temp_dir();
+        // The host volume's own numbers decide what "too big" and "small enough" mean here, so the criterion asks for them instead of assuming a disk size.
+        let Some((_total, free)) = fs_winfsp::callbacks::host_capacity(&store) else {
+            eprintln!("SKIP: the host volume cannot be asked about its free space");
+            return;
+        };
+        let warning = volume_warning(&store, free + (1 << 30));
+        println!("C5 reading: host_free={free} warning={warning:?}");
+        let warning = warning.expect("cell C5: asking for more than the host has must warn");
+        assert!(
+            warning.starts_with("warning: ") && warning.contains("advertises"),
+            "cell C5: the line has to say which store and what it advertises, got {warning:?}"
+        );
+
+        // And nothing when the volume fits comfortably.
+        let quiet = volume_warning(&store, 1 << 20);
+        assert!(
+            quiet.is_none(),
+            "cell C5: a small volume must not warn, got {quiet:?}"
+        );
     }
 }

@@ -213,3 +213,43 @@ fn the_used_amount_is_the_logical_size_of_the_view() {
     );
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// **C6** — a store created before `volume_size` existed advertises the **default**, not zero.
+///
+/// Simulated the way it happens: the row is deleted from `store_policy` (which is exactly what an older store looks like — the table is there, the key is not).
+#[test]
+fn an_old_store_advertises_the_default_size() {
+    common::strict_gate();
+    let store = temp_dir("old");
+    let output = Command::new(binary())
+        .arg("init")
+        .arg(&store)
+        .arg("--size")
+        .arg("1G")
+        .output()
+        .expect("init");
+    assert!(output.status.success(), "cell C6: init must succeed");
+    {
+        // The store's own database, opened directly: deleting the row is the only faithful way to be an old store.
+        // The CAS store's own database, where `store_policy` lives.
+        let database = store.join("store.sqlite");
+        let connection = rusqlite::Connection::open(&database).expect("open the store database");
+        let removed = connection
+            .execute("DELETE FROM store_policy WHERE key = 'volume_size'", [])
+            .expect("delete the row");
+        println!("C6 reading: removed {removed} row(s) from store_policy at {database:?}");
+        assert_eq!(
+            removed, 1,
+            "cell C6: the row must have existed to be removed"
+        );
+    }
+    let (_child, _root) = mount(&store, "K:");
+    let (total, _free) = capacity("K:");
+    println!("C6 reading: total={total} ({} GiB)", total / GIB);
+    assert_eq!(
+        total,
+        128 * GIB,
+        "cell C6: a store with no volume_size row advertises the default"
+    );
+    let _ = std::fs::remove_dir_all(&store);
+}
