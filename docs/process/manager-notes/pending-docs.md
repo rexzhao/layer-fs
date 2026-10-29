@@ -3461,3 +3461,8 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      \"base 缓存+overlay 活算\"降本不落地：read_tree 合成视图、拆开要碰
      fs-overlay 读路径——降本不成比例；Explorer 实测卡顿再开\"拆视图\"卡
      （把优化留给证据）。下一步：policy 行/--size/宿主警告/判据 C1-C7。
+
+657. 【虚拟卷第 2 步 2a（f9a91a4）】store_policy.volume_size 读写就位（None=旧store），
+     默认值 128GiB 归 CLI 不归 cas-store（产品决定与存取分层）。
+     中途撞到：fs-cli 无 cas-store 依赖+编造不存在的函数 ⇒ 立即撤回不留半截；
+     正确形状 Repo 访问器+fs-api 透传。741/741。
