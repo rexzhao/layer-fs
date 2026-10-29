@@ -3455,3 +3455,9 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      worker 产品面纪律好：裁决前只读代码不写代码，避免返工。
      实现点已查清：store_policy 表加 volume_size 行（旧 store 缺行读默认 128G，
      DDL 不动）；CLI init --size；init/mount 时宿主 free < 配置 ⇒ 警告。
+
+656. 【虚拟卷第 1 步（5651821）】Workspace::view_logical_bytes() + 250ms 缓存。
+     口径：视图内文件逻辑大小和（目录不计/同内容各算各/不含历史）。
+     \"base 缓存+overlay 活算\"降本不落地：read_tree 合成视图、拆开要碰
+     fs-overlay 读路径——降本不成比例；Explorer 实测卡顿再开\"拆视图\"卡
+     （把优化留给证据）。下一步：policy 行/--size/宿主警告/判据 C1-C7。
