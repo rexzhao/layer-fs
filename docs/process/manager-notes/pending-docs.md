@@ -3383,3 +3383,9 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      mounted_write_chain）——随机红收敛到 fs-winfsp 一条。
      决策：最后一条先摆着（已隔离、收益已兑现、B-17a 排后），连红两次再开工。
      插桩四步全部兑现：records_dir 单源→就绪两分法→留现场→等收干净。
+
+646. 【安排】夹具四件一页纸（scripts/drafts，worker 直接推 main）——五条判据的
+     教训集中：sed 漏跨行/helper 忘带 env/pipe 早答 hello/写探针弄脏工作区/
+     目录挂载点没有 present。B-17a 等触发（连红两次）。
+     manager 接下来：收口报告更新（main 自 e0036fd 后走了很远——ADR-010 四期 +
+     README + 覆盖率基线 + 夹具治理，判据 583-645 段要补进项目最终报告）。
