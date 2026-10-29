@@ -195,10 +195,19 @@ pub unsafe fn read_directory_from(
 /// `out` must be valid for writes of `capacity` bytes for the duration of the call.
 pub unsafe fn get_volume_info_shell(adapter: Option<&crate::DynAdapter>, out: *mut c_void) -> i32 {
     VOLUME_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let volume = adapter.and_then(|adapter| adapter.config().volume);
+    let config = adapter.map(|adapter| adapter.config());
+    let volume = config.and_then(|config| config.volume);
+    let capacity_source = config.and_then(|config| config.capacity);
     // SAFETY: the caller's contract covers `out`; the size is the structure's own, because the dispatcher always passes an
     // 88-byte local (`fsop.c:1245-1260`).
-    unsafe { get_volume_info_for(volume, out, std::mem::size_of::<VolumeInfo>() as u32) }
+    unsafe {
+        get_volume_info_for(
+            volume,
+            capacity_source,
+            out,
+            std::mem::size_of::<VolumeInfo>() as u32,
+        )
+    }
 }
 
 /// The `GetVolumeInfo` body with the volume handed in: **the logic lives here, the process-wide lookup lives above** (361).
@@ -210,8 +219,73 @@ pub unsafe fn get_volume_info_shell(adapter: Option<&crate::DynAdapter>, out: *m
 /// # Safety
 ///
 /// `out` must be valid for writes of `capacity` bytes for the duration of the call.
+/// The **capacity** of the volume, asked afresh on every call.
+///
+/// The first version hard-coded `1 GiB / 512 MiB` as a placeholder and never replaced it, so Explorer showed "1 GB, 512 MB used" regardless of content — a number
+/// that was not merely stale but invented. The honest answer for a content-addressed store is the **host volume it lives on**: when that disk fills, writes through
+/// the mount fail, and the reported free space should say so at the same moment rather than after a remount.
+///
+/// `None` means "cannot be asked" (no store path, or the call failed): the caller then keeps whatever the configuration supplied.
+pub type CapacitySource = fn() -> Option<(u64, u64)>;
+
+#[cfg(windows)]
+mod capacity_api {
+    #[link(name = "kernel32")]
+    extern "system" {
+        /// `BOOL GetDiskFreeSpaceExW(LPCWSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER)`.
+        pub fn GetDiskFreeSpaceExW(
+            directory_name: *const u16,
+            free_bytes_available: *mut u64,
+            total_bytes: *mut u64,
+            total_free_bytes: *mut u64,
+        ) -> i32;
+    }
+}
+
+/// The host volume behind `path`: `(total_bytes, free_bytes_available)`.
+///
+/// `None` when the path cannot be resolved to a volume or the API refuses — the caller then keeps the configured numbers rather than inventing one.
+#[cfg(windows)]
+pub fn host_capacity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free_available: u64 = 0;
+    let mut total: u64 = 0;
+    let mut total_free: u64 = 0;
+    // SAFETY: `wide` is NUL-terminated; the three out-pointers are valid locals. The API accepts a directory path and resolves its volume itself.
+    let asked = unsafe {
+        capacity_api::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_available,
+            &mut total,
+            &mut total_free,
+        )
+    };
+    if asked == 0 || total == 0 {
+        return None;
+    }
+    Some((total, free_available))
+}
+
+/// Non-Windows builds have no host volume to ask.
+#[cfg(not(windows))]
+pub fn host_capacity(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// `GetVolumeInfo`: the configured label plus the **live** capacity of the host volume, written as far as the caller's buffer reaches.
+///
+/// # Safety
+///
+/// `out` must be writable for `capacity` bytes, or null.
 pub unsafe fn get_volume_info_for(
     volume: Option<VolumeInfo>,
+    capacity_source: Option<CapacitySource>,
     out: *mut c_void,
     capacity: u32,
 ) -> i32 {
@@ -227,6 +301,14 @@ pub unsafe fn get_volume_info_for(
     // repeatedly), and answering `BUFFER_TOO_SMALL` forever is what left the volume showing no size in Explorer. The structure's
     // fields are laid out leading-first (`fsctl.h:270-275`), so a prefix **is** a valid answer to "how big is this volume" — and the
     // alternative, writing all 88 bytes into an 8-byte buffer, would be a buffer overrun rather than an answer.
+    // The label is configuration; the two numbers are **state**.
+    let mut volume = volume;
+    if let Some(source) = capacity_source {
+        if let Some((total, free)) = source() {
+            volume.total_size = total;
+            volume.free_size = free;
+        }
+    }
     let wanted = std::mem::size_of::<VolumeInfo>();
     let take = (capacity as usize).min(wanted);
     // SAFETY: `out` is non-null and valid for `capacity` bytes per the caller's contract; `take <= capacity` and `take <= wanted`.

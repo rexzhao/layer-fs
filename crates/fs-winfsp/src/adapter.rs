@@ -26,6 +26,11 @@ pub struct AdapterConfig {
     /// The volume answer (`GetVolumeInfo`). Configuration, not state: it is decided before the mount starts and does not
     /// change while it runs — which is why it belongs to the mount rather than to the process.
     pub volume: Option<crate::abi::VolumeInfo>,
+    /// Where the two capacity numbers come from, asked on **every** `GetVolumeInfo`.
+    ///
+    /// The label above is configuration; these numbers are state. A placeholder here is not a rounding error — it is a number the user reads and cannot reconcile
+    /// with anything (measured: Explorer showed "1 GB, 512 MB used" for every mount, because the placeholder was never replaced).
+    pub capacity: Option<crate::callbacks::CapacitySource>,
     /// `path -> FileId`, for `Open`/`Create`/`GetSecurityByName`.
     pub resolve: Option<fn(&str) -> Option<u64>>,
     /// `FileId -> metadata`, for `GetFileInfo`.
