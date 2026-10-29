@@ -41,6 +41,7 @@ Every line below was run on a real machine before it was written here.
 
 ```powershell
 layerfs init F:\repo                     # create a store; creates the `main` branch and workspace
+                                         # add `--size 512M` to advertise a smaller volume (default 128 GiB)
 layerfs --store F:\repo mount Z: --workspace main
                                          # serve `main` at Z: (Ctrl-C in that window = clean unmount)
 dir Z:\                                   # use it like any other drive
@@ -125,7 +126,7 @@ held open by its mount and removed when the process dies, so a leftover record m
 
 | Command | What it does |
 |---|---|
-| `init <path>` | create a store, a scope and the `main` branch |
+| `init <path> [--size N]` | create a store, a scope and the `main` branch; `--size` sets the volume size (default 128 GiB) |
 | `branch [<name>] [--from <src>]` | list branches, or create one |
 | `branch delete <name>` | delete a branch (its history stays a GC root) |
 | `checkout <branch>` | create or resume the workspace on a branch; inside a mount, **switch** it |
@@ -159,6 +160,22 @@ handles, and so on).
 5  conflict    (branch moved, nothing to commit, already exists)
 1  anything else
 ```
+
+## What the volume reports
+
+The volume is **virtual**: its size is what `init` recorded (`--size`, default **128 GiB**), not the size of the disk the store
+lives on. Usage is the **logical size of everything the view shows** — files only, each name counted (two names pointing at
+the same content each count), history excluded — and free space is the difference, never below zero.
+
+Two things worth knowing when you compare with Explorer:
+
+- **Explorer rounds to 4 KiB.** The product's own figure is byte-exact (a 5-byte file adds 5), but Windows rounds the number it
+  displays up to the allocation unit, so the same 5 bytes show as 4096. That is the shell, not the accounting.
+- **The number refreshes at most every 250 ms.** The shell asks for the volume's size many times per second and the answer costs a
+tree walk, so the reading is cached for a quarter of a second; a copy shows up on the next refresh, not instantly.
+
+If the host volume has less free space than the advertised size, `init` and `mount` print a warning naming both numbers and
+**carry on**: a write that cannot be satisfied fails on its own, and a full disk is not a reason to refuse to mount.
 
 ## Known limitations
 
