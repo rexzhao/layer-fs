@@ -85,9 +85,35 @@ fn start_mount(label: &str, mount_point: &Path) -> (PathBuf, MountChild) {
     }
     assert!(
         ready,
-        "cell setup: the mount at {} must serve",
+        "cell setup: the mount at {} must serve (control channel answered={ready})",
         mount_point.display()
     );
+    // **The control channel answering is not the volume serving** (measured: `hello` is answered by the pipe thread, which starts *before* the volume is attached,
+    // and the next command then fails with `ERROR_DIRECTORY (267)` when it tries to stand inside the mount). Readiness is a **write through the mount**, with a
+    // bound; the reading is printed if it never comes.
+    let root = if mount_point.to_string_lossy().ends_with(':') {
+        PathBuf::from(format!("{}\\", mount_point.display()))
+    } else {
+        mount_point.to_path_buf()
+    };
+    let probe = root.join("probe.txt");
+    let started = Instant::now();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match std::fs::write(&probe, b"probe") {
+            Ok(()) => break,
+            Err(error) if started.elapsed() < Duration::from_secs(15) => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!(
+                "cell setup: the volume at {} never became writable after {attempts} attempts: {error:?}",
+                mount_point.display()
+            ),
+        }
+    }
+    let _ = std::fs::remove_file(&probe);
     (store, child)
 }
 
