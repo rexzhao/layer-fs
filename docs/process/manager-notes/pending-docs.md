@@ -3325,3 +3325,10 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      QA 的好判断：overlay BUSY 场景 CLI 自然操作不触发，\"记为观测非缺陷\"——
      df4527c 的映射在挂载服务+并发持有路径（W3 已验 exit 4）。
      项目对使用者的入口齐了：README + help + help <command>。
+
+638. 【夹具隔离落地（5ce1f32）】records_dir(&store) 单一来源 + mount_* 返回它 +
+     cli/cli_code helper 统一带 env + 测试体 grep mounts_dir()=0（负向断言）。
+     前两层失败（sed 漏跨行 634 / helper 没带 env 637）写进注释。
+     restore_live 12/12（隔离目录上）、fs-cli 62/62、全量 737/739（两红皆并行族单跑绿）。
+     overlay 结论：\"prepare 退出较慢\"用可验证等待解决，不动 busy_timeout——与甲2 一致。
+     三层教训→结构的转化：单一来源/返回值防拼错/helper 统一 env 防 spawn 忘传。
