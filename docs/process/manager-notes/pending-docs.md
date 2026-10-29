@@ -3374,3 +3374,12 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      restore_live 失败留现场（process_alive/record/drive_present + stderr 继承）。
      读数：60/62→62/62，红的形式从\"卷没起\"变为\"上一条没收干净\"——
      症状迁移 = 一层修好下一层露出。第 1 步（start_mount 等收干净）留下一轮。
+
+645. 【插桩第 1 步完成（7ef560c）——全量首次 739/739】wait_until_free（盘符等
+     drive_present==Some(false)，上界 20s，等状态不睡）用于四处夹具。
+     坑：目录挂载点 drive_present 答 None（宿主卷上的目录）——等 Some(false) 等到
+     20s 上界把 A6d 弄红 ⇒ 只在盘符上等。同一等待在两类挂载点语义不同（与 644 同族）。
+     读数：fs-cli 三轮 62/62；全量 739/739（首次全绿）+ 738/739（唯一红
+     mounted_write_chain）——随机红收敛到 fs-winfsp 一条。
+     决策：最后一条先摆着（已隔离、收益已兑现、B-17a 排后），连红两次再开工。
+     插桩四步全部兑现：records_dir 单源→就绪两分法→留现场→等收干净。
