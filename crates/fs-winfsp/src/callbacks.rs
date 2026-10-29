@@ -911,12 +911,8 @@ pub unsafe fn get_security(
     if context.is_null() {
         return OURS_INVALID_PARAMETER;
     }
-    if !descriptor_size_out.is_null() {
-        // SAFETY: writable out-parameter.
-        unsafe { std::ptr::write(descriptor_size_out, 0) };
-    }
-    let _ = descriptor_out;
-    0
+    // SAFETY: the caller's contract covers both pointers; the same descriptor and the same in/out rule as the name door.
+    unsafe { write_descriptor(descriptor_out, descriptor_size_out) }
 }
 
 /// How many times `ReadDirectory` was entered — the counter that separates "our callback ran and answered empty" from "the
@@ -2032,11 +2028,142 @@ pub unsafe fn get_security_by_name_shell(
     unsafe { write_security_answer(attributes_out, descriptor_out, descriptor_size_out, &node) }
 }
 
+/// `STATUS_BUFFER_OVERFLOW` — "the buffer you gave me is too small; here is the size you need" (`ntstatus.h:1501`).
+///
+/// Read from the header, and from the **SDK's own samples**: both `memfs` and `passthrough` answer a security query that way — `*PSecurityDescriptorSize`
+/// carries the caller's buffer size **in**, and the needed size **out** with this status. Answering `STATUS_SUCCESS` with a size that does not fit is what made
+/// our volume unopenable (`Access denied (5)` on the very first open) while the DACL granted Everyone full access: WinFsp believed it had a descriptor it never
+/// received.
+const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005_u32 as i32;
+
+/// The volume's security descriptor: a **real** one, built once from SDDL.
+///
+/// The previous answer was a zero-length descriptor described as "the truth for a workspace-backed volume". It is not the truth, it is the absence of an answer:
+/// with no descriptor WinFsp falls back to its default, Explorer decides the user may not write, and the shell's **New** menu offers only a folder and asks for
+/// elevation (reported from a real mount).
+///
+/// The DACL grants full access to `SY` (LocalSystem), `BA` (Builtin Administrators) and `WD` (Everyone). Everyone is deliberate: this is a **local** volume whose
+/// backing store is a directory the caller already owns, and resolving the mounting process's SID into the SDDL would buy no protection the store's own ACL does
+/// not already give. The owner is `SY`, which is what a volume normally reports.
+const VOLUME_SDDL: &str = "O:SYG:SYD:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)";
+
+#[cfg(windows)]
+mod security_api {
+    #[link(name = "advapi32")]
+    extern "system" {
+        /// `BOOL ConvertStringSecurityDescriptorToSecurityDescriptorW(LPCWSTR, DWORD, PSECURITY_DESCRIPTOR *, PULONG)`.
+        pub fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut std::ffi::c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
+        /// `HLOCAL LocalFree(HLOCAL)`.
+        pub fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+}
+
+/// The descriptor's bytes, built at most once per process.
+static VOLUME_DESCRIPTOR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+fn volume_descriptor() -> &'static [u8] {
+    // **Disabled, deliberately, with the reading recorded.** Two-phase protocol and a real DACL were implemented (memfs/passthrough semantics: the size parameter
+    // is in/out, too small a buffer is `STATUS_BUFFER_OVERFLOW`) and the answer STILL refused the very first open with `Access denied (5)` — so the descriptor
+    // WinFsp wants is not the one SDDL produces here, and guessing again would cost another round. The empty answer is what this callback gave before the card,
+    // it does not deny access, and it is visibly not the fix: the volume-security card stays open until a mount-side reading shows what WinFsp passes in and what
+    // it does with what we hand back.
+    &[]
+}
+
+#[cfg(windows)]
+#[allow(dead_code)] // kept whole for the next attempt, see `volume_descriptor`
+fn build_volume_descriptor() -> &'static [u8] {
+    VOLUME_DESCRIPTOR.get_or_init(|| {
+        const SDDL_REVISION_1: u32 = 1;
+        let wide: Vec<u16> = VOLUME_SDDL
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut descriptor: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut size: u32 = 0;
+        // SAFETY: `wide` is NUL-terminated; both out-parameters point at locals.
+        let converted = unsafe {
+            security_api::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                &mut size,
+            )
+        };
+        if converted == 0 || descriptor.is_null() || size == 0 {
+            return Vec::new();
+        }
+        // SAFETY: the API returned this pointer and this length; the bytes are copied before the buffer is released.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(descriptor.cast::<u8>(), size as usize).to_vec() };
+        // SAFETY: the buffer came from the API above, which documents `LocalFree` as its release.
+        unsafe { security_api::LocalFree(descriptor) };
+        bytes
+    })
+}
+
+#[cfg(not(windows))]
+fn volume_descriptor() -> &'static [u8] {
+    &[]
+}
+
+/// The descriptor both security doors answer, exposed so a criterion can check its **shape** without a mount.
+#[doc(hidden)]
+#[must_use]
+pub fn volume_descriptor_for_test() -> &'static [u8] {
+    volume_descriptor()
+}
+
+/// Writes a security descriptor the way the SDK's samples do: the caller's buffer size comes **in**, the needed size goes **out**, and a buffer that is too small
+/// is refused with `STATUS_BUFFER_OVERFLOW` rather than quietly overrun or ignored.
+///
+/// # Safety
+///
+/// `descriptor_size_out` is either null or valid for read and write; `descriptor_out` is either null or valid for the size the caller passed in.
+unsafe fn write_descriptor(descriptor_out: *mut c_void, descriptor_size_out: *mut usize) -> i32 {
+    if descriptor_size_out.is_null() {
+        // Only the attributes were asked for; nothing to answer here.
+        return 0;
+    }
+    let descriptor = volume_descriptor();
+    // SAFETY: non-null per the check above; it is an **in/out** parameter.
+    let capacity = unsafe { std::ptr::read(descriptor_size_out) };
+    if descriptor.len() > capacity {
+        // SAFETY: writable out-parameter.
+        unsafe { std::ptr::write(descriptor_size_out, descriptor.len()) };
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    // SAFETY: writable out-parameter.
+    unsafe { std::ptr::write(descriptor_size_out, descriptor.len()) };
+    if !descriptor_out.is_null() && !descriptor.is_empty() {
+        // SAFETY: the caller's contract says the buffer is `capacity` bytes and `descriptor.len() <= capacity`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                descriptor.as_ptr(),
+                descriptor_out.cast::<u8>(),
+                descriptor.len(),
+            )
+        };
+    }
+    0
+}
+
 /// The answer both `GetSecurityByName` paths share: attributes out, a **zero-length** descriptor, nothing written into a buffer.
 ///
 /// # Safety
 ///
 /// `attributes_out` and `descriptor_size_out` may be null; `descriptor_out` is only read, never written.
+/// The answer both `GetSecurityByName` paths share: attributes, then the descriptor (two-phase, see `write_descriptor`).
+///
+/// # Safety
+///
+/// The three out-parameters may be null; `descriptor_out` is written only when the caller's size allows it.
 unsafe fn write_security_answer(
     attributes_out: *mut u32,
     descriptor_out: *mut c_void,
@@ -2047,13 +2174,6 @@ unsafe fn write_security_answer(
         // SAFETY: the caller passes either a valid pointer or null (fsop.c:797 passes null when it only wants the size).
         unsafe { std::ptr::write(attributes_out, node.attributes.0) };
     }
-    if !descriptor_size_out.is_null() {
-        // **Two-phase contract**: on a size query the caller wants only the required size and must not get a byte written into
-        // its buffer. `0` means "no explicit security information", which is the truth for a workspace-backed volume and the
-        // one answer that needs no buffer at all.
-        // SAFETY: writable out-parameter, checked non-null above.
-        unsafe { std::ptr::write(descriptor_size_out, 0) };
-    }
-    let _ = descriptor_out;
-    0
+    // SAFETY: the caller's contract covers both pointers; `write_descriptor` implements the in/out rule the SDK samples use.
+    unsafe { write_descriptor(descriptor_out, descriptor_size_out) }
 }
