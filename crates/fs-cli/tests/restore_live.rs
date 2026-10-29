@@ -21,6 +21,23 @@ impl Drop for MountChild {
     }
 }
 
+impl MountChild {
+    /// What a failing mount looked like **at the moment the fixture gave up** — the three readings that separate the ways a mount can be absent.
+    ///
+    /// A mount that never recorded itself, a mount whose volume never came up, and a mount that died are three different defects with three different fixes;
+    /// without these numbers a timeout only says "something is wrong". `stderr` is **inherited** by every fixture mount for the same reason: the mount's own
+    /// last words are the first thing anyone will want, and a piped stream nobody reads is how they get lost.
+    fn evidence(&mut self, record: &std::path::Path, mount_point: &std::path::Path) -> String {
+        let alive = matches!(self.0.try_wait(), Ok(None));
+        let record_text =
+            std::fs::read_to_string(record).unwrap_or_else(|error| format!("<{error}>"));
+        format!(
+            "process_alive={alive} record={record:?} content={record_text:?} present={:?}",
+            fs_winfsp::mounted::drive_present(mount_point)
+        )
+    }
+}
+
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_fs-cli"))
 }
@@ -93,7 +110,8 @@ fn a_restore_through_the_mount_shows_the_old_bytes() {
             .arg("main")
             .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // **Inherited**: the mount's own last words are evidence; a piped stream nobody reads loses them exactly when they matter.
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn mount"),
     );
@@ -217,7 +235,8 @@ fn mount_at(letter: &str) -> (PathBuf, MountChild, PathBuf) {
             .arg("main")
             .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // **Inherited**: the mount's own last words are evidence; a piped stream nobody reads loses them exactly when they matter.
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn mount"),
     );
@@ -594,7 +613,7 @@ fn mount_prepared(
         Some(false),
         "cell precondition: {letter} must be free before mounting"
     );
-    let child = MountChild(
+    let mut child = MountChild(
         Command::new(binary())
             .arg("--store")
             .arg(&store)
@@ -604,7 +623,7 @@ fn mount_prepared(
             .arg("main")
             .env("LAYERFS_MOUNTS_DIR", &records)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn mount"),
     );
@@ -622,7 +641,8 @@ fn mount_prepared(
         std::fs::read_to_string(&record)
             .unwrap_or_default()
             .contains("pipe="),
-        "cell setup: the mount must be recorded and listening"
+        "cell setup: the mount must be recorded and listening: {}",
+        child.evidence(&record, &mount_point)
     );
     let probe = root.join("probe.txt");
     let mut attempt = 0;
@@ -756,7 +776,7 @@ fn mount_at_directory(label: &str) -> (PathBuf, MountChild, PathBuf) {
         .output()
         .expect("init");
     let mount_point = store.join("mnt");
-    let child = MountChild(
+    let mut child = MountChild(
         Command::new(binary())
             .arg("--store")
             .arg(&store)
@@ -766,7 +786,8 @@ fn mount_at_directory(label: &str) -> (PathBuf, MountChild, PathBuf) {
             .arg("main")
             .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // **Inherited**: the mount's own last words are evidence; a piped stream nobody reads loses them exactly when they matter.
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn mount"),
     );
@@ -785,7 +806,8 @@ fn mount_at_directory(label: &str) -> (PathBuf, MountChild, PathBuf) {
         std::fs::read_to_string(&record)
             .unwrap_or_default()
             .contains("pipe="),
-        "cell setup: the mount must be recorded and listening"
+        "cell setup: the mount must be recorded and listening: {}",
+        child.evidence(&record, &mount_point)
     );
     (store, child, mount_point)
 }
@@ -1053,7 +1075,8 @@ fn an_open_during_a_closing_switch_fails_instead_of_waiting() {
             .env("WCAS_CLI_PAUSE_AT", "switch-after-quiesce=3000")
             .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // **Inherited**: the mount's own last words are evidence; a piped stream nobody reads loses them exactly when they matter.
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn mount"),
     );
@@ -1166,7 +1189,8 @@ fn a_failed_remount_rolls_back_and_says_so() {
             .env("WCAS_CLI_FAIL_AT", "switch-mount-new")
             .env("LAYERFS_MOUNTS_DIR", records_dir(&store))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // **Inherited**: the mount's own last words are evidence; a piped stream nobody reads loses them exactly when they matter.
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn mount"),
     );
