@@ -1,6 +1,8 @@
 # P3-4 收口报告（项目最终报告）
 
 > 状态：终稿。所有数字来自 QA 独立复跑（L2/M/U 三段验收，SHA `46a097a`），判据编号可引（`criteria-and-acceptance.md` §十七，178–527 条）。
+>
+> **增补（2026-10-29）**：§12 收录 P3-4 收口后的 ADR-010 四期与收尾段（判据 528–647）。Backlog B-22/B-23/B-24 已随 ADR-010 落地消项。
 
 ## 0. 一句话
 
@@ -214,4 +216,52 @@ M7 平台局限：WinFsp 用户模式设计——进程死后卷设备由 OS/驱
 
 ---
 
-> **从 spec 到 Windows 上的文件系统——P1/P2/P3 全链闭合。判据 527 条，验收零缺陷。**
+## 12. ADR-010 与收尾段（判据 528–647）
+
+P3-4 收口后，owner 裁定 CLI 行为模式重构（ADR-010，七项裁定 D1–D7）：**CLI 收敛为“生命周期管理 + 挂载服务”，文件操作完全经挂载后的文件系统**（文件级命令 put/get/ls/stat/mkdir/rm/mv/cat 全部移除，exit 2 + 指路消息）。
+
+### 12.1 四期交付
+
+| 期 | 内容 | 代表判据 |
+|---|---|---|
+| S0 | 文件命令移除（exit 2）；cli/current 全删（无默认，显式 `--workspace` 或路径发现）；全局 `--store`/`--workspace` | 528–552 |
+| S1 | 挂载记录迁 `%LOCALAPPDATA%\layerfs\mounts\`（DELETE_ON_CLOSE 判活，进程死=内核删记录）；路径发现（resolve 纯函数 + 卷标安全网 + reparse point）；Ctrl-C = 正常卸载（flush→卸载→删记录）；控制管道骨架 | 553–570 |
+| S2 | 发布锁 Gate(RwLock) 七判据 G1–G7（互斥/隔离/完整/深度/无绕过/饥饿/上界）；commit/snapshot/restore/rebind 从 `&mut` 改 `&self`；管道 commit/snapshot——**挂载内 `cd /j && layerfs commit` 走通**；A17 句柄身份跨 commit 不变 | 570–582 |
+| S3 | 准入状态机（Open/Paused/Closing + 三回调持票，Paused 等/Closing 立拒——变异 116s = 真实死锁路径）；管道 restore/switch；W1–W8 | 583–626 |
+
+**switch 语义（实测）**：换挂窗口 29.6ms（界 2000）；打开的文件句柄挡住换挂（exit 4，文件/目录数分开报）；目录句柄放行 + 报数字 + `cd .` 提示；新挂载失败回退旧 workspace（exit 1，内容仍在）；三种 shell 存活；控制管道串行（过渡态的诚实——期间不答 hello，结束后 180µs 恢复）。
+
+### 12.2 收尾段（判据 620–647）
+
+- **README + help**：用户入口齐了（README 176 行 + `help`/`help <command>` + `--help` 重写；判据 C1–C5——含“README 反引号 docs/ 路径必须存在”）
+- **HandleTable 泄漏修复**（619）：每次 fs-cli 命令 +8 句柄永不回落——七轮读数定位（Cleanup 到 Close 没到 → 盘符也漏 → 不衰减 → refs 2→1 停住 → 记账自洽 live_refs=0 → 上下文表空 → 泄漏在 HandleTable：每次 open 注册新 handle 但上下文只记得第一个）。修法两件必须一起：一个 file_id 一份 handle + refs 计数——泄漏消失且计数语义不变
+- **overlay 锁正名**（633）："database is locked" 的真名是 "workspace overlay is already open"（EXCLUSIVE 设计），归 in-use/exit 4——“独占是写者身份，不是资源争用”
+- **覆盖率基线**（641）：6ecae76 首基线——行 82.76%、函数 82.90%（fs-semantics 100%；gc/apply.rs 73.20% 最低；串行消除并行 flake）
+- **夹具治理**（638/644/645）：records_dir 单源 + 就绪判据两分法 + 等收干净 + 失败留现场——全量首次 739/739
+- **并行族治理**：nextest 挂载类串行组；“固定两条红 → 一条偶发红”（mounted_write_chain，B-17a 等触发）
+
+### 12.3 数据总结（增补）
+
+| 维度 | 数字 |
+|---|---|
+| 判据条数（累计） | **647** |
+| 全量测试 | **739/739**（首次全绿；另轮 738/739，唯一红 = mounted_write_chain 偶发，单跑绿） |
+| clippy | 0 |
+| 覆盖率（6ecae76） | 行 82.76% / 函数 82.90%（fs-winfsp 排除，原因具名） |
+| CLI 命令 | 18 个生命周期命令；文件命令 0 个 |
+| 换挂窗口 | 29.6ms（实测，界 2000） |
+| Backlog 消项 | B-22（两层防护：记录层 + overlay EXCLUSIVE）/ B-23（版本闸）/ B-24（挂载 CLI） |
+
+### 12.4 Backlog 更新
+
+| 项 | 变化 |
+|---|---|
+| B-22 挂载级互斥 | **消项**（D5 两层防护落地：记录层先拒 + overlay EXCLUSIVE 兜底，exit 4） |
+| B-23 版本闸 | **消项**（启动比对，不符即拒） |
+| B-24 挂载 CLI | **消项**（mount/umount/list/version + force 清陈旧记录） |
+| B-17a crash 族 | 保留；追加“半活族”条目（挂载活着记录未现，触发=连红两次，evidence() 已在场） |
+| 新增 | 环境遗留：Y:/Z: stale 盘符需重启；C6 Display 穷举缺口；CDC 读路径 158 行未覆盖 |
+
+---
+
+> **从 spec 到 Windows 上的文件系统，再到完整的 CLI 与用户入口——P1/P2/P3/ADR-010 全链闭合。判据 647 条，全量 739/739，验收零缺陷。**
