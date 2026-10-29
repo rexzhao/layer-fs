@@ -6,6 +6,7 @@
 mod common;
 
 use std::io::{Read, Write};
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -93,11 +94,32 @@ fn start_mount(label: &str, mount_point: &Path) -> MountChild {
     while started.elapsed() < Duration::from_secs(10) && std::fs::metadata(&root).is_err() {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(
-        std::fs::metadata(&root).is_ok(),
-        "cell setup: the mount at {} must serve before a case asks it anything",
-        mount_point.display()
-    );
+    // **A visible mount point is not a serving volume**, and a **write** probe is worse than useless here: it leaves the workspace dirty, so a criterion that starts
+    // from "a fresh mount is clean" would fail for a reason the fixture created. Readiness is **opening the root as a directory** — Q2's lesson (hold a handle, do
+    // not enumerate) — which proves the volume answers and changes nothing.
+    let started = Instant::now();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0200_0000)
+            .open(&root)
+        {
+            Ok(handle) => {
+                drop(handle);
+                break;
+            }
+            Err(error) if started.elapsed() < Duration::from_secs(15) => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!(
+                "cell setup: the volume at {} never answered after {attempts} attempts: {error:?}",
+                mount_point.display()
+            ),
+        }
+    }
     child
 }
 
