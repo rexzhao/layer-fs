@@ -184,6 +184,21 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
     }
 
     let repo = std::sync::Arc::new(Repo::open(&store, false)?);
+    // **The volume size this store advertises** (128 GiB for a store that predates the key), and a warning when the host cannot back it: the warning is a
+    // warning, not a refusal — a write that cannot be satisfied still fails on its own, and refusing to mount because a disk might fill would be guessing.
+    let volume_total = repo
+        .volume_size_bytes()?
+        .unwrap_or(fs_cli::DEFAULT_VOLUME_SIZE_BYTES);
+    if let Some((_host_total, host_free)) = fs_winfsp::callbacks::host_capacity(&store) {
+        if host_free < volume_total {
+            eprintln!(
+                "warning: {} advertises {} but the host volume has {} free; writes will fail before the volume reports full",
+                store.display(),
+                volume_total,
+                host_free
+            );
+        }
+    }
     let workspace = repo.workspace_open(&name)?;
     // `DynOps` carries no lifetime, and this process exists to serve one mount: leaking the workspace is the honest way to say "this outlives every
     // borrow", rather than pretending with a `Box::leak` hidden behind an abstraction.
@@ -309,12 +324,14 @@ pub fn mount(store: &Path, workspace: Option<&str>, arguments: &[String]) -> Res
                 &mount_point,
                 backend,
                 volume(),
-                // **The two capacity numbers are state**: asked from the host volume of the store on every `GetVolumeInfo`, so the reported free space and the
-                // moment a write fails come from the same measurement.
+                // **The volume is virtual**: `total_size` is the store's configured size (128 GiB when it was never told), and `free` is that minus what the
+                // **view** currently shows. Clamped at zero: a view larger than the volume reports "no free space", never a negative number.
                 {
-                    let store = store.clone();
+                    let total = volume_total;
+                    let handle = current_handle;
                     Some(Box::leak(Box::new(move || {
-                        fs_winfsp::callbacks::host_capacity(&store)
+                        let used = handle.view_logical_bytes().unwrap_or(0);
+                        Some((total, total.saturating_sub(used)))
                     }))
                         as fs_winfsp::callbacks::CapacitySource)
                 },

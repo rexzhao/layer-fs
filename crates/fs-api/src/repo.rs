@@ -296,6 +296,24 @@ impl Repo {
         let root = fs_workspace::parse_oid(&info.root)?;
         ReadView::open(self.inner.store_dir(), root)
     }
+
+    /// The volume size this store advertises, when it has one.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the repository says.
+    pub fn volume_size_bytes(&self) -> ApiResult<Option<u64>> {
+        Ok(self.inner.volume_size_bytes()?)
+    }
+
+    /// Records the volume size this store advertises.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the repository says.
+    pub fn set_volume_size_bytes(&self, bytes: u64) -> ApiResult<()> {
+        Ok(self.inner.set_volume_size_bytes(bytes)?)
+    }
 }
 
 /// What `status` reports about a workspace.

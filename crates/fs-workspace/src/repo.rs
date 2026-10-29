@@ -1024,6 +1024,29 @@ impl Repo {
         Ok(root)
     }
 
+    /// The volume size this store advertises, when it has one (`store_policy.volume_size`).
+    ///
+    /// `None` for a store written before the key existed: **the default is the caller's decision**, because "128 GiB" is a product choice and this layer only
+    /// records what it was told.
+    ///
+    /// # Errors
+    ///
+    /// A store that cannot be opened, or a policy row that is not a number.
+    pub fn volume_size_bytes(&self) -> WorkspaceResult<Option<u64>> {
+        let store = Store::open(&self.store_dir, OpenMode::ReadOnly)?;
+        Ok(store.volume_size_bytes()?)
+    }
+
+    /// Records the volume size this store advertises.
+    ///
+    /// # Errors
+    ///
+    /// A store that cannot be opened for writing.
+    pub fn set_volume_size_bytes(&self, bytes: u64) -> WorkspaceResult<()> {
+        let store = Store::open(&self.store_dir, OpenMode::ReadWrite)?;
+        store.set_volume_size_bytes(bytes)?;
+        Ok(())
+    }
     /// The serial scope a published tree was allocated in.
     fn root_scope(&self, root: ObjectId) -> WorkspaceResult<[u8; 32]> {
         let store = Store::open(&self.store_dir, OpenMode::ReadOnly)?;

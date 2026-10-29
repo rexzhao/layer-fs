@@ -100,6 +100,56 @@ fn exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
     1
 }
 
+/// The default volume size a new store advertises: **128 GiB**.
+///
+/// A product decision, which is why it lives in the CLI: the store records what it was told, and a store that was never told reports this default so old
+/// repositories keep working.
+const DEFAULT_VOLUME_SIZE_BYTES: u64 = fs_cli::DEFAULT_VOLUME_SIZE_BYTES;
+
+/// Parses a size the way a person writes one: `128G`, `512GiB`, `256M`, or a bare byte count.
+///
+/// Every unit is **binary** (K = 1024), because that is what a volume size means everywhere else in this product; `GB` is accepted and read as GiB rather than
+/// rejected, since a user who types it means the same thing.
+fn parse_size(text: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let trimmed = text.trim();
+    let (number, unit) = trimmed.split_at(
+        trimmed
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(trimmed.len()),
+    );
+    let value: u64 = number
+        .parse()
+        .map_err(|_| fs_cli::Failure::usage(format!("not a size: {text:?}")))?;
+    let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" => 1024 * 1024 * 1024 * 1024,
+        other => {
+            return Err(fs_cli::Failure::usage(format!(
+                "not a size unit: {other:?} (use K, M, G, T, or a byte count)"
+            ))
+            .into())
+        }
+    };
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| fs_cli::Failure::usage(format!("size too large: {text:?}")).into())
+}
+
+/// The `--size` given to `init`, or the default.
+fn requested_volume_size(arguments: &[String]) -> Result<u64, Box<dyn std::error::Error>> {
+    match arguments
+        .iter()
+        .position(|argument| argument == "--size")
+        .and_then(|index| arguments.get(index + 1))
+    {
+        Some(text) => parse_size(text),
+        None => Ok(DEFAULT_VOLUME_SIZE_BYTES),
+    }
+}
+
 fn require_workspace() -> Result<String, Box<dyn std::error::Error>> {
     match WORKSPACE.get().and_then(Option::clone) {
         Some(name) => Ok(name),
@@ -253,10 +303,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if command == "init" {
+        // **Parsed before the store exists**: a typo in `--size` costs nothing, and the value is a product decision recorded in the store.
+        let volume_size = requested_volume_size(&arguments)?;
+        // The path is the first argument that is neither a flag nor the value of one: `--size 128G` must not become the repository path.
+        let size_position = arguments.iter().position(|argument| argument == "--size");
         let path = arguments
-            .first()
-            .map_or_else(|| store.clone(), PathBuf::from);
+            .iter()
+            .enumerate()
+            .find(|(index, argument)| {
+                !argument.starts_with("--")
+                    && size_position.is_none_or(|position| *index != position + 1)
+            })
+            .map_or_else(|| store.clone(), |(_, argument)| PathBuf::from(argument));
         let repo = Repo::create(&path)?;
+        repo.set_volume_size_bytes(volume_size)?;
         let head = repo.branch_head("main")?;
         // **`init` leaves the repository usable**, not merely created: a fresh store with no workspace makes the very next lifecycle command fail for a
         // reason the user cannot see. Creating `main` is the same thing `checkout main` does, done once at the moment it is obviously wanted. No

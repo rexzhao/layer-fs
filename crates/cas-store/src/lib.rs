@@ -380,7 +380,6 @@ impl Store {
         Ok(())
     }
 
-
     /// The identity a `put` of `role`/`value` would publish.
     ///
     /// # Errors

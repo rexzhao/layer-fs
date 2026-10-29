@@ -273,6 +273,12 @@ pub fn switch_refusal(files: usize, dirs: usize) -> String {
         "switch: {files} still open ({dirs} directory handle(s) do not block); close the files and try again — the mount still serves the old workspace"
     )
 }
+/// The volume size a store advertises when it was never told one: **128 GiB**.
+///
+/// A product decision, so it lives here rather than in the store crate: the store records what it was told, and a repository created before the key existed
+/// reports this so old work keeps mounting.
+pub const DEFAULT_VOLUME_SIZE_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::{
