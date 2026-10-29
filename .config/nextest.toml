@@ -1,20 +1,30 @@
 # Mount-level criteria, one at a time.
 #
-# Every test that mounts a volume takes a drive letter or a directory on the host and then talks to WinFsp through it. Running several of those at once makes the
-# *fixture* the variable: a letter can be occupied for a moment too long, a mount point can be briefly unusable right after a remount, and a handle's `Close` can
-# arrive later than the next test expects. All three were observed as "fails in the full run, passes alone" — and the honest reading of that is "the suite cannot
-# run these in parallel", not "the product is flaky".
+# Every test in these binaries mounts a volume (a drive letter or a directory on the host) and then talks to WinFsp through it. Running several at once makes the
+# *fixture* the variable: a letter can stay occupied a moment too long, a mount point can be briefly unusable right after a remount, and a handle's `Close` can
+# arrive later than the next test expects. All three were observed as "fails in the full run, passes alone", and the honest reading is "these cannot run in
+# parallel", not "the product is flaky".
 #
-# So they are grouped: everything matching the filter below runs with **one** test at a time, while the rest of the suite keeps its parallelism.
+# Syntax note: nextest's `binary(...)` matches the **binary name**, not `crate::binary` — and it takes a glob (an earlier version passed a regex, which quietly
+# matched nothing, so the group looked configured while every mount test still ran in parallel).
 [test-groups]
 mounts = { max-threads = 1 }
 
 [[profile.default.overrides]]
-# The tests that mount: the CLI's mounted criteria, the frontend's mount tests, and the ones that sample a live volume while another thread works.
-filter = 'test(/^fs_cli::(restore_live|control_pipe|mount_cli|discovery_live|handle_identity)/) | test(/^fs_winfsp::(mounted_|mount_|admission_handles|registry_lifetime)/)'
+filter = '''
+binary(=restore_live)
+| binary(=control_pipe)
+| binary(=mount_cli)
+| binary(=discovery_live)
+| binary(=handle_identity)
+| binary(mounted_*)
+| binary(mount_*)
+| binary(admission_*)
+| binary(=registry_lifetime)
+'''
 test-group = 'mounts'
 
-[[profile.default.overrides]]
 # Crash/recovery criteria spawn processes and kill them; two of those at once is another environment variable nobody controls.
-filter = 'test(/crash/)'
+[[profile.default.overrides]]
+filter = 'test(~crash)'
 test-group = 'mounts'
