@@ -3536,3 +3536,9 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      宿主警告 carry-on 理由）。C2/C5 自动复核 8 命令 8 路径全存在，docs_help 5/5。
      纯文档单笔直接合入（行为无变化）。分支已删。
      虚拟卷全线收口：代码+判据+QA+README+release exe。
+
+668. 【QA·覆盖率第 5 轮窗口批准】main @ 2b5344d（距上基线 6ecae76 55 提交，
+     crates +1655 行）。口径沿用：SHA 标注/fs-winfsp --exclude/串行/跳过具名/
+     不全局导出 MOUNTS_DIR/报告落 docs/reports。先行分析三点：虚拟卷自带测试、
+     winfsp 环境敏感文件改动效果观察、上轮观察点复核（gc/apply.rs 73.20%/
+     CDC read.rs/C6 穷举）。
