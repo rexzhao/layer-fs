@@ -3591,3 +3591,13 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      下探针：批量事务变体（K 次 insert 一事务）——线性降=每提交固定成本坐实；
      不降=嫌疑转 WAL 追加/storage 同步点（主库与 overlay insert 分开数）。
      归因排在报告两欠账（scale 0.1/mount-seconds）之前——归因决定报告的话。
+
+675. 【txncost 定案（b038db9）】同机同 pragmas：提交固定成本 NORMAL 0.009ms/
+     FULL 1.27ms——\"overlay 每提交是主因\"不成立（小 1-3 个数量级）。
+     FULL 增量 3.7ms ≠ 1.27×次数 ⇒ FULL 大头不在提交本身，在 storage 层
+     每 op 的 fsync 点（内容落盘的 fsync 是我们 storage 自己写的）。
+     8ms 嫌疑集中：每 op SQL 条数（insert+meta 读改写）/storage fsync/
+     每 op 整树遍历类结构性开销。下探针：create 路径三段计时
+     （进入/写完 overlay/返回），落在哪段一眼可见。
+     归因链至此：open 0.185（674）→ sqlite 提交 0.009-1.27（675）——
+     两层外部依赖洗清，8ms 在自己代码。
