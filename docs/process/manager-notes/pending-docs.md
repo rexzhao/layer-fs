@@ -3550,3 +3550,12 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      缩比 ops/s 让全尺度可推算。下轮：scale 1/10+进度+报告草案。
      元数据密集（每 op FFI 往返+句柄登记+CAS 写）是已知代价方向，
      基线钉住量级正是这卡目的。
+
+670. 【S10 撞出 git 兼容性缺口】git init 在挂载内失败：could not write config
+     file .git/config: No such file or directory（exit 128）——产品缺口非 harness
+     问题（挂载上不能跑 git=真实场景限制）。
+     方向：git 写 config 走 temp+create/rename 族；探针法钉缺口在 create 族还是
+     rename 族（mkdir→Create→write→close 及 temp+rename 两变体）；
+     顺带查 L2 是否覆盖\"mkdir 后立即 create 子文件\"——若没有则同时是 L2 盲区。
+     教训：报告最后才落盘 ⇒ panic 丢全部数字——改每场景增量写。
+     \"真实复合负载\"立刻回报：S10 选 git 就是等这种撞法。
