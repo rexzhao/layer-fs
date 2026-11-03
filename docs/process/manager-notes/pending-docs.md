@@ -3559,3 +3559,12 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      顺带查 L2 是否覆盖\"mkdir 后立即 create 子文件\"——若没有则同时是 L2 盲区。
      教训：报告最后才落盘 ⇒ panic 丢全部数字——改每场景增量写。
      \"真实复合负载\"立刻回报：S10 选 git 就是等这种撞法。
+
+671. 【首份性能基线（0e744f6）】scale 0.02 两臂：顺序写 16-19×/读 5.5×/
+     随机 4K 读 14×/写 19×/create 27×（13.5ms/op）/stat 44×/list 41×/delete 16×/
+     copy 23×/覆写 16×——元数据密集代价最大。
+     归因读数：stat 1.2ms=FFI+解析地板；create 比 stat 多 ~12ms——嫌疑排序
+     ① sqlite synchronous=FULL 每操作一次同步（repo.rs:1298）② 哈希+落盘 ③ FFI 叠加。
+     诊断实验：scratch 构建改 NORMAL 只测 S5 create（掉到 2ms=主因；
+     NORMAL 化是产品卡需单独论证崩溃语义；诊断变体不进主线）。
+     三个缺口如实标注：scale 仅 0.02/mount 计时未接线/S10 缺席（670）。
