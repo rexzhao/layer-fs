@@ -3623,3 +3623,11 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      677 的\"同名两处\"只是表层，真相是两条实现路径。
      下轮：Rules::create_or_open 六段计时（parse/resolve parent/lookup/
      create_inode/bind/view），先 HIT 后计时，env-gated 测完即撤。
+
+679. 【manager 代码复核：top_up 降嫌疑+链条矛盾】top_up（tree.rs:46-55）实为
+     serial 水位检查：两条 meta 读，end−next≥256 即返回；贵分支（reserve_segment
+     主库事务）每 256 写一次摊销可忽略——非\"整树检查\"，8ms 嫌疑降。
+     链条矛盾：worker 推断 create→WorkspaceStore::write→TreeStore::write(&*self.overlay)
+     （tree.rs:83），若真执行则上轮 OverlayStore trait write 的 HIT 应打印（实为 0）——
+     要么 HIT 第三次放错同名方法，要么链条在 Rules 层分岔。tree.rs:82/83 两行 HIT
+     裁决：82有83有=HIT放置问题；82无=链条分岔往上找。
