@@ -3583,3 +3583,11 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      下层探针：①批量事务变体（掉 2ms=提交坐实）②不动则查 HandleTable/登记
      （只 open 不 create 对比）③纯 stat 两变体各跑拆页缓存混杂。
      S0 归仪器集不进默认基线。归因读数进报告附录。
+
+674. 【S0-open 定案（623ff5f）】open 已存在文件 0.185ms（便宜 create 46×）——
+     名字解析+context acquire+句柄登记+FFI 全部洗清；代价集中在
+     \"写一条新记录并提交\"。四层账：create 13.5 = FULL 3.7 + 内容 1.8 +
+     overlay 提交 ~3 + 未归属 ~5；0 字节 8.6 = FULL 3.7 + 提交 ~3 + 未归属 ~2。
+     下探针：批量事务变体（K 次 insert 一事务）——线性降=每提交固定成本坐实；
+     不降=嫌疑转 WAL 追加/storage 同步点（主库与 overlay insert 分开数）。
+     归因排在报告两欠账（scale 0.1/mount-seconds）之前——归因决定报告的话。
