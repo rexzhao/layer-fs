@@ -3679,3 +3679,12 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      只读 op 排队为后续小卡（改管道协议=产品面），不阻塞本卡。",
      修正记录：mountcmd 报告调用点 report(&out, Duration::ZERO) 写死零——参数
      读了没用上（遮蔽又一例）。
+
+686. 【662 第三次+绊线被 tail 吃掉】perfbench 卡期间我的判据提交全落在
+     feat/perfbench（共用工作树），push HEAD:main 又把 worker 的卡提交带上 main。
+     钩子其实已激活（core.hooksPath=.githooks）——每次都响，但我的推送命令
+     用 2>&1|tail -1 把 6 行警告喂给了 tail，从没看见。
+     本次内容为纯测试面（examples+drafts+pending-docs）——直推本就授权，
+     政策合法无需回滚；与 662（产品卡）性质不同。
+     自我修正两条：①推送命令永不再 tail 截断输出；②判据提交只在 main 上做，
+     工作树在分支上就等合入后再补。perfbench 分支已合（cf92142）删除。
