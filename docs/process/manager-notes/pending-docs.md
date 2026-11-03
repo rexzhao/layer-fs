@@ -3615,3 +3615,11 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      是\"改哪\"的定位问题。教训入册：插桩前先 eprintln(\"HIT\") 确认到达
      （诚实的到达性检查——与\"变异要红\"同族：仪器本身也要验证它在测东西）。
      仪器已撤，工作树干净。归因账停\"~8ms 未归属\"。
+
+678. 【HIT 定位：两条实现路径】create 的挂载路径不走 fs-overlay content（那两处
+     HIT 全零）——走 fs-api Rules::create_or_open（winfsp_backend.rs:157）。
+     \"在仪表盘 B 上量仪表盘 A 的事\"：fs-cli lifecycle 命令走 content 路径，
+     fs-winfsp Create 回调走 Rules 路径——性能量挂载、插桩插 lifecycle，层就不对。
+     677 的\"同名两处\"只是表层，真相是两条实现路径。
+     下轮：Rules::create_or_open 六段计时（parse/resolve parent/lookup/
+     create_inode/bind/view），先 HIT 后计时，env-gated 测完即撤。
