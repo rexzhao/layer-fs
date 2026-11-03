@@ -457,7 +457,7 @@ fn report(path: &Path, mount_seconds: Duration, rows: &[Row], runs: usize, scena
     ));
     text.push_str(&format!("- scenarios: {}\n", scenarios.join(", ")));
     text.push_str(&format!(
-        "- **mount time (outside the clock): {:.3} s**\n\n",
+        "- **mount time (measured by the caller; outside every number below): {:.3} s**\n\n",
         mount_seconds.as_secs_f64()
     ));
     text.push_str("## Numbers\n\n");
@@ -518,6 +518,8 @@ fn main() {
     let mut arm_b = None;
     let mut runs = 1usize;
     let mut scale = 1.0f64;
+    // Mount time is measured by the caller (the harness starts after the volume is up) and reported on its own line, never inside a scenario number.
+    let mut mount_seconds = 0.0f64;
     let mut only: Option<Vec<String>> = None;
     let mut out = PathBuf::from("perf-baseline.md");
     while let Some(argument) = arguments.next() {
@@ -536,6 +538,12 @@ fn main() {
                     .next()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(1.0)
+            }
+            "--mount-seconds" => {
+                mount_seconds = arguments
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0.0)
             }
             "--scenarios" => {
                 only = arguments.next().map(|value| {
