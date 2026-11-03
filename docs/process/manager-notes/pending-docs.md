@@ -3654,3 +3654,13 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      ——下轮同次运行同打两个仪器互相校准。预测供对照：tree.inode(existing) 若走",
      base 树读快照——\"每次 create 都从快照拉父 inode\"；inode 段独大则产品方向",
      是解析缓存/物化短路。
+
+683. 【归因到底（lookup 3.07 + bind 4.63）】body 三段：lookup 3.068ms +
+     bind 4.631ms ≈ 7.7ms 占全部（create_inode 78µs、inode 0）。
+     两段都是\"父目录条目\"操作——读父条目集 3ms/写回 4.6ms；父目录在 base
+     快照，疑似每次重建条目块。总账：create 13.5 = FULL 3.7 + lookup 3.1 +
+     bind 4.6 + 内容 1.8 + 事务 0.13——不是哈希不是事务不是 FFI。
+     归因链 671-683 全记录（四层逐层洗清：open/sqlite/机器层/事务全部排除，
+     落在父目录条目块）。
+     perfbench 卡收口：scale 0.1 + mount-seconds + 报告定稿（含归因附录）+ 四步交卡。
+     排队新卡：①perf-opt-1 父目录条目缓存（第一读数=lookup/bind 内切）②git 兼容（670）。
