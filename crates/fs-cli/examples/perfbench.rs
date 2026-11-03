@@ -125,6 +125,31 @@ fn time_it(reading: &mut Reading, bytes: u64, body: impl FnOnce()) {
 /// This exists to split one number in two. If an empty create already costs as much as a 1 KiB one, the cost is in the per-operation machinery (overlay insert,
 /// transaction, handle registration); if it is an order of magnitude cheaper, the cost is in the content path (hash and store write). It is a probe, not a
 /// scenario: it is measured with the same discipline so the two numbers are comparable.
+/// **S0-open (diagnostic)** — opening an existing file, with the clock on the open only.
+///
+/// Paired with `S0` (empty create): if opening costs about the same as creating, the fixed cost is in the **open path** (name resolution, context acquire, handle
+/// registration); if opening is far cheaper, the cost is in the create's overlay insert and commit. Files are made before the clock starts.
+fn opens_only(root: &Path, count: usize) -> Reading {
+    let directory = fresh_dir(root, "opens-only");
+    let mut paths = Vec::with_capacity(count);
+    for index in 0..count {
+        let path = directory.join(format!("o-{index:05}.bin"));
+        std::fs::write(&path, b"x").expect("prepare file");
+        paths.push(path);
+    }
+    let mut reading = Reading {
+        scenario: "S0-open existing file",
+        ..Reading::default()
+    };
+    for path in &paths {
+        time_it(&mut reading, 0, || {
+            let handle = std::fs::File::open(path).expect("open");
+            drop(handle);
+        });
+    }
+    reading
+}
+
 fn empty_creates(root: &Path, count: usize) -> Reading {
     let directory = fresh_dir(root, "empty-creates");
     let mut reading = Reading {
@@ -556,6 +581,13 @@ fn main() {
             let mut collected: Vec<Row> = Vec::new();
             if wanted("S0") {
                 let reading = empty_creates(arm, ops(5000));
+                collected.push(Row {
+                    scenario: reading.scenario,
+                    load: "0-byte files".into(),
+                    a: reading,
+                    b: Reading::default(),
+                });
+                let reading = opens_only(arm, ops(5000));
                 collected.push(Row {
                     scenario: reading.scenario,
                     load: "0-byte files".into(),
