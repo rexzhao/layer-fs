@@ -204,7 +204,7 @@ fn random_4k(root: &Path, writes: bool, operations: usize) -> Reading {
 }
 
 /// S5: 1000 files — create, stat, list, delete — inside a nested directory.
-fn metadata_1000(root: &Path) -> Vec<Reading> {
+fn metadata_1000(root: &Path, count: usize) -> Vec<Reading> {
     let directory = fresh_dir(root, "metadata-1000");
     let nested = directory.join("a").join("b").join("c");
     std::fs::create_dir_all(&nested).expect("nested directories");
@@ -224,8 +224,8 @@ fn metadata_1000(root: &Path) -> Vec<Reading> {
         scenario: "S5 delete 1000",
         ..Reading::default()
     };
-    let mut paths = Vec::with_capacity(1000);
-    for index in 0..1000 {
+    let mut paths = Vec::with_capacity(count);
+    for index in 0..count {
         let path = nested.join(format!("file-{index:04}.txt"));
         time_it(&mut create, 0, || {
             std::fs::write(&path, b"x").expect("create");
@@ -242,7 +242,7 @@ fn metadata_1000(root: &Path) -> Vec<Reading> {
             .expect("list")
             .flatten()
             .collect();
-        assert_eq!(entries.len(), 1000, "the listing must see every file");
+        assert_eq!(entries.len(), count, "the listing must see every file");
     });
     for path in &paths {
         time_it(&mut delete, 0, || {
@@ -253,16 +253,16 @@ fn metadata_1000(root: &Path) -> Vec<Reading> {
 }
 
 /// S6: a tree of 100 directories × 100 files, then a full walk.
-fn tree(root: &Path) -> Vec<Reading> {
+fn tree(root: &Path, per_directory: usize) -> Vec<Reading> {
     let directory = fresh_dir(root, "tree-100x100");
     let mut build = Reading {
         scenario: "S6 build 100x100",
         ..Reading::default()
     };
-    for parent in 0..100 {
+    for parent in 0..per_directory {
         let path = directory.join(format!("dir-{parent:03}"));
         std::fs::create_dir_all(&path).expect("directory");
-        for child in 0..100 {
+        for child in 0..per_directory {
             let file = path.join(format!("f-{child:03}.txt"));
             time_it(&mut build, 0, || {
                 std::fs::write(&file, b"x").expect("file");
@@ -276,7 +276,11 @@ fn tree(root: &Path) -> Vec<Reading> {
     time_it(&mut walk, 0, || {
         let mut count = 0u64;
         walk_tree(&directory, &mut count);
-        assert_eq!(count, 100 * 100, "the walk must see every file");
+        assert_eq!(
+            count,
+            (per_directory * per_directory) as u64,
+            "the walk must see every file"
+        );
     });
     vec![build, walk]
 }
@@ -293,7 +297,7 @@ fn walk_tree(directory: &Path, files: &mut u64) {
 }
 
 /// S7: 5000 small files (1 KiB) — create, read, delete.
-fn small_files(root: &Path) -> Vec<Reading> {
+fn small_files(root: &Path, count: usize) -> Vec<Reading> {
     let directory = fresh_dir(root, "small-5000");
     let payload = pattern(1024, 0xC0FFEE);
     let mut create = Reading {
@@ -308,8 +312,8 @@ fn small_files(root: &Path) -> Vec<Reading> {
         scenario: "S7 delete 5000x1KiB",
         ..Reading::default()
     };
-    let mut paths = Vec::with_capacity(5000);
-    for index in 0..5000 {
+    let mut paths = Vec::with_capacity(count);
+    for index in 0..count {
         let path = directory.join(format!("s-{index:05}.bin"));
         time_it(&mut create, 1024, || {
             std::fs::write(&path, &payload).expect("create");
@@ -468,6 +472,7 @@ fn main() {
     let mut arm_a = None;
     let mut arm_b = None;
     let mut runs = 1usize;
+    let mut scale = 1.0f64;
     let mut only: Option<Vec<String>> = None;
     let mut out = PathBuf::from("perf-baseline.md");
     while let Some(argument) = arguments.next() {
@@ -479,6 +484,13 @@ fn main() {
                     .next()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(1)
+            }
+            // **Sizes are scaled, not shapes**: a tenth of the card's counts still exercises the same code path, and the report says so.
+            "--scale" => {
+                scale = arguments
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1.0)
             }
             "--scenarios" => {
                 only = arguments.next().map(|value| {
@@ -514,7 +526,8 @@ fn main() {
         Some(list) => list.iter().any(|entry| entry.eq_ignore_ascii_case(name)),
         None => true,
     };
-    let megabytes = 64 * 1024 * 1024;
+    let megabytes = (64.0 * 1024.0 * 1024.0 * scale) as usize;
+    let ops = |count: usize| ((count as f64 * scale).round() as usize).max(1);
     let started = Instant::now();
     let mut rows: Vec<Row> = Vec::new();
     for run in 0..runs {
@@ -550,7 +563,7 @@ fn main() {
                 });
             }
             if wanted("S3") {
-                let reading = random_4k(arm, false, 2000);
+                let reading = random_4k(arm, false, ops(2000));
                 collected.push(Row {
                     scenario: reading.scenario,
                     load: "2000 ops, 4 KiB, 64 MiB file".into(),
@@ -559,7 +572,7 @@ fn main() {
                 });
             }
             if wanted("S4") {
-                let reading = random_4k(arm, true, 2000);
+                let reading = random_4k(arm, true, ops(2000));
                 collected.push(Row {
                     scenario: reading.scenario,
                     load: "2000 ops, 4 KiB, 64 MiB file".into(),
@@ -568,7 +581,7 @@ fn main() {
                 });
             }
             if wanted("S5") {
-                for reading in metadata_1000(arm) {
+                for reading in metadata_1000(arm, ops(1000)) {
                     collected.push(Row {
                         scenario: reading.scenario,
                         load: "1000 files, 3 levels deep".into(),
@@ -578,7 +591,7 @@ fn main() {
                 }
             }
             if wanted("S6") {
-                for reading in tree(arm) {
+                for reading in tree(arm, ops(100)) {
                     collected.push(Row {
                         scenario: reading.scenario,
                         load: "100 dirs × 100 files".into(),
@@ -588,7 +601,7 @@ fn main() {
                 }
             }
             if wanted("S7") {
-                for reading in small_files(arm) {
+                for reading in small_files(arm, ops(5000)) {
                     collected.push(Row {
                         scenario: reading.scenario,
                         load: "5000 files × 1 KiB".into(),
@@ -615,6 +628,22 @@ fn main() {
                     a: reading,
                     b: Reading::default(),
                 });
+            }
+            // **Per scenario, not per run**: a scenario that takes minutes must be visible while it runs, and the mean per operation is the number that explains
+            // why (201cslow to measure201d is a reading, not an obstacle).
+            for row in &collected {
+                let mean = if row.a.operations > 0 {
+                    row.a.total().as_secs_f64() * 1000.0 / row.a.operations as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "  run {run} arm {label}: {} — {} ops, {:.1} op/s, mean {:.3} ms/op",
+                    row.scenario,
+                    row.a.operations,
+                    row.a.throughput(),
+                    mean
+                );
             }
             eprintln!(
                 "run {run}: arm {label} finished {} scenarios in {:?}",
