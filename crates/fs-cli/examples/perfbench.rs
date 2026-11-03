@@ -120,6 +120,26 @@ fn time_it(reading: &mut Reading, bytes: u64, body: impl FnOnce()) {
     reading.push(started.elapsed(), bytes);
 }
 
+/// **S0 (diagnostic)** — creating *empty* files: the same path as S7 with no content at all.
+///
+/// This exists to split one number in two. If an empty create already costs as much as a 1 KiB one, the cost is in the per-operation machinery (overlay insert,
+/// transaction, handle registration); if it is an order of magnitude cheaper, the cost is in the content path (hash and store write). It is a probe, not a
+/// scenario: it is measured with the same discipline so the two numbers are comparable.
+fn empty_creates(root: &Path, count: usize) -> Reading {
+    let directory = fresh_dir(root, "empty-creates");
+    let mut reading = Reading {
+        scenario: "S0 create 0-byte files",
+        ..Reading::default()
+    };
+    for index in 0..count {
+        let path = directory.join(format!("e-{index:05}.bin"));
+        time_it(&mut reading, 0, || {
+            std::fs::write(&path, b"").expect("create empty");
+        });
+    }
+    reading
+}
+
 /// S1/S2: 64 MiB sequential write and read, in two shapes.
 fn sequential(root: &Path, shape: &str, bytes: usize) -> (Reading, Reading) {
     let mut write = Reading {
@@ -534,6 +554,15 @@ fn main() {
         let mut one_arm = |arm: &Path, label: &str| -> (Vec<Row>, Duration) {
             let begin = Instant::now();
             let mut collected: Vec<Row> = Vec::new();
+            if wanted("S0") {
+                let reading = empty_creates(arm, ops(5000));
+                collected.push(Row {
+                    scenario: reading.scenario,
+                    load: "0-byte files".into(),
+                    a: reading,
+                    b: Reading::default(),
+                });
+            }
             if wanted("S1") || wanted("S2") {
                 let (write, read) = sequential(arm, "zero", megabytes);
                 collected.push(Row {
