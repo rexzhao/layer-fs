@@ -738,7 +738,7 @@ fn main() {
     eprintln!("measured {runs} run(s) in {total:?} (mount time is not part of this: it happened before the harness started)");
     report(
         &out,
-        Duration::ZERO,
+        Duration::from_secs_f64(mount_seconds),
         &rows,
         runs,
         &["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10"],
