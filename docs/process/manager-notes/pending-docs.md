@@ -3568,3 +3568,10 @@ GSBN-成功假设当头号候选：读链时代的 GSBN（两段式、只报 siz
      诊断实验：scratch 构建改 NORMAL 只测 S5 create（掉到 2ms=主因；
      NORMAL 化是产品卡需单独论证崩溃语义；诊断变体不进主线）。
      三个缺口如实标注：scale 仅 0.02/mount 计时未接线/S10 缺席（670）。
+
+672. 【create 12ms 归因（一）】synchronous FULL→NORMAL 诊断实验（已回滚未提交）：
+     create 13.5→9.77ms/op——FULL 同步只占 3.7ms；剩 ~9.8ms 在别处。
+     stat 同次 1.2→0.256ms 疑页缓存混杂（stat 不写库，须单独复测拆掉）。
+     下一步探针：0 字节 create vs 1KiB create——0字节也 9ms=每op事务/提交开销；
+     0字节 1ms=内容路径（hash+落盘）。无论结果，NORMAL 化是产品卡须过崩溃
+     语义论证，这轮只出归因。
