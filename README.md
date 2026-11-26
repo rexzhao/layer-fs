@@ -12,6 +12,7 @@ A general-purpose **Windows native LayerFS CLI + WinFsp filesystem** built direc
 
 ## Design Notes (Aligned with Upstream LayerFS)
 
+- **Store auto-discovery**: When `--store <dir>` is omitted, all commands automatically locate the store from: (1) a live mount containing the current directory, (2) the current directory or an ancestor store directory (`store.sqlite` + `repo.json`), or (3) the `LAYERFS_STORE` environment variable.
 - **Ephemeral mount overlay**: Matches upstream LayerFS semantics — uncommitted modifications live in the mount's ephemeral overlay until `layerfs commit` persists them into `store.sqlite`. Unmounting discards uncommitted overlay edits.
 - **Durability profiles**: Defaults to `--durable` (SQLite WAL + `synchronous=FULL`); pass `--disposable` for upstream's high-throughput WAL + `synchronous=OFF` mode.
 - **Windows semantics**: Case-insensitive / case-preserving paths, Windows share-mode exclusion (via WinFsp kernel FSD), `FILE_ATTRIBUTE_READONLY` mapped to POSIX write bits (`0o222`), and imported POSIX symlinks safely exposed as immutable target-text files (no Admin / Developer Mode required).
@@ -38,6 +39,8 @@ layerfs init F:\imported-repo --from F:\existing-project --durable
 
 # 2. Mount the default writable branch `work` to a drive letter or directory mount point
 layerfs --store F:\my-repo mount Z: --branch work
+# Add `-d` / `--background` to detach into the background once mounted:
+layerfs --store F:\my-repo mount Z: --branch work -d
 # (or mount to a non-existent directory path, e.g. F:\mnt\work)
 
 # 3. Use any Windows app, shell, or Git directly inside Z:\
@@ -84,8 +87,8 @@ layerfs --store F:\my-repo compact
 | `layerfs status` | Show live mount status (inside mount) or branch status (offline) |
 | `layerfs stats` | Repository profile, file size, and logical/canonical/stored byte counts |
 | `layerfs compact [--pages <n>]` | Reclaim free SQLite pages in `store.sqlite` (upstream incremental vacuum) |
-| `layerfs mount <point> [--branch <name>] [--no-version-gate]` | Mount a branch via WinFsp |
-| `layerfs umount <point> [--force]` | Orderly unmount via control pipe |
+| `layerfs mount <point> [--branch <name>] [-d\|--background] [--no-version-gate]` | Mount a branch via WinFsp (`-d` detaches after ready) |
+| `layerfs umount [<point>] [--force]` | Orderly unmount via control pipe (omitting `<point>` works inside a store dir with one live mount) |
 | `layerfs list` | List recorded mounts and liveness |
 | `layerfs version` | Check WinFsp DLL version and ABI compatibility |
 

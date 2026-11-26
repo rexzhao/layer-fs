@@ -182,3 +182,79 @@ fn init_profiles_branch_fork_log_diff_stats_and_exit_codes() {
     );
     assert_eq!(bad.status.code(), Some(2));
 }
+
+#[test]
+fn auto_discovers_store_from_cwd_subdir_and_env() {
+    let tmp = TempDir::new("autodiscover");
+    let mounts = tmp.0.join("mounts");
+    let repo_dir = tmp.0.join("repo");
+    let nested_dir = repo_dir.join("notes").join("sub");
+    let outside_dir = tmp.0.join("outside");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+
+    let init = run_cli(&["init", repo_dir.to_str().unwrap(), "--disposable"], &mounts);
+    assert!(init.status.success(), "init failed");
+    std::fs::create_dir_all(&nested_dir).unwrap();
+
+    // 1. Inside the store directory itself, all commands work without `--store`.
+    for args in [
+        &["branch"][..],
+        &["fork", "auto-feat", "--from", "work"][..],
+        &["diff", "work", "auto-feat"][..],
+        &["status"][..],
+        &["stats"][..],
+        &["log"][..],
+        &["compact"][..],
+    ] {
+        let out = Command::new(bin())
+            .args(args)
+            .current_dir(&repo_dir)
+            .env("LAYERFS_MOUNTS_DIR", &mounts)
+            .env_remove("LAYERFS_STORE")
+            .output()
+            .expect("run inside store dir");
+        assert!(
+            out.status.success(),
+            "command {args:?} failed inside store dir: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // 2. Inside a nested subdirectory of the store, ancestor discovery finds the store.
+    let nested_branch = Command::new(bin())
+        .args(["branch"])
+        .current_dir(&nested_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts)
+        .env_remove("LAYERFS_STORE")
+        .output()
+        .expect("branch from nested dir");
+    assert!(
+        nested_branch.status.success(),
+        "branch from nested dir failed: {}",
+        String::from_utf8_lossy(&nested_branch.stderr)
+    );
+    assert!(String::from_utf8_lossy(&nested_branch.stdout).contains("auto-feat"));
+
+    // 3. Outside the store, `LAYERFS_STORE` env var resolves it; without it, exit code 2.
+    let from_env = Command::new(bin())
+        .args(["stats"])
+        .current_dir(&outside_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts)
+        .env("LAYERFS_STORE", &repo_dir)
+        .output()
+        .expect("stats via LAYERFS_STORE");
+    assert!(
+        from_env.status.success(),
+        "stats via LAYERFS_STORE failed: {}",
+        String::from_utf8_lossy(&from_env.stderr)
+    );
+
+    let missing = Command::new(bin())
+        .args(["stats"])
+        .current_dir(&outside_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts)
+        .env_remove("LAYERFS_STORE")
+        .output()
+        .expect("stats outside store");
+    assert_eq!(missing.status.code(), Some(2));
+}

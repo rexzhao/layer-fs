@@ -27,15 +27,18 @@ layerfs [--store <dir>] [--branch <name>] <command> [args]
   stats                           repository and storage statistics
   compact [--pages <n>]           reclaim free SQLite pages in store.sqlite (upstream incremental vacuum)
 
-  mount <mount_point> [--branch <name>] [--no-version-gate]
-                                  mount a writable branch over WinFsp until `umount` stops it
-  umount <mount_point> [--force]  orderly unmount via the mount's control pipe (--force removes stale record)
+  mount <mount_point> [--branch <name>] [-d|--background] [--no-version-gate]
+                                  mount a writable branch over WinFsp (`-d` detaches after ready)
+  umount [<mount_point>] [--force]
+                                  orderly unmount via the mount's control pipe (--force removes stale record)
   list                            list mounts recorded under %LOCALAPPDATA%\\layerfs\\mounts
   version                         WinFsp DLL version and ABI compatibility check
   help [<command>]                show general usage or help for one command
 
 Files are read and written through the mounted filesystem, not through CLI file verbs.
 Consistent with upstream LayerFS, uncommitted edits live in the mount's ephemeral overlay until `layerfs commit`.
+When `--store` is omitted, commands auto-detect the store from: (1) a live mount containing CWD,
+(2) CWD or an ancestor store directory (`store.sqlite` + `repo.json`), or (3) `LAYERFS_STORE`.
 Global option `--workspace <name>` is accepted as an alias for `--branch <name>`.";
 
 fn main() -> ExitCode {
@@ -115,8 +118,8 @@ fn command_help(command: &str) -> Option<&'static str> {
         "status" => "status\n  Show branch, base layer, head commit, effective root, dirty counts, and open handles.\n  Inside a mount, queries the live mount process over the control pipe.",
         "stats" => "stats\n  Show repository profile, store file size, branch count, and logical/canonical/stored bytes.",
         "compact" => "compact [--pages <n>]\n  Reclaim free SQLite pages in store.sqlite using upstream bounded incremental vacuum.\n  Logical objects and history are unchanged.",
-        "mount" => "mount <mount_point> [--branch <name>] [--no-version-gate]\n  Mount a writable branch (default: `work`) via WinFsp at `<mount_point>` (drive letter like `Z:`\n  or directory path). Press Ctrl-C or run `layerfs umount <mount_point>` for orderly unmount.",
-        "umount" => "umount <mount_point> [--force]\n  Ask a running mount to unmount cleanly (uncommitted ephemeral-overlay edits are discarded unless\n  committed first, matching upstream LayerFS). Refuses (exit 4) while user handles are open.\n  `--force` removes a stale mount record whose owner process is gone.",
+        "mount" => "mount <mount_point> [--branch <name>] [-d|--background|--detach] [--no-version-gate]\n  Mount a writable branch (default: `work`) via WinFsp at `<mount_point>` (drive letter like `Z:`\n  or directory path). Defaults to foreground (Ctrl-C or `layerfs umount <mount_point>` to stop);\n  pass `-d` / `--background` / `--detach` to detach into the background once mounted.",
+        "umount" => "umount [<mount_point>] [--force]\n  Ask a running mount to unmount cleanly (uncommitted ephemeral-overlay edits are discarded unless\n  committed first, matching upstream LayerFS). Refuses (exit 4) while user handles are open.\n  Omit `<mount_point>` inside a store directory (when it has one live mount) to unmount it automatically.\n  `--force` removes a stale mount record whose owner process is gone.",
         "list" => "list\n  List mounts recorded under %LOCALAPPDATA%\\layerfs\\mounts with live/stale status.",
         "version" => "version\n  Print WinFsp DLL version, calibrated ABI layout, and LayerFS core compatibility.",
         "help" => "help [<command>]\n  Show the top-level usage summary or detailed help for one command.",
@@ -182,35 +185,78 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Standalone commands that don't require an existing repo via discovery:
     match command.as_str() {
         "init" => return cmd_init(explicit_store.as_deref(), &arguments),
-        "umount" => return mountcmd::umount(&arguments),
         "list" => return mountcmd::list(),
         "version" => return mountcmd::version(),
         _ => {}
     }
 
-    // Discover active mount from CWD when `--store` / `--branch` are omitted.
-    let discovered = std::env::current_dir().ok().and_then(|cwd| {
+    // Auto-discover store & active mount when `--store` is omitted:
+    //   1. Live mounted volume containing CWD
+    //   2. CWD (or an ancestor directory) that is a LayerFS store (`store.sqlite` + `repo.json`)
+    //   3. `LAYERFS_STORE` environment variable
+    let cwd = std::env::current_dir().ok();
+    let discovered = cwd.as_deref().and_then(|dir| {
         fs_cli::discovery::discover(
-            &cwd,
+            dir,
             fs_cli::winpaths::volume_root,
             fs_cli::winpaths::is_volume_mount_point,
             mountcmd::live_records,
         )
     });
+    let local_store = if explicit_store.is_none() && discovered.is_none() {
+        cwd.as_deref()
+            .and_then(fs_cli::discovery::discover_store_dir)
+    } else {
+        None
+    };
+    let env_store = if explicit_store.is_none() && discovered.is_none() && local_store.is_none() {
+        std::env::var_os("LAYERFS_STORE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    } else {
+        None
+    };
+    let auto_store = local_store.or(env_store);
+    let effective_store_flag = explicit_store.as_deref().or(auto_store.as_deref());
+    let store_was_resolved =
+        explicit_store_was_given || discovered.is_some() || auto_store.is_some();
+
     let target = fs_cli::discovery::resolve(
-        explicit_store.as_deref(),
+        effective_store_flag,
         branch_opt.as_deref(),
         discovered.as_ref(),
     );
     let store = target.store;
     let active_branch = target.workspace;
 
+    if command == "umount" {
+        let store_hint = store_was_resolved.then_some(store.as_path());
+        let discovered_mount = if explicit_store_was_given {
+            None
+        } else {
+            discovered.as_ref().map(|rec| rec.mount_point.as_path())
+        };
+        return mountcmd::umount(&arguments, discovered_mount, store_hint);
+    }
+
     if command == "mount" {
-        if !explicit_store_was_given && discovered.is_none() && store.as_os_str() == "." {
+        if !store_was_resolved && store.as_os_str() == "." {
+            let mut positional_count = 0usize;
+            let mut idx = 0;
+            while idx < arguments.len() {
+                match arguments[idx].as_str() {
+                    "--branch" | "--workspace" => idx += 2,
+                    other if other.starts_with('-') => idx += 1,
+                    _ => {
+                        positional_count += 1;
+                        idx += 1;
+                    }
+                }
+            }
             // Allow positional `mount <store> <mount_point>` fallback inside mountcmd, or error clearly.
-            if arguments.len() < 2 {
+            if positional_count < 2 {
                 return Err(fs_cli::Failure::usage(
-                    "mount needs a store: add `--store <dir>` (the repository to serve)",
+                    "mount needs a store: pass `--store <dir>`, set LAYERFS_STORE, or run from inside a store directory or mounted volume",
                 )
                 .into());
             }
@@ -243,9 +289,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if !explicit_store_was_given && discovered.is_none() {
+    if !store_was_resolved {
         return Err(fs_cli::Failure::usage(
-            "no store specified; pass `--store <dir>` or run from inside a mounted volume",
+            "no store found; pass `--store <dir>`, set LAYERFS_STORE, or run from inside a store directory or mounted volume",
         )
         .into());
     }

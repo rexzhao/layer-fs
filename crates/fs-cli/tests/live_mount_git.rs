@@ -572,3 +572,177 @@ fn live_mount_hot_switch_merge_conflict_and_concurrent_io() {
     let exit = guard.0.take().unwrap().wait().expect("wait mount child");
     assert!(exit.success());
 }
+
+#[test]
+fn live_mount_background_detach_error_propagation_and_umount() {
+    let dll = fs_winfsp::loader::default_library();
+    if fs_winfsp::handshake::read_version(&dll).is_err() {
+        eprintln!("SKIP: WinFsp DLL not loadable at {}", dll.display());
+        return;
+    }
+
+    let tmp = TempDir::new("bg");
+    let mounts_dir = tmp.0.join("mounts");
+    let repo_dir = tmp.0.join("repo");
+    let mount_dir = tmp.0.join("mnt");
+
+    // 1. Initialize repo.
+    let init = Command::new(bin())
+        .args(["init", repo_dir.to_str().unwrap(), "--disposable"])
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .output()
+        .expect("init");
+    assert!(init.status.success(), "init failed");
+
+    // 2. Background mount of a missing branch must fail cleanly with exit 3 (not hang or falsely succeed).
+    let bad = Command::new(bin())
+        .args([
+            "--store",
+            repo_dir.to_str().unwrap(),
+            "mount",
+            mount_dir.to_str().unwrap(),
+            "--branch",
+            "does-not-exist",
+            "-d",
+        ])
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .output()
+        .expect("bad background mount");
+    assert_eq!(
+        bad.status.code(),
+        Some(3),
+        "expected not-found exit 3, got {:?}, stderr={}",
+        bad.status.code(),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    // 3. Background mount (`-d`) from INSIDE the store directory without `--store`!
+    // Must return immediately once WinFsp is ready (Command::output must not hang).
+    let bg = Command::new(bin())
+        .args(["mount", mount_dir.to_str().unwrap(), "--branch", "work", "-d"])
+        .current_dir(&repo_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .env_remove("LAYERFS_STORE")
+        .output()
+        .expect("background mount");
+    assert!(
+        bg.status.success(),
+        "background mount failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&bg.stdout),
+        String::from_utf8_lossy(&bg.stderr)
+    );
+    let bg_stdout = String::from_utf8_lossy(&bg.stdout);
+    assert!(
+        bg_stdout.contains("in background (pid "),
+        "unexpected mount -d output: {bg_stdout}"
+    );
+
+    // Guard against leaking the detached mount if an assertion fails mid-test.
+    struct BackgroundUnmountGuard {
+        mount_dir: PathBuf,
+        mounts_dir: PathBuf,
+        armed: bool,
+    }
+    impl Drop for BackgroundUnmountGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = Command::new(bin())
+                    .args(["umount", self.mount_dir.to_str().unwrap(), "--force"])
+                    .env("LAYERFS_MOUNTS_DIR", &self.mounts_dir)
+                    .output();
+            }
+        }
+    }
+    let mut bg_guard = BackgroundUnmountGuard {
+        mount_dir: mount_dir.clone(),
+        mounts_dir: mounts_dir.clone(),
+        armed: true,
+    };
+
+    // 4. Mount is immediately usable without any polling!
+    std::fs::write(mount_dir.join("bg.txt"), b"detached mount works\n")
+        .expect("write inside detached mount");
+    assert_eq!(
+        std::fs::read_to_string(mount_dir.join("bg.txt")).expect("read inside detached mount"),
+        "detached mount works\n"
+    );
+
+    // 5. Inside the mounted directory, `branch`, `stats`, and `commit` auto-discover the store without `--store`.
+    let inside_branch = Command::new(bin())
+        .args(["branch"])
+        .current_dir(&mount_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .env_remove("LAYERFS_STORE")
+        .output()
+        .expect("branch inside mount");
+    assert!(
+        inside_branch.status.success(),
+        "branch inside mount failed: {}",
+        String::from_utf8_lossy(&inside_branch.stderr)
+    );
+    assert!(String::from_utf8_lossy(&inside_branch.stdout).contains("work"));
+
+    let list = Command::new(bin())
+        .args(["list"])
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .output()
+        .expect("list");
+    assert!(list.status.success());
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(list_stdout.contains("[live]"), "list: {list_stdout}");
+
+    let commit = Command::new(bin())
+        .args(["commit", "-m", "from background mount"])
+        .current_dir(&mount_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .output()
+        .expect("commit");
+    assert!(
+        commit.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    // 6. Second background mount at the same mount point must be refused with exit 4 (in use).
+    let dup = Command::new(bin())
+        .args(["mount", mount_dir.to_str().unwrap(), "--background"])
+        .current_dir(&repo_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .env_remove("LAYERFS_STORE")
+        .output()
+        .expect("duplicate background mount");
+    assert_eq!(
+        dup.status.code(),
+        Some(4),
+        "expected in-use exit 4, got {:?}, stderr={}",
+        dup.status.code(),
+        String::from_utf8_lossy(&dup.stderr)
+    );
+
+    // 7. Clean `layerfs umount` from INSIDE the store directory (no mount_point argument!) stops the detached mount.
+    let umount = Command::new(bin())
+        .args(["umount"])
+        .current_dir(&repo_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .env_remove("LAYERFS_STORE")
+        .output()
+        .expect("umount");
+    assert!(
+        umount.status.success(),
+        "umount failed: {}",
+        String::from_utf8_lossy(&umount.stderr)
+    );
+    bg_guard.armed = false;
+
+    let list_after = Command::new(bin())
+        .args(["list"])
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .output()
+        .expect("list after umount");
+    assert!(list_after.status.success());
+    assert!(
+        String::from_utf8_lossy(&list_after.stdout).contains("no mounts recorded"),
+        "list after umount: {}",
+        String::from_utf8_lossy(&list_after.stdout)
+    );
+}

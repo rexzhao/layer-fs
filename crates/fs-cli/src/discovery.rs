@@ -44,6 +44,20 @@ pub struct Target {
 /// The volume label a mounted workspace carries; anything else is not ours (ADR-010 §4.4).
 pub const WORKSPACE_VOLUME_LABEL: &str = "layerfs";
 
+/// Returns `true` when `dir` is a LayerFS store directory (`store.sqlite` and `repo.json` exist).
+#[must_use]
+pub fn is_store_dir(dir: &Path) -> bool {
+    dir.join("store.sqlite").is_file() && dir.join("repo.json").is_file()
+}
+
+/// Finds a LayerFS store by inspecting `cwd` and walking its ancestor directories.
+#[must_use]
+pub fn discover_store_dir(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .find(|dir| is_store_dir(dir))
+        .map(Path::to_path_buf)
+}
+
 /// The combination rules of ADR-010 §4.2, as one function.
 ///
 /// The rule that is easy to get wrong is row 4: an explicit `--store` that disagrees with the mount around the current directory **discards** what was
@@ -312,5 +326,30 @@ mod tests {
             .map(|record| record.workspace),
             Some("dev".to_owned())
         );
+    }
+
+    #[test]
+    fn discover_store_dir_finds_cwd_and_ancestors() {
+        let base = std::env::temp_dir().join(format!(
+            "layerfs-discover-store-{}",
+            std::process::id()
+        ));
+        let nested = base.join("sub").join("deep");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&nested).unwrap();
+
+        // Plain directory is not a store.
+        assert!(!super::is_store_dir(&base));
+        assert_eq!(super::discover_store_dir(&nested), None);
+
+        // Once both `store.sqlite` and `repo.json` exist, both root and nested dirs find it.
+        std::fs::write(base.join("store.sqlite"), b"").unwrap();
+        assert!(!super::is_store_dir(&base));
+        std::fs::write(base.join("repo.json"), b"{}").unwrap();
+        assert!(super::is_store_dir(&base));
+        assert_eq!(super::discover_store_dir(&base), Some(base.clone()));
+        assert_eq!(super::discover_store_dir(&nested), Some(base.clone()));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

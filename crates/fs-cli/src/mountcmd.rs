@@ -19,6 +19,10 @@ pub type Error = Box<dyn std::error::Error>;
 
 const UNMOUNT_WAIT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(50);
+const MOUNT_READY_ENV: &str = "LAYERFS_MOUNT_READY_FILE";
+const MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const MOUNT_READY_POLL: Duration = Duration::from_millis(25);
+const MOUNT_ACCESS_WAIT: Duration = Duration::from_secs(3);
 const OURS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 const OURS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 
@@ -110,16 +114,21 @@ pub fn version() -> Result<(), Error> {
     Ok(())
 }
 
-/// `layerfs --store <dir> mount <mount_point> [--branch <name>] [--no-version-gate]`
+/// `layerfs --store <dir> mount <mount_point> [--branch <name>] [-d|--background|--detach] [--no-version-gate]`
 pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result<(), Error> {
     let mut positional: Vec<&String> = Vec::new();
     let mut inline_branch: Option<&str> = None;
+    let mut background = false;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--branch" | "--workspace" => {
                 inline_branch = arguments.get(index + 1).map(String::as_str);
                 index += 2;
+            }
+            "-d" | "--background" | "--detach" => {
+                background = true;
+                index += 1;
             }
             "--no-version-gate" => index += 1,
             other if other.starts_with("--branch=") => {
@@ -153,7 +162,7 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
         }
         _ => {
             return Err(fs_cli::Failure::usage(
-                "usage: layerfs --store <store> mount <mount_point> [--branch <name>]",
+                "usage: layerfs --store <store> mount <mount_point> [--branch <name>] [-d|--background]",
             )
             .into())
         }
@@ -165,6 +174,176 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
         .to_owned();
     let skip_gate = arguments.iter().any(|a| a == "--no-version-gate");
 
+    if background {
+        return spawn_background_mount(&store, &mount_point, &name, skip_gate);
+    }
+
+    let ready_file = std::env::var_os(MOUNT_READY_ENV).map(PathBuf::from);
+    let signaled_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let result = mount_foreground(
+        &store,
+        &mount_point,
+        &name,
+        skip_gate,
+        ready_file.as_deref(),
+        &signaled_ready,
+    );
+    if let Err(ref error) = result {
+        if !signaled_ready.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if let Some(ref ready_path) = ready_file {
+                let code = classify_error_code(error.as_ref());
+                let sanitized = error.to_string().replace(['\r', '\n'], " ");
+                let _ = write_ready_status(ready_path, &format!("ERR\t{code}\t{sanitized}\n"));
+            }
+        }
+    }
+    result
+}
+
+fn classify_error_code(error: &(dyn std::error::Error + 'static)) -> u8 {
+    if let Some(failure) = error.downcast_ref::<fs_cli::Failure>() {
+        return failure.code;
+    }
+    if let Some(err) = error.downcast_ref::<LayerError>() {
+        return match err {
+            LayerError::InvalidInput(_) => 2,
+            LayerError::NotFound(_) => 3,
+            LayerError::Busy(_) => 4,
+            LayerError::Conflict(_) => 5,
+            LayerError::Unsupported(_) | LayerError::Other(_) => 1,
+        };
+    }
+    1
+}
+
+fn write_ready_status(path: &Path, content: &str) -> std::io::Result<()> {
+    let part = path.with_extension("part");
+    std::fs::write(&part, content.as_bytes())?;
+    std::fs::rename(&part, path)
+}
+
+struct ReadyFileGuard(PathBuf);
+
+impl Drop for ReadyFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(self.0.with_extension("part"));
+    }
+}
+
+fn parse_ready_status(
+    text: &str,
+    store: &Path,
+    mount_point: &Path,
+    branch: &str,
+) -> Result<(), Error> {
+    let line = text.lines().next().unwrap_or("");
+    let mut parts = line.splitn(3, '\t');
+    match parts.next() {
+        Some("OK") => {
+            let pid = parts.next().unwrap_or("?");
+            let profile = parts.next().unwrap_or("unknown");
+            let wait_start = Instant::now();
+            while wait_start.elapsed() < MOUNT_ACCESS_WAIT {
+                if std::fs::read_dir(mount_point).is_ok() {
+                    break;
+                }
+                std::thread::sleep(MOUNT_READY_POLL);
+            }
+            println!(
+                "mounted {} at {} in background (pid {pid}, branch {branch}, profile={profile}); stop with `layerfs umount {}`",
+                store.display(),
+                mount_point.display(),
+                mount_point.display()
+            );
+            Ok(())
+        }
+        Some("ERR") => {
+            let code: u8 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+            let message = parts.next().unwrap_or("background mount failed").to_owned();
+            Err(fs_cli::Failure { message, code }.into())
+        }
+        _ => Err(format!("unexpected background mount handshake payload: {line:?}").into()),
+    }
+}
+
+fn spawn_background_mount(
+    store: &Path,
+    mount_point: &Path,
+    branch: &str,
+    skip_gate: bool,
+) -> Result<(), Error> {
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static READY_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    std::fs::create_dir_all(mounts_dir())?;
+    let seq = READY_SEQ.fetch_add(1, Ordering::Relaxed);
+    let ready_path = mounts_dir().join(format!(".ready-{}-{seq}.tmp", std::process::id()));
+    let _ready_guard = ReadyFileGuard(ready_path.clone());
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("--store")
+        .arg(store)
+        .arg("mount")
+        .arg(mount_point)
+        .arg("--branch")
+        .arg(branch);
+    if skip_gate {
+        cmd.arg("--no-version-gate");
+    }
+    cmd.env(MOUNT_READY_ENV, &ready_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        clear_std_handle_inheritance();
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    let mut child = cmd.spawn()?;
+    let started = Instant::now();
+    while started.elapsed() < MOUNT_READY_TIMEOUT {
+        if let Ok(text) = std::fs::read_to_string(&ready_path) {
+            if text.starts_with("ERR\t") {
+                let _ = child.wait();
+            }
+            return parse_ready_status(&text, store, mount_point, branch);
+        }
+        if let Some(status) = child.try_wait()? {
+            if let Ok(text) = std::fs::read_to_string(&ready_path) {
+                return parse_ready_status(&text, store, mount_point, branch);
+            }
+            return Err(format!("background mount process exited prematurely ({status})").into());
+        }
+        std::thread::sleep(MOUNT_READY_POLL);
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!(
+        "timed out waiting for background mount at {} after {:?}",
+        mount_point.display(),
+        MOUNT_READY_TIMEOUT
+    )
+    .into())
+}
+
+fn mount_foreground(
+    store: &Path,
+    mount_point: &Path,
+    name: &str,
+    skip_gate: bool,
+    ready_file: Option<&Path>,
+    signaled_ready: &Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), Error> {
     if !skip_gate {
         let library = default_library();
         match fs_winfsp::handshake::read_version(&library) {
@@ -188,17 +367,18 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
         }
     }
 
-    let repo = Repo::open(&store)?;
+    let repo = Repo::open(store)?;
+    let profile_str = repo.profile().as_str().to_owned();
     let volume_total = repo.volume_size_bytes();
-    if let Some(warning) = volume_warning(&store, volume_total) {
+    if let Some(warning) = volume_warning(store, volume_total) {
         eprintln!("{warning}");
     }
 
-    let initial_ws = Arc::new(repo.open_workspace(&name)?);
+    let initial_ws = Arc::new(repo.open_workspace(name)?);
 
     std::fs::create_dir_all(mounts_dir())?;
-    let state = state_path(&mount_point);
-    let pipe = fs_cli::pipe_win::pipe_name(&record_name(&mount_point), std::process::id());
+    let state = state_path(mount_point);
+    let pipe = fs_cli::pipe_win::pipe_name(&record_name(mount_point), std::process::id());
 
     match record_is_live(&state) {
         Liveness::Live => {
@@ -218,30 +398,29 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
     }
 
     let record = switched_record(
-        &canonical(&store),
-        &canonical(&mount_point),
-        &name,
-        &name,
+        &canonical(store),
+        &canonical(mount_point),
+        name,
+        name,
         &pipe,
     );
     let mut record_handle = hold_record(&state, &record)?;
     println!(
-        "mounting {} at {} (branch {name}, profile={}); stop with `layerfs umount {}`",
+        "mounting {} at {} (branch {name}, profile={profile_str}); stop with `layerfs umount {}`",
         store.display(),
         mount_point.display(),
-        repo.profile().as_str(),
         mount_point.display()
     );
 
     let adapter_slot: AdapterSlot = Arc::new(RwLock::new(None));
     let pipe_serving = Arc::new(PipeServing {
-        store: canonical(&store),
+        store: canonical(store),
         current: RwLock::new(Current {
-            workspace: name.clone(),
-            branch: name.clone(),
+            workspace: name.to_owned(),
+            branch: name.to_owned(),
             handle: Arc::clone(&initial_ws),
         }),
-        mount_point: canonical(&mount_point),
+        mount_point: canonical(mount_point),
         record: state.clone(),
         adapter: Arc::clone(&adapter_slot),
     });
@@ -263,7 +442,7 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
     install_console_handler();
 
     let mut current_handle = initial_ws;
-    let mut previous_workspace = name.clone();
+    let mut previous_workspace = name.to_owned();
     let mut previous_handle: Option<Arc<WorkspaceHandle>> = None;
     let pending_switch: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
     let mut report;
@@ -281,7 +460,7 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
 
         report = mount_serving(
             &library,
-            &mount_point,
+            mount_point,
             backend,
             volume(),
             Some(capacity),
@@ -290,6 +469,15 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
                 *adapter_slot
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mounted.adapter());
+
+                if !signaled_ready.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    if let Some(ready_path) = ready_file {
+                        let _ = write_ready_status(
+                            ready_path,
+                            &format!("OK\t{}\t{profile_str}\n", std::process::id()),
+                        );
+                    }
+                }
 
                 if let Some(done) = pending_switch
                     .lock()
@@ -339,8 +527,8 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
             };
             if let Some(prev) = previous_handle.take() {
                 let text = switched_record(
-                    &canonical(&store),
-                    &canonical(&mount_point),
+                    &canonical(store),
+                    &canonical(mount_point),
                     &previous_workspace,
                     &previous_workspace,
                     &pipe,
@@ -384,8 +572,8 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
             Ok(next_ws) => {
                 let next_handle = Arc::new(next_ws);
                 let text = switched_record(
-                    &canonical(&store),
-                    &canonical(&mount_point),
+                    &canonical(store),
+                    &canonical(mount_point),
                     &next,
                     &next,
                     &pipe,
@@ -483,15 +671,76 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
     }
 }
 
-/// `layerfs umount <mount_point> [--force]`
-pub fn umount(arguments: &[String]) -> Result<(), Error> {
-    let Some(mount_point) = arguments.first() else {
-        return Err(
-            fs_cli::Failure::usage("usage: layerfs umount <mount_point> [--force]").into(),
-        );
+/// `layerfs umount [<mount_point>] [--force]`
+pub fn umount(
+    arguments: &[String],
+    discovered_mount: Option<&Path>,
+    store_hint: Option<&Path>,
+) -> Result<(), Error> {
+    let mut force = false;
+    let mut positional: Option<&str> = None;
+    for arg in arguments {
+        match arg.as_str() {
+            "--force" => force = true,
+            other if other.starts_with('-') => {
+                return Err(
+                    fs_cli::Failure::usage(format!("unknown umount option {other:?}")).into(),
+                );
+            }
+            other => {
+                if positional.is_some() {
+                    return Err(
+                        fs_cli::Failure::usage("usage: layerfs umount [<mount_point>] [--force]")
+                            .into(),
+                    );
+                }
+                positional = Some(other);
+            }
+        }
+    }
+
+    let mount_point = if let Some(explicit) = positional {
+        PathBuf::from(explicit)
+    } else if let Some(mounted) = discovered_mount {
+        mounted.to_path_buf()
+    } else if let Some(store) = store_hint {
+        let mut live: Vec<PathBuf> = live_records()
+            .into_iter()
+            .filter(|(rec, liveness)| {
+                *liveness == fs_cli::discovery::Liveness::Live
+                    && fs_cli::discovery::same_path(&rec.store, store)
+            })
+            .map(|(rec, _)| rec.mount_point)
+            .collect();
+        match live.len() {
+            0 => {
+                return Err(fs_cli::Failure::not_found(format!(
+                    "no live mount recorded for store {}",
+                    store.display()
+                ))
+                .into());
+            }
+            1 => live.remove(0),
+            _ => {
+                let list = live
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(fs_cli::Failure::usage(format!(
+                    "multiple live mounts exist for {} ({list}); specify `<mount_point>`",
+                    store.display()
+                ))
+                .into());
+            }
+        }
+    } else {
+        return Err(fs_cli::Failure::usage(
+            "usage: layerfs umount [<mount_point>] [--force] (omit `<mount_point>` inside a store directory with one live mount)",
+        )
+        .into());
     };
-    let mount_point = PathBuf::from(mount_point);
-    let force = arguments.iter().any(|a| a == "--force");
+
     let state = state_path(&mount_point);
     if !state.exists() {
         return Err(
@@ -639,6 +888,32 @@ extern "system" fn console_control_handler(event: u32) -> i32 {
             1
         }
         _ => 0,
+    }
+}
+
+#[cfg(windows)]
+fn clear_std_handle_inheritance() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn SetHandleInformation(h_object: isize, dw_mask: u32, dw_flags: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    for std_id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: `GetStdHandle` returns a standard process handle, 0, or `INVALID_HANDLE_VALUE`.
+        // Clearing `HANDLE_FLAG_INHERIT` keeps the handles usable in this process while preventing
+        // detached child processes from keeping parent stdout/stderr pipes open.
+        unsafe {
+            let handle = GetStdHandle(std_id);
+            if handle != 0 && handle != INVALID_HANDLE_VALUE {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
     }
 }
 
