@@ -12,12 +12,12 @@ use fs_layerfs::{Error as LayerError, PersistenceProfile, Repo, DEFAULT_BRANCH};
 const USAGE: &str = "\
 layerfs [--store <dir>] [--branch <name>] <command> [args]
 
-  init <path> [--durable|--disposable] [--size <size>]
-                                  create a repository (upstream LayerFS store + main stack + work branch)
+  init <path> [--from <dir>] [--durable|--disposable] [--size <size>]
+                                  create a repository (optionally importing an existing directory)
   branch [<name>] [--from <src>]  list branches, or fork a new branch from <src> (default: main)
   fork <name> [--from <src>]      alias for `branch <name> [--from <src>]`
   checkout <branch>               verify a branch; from inside a mount, hot-switch that mount to <branch>
-  commit [-m <message>] [--force] commit uncommitted changes on the mounted or selected branch
+  commit [-m <message>] [--force] commit uncommitted overlay changes on the mounted branch
   merge <left> <right> <into> [-m <message>]
                                   3-way merge <left> and <right> into new branch <into>
   publish <branch> [<commit>]     publish a branch's head (or commit) onto `main` as a new Layer
@@ -25,6 +25,7 @@ layerfs [--store <dir>] [--branch <name>] <command> [args]
   log [<branch>] [<limit>]        list commits on a branch
   status                          current branch, base layer, head commit, root, dirty counts & open handles
   stats                           repository and storage statistics
+  compact [--pages <n>]           reclaim free SQLite pages in store.sqlite (upstream incremental vacuum)
 
   mount <mount_point> [--branch <name>] [--no-version-gate]
                                   mount a writable branch over WinFsp until `umount` stops it
@@ -34,6 +35,7 @@ layerfs [--store <dir>] [--branch <name>] <command> [args]
   help [<command>]                show general usage or help for one command
 
 Files are read and written through the mounted filesystem, not through CLI file verbs.
+Consistent with upstream LayerFS, uncommitted edits live in the mount's ephemeral overlay until `layerfs commit`.
 Global option `--workspace <name>` is accepted as an alias for `--branch <name>`.";
 
 fn main() -> ExitCode {
@@ -101,19 +103,20 @@ fn parse_size(text: &str) -> Result<u64, Box<dyn std::error::Error>> {
 
 fn command_help(command: &str) -> Option<&'static str> {
     Some(match command {
-        "init" => "init <path> [--durable|--disposable] [--size <size>]\n  Create an upstream-compatible LayerFS repository with `main` layer stack and default writable\n  branch `work`. Defaults to `--durable` (SQLite WAL/FULL) and 128 GiB advertised size.\n  Use `--disposable` for upstream WAL/OFF high-throughput mode.",
+        "init" => "init <path> [--from <dir>] [--durable|--disposable] [--size <size>]\n  Create an upstream-compatible LayerFS repository with `main` layer stack and default writable\n  branch `work`. Pass `--from <dir>` to import an existing directory via upstream `layerfs-project`.\n  Defaults to `--durable` (SQLite WAL/FULL) and 128 GiB advertised size; `--disposable` uses WAL/OFF.",
         "branch" => "branch [<name>] [--from <src>]\n  With no name: list `main` and all branches. With a name: fork a new branch from `<src>`\n  (default `main`).",
         "fork" => "fork <name> [--from <src>]\n  Fork a new writable branch `<name>` from `<src>` (default `main`).",
         "checkout" => "checkout <branch>\n  Verify `<branch>` exists; when run from inside a live mount, hot-switch that mount to `<branch>`.",
-        "commit" => "commit [-m <message>] [--force]\n  Commit uncommitted changes on the currently mounted branch (over the control pipe).\n  `--force` overwrites if the branch head moved concurrently.",
+        "commit" => "commit [-m <message>] [--force]\n  Commit uncommitted ephemeral-overlay changes on the currently mounted branch (over the control pipe).\n  `--force` overwrites if the branch head moved concurrently.",
         "merge" => "merge <left> <right> <into> [-m <message>]\n  Perform a 3-way merge of branches `<left>` and `<right>` into a new branch `<into>`.",
         "publish" => "publish <branch> [<commit>]\n  Publish `<branch>`'s head (or a specific commit id) onto `main` as the next immutable Layer.",
         "diff" => "diff <left> <right>\n  Show changed paths between `<left>` and `<right>` (branches or `main`).",
         "log" => "log [<branch>] [<limit>]\n  List commits on `<branch>` (default: mounted branch or `work`), newest first.",
         "status" => "status\n  Show branch, base layer, head commit, effective root, dirty counts, and open handles.\n  Inside a mount, queries the live mount process over the control pipe.",
         "stats" => "stats\n  Show repository profile, store file size, branch count, and logical/canonical/stored bytes.",
+        "compact" => "compact [--pages <n>]\n  Reclaim free SQLite pages in store.sqlite using upstream bounded incremental vacuum.\n  Logical objects and history are unchanged.",
         "mount" => "mount <mount_point> [--branch <name>] [--no-version-gate]\n  Mount a writable branch (default: `work`) via WinFsp at `<mount_point>` (drive letter like `Z:`\n  or directory path). Press Ctrl-C or run `layerfs umount <mount_point>` for orderly unmount.",
-        "umount" => "umount <mount_point> [--force]\n  Ask a running mount to unmount cleanly. Refuses (exit 4) while handles are open.\n  `--force` removes a stale mount record whose owner process is gone.",
+        "umount" => "umount <mount_point> [--force]\n  Ask a running mount to unmount cleanly (uncommitted ephemeral-overlay edits are discarded unless\n  committed first, matching upstream LayerFS). Refuses (exit 4) while user handles are open.\n  `--force` removes a stale mount record whose owner process is gone.",
         "list" => "list\n  List mounts recorded under %LOCALAPPDATA%\\layerfs\\mounts with live/stale status.",
         "version" => "version\n  Print WinFsp DLL version, calibrated ABI layout, and LayerFS core compatibility.",
         "help" => "help [<command>]\n  Show the top-level usage summary or detailed help for one command.",
@@ -247,6 +250,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    if command == "compact" {
+        return cmd_compact(&store, &arguments);
+    }
+
     let repo = Repo::open(&store)?;
     match command.as_str() {
         "branch" => cmd_branch(&repo, &arguments),
@@ -277,6 +284,7 @@ fn cmd_init(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut profile = PersistenceProfile::Durable;
     let mut volume_size = DEFAULT_VOLUME_SIZE_BYTES;
+    let mut from_dir: Option<PathBuf> = None;
     let mut positional: Option<PathBuf> = None;
     let mut i = 0;
     while i < arguments.len() {
@@ -287,6 +295,17 @@ fn cmd_init(
             }
             "--disposable" => {
                 profile = PersistenceProfile::Disposable;
+                i += 1;
+            }
+            "--from" => {
+                let raw = arguments
+                    .get(i + 1)
+                    .ok_or_else(|| fs_cli::Failure::usage("--from requires a directory path"))?;
+                from_dir = Some(PathBuf::from(raw));
+                i += 2;
+            }
+            other if other.starts_with("--from=") => {
+                from_dir = Some(PathBuf::from(&other["--from=".len()..]));
                 i += 1;
             }
             "--size" => {
@@ -311,16 +330,79 @@ fn cmd_init(
     }
     let path = positional
         .or_else(|| explicit_store.map(Path::to_path_buf))
-        .ok_or_else(|| fs_cli::Failure::usage("usage: layerfs init <path> [--durable|--disposable] [--size <size>]"))?;
+        .ok_or_else(|| {
+            fs_cli::Failure::usage(
+                "usage: layerfs init <path> [--from <dir>] [--durable|--disposable] [--size <size>]",
+            )
+        })?;
 
-    let repo = Repo::init(&path, profile, volume_size)?;
-    let stats = repo.stats()?;
+    if let Some(source) = from_dir {
+        let (repo, summary) = Repo::init_from(&path, &source, profile, volume_size)?;
+        let stats = repo.stats()?;
+        println!(
+            "initialized {} from {} (entries={}, profile={}, default branch={}, main={})",
+            path.display(),
+            source.display(),
+            summary.entries,
+            repo.profile().as_str(),
+            DEFAULT_BRANCH,
+            short(&stats.head_layer),
+        );
+    } else {
+        let repo = Repo::init(&path, profile, volume_size)?;
+        let stats = repo.stats()?;
+        println!(
+            "initialized {} (profile={}, default branch={}, main={})",
+            path.display(),
+            repo.profile().as_str(),
+            DEFAULT_BRANCH,
+            short(&stats.head_layer),
+        );
+    }
+    Ok(())
+}
+
+fn cmd_compact(store: &Path, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut max_pages: Option<u32> = None;
+    let mut i = 0;
+    while i < arguments.len() {
+        match arguments[i].as_str() {
+            "--pages" => {
+                let raw = arguments
+                    .get(i + 1)
+                    .ok_or_else(|| fs_cli::Failure::usage("--pages requires a positive integer"))?;
+                let parsed: u32 = raw
+                    .parse()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| fs_cli::Failure::usage(format!("invalid --pages value: {raw:?}")))?;
+                max_pages = Some(parsed);
+                i += 2;
+            }
+            other if other.starts_with("--pages=") => {
+                let raw = &other["--pages=".len()..];
+                let parsed: u32 = raw
+                    .parse()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| fs_cli::Failure::usage(format!("invalid --pages value: {raw:?}")))?;
+                max_pages = Some(parsed);
+                i += 1;
+            }
+            other => {
+                return Err(
+                    fs_cli::Failure::usage(format!("unknown compact option {other:?}")).into(),
+                );
+            }
+        }
+    }
+    let summary = Repo::reclaim_space(store, max_pages)?;
     println!(
-        "initialized {} (profile={}, default branch={}, main={})",
-        path.display(),
-        repo.profile().as_str(),
-        DEFAULT_BRANCH,
-        short(&stats.head_layer),
+        "compacted {} (free_before={}, reclaimed={}, remaining_free={})",
+        store.display(),
+        summary.free_pages_before,
+        summary.reclaimed_pages,
+        summary.remaining_free_pages
     );
     Ok(())
 }

@@ -255,3 +255,86 @@ fn remove_pagination_resize_times_and_windowed_io() {
     ws.commit(Some("edgecases"), false).unwrap();
     ws.close().unwrap();
 }
+
+#[test]
+fn init_from_host_directory_and_reclaim_space() {
+    let tmp = TempDir::new("import");
+    let src = tmp.0.join("src_tree");
+    std::fs::create_dir_all(src.join("Nested").join("EmptyDir")).unwrap();
+    std::fs::write(src.join("Root.txt"), b"root content").unwrap();
+    let big: Vec<u8> = (0..300_000usize).map(|i| (i % 241) as u8).collect();
+    std::fs::write(src.join("Nested").join("Data.bin"), &big).unwrap();
+
+    // Create a read-only file and verify READONLY attribute maps cleanly through POSIX mode 0444.
+    let ro_path = src.join("ReadOnly.txt");
+    std::fs::write(&ro_path, b"readonly").unwrap();
+    let mut perms = std::fs::metadata(&ro_path).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&ro_path, perms).unwrap();
+
+    // Refuses creating repo inside source directory!
+    let inside = src.join("bad-repo");
+    let err = Repo::init_from(
+        &inside,
+        &src,
+        PersistenceProfile::Disposable,
+        DEFAULT_VOLUME_SIZE_BYTES,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, fs_layerfs::Error::InvalidInput(_)),
+        "expected InvalidInput when repo lies inside source, got {err:?}"
+    );
+    assert!(!inside.join("store.sqlite").exists());
+
+    // Real import into sibling repo directory.
+    let repo_dir = tmp.0.join("repo");
+    let (repo, imported) = Repo::init_from(
+        &repo_dir,
+        &src,
+        PersistenceProfile::Durable,
+        DEFAULT_VOLUME_SIZE_BYTES,
+    )
+    .expect("init_from");
+    assert_eq!(imported.entries, 6, "root + Nested + EmptyDir + 3 files");
+
+    let ws = repo.open_workspace(DEFAULT_BRANCH).unwrap();
+    let ops = ws.backend();
+
+    let f_root = ops
+        .create_or_open(&Path::new(b"/root.txt"), Disposition::Open)
+        .expect("case-insensitive lookup of imported Root.txt");
+    assert_eq!(ops.read(f_root.file_id, 0, 12).unwrap(), b"root content");
+
+    let f_big = ops
+        .create_or_open(&Path::new(b"/nested/data.bin"), Disposition::Open)
+        .expect("open imported Nested/Data.bin");
+    assert_eq!(ops.read(f_big.file_id, 0, big.len()).unwrap(), big);
+
+    let f_ro = ops
+        .create_or_open(&Path::new(b"/ReadOnly.txt"), Disposition::Open)
+        .expect("open imported ReadOnly.txt");
+    assert_ne!(
+        ops.get_info(f_ro.file_id).unwrap().attributes.0 & 0x01,
+        0,
+        "readonly source file must import with READONLY bit set"
+    );
+
+    let empty_id = ops
+        .open_dir(&Path::new(b"/Nested/EmptyDir"))
+        .expect("imported empty dir");
+    assert!(ops.read_dir(empty_id).unwrap().is_empty());
+
+    ws.close().unwrap();
+    drop(repo);
+
+    // Clear readonly before TempDir Drop removes `src`.
+    let mut perms = std::fs::metadata(&ro_path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&ro_path, perms).unwrap();
+
+    // Incremental SQLite space reclamation succeeds cleanly.
+    let reclaimed = Repo::reclaim_space(&repo_dir, Some(64)).expect("reclaim_space");
+    assert!(reclaimed.remaining_free_pages <= reclaimed.free_pages_before);
+}

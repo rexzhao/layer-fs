@@ -27,7 +27,11 @@ use layerfs_history::{
 /// Tag byte of a `LayerStackId` (`layerfs_history::contract::identity::LAYER_STACK_TAG`).
 const LAYER_STACK_TAG: u8 = 0x31;
 use layerfs_overlay::ProfileConfig;
-use layerfs_persistence::{Handles, PersistenceConfig, SqlitePersistenceProfile};
+use layerfs_persistence::{
+    Handles, PersistenceConfig, SqliteAcquisitionSchema, SqlitePersistenceProfile,
+    RECLAMATION_PAGE_LIMIT,
+};
+use layerfs_project::{init as import_project, InitRequest, ProjectError};
 use layerfs_storage::{ReservationBlocks, Storage, StoragePolicy};
 use layerfs_store_service::bootstrap::{open_store_observed, OpenedStore};
 use layerfs_store_service::history::{branch, lookup};
@@ -36,6 +40,7 @@ use layerfs_store_service::store::{
     BindRequest, BoundWorkspace, CommitOptions, Store,
 };
 use layerfs_store_service::{kernel_guard, Owner, OwnerConfig};
+use layerfs_telemetry::timer::Timing;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::WinFspBackend;
@@ -161,6 +166,26 @@ pub struct StoreStats {
     pub stored_bytes: u64,
 }
 
+/// Result of importing a host directory into a new repository (`init --from`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportSummary {
+    /// Total entries imported (including the root directory).
+    pub entries: u64,
+    /// Hex-encoded genesis filesystem root object ID.
+    pub root: String,
+}
+
+/// Result of SQLite incremental space reclamation (`compact`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReclaimSummary {
+    /// Free pages observed before reclamation.
+    pub free_pages_before: u64,
+    /// Total free pages reclaimed back to the host filesystem.
+    pub reclaimed_pages: u64,
+    /// Remaining free pages after reclamation.
+    pub remaining_free_pages: u64,
+}
+
 /// Live workspace status.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceStatus {
@@ -203,14 +228,43 @@ impl Drop for Repo {
 }
 
 impl Repo {
-    /// Creates a new repository directory containing a standard upstream LayerFS
+    /// Creates a new empty repository directory containing a standard upstream LayerFS
     /// `store.sqlite`, an empty genesis LayerStack, and an initial writable branch (`work`).
     pub fn init(
         dir: impl AsRef<Path>,
         profile: PersistenceProfile,
         volume_size_bytes: u64,
     ) -> Result<Self> {
-        let dir = dir.as_ref().to_path_buf();
+        let (repo, _) = Self::init_inner(dir.as_ref(), None, profile, volume_size_bytes)?;
+        Ok(repo)
+    }
+
+    /// Creates a new repository directory initialized from an existing host directory
+    /// using upstream `layerfs-project` streaming import (4-worker parallel CDC + packing).
+    pub fn init_from(
+        dir: impl AsRef<Path>,
+        source: impl AsRef<Path>,
+        profile: PersistenceProfile,
+        volume_size_bytes: u64,
+    ) -> Result<(Self, ImportSummary)> {
+        let source = source.as_ref();
+        if !source.is_dir() {
+            return Err(Error::InvalidInput(format!(
+                "source directory does not exist or is not a directory: {}",
+                source.display()
+            )));
+        }
+        Self::init_inner(dir.as_ref(), Some(source), profile, volume_size_bytes)
+    }
+
+    fn init_inner(
+        dir: &Path,
+        source: Option<&Path>,
+        profile: PersistenceProfile,
+        volume_size_bytes: u64,
+    ) -> Result<(Self, ImportSummary)> {
+        let dir = dir.to_path_buf();
+        let dir_existed = dir.exists();
         std::fs::create_dir_all(&dir)?;
         let store_path = dir.join("store.sqlite");
         if store_path.exists() {
@@ -255,117 +309,164 @@ impl Repo {
             cursor_key,
             incarnation: 1,
         };
-        let config =
-            PersistenceConfig::sqlite(&store_path).with_sqlite_profile(profile.to_sqlite());
+        let config = PersistenceConfig::sqlite(&store_path)
+            .with_sqlite_profile(profile.to_sqlite())
+            .with_sqlite_acquisition(SqliteAcquisitionSchema::Tables);
 
-        {
+        let init_result: Result<ImportSummary> = (|| {
             let handles = Handles::create(config, StoragePolicy::frozen_default(), &history_cfg)
                 .map_err(|e| Error::Other(format!("create store: {e:?}")))?;
             let storage = Storage::new(handles.storage.clone())
                 .map_err(|e| Error::Other(format!("storage: {e:?}")))?;
-            let scope = scope_for_seed(scope_seed);
-            let reservation = handles
-                .history
-                .reserve_inodes(&ReserveRequest {
-                    scope: scope.object(),
-                    count: 1,
-                })
-                .map_err(|e| Error::Other(format!("reserve root inode: {e:?}")))?;
-            let root_serial = reservation.start;
 
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
-            let portable = PortableMetadata {
-                mode: 0o755,
-                mtime_seconds: now.as_secs() as i64,
-                mtime_nanoseconds: now.subsec_nanos(),
+            let (stack, summary) = if let Some(src) = source {
+                let (imported, _) = Timing::disabled("layerfs.init_from", |timer| {
+                    import_project(
+                        &storage,
+                        &handles.history,
+                        InitRequest {
+                            source: src,
+                            acquisition: &handles.acquisition,
+                            stack: stack_id,
+                            name: stack_name.clone(),
+                            scope_seed,
+                            deadline: Instant::now() + Duration::from_secs(3600),
+                        },
+                        timer,
+                    )
+                });
+                let imported = imported.map_err(|e| match e {
+                    ProjectError::BackingInsideSource => Error::InvalidInput(format!(
+                        "repository path {} cannot lie inside source directory {}",
+                        dir.display(),
+                        src.display()
+                    )),
+                    ProjectError::InvalidInput => {
+                        Error::InvalidInput(format!("invalid source tree at {}", src.display()))
+                    }
+                    ProjectError::Unsupported => Error::Unsupported(format!(
+                        "source tree {} contains unsupported entry types",
+                        src.display()
+                    )),
+                    other => Error::Other(format!("import {}: {other}", src.display())),
+                })?;
+                // Best-effort reclaim of discarded acquisition working pages.
+                let _ = handles.reclaim_space(RECLAMATION_PAGE_LIMIT);
+                let summary = ImportSummary {
+                    entries: imported.entries,
+                    root: encode_hex(imported.root.as_bytes()),
+                };
+                (imported.stack, summary)
+            } else {
+                let scope = scope_for_seed(scope_seed);
+                let reservation = handles
+                    .history
+                    .reserve_inodes(&ReserveRequest {
+                        scope: scope.object(),
+                        count: 1,
+                    })
+                    .map_err(|e| Error::Other(format!("reserve root inode: {e:?}")))?;
+                let root_serial = reservation.start;
+
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                let portable = PortableMetadata {
+                    mode: 0o755,
+                    mtime_seconds: now.as_secs() as i64,
+                    mtime_nanoseconds: now.subsec_nanos(),
+                };
+
+                let reader = storage
+                    .reader()
+                    .map_err(|e| Error::Other(format!("reader: {e:?}")))?;
+                let save = storage
+                    .begin_save()
+                    .map_err(|e| Error::Other(format!("begin save: {e:?}")))?;
+                let built_root = {
+                    let mut sink = save.sink();
+                    let mut objects = FilesystemObjects::new(&reader, &mut sink);
+                    let mode_bytes = portable
+                        .mode_bytes(InodeKind::Directory)
+                        .map_err(|e| Error::Other(format!("mode bytes: {e:?}")))?;
+                    let mtime_bytes = portable
+                        .mtime_bytes()
+                        .map_err(|e| Error::Other(format!("mtime bytes: {e:?}")))?;
+                    let mode_root = emit_value(&mut objects, &mode_bytes)
+                        .map_err(|e| Error::Other(format!("emit mode: {e:?}")))?;
+                    let mtime_root = emit_value(&mut objects, &mtime_bytes)
+                        .map_err(|e| Error::Other(format!("emit mtime: {e:?}")))?;
+                    let attr_key_mode = AttributeKey::new("portable".into(), b"mode".to_vec())
+                        .map_err(|e| Error::Other(format!("attr key: {e:?}")))?;
+                    let attr_key_mtime = AttributeKey::new("portable".into(), b"mtime".to_vec())
+                        .map_err(|e| Error::Other(format!("attr key: {e:?}")))?;
+                    let (dir_meta, _) = build_attribute_tree(
+                        &mut objects,
+                        [
+                            Ok(AttributeEntry {
+                                key: attr_key_mode,
+                                value_root: mode_root,
+                            }),
+                            Ok(AttributeEntry {
+                                key: attr_key_mtime,
+                                value_root: mtime_root,
+                            }),
+                        ]
+                        .into_iter(),
+                    )
+                    .map_err(|e| Error::Other(format!("attr tree: {e:?}")))?;
+
+                    let root_inode = InodeUpdate {
+                        serial: root_serial,
+                        value: InodeValue {
+                            kind: InodeKind::Directory,
+                            content_root: ObjectId::for_bytes(b"new-directory"),
+                            metadata_root: InodeMetadata::Root(dir_meta),
+                            namespace_ref_count: 0,
+                        },
+                    };
+                    let root_dir = DirectoryUpdate {
+                        parent: root_serial,
+                        changes: Vec::new(),
+                    };
+                    let input = FilesystemInput {
+                        base: None,
+                        scope,
+                        root_serial,
+                        directories: &[root_dir],
+                        inodes: &[root_inode],
+                        new_inodes: &[root_serial],
+                        resources: FilesystemResources::default(),
+                    };
+                    build_filesystem(&mut objects, &input, None)
+                        .map_err(|e| Error::Other(format!("build empty root: {e:?}")))?
+                        .root
+                };
+                save.finish()
+                    .map_err(|e| Error::Other(format!("finish genesis save: {e:?}")))?;
+
+                let reader = storage
+                    .reader()
+                    .map_err(|e| Error::Other(format!("reader after save: {e:?}")))?;
+                let logical = logical_size(&reader, built_root)
+                    .map_err(|e| Error::Other(format!("logical size: {e:?}")))?;
+                let stack = handles
+                    .history
+                    .initialize_layerstack(&StackInitialization {
+                        stack: stack_id,
+                        name: stack_name.clone(),
+                        scope: scope.object(),
+                        profile: profile_id(),
+                        genesis_root: built_root.0,
+                        logical,
+                    })
+                    .map_err(|e| Error::Other(format!("initialize layerstack: {e:?}")))?;
+                let summary = ImportSummary {
+                    entries: 1,
+                    root: encode_hex(built_root.0.as_bytes()),
+                };
+                (stack, summary)
             };
-
-            let reader = storage
-                .reader()
-                .map_err(|e| Error::Other(format!("reader: {e:?}")))?;
-            let save = storage
-                .begin_save()
-                .map_err(|e| Error::Other(format!("begin save: {e:?}")))?;
-            let built_root = {
-                let mut sink = save.sink();
-                let mut objects = FilesystemObjects::new(&reader, &mut sink);
-                let mode_bytes = portable
-                    .mode_bytes(InodeKind::Directory)
-                    .map_err(|e| Error::Other(format!("mode bytes: {e:?}")))?;
-                let mtime_bytes = portable
-                    .mtime_bytes()
-                    .map_err(|e| Error::Other(format!("mtime bytes: {e:?}")))?;
-                let mode_root = emit_value(&mut objects, &mode_bytes)
-                    .map_err(|e| Error::Other(format!("emit mode: {e:?}")))?;
-                let mtime_root = emit_value(&mut objects, &mtime_bytes)
-                    .map_err(|e| Error::Other(format!("emit mtime: {e:?}")))?;
-                let attr_key_mode = AttributeKey::new("portable".into(), b"mode".to_vec())
-                    .map_err(|e| Error::Other(format!("attr key: {e:?}")))?;
-                let attr_key_mtime = AttributeKey::new("portable".into(), b"mtime".to_vec())
-                    .map_err(|e| Error::Other(format!("attr key: {e:?}")))?;
-                let (dir_meta, _) = build_attribute_tree(
-                    &mut objects,
-                    [
-                        Ok(AttributeEntry {
-                            key: attr_key_mode,
-                            value_root: mode_root,
-                        }),
-                        Ok(AttributeEntry {
-                            key: attr_key_mtime,
-                            value_root: mtime_root,
-                        }),
-                    ]
-                    .into_iter(),
-                )
-                .map_err(|e| Error::Other(format!("attr tree: {e:?}")))?;
-
-                let root_inode = InodeUpdate {
-                    serial: root_serial,
-                    value: InodeValue {
-                        kind: InodeKind::Directory,
-                        content_root: ObjectId::for_bytes(b"new-directory"),
-                        metadata_root: InodeMetadata::Root(dir_meta),
-                        namespace_ref_count: 0,
-                    },
-                };
-                let root_dir = DirectoryUpdate {
-                    parent: root_serial,
-                    changes: Vec::new(),
-                };
-                let input = FilesystemInput {
-                    base: None,
-                    scope,
-                    root_serial,
-                    directories: &[root_dir],
-                    inodes: &[root_inode],
-                    new_inodes: &[root_serial],
-                    resources: FilesystemResources::default(),
-                };
-                build_filesystem(&mut objects, &input, None)
-                    .map_err(|e| Error::Other(format!("build empty root: {e:?}")))?
-                    .root
-            };
-            save.finish()
-                .map_err(|e| Error::Other(format!("finish genesis save: {e:?}")))?;
-
-            let reader = storage
-                .reader()
-                .map_err(|e| Error::Other(format!("reader after save: {e:?}")))?;
-            let logical = logical_size(&reader, built_root)
-                .map_err(|e| Error::Other(format!("logical size: {e:?}")))?;
-            let stack = handles
-                .history
-                .initialize_layerstack(&StackInitialization {
-                    stack: stack_id,
-                    name: stack_name.clone(),
-                    scope: scope.object(),
-                    profile: profile_id(),
-                    genesis_root: built_root.0,
-                    logical,
-                })
-                .map_err(|e| Error::Other(format!("initialize layerstack: {e:?}")))?;
 
             // Fork the default writable branch `work` from the genesis layer.
             let default_name = HistoryName::new(DEFAULT_BRANCH)
@@ -379,7 +480,22 @@ impl Repo {
                     source: ForkSource::Layer(stack.head_layer),
                 })
                 .map_err(|e| Error::Other(format!("fork default branch: {e:?}")))?;
-        }
+            Ok(summary)
+        })();
+
+        let summary = match init_result {
+            Ok(summary) => summary,
+            Err(err) => {
+                // Clean up partial store artifacts on init/import failure.
+                let _ = std::fs::remove_file(&store_path);
+                let _ = std::fs::remove_file(dir.join("store.sqlite-wal"));
+                let _ = std::fs::remove_file(dir.join("store.sqlite-shm"));
+                if !dir_existed {
+                    let _ = std::fs::remove_dir(&dir);
+                }
+                return Err(err);
+            }
+        };
 
         let meta = RepoMeta {
             version: 1,
@@ -394,7 +510,54 @@ impl Repo {
             .map_err(|e| Error::Other(format!("serialize repo.json: {e}")))?;
         std::fs::write(dir.join("repo.json"), meta_json)?;
 
-        Self::open(dir)
+        Ok((Self::open(dir)?, summary))
+    }
+
+    /// Reclaims free SQLite pages in `dir`'s `store.sqlite` using upstream bounded
+    /// incremental vacuum (`Handles::reclaim_space`). Logical objects are untouched.
+    pub fn reclaim_space(dir: impl AsRef<Path>, max_pages: Option<u32>) -> Result<ReclaimSummary> {
+        let dir = dir.as_ref();
+        let meta_path = dir.join("repo.json");
+        let store_path = dir.join("store.sqlite");
+        if !meta_path.is_file() || !store_path.is_file() {
+            return Err(Error::NotFound(format!(
+                "no layerfs repository at {}",
+                dir.display()
+            )));
+        }
+        let meta: RepoMeta = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)
+            .map_err(|e| Error::InvalidInput(format!("invalid repo.json: {e}")))?;
+        let cursor_key: [u8; 32] = decode_hex_array(&meta.cursor_key_hex)?;
+        let config =
+            PersistenceConfig::sqlite(&store_path).with_sqlite_profile(meta.profile.to_sqlite());
+        let handles = Handles::open_writable(config, meta.binding_key.as_bytes(), cursor_key)
+            .map_err(|e| Error::Other(format!("open store for space reclamation: {e:?}")))?;
+
+        let mut remaining_budget = max_pages.unwrap_or(u32::MAX);
+        let mut free_pages_before = None;
+        let mut total_reclaimed = 0u64;
+        let mut remaining_free_pages = 0u64;
+        while remaining_budget > 0 {
+            let chunk = remaining_budget.min(RECLAMATION_PAGE_LIMIT);
+            let rec = handles
+                .reclaim_space(chunk)
+                .map_err(|e| Error::Unsupported(format!("reclaim_space refused: {e:?}")))?;
+            if free_pages_before.is_none() {
+                free_pages_before = Some(rec.free_pages_before);
+            }
+            total_reclaimed = total_reclaimed.saturating_add(rec.reclaimed_pages);
+            remaining_free_pages = rec.remaining_free_pages;
+            if rec.reclaimed_pages == 0 || rec.remaining_free_pages == 0 {
+                break;
+            }
+            remaining_budget = remaining_budget.saturating_sub(chunk);
+        }
+        handles.close();
+        Ok(ReclaimSummary {
+            free_pages_before: free_pages_before.unwrap_or(0),
+            reclaimed_pages: total_reclaimed,
+            remaining_free_pages,
+        })
     }
 
     /// Opens an existing repository directory.
@@ -543,8 +706,27 @@ impl Repo {
         message: Option<&str>,
     ) -> Result<MergeOutcome> {
         let stack = self.stack()?;
-        let val = branch::merge(&self.store, &stack, left, right, into, message, &[])
-            .map_err(Error::from_sdk)?;
+        let val = match branch::merge(&self.store, &stack, left, right, into, message, &[]) {
+            Ok(val) => val,
+            Err(refusal) if refusal.code == "Conflict" => {
+                let conflicts = match refusal.detail.get("conflicts") {
+                    Some(SdkValue::List(list)) => list
+                        .iter()
+                        .filter_map(|c| c.get_text("path").map(str::to_owned))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                return Ok(MergeOutcome {
+                    kind: "Conflict".to_owned(),
+                    branch: into.to_owned(),
+                    fast_forward: false,
+                    head: None,
+                    root: None,
+                    conflicts,
+                });
+            }
+            Err(refusal) => return Err(Error::from_sdk(refusal)),
+        };
         let conflicts = match val.get("conflicts") {
             Some(SdkValue::List(list)) => list
                 .iter()

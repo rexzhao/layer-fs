@@ -7,6 +7,7 @@
 use crate::backing::{Backing, Stamp, WINDOW_ROWS};
 use crate::error::ProjectError as Failure;
 use crate::error::{content, storage};
+use crate::host;
 use crate::{
     batch::{BatchProducer, Event, ImportBatch, QUEUE_SLOTS},
     import::observe::InitStep,
@@ -17,9 +18,7 @@ use layerfs_storage::port::acquisition::{self, WRITE_WINDOW_ROWS};
 use layerfs_storage::{Save, Storage};
 use layerfs_telemetry::timer::Timing;
 use std::{
-    ffi::{OsStr, OsString},
     fs::{self, File},
-    os::unix::ffi::{OsStrExt, OsStringExt},
     path::PathBuf,
     sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant},
@@ -35,12 +34,12 @@ struct Job {
     stamp: Stamp,
 }
 impl Job {
-    fn of(job: acquisition::Job) -> Self {
-        Self {
+    fn of(job: acquisition::Job) -> Result<Self, Failure> {
+        Ok(Self {
             id: job.position,
             stamp: Stamp::from_identity(&job.host),
-            path: PathBuf::from(OsString::from_vec(job.host_path)),
-        }
+            path: host::bytes_to_path(job.host_path)?,
+        })
     }
 }
 
@@ -92,7 +91,7 @@ pub(crate) fn save_files(
                 let job = match held.take() {
                     Some(job) => job,
                     None => match host_files.next()? {
-                        Some(job) => Job::of(job),
+                        Some(job) => Job::of(job)?,
                         None => {
                             feed = None;
                             break;
@@ -171,8 +170,8 @@ fn check_aliases(backing: &Backing<'_>, progress: &mut ImportProgress) -> Result
         };
         let parent = entry.key.parent.ok_or(Failure::InvalidInput)?;
         if directory.as_ref().is_none_or(|(held, _)| *held != parent) {
-            let path = OsString::from_vec(backing.directory_path(parent)?);
-            directory = Some((parent, PathBuf::from(path)));
+            let path = host::bytes_to_path(backing.directory_path(parent)?)?;
+            directory = Some((parent, path));
         }
         if first.is_none_or(|(held, _)| held != canonical) {
             let job = backing.job(canonical)?;
@@ -181,8 +180,8 @@ fn check_aliases(backing: &Backing<'_>, progress: &mut ImportProgress) -> Result
         let (Some((_, directory)), Some((_, stamp))) = (&directory, &first) else {
             return Err(Failure::InvalidInput);
         };
-        let path = directory.join(OsStr::from_bytes(&entry.key.name));
-        if !stamp.matches_file(&fs::symlink_metadata(&path)?) {
+        let path = host::join_name(directory, &entry.key.name)?;
+        if !stamp.matches_path(&path, &fs::symlink_metadata(&path)?) {
             return Err(Failure::InvalidInput);
         }
     }
@@ -200,7 +199,7 @@ fn construct_file(
         return Err(Failure::Deadline);
     }
     let mut file = File::open(&job.path)?;
-    if !job.stamp.matches_file(&file.metadata()?) {
+    if !job.stamp.matches_open_file(&file, &file.metadata()?) {
         return Err(Failure::InvalidInput);
     }
     let (result, _) = Timing::disabled("history.import_file", |scope| {
@@ -214,8 +213,8 @@ fn construct_file(
     });
     let built = result.map_err(content)?;
     if built.logical_len != job.stamp.len
-        || !job.stamp.matches_file(&file.metadata()?)
-        || !job.stamp.matches_file(&fs::symlink_metadata(&job.path)?)
+        || !job.stamp.matches_open_file(&file, &file.metadata()?)
+        || !job.stamp.matches_path(&job.path, &fs::symlink_metadata(&job.path)?)
     {
         return Err(Failure::InvalidInput);
     }

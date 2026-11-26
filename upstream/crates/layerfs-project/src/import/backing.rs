@@ -13,7 +13,12 @@ use layerfs_storage::port::acquisition::{
     WRITE_ROW_BYTES, WRITE_WINDOW_BYTES, WRITE_WINDOW_ROWS,
 };
 use layerfs_storage::port::PersistenceError;
-use std::{cell::Cell, collections::VecDeque, fs::Metadata, os::unix::fs::MetadataExt};
+use std::{
+    cell::Cell,
+    collections::VecDeque,
+    fs::{File, Metadata},
+    path::Path,
+};
 
 /// Rows the job queue or one resident child buffer may hold.
 pub(crate) const WINDOW_ROWS: usize = 512;
@@ -31,21 +36,20 @@ pub(crate) struct Stamp {
     pub ctime_nsec: i64,
 }
 impl Stamp {
-    pub(crate) fn of(metadata: &Metadata) -> Self {
-        Self {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-            len: metadata.len(),
-            mode: metadata.mode(),
-            mtime: metadata.mtime(),
-            mtime_nsec: metadata.mtime_nsec(),
-            ctime: metadata.ctime(),
-            ctime_nsec: metadata.ctime_nsec(),
-        }
+    pub(crate) fn of_path(path: &Path, metadata: &Metadata) -> Result<Self, Failure> {
+        crate::host::stamp_of_path(path, metadata)
     }
-    /// True while `metadata` is still the same unchanged regular file.
-    pub(crate) fn matches_file(&self, metadata: &Metadata) -> bool {
-        metadata.is_file() && !metadata.file_type().is_symlink() && *self == Self::of(metadata)
+    /// True while `metadata` at `path` is still the same unchanged regular file.
+    pub(crate) fn matches_path(&self, path: &Path, metadata: &Metadata) -> bool {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && crate::host::stamp_of_path(path, metadata).is_ok_and(|now| *self == now)
+    }
+    /// True while the opened `file` handle is still the same unchanged regular file.
+    pub(crate) fn matches_open_file(&self, file: &File, metadata: &Metadata) -> bool {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && crate::host::stamp_of_file(file, metadata).is_ok_and(|now| *self == now)
     }
     /// The identity and byte-exact evidence every path of this inode must share.
     pub(crate) fn identity(&self) -> HostIdentity {

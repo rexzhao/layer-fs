@@ -1,18 +1,20 @@
 //! Responsibility-scoped implementation modules and reexports.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod backing;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod batch;
 pub(crate) mod error;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod files;
 pub(crate) mod hints;
+#[cfg(any(unix, windows))]
+pub(crate) mod host;
 pub(crate) mod init;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod namespace;
 pub(crate) mod observe;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod scan;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod source;
 pub(crate) mod work;

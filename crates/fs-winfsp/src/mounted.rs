@@ -895,6 +895,7 @@ mod platform {
             params.set_sector_size(4096);
             params.set_sectors_per_allocation_unit(1);
             params.set_max_component_length(255);
+            params.set_name_flags();
             // No caching: the workspace is the only source of truth, and a cached FileInfo would hide another handle's write.
             params.set_file_info_timeout(0);
             // **A directory mount has no name of its own**, unlike a drive letter, so the volume must carry one. Applied only for

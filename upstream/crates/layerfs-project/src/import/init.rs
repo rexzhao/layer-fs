@@ -1,26 +1,26 @@
 //! Scan, construct/save, consume inode identities and publish one genesis stack.
 use crate::import::observe::InitCounters;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::import::observe::InitStep;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::{
     backing::Backing,
     error::{acquisition, storage},
-    files,
+    files, host,
     namespace::{self, ImportProgress},
     scan,
 };
 use crate::{ProjectError, ProjectResult};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use layerfs_content::filesystem::{profile_id, scope_for_seed, FilesystemObjects};
 use layerfs_content::ObjectId;
 use layerfs_history::{HistoryCatalog, HistoryName, LayerStackId, LayerStackRecord};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use layerfs_history::{ReserveRequest, StackInitialization};
 use layerfs_storage::port::acquisition::Acquisition;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use layerfs_storage::port::acquisition::Begin;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use layerfs_storage::Save;
 use layerfs_storage::{read::Diagnostics, Storage};
 use layerfs_telemetry::timer::{Active, TimingScope};
@@ -88,7 +88,7 @@ pub fn init(
 /// published. A failure of that removal is [`ProjectError::Cleanup`]; an
 /// unknown Store, history or backing outcome is [`ProjectError::Uncertain`]
 /// and leaves the operation untouched for its owner.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn init_observed(
     store: &Storage,
     catalog: &dyn HistoryCatalog,
@@ -96,20 +96,20 @@ pub fn init_observed(
     timer: &TimingScope<'_, Active>,
     counters: Arc<InitCounters>,
 ) -> ProjectResult<Initialized> {
-    use std::os::unix::fs::MetadataExt;
     counters.step(InitStep::Scan);
     let mut progress = ImportProgress::observed(request.deadline, counters);
     progress.tick()?;
     let source = scan::check_root(request.source)?;
     if let Some(placement) = request.acquisition.placement() {
-        super::source::outside_source(&source, &placement)?;
+        super::source::outside_source(request.source, &source, &placement)?;
     }
     let scope = scope_for_seed(request.scope_seed);
     let mut stack = [0; 16];
     stack.copy_from_slice(&request.stack.to_bytes()[1..]);
+    let (source_device, source_inode) = host::dev_ino_of_path(request.source, &source)?;
     let begun = request.acquisition.begin(&Begin {
-        source_device: source.dev(),
-        source_inode: source.ino(),
+        source_device,
+        source_inode,
         stack,
         scope: scope.object(),
     });
@@ -176,7 +176,7 @@ pub fn init_observed(
 
 /// Scans with attributes, constructs each file once, consumes serials and
 /// builds the tree. The returned tree save is unfinished.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn acquire<'a>(
     store: &'a Storage,
     catalog: &dyn HistoryCatalog,
@@ -238,7 +238,7 @@ fn acquire<'a>(
 }
 
 /// Refuses host Init where the required Unix metadata contract is unavailable.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn init_observed(
     _storage: &Storage,
     _catalog: &dyn HistoryCatalog,

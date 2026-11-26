@@ -131,10 +131,54 @@ fn init_profiles_branch_fork_log_diff_stats_and_exit_codes() {
     assert!(disp.status.success());
     assert!(String::from_utf8_lossy(&disp.stdout).contains("profile=disposable"));
 
-    // 8. Version and list succeed cleanly.
+    // 8. Version, compact, and list succeed cleanly.
+    let compact = run_cli(&["--store", &repo_str, "compact"], &mounts);
+    assert!(
+        compact.status.success(),
+        "compact failed: {}",
+        String::from_utf8_lossy(&compact.stderr)
+    );
+    assert!(String::from_utf8_lossy(&compact.stdout).contains("compacted "));
+
     let ver = run_cli(&["version"], &mounts);
     assert!(ver.status.success());
     assert!(String::from_utf8_lossy(&ver.stdout).contains("upstream layerfs"));
     let list = run_cli(&["list"], &mounts);
     assert!(list.status.success());
+
+    // 9. `init --from <dir>` imports an existing directory and refuses overlapping store.
+    let src = tmp.0.join("import-src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a.txt"), b"hello").unwrap();
+    std::fs::write(src.join("sub").join("b.txt"), b"world").unwrap();
+    let imported_repo = tmp.0.join("imported-repo");
+    let imp = run_cli(
+        &[
+            "init",
+            imported_repo.to_str().unwrap(),
+            "--from",
+            src.to_str().unwrap(),
+            "--disposable",
+        ],
+        &mounts,
+    );
+    assert!(
+        imp.status.success(),
+        "init --from failed: {}",
+        String::from_utf8_lossy(&imp.stderr)
+    );
+    let imp_out = String::from_utf8_lossy(&imp.stdout);
+    assert!(imp_out.contains("entries=4"), "stdout: {imp_out}");
+
+    let bad_inside = src.join("nested-store");
+    let bad = run_cli(
+        &[
+            "init",
+            bad_inside.to_str().unwrap(),
+            "--from",
+            src.to_str().unwrap(),
+        ],
+        &mounts,
+    );
+    assert_eq!(bad.status.code(), Some(2));
 }

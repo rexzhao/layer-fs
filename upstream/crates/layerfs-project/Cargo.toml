@@ -12,6 +12,9 @@ layerfs-storage = { path = "../layerfs-storage" }
 layerfs-history = { path = "../layerfs-history", default-features = false }
 layerfs-telemetry = { path = "../layerfs-telemetry" }
 
+[target.'cfg(windows)'.dependencies]
+layerfs-win32-host = { path = "../layerfs-win32-host" }
+
 [dev-dependencies]
 layerfs-persistence = { path = "../layerfs-persistence" }
 sha2 = "=0.11.0"

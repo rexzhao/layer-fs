@@ -3,18 +3,20 @@
 #![deny(missing_docs)]
 mod import;
 pub use error::{ProjectError, ProjectResult, RetainedAcquisition};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use import::backing;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use import::batch;
 pub(crate) use import::error;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use import::files;
+#[cfg(any(unix, windows))]
+pub(crate) use import::host;
 pub(crate) use import::init;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use import::namespace;
 pub use import::observe::{InitCounters, InitCounts, InitStep};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use import::scan;
 pub use init::{init, init_observed, InitRequest, Initialized};
 

@@ -9,6 +9,7 @@
 use crate::backing::{placed_bytes, window_full, Backing, Bound, Pending, Stamp, WINDOW_ROWS};
 use crate::error::content;
 use crate::error::ProjectError as Failure;
+use crate::host;
 
 use crate::namespace::ImportProgress;
 use layerfs_content::filesystem::attributes::PortableMetadata;
@@ -17,10 +18,8 @@ use layerfs_content::filesystem::FilesystemObjects;
 use layerfs_content::{inode_leaf::InodeKind, PathName};
 use layerfs_storage::port::acquisition::{EntryKey, NewEntry, Placed};
 use std::{
-    ffi::{OsStr, OsString},
     fs::{self, Metadata},
-    os::unix::ffi::{OsStrExt, OsStringExt},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 /// What one completed scan placed in backing.
@@ -98,13 +97,15 @@ impl Roots<'_, '_> {
             }
             None => None,
         };
-        let path = || match parent {
-            Some(_) => child_path(directory, &child.name),
-            None => directory.as_os_str().as_bytes().to_vec(),
+        let path = || -> Result<Vec<u8>, Failure> {
+            match parent {
+                Some(_) => host::child_path_bytes(directory, &child.name),
+                None => host::os_str_to_bytes(directory.as_os_str()),
+            }
         };
         let (host_path, host) = match child.kind {
-            InodeKind::Directory => (Some(path()), None),
-            InodeKind::RegularFile => (Some(path()), Some(child.stamp.identity())),
+            InodeKind::Directory => (Some(path()?), None),
+            InodeKind::RegularFile => (Some(path()?), Some(child.stamp.identity())),
             InodeKind::Symlink => (None, None),
         };
         Ok(NewEntry {
@@ -120,13 +121,6 @@ impl Roots<'_, '_> {
             host,
         })
     }
-}
-
-fn child_path(directory: &Path, name: &[u8]) -> Vec<u8> {
-    directory
-        .join(OsStr::from_bytes(name))
-        .into_os_string()
-        .into_vec()
 }
 
 /// Positions being assigned while directories are read.
@@ -168,7 +162,7 @@ pub(crate) fn scan(
         name: Vec::new(),
         kind: InodeKind::Directory,
         target: None,
-        stamp: Stamp::of(root),
+        stamp: Stamp::of_path(source, root)?,
     };
     let root = roots.entry(root, None, Some(0), source)?;
     placement
@@ -189,12 +183,13 @@ pub(crate) fn scan(
         placement.frontier -= 1;
         progress.tick()?;
         let parent = directory.position;
-        let path = PathBuf::from(OsString::from_vec(directory.host_path));
+        let path = host::bytes_to_path(directory.host_path)?;
         let (mut count, mut wide) = (0usize, false);
         for child in fs::read_dir(&path)? {
             progress.tick()?;
             let child = child?;
-            buffer.push(observe(&child.path(), child.file_name().as_bytes())?);
+            let child_name = host::os_str_to_bytes(&child.file_name())?;
+            buffer.push(observe(&child.path(), &child_name)?);
             count += 1;
             progress.counters.entry();
             if buffer.len() == WINDOW_ROWS {
@@ -266,9 +261,10 @@ fn place_wide(
         after = Some(last.name.clone());
         for child in window {
             progress.tick()?;
-            let host = child
-                .host
-                .map(|identity| (identity, child_path(directory, &child.name)));
+            let host = match child.host {
+                Some(identity) => Some((identity, host::child_path_bytes(directory, &child.name)?)),
+                None => None,
+            };
             let child = Placed {
                 position: placement.assign(child.kind)?,
                 name: child.name,
@@ -303,6 +299,6 @@ fn observe(path: &Path, name: &[u8]) -> Result<Child, Failure> {
         name: name.to_vec(),
         kind,
         target,
-        stamp: Stamp::of(&metadata),
+        stamp: Stamp::of_path(path, &metadata)?,
     })
 }

@@ -193,7 +193,8 @@ fn from_serial(view: &SourceView, serial: u64) -> u64 {
 
 fn node_info_of(view: &SourceView, stat: &ViewStat) -> NodeInfo {
     let is_dir = stat.kind == InodeKind::Directory;
-    let stored_bits = if !is_dir && (stat.metadata.mode & 0o222) == 0 {
+    let is_symlink = stat.kind == InodeKind::Symlink;
+    let stored_bits = if is_symlink || (!is_dir && (stat.metadata.mode & 0o222) == 0) {
         READONLY
     } else {
         0
@@ -601,8 +602,25 @@ impl WorkspaceOps for WinFspBackend {
             while remaining > 0 {
                 let want = remaining.min(READ_WINDOW) as u32;
                 let before = out.len();
-                view.read(op.overlay(), serial, pos, want, &mut out)
-                    .map_err(map_workspace_err)?;
+                match view.read(op.overlay(), serial, pos, want, &mut out) {
+                    Ok(_) => {}
+                    Err(WorkspaceError::Refused(Refusal::Invalid))
+                        if out.is_empty()
+                            && view
+                                .stat(op.overlay(), serial)
+                                .is_ok_and(|s| s.kind == InodeKind::Symlink) =>
+                    {
+                        // Expose POSIX symlinks safely as immutable target-text files on Windows
+                        // (matches git core.symlinks=false and avoids requiring Developer Mode/Admin).
+                        let target = view.readlink(op.overlay(), serial).map_err(map_workspace_err)?;
+                        let raw = target.as_bytes();
+                        let start = usize::try_from(offset).unwrap_or(raw.len()).min(raw.len());
+                        let end = start.saturating_add(len).min(raw.len());
+                        out.extend_from_slice(&raw[start..end]);
+                        break;
+                    }
+                    Err(err) => return Err(map_workspace_err(err)),
+                }
                 let got = out.len() - before;
                 if got == 0 {
                     break;
@@ -732,7 +750,7 @@ impl WorkspaceOps for WinFspBackend {
         self.with_view(|op, view, state| {
             let serial = to_serial(view, file_id);
             let stat = view.stat(op.overlay(), serial).map_err(map_workspace_err)?;
-            if stat.kind == InodeKind::Directory {
+            if matches!(stat.kind, InodeKind::Directory | InodeKind::Symlink) {
                 return Ok(());
             }
             let current = stat.metadata.mode & 0o777;

@@ -15,6 +15,7 @@ layerfs-content = { path = "../../upstream/crates/layerfs-content" }
 layerfs-history = { path = "../../upstream/crates/layerfs-history" }
 layerfs-overlay = { path = "../../upstream/crates/layerfs-overlay" }
 layerfs-persistence = { path = "../../upstream/crates/layerfs-persistence" }
+layerfs-project = { path = "../../upstream/crates/layerfs-project" }
 layerfs-storage = { path = "../../upstream/crates/layerfs-storage" }
 layerfs-store-service = { path = "../../upstream/crates/layerfs-store-service" }
 layerfs-telemetry = { path = "../../upstream/crates/layerfs-telemetry" }

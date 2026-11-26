@@ -12,7 +12,8 @@
 *.rs       text
 *.toml     text
 *.md       text
-*.sql      text
+# SQL files are embedded verbatim via include_str! (SQLite schema identity across OSes).
+*.sql      text eol=lf
 *.json     text
 *.yml      text
 *.yaml     text

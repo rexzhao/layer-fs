@@ -13,7 +13,6 @@ use layerfs_telemetry::timer::Timing;
 use std::{
     collections::BTreeMap,
     fs,
-    os::unix::fs::MetadataExt,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -120,9 +119,31 @@ impl Fixture {
             )
             .unwrap();
             let metadata = fs::symlink_metadata(self.source.join(&path)).unwrap();
-            assert_eq!(portable.mode, metadata.mode() & 0o7777);
-            assert_eq!(portable.mtime_seconds, metadata.mtime());
-            assert_eq!(portable.mtime_nanoseconds as i64, metadata.mtime_nsec());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(portable.mode, metadata.mode() & 0o7777);
+                assert_eq!(portable.mtime_seconds, metadata.mtime());
+                assert_eq!(portable.mtime_nanoseconds as i64, metadata.mtime_nsec());
+            }
+            #[cfg(windows)]
+            {
+                let expected_mode = if metadata.is_dir() {
+                    0o755
+                } else if metadata.permissions().readonly() {
+                    0o444
+                } else {
+                    0o644
+                };
+                assert_eq!(portable.mode, expected_mode);
+                let dur = metadata
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap();
+                assert_eq!(portable.mtime_seconds, dur.as_secs() as i64);
+                assert_eq!(portable.mtime_nanoseconds, dur.subsec_nanos());
+            }
             if metadata.is_dir() {
                 let mut after = None;
                 loop {
