@@ -19,9 +19,9 @@ use layerfs_content::filesystem::{
 use layerfs_content::object::inode_leaf::{InodeKind, InodeMetadata, InodeValue};
 use layerfs_content::ObjectId;
 use layerfs_history::{
-    BranchId, CommitOutcome, ForkRequest, ForkSource, HistoryCatalog, HistoryCatalogConfig,
-    HistoryName, LayerStackId, LayerStackRecord, NodeId, ReserveRequest, StackInitialization,
-    WorkspaceId,
+    BranchId, CommitMeta, CommitOutcome, CommitRequest, CommitStatistics, CommitVia, ForkRequest,
+    ForkSource, HistoryCatalog, HistoryCatalogConfig, HistoryName, LayerStackId, LayerStackRecord,
+    NodeId, ReserveRequest, StackInitialization, WorkspaceId,
 };
 
 /// Tag byte of a `LayerStackId` (`layerfs_history::contract::identity::LAYER_STACK_TAG`).
@@ -31,7 +31,7 @@ use layerfs_persistence::{
     Handles, PersistenceConfig, SqliteAcquisitionSchema, SqlitePersistenceProfile,
     RECLAMATION_PAGE_LIMIT,
 };
-use layerfs_project::{init as import_project, InitRequest, ProjectError};
+use layerfs_project::{import_tree, ImportTreeRequest, ProjectError};
 use layerfs_storage::{ReservationBlocks, Storage, StoragePolicy};
 use layerfs_store_service::bootstrap::{open_store_observed, OpenedStore};
 use layerfs_store_service::history::{branch, lookup};
@@ -166,13 +166,68 @@ pub struct StoreStats {
     pub stored_bytes: u64,
 }
 
-/// Result of importing a host directory into a new repository (`init --from`).
+/// One host directory source for `init --from`, with an optional explicit branch name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportSource {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+}
+
+/// Parses a `--from` source spec of the form `<path_to_dir>` or `<path_to_dir>:<branch_name>`.
+///
+/// Preserves Windows drive-letter colons (`C:\foo`, `C:`, `\\?\C:\foo`) while splitting a
+/// trailing `:branch_name` suffix that contains no path separators.
+pub fn parse_import_source(spec: &str) -> Result<ImportSource> {
+    if spec.is_empty() {
+        return Err(Error::InvalidInput("`--from` source cannot be empty".into()));
+    }
+    if let Some(colon_idx) = spec.rfind(':') {
+        let is_drive_colon = colon_idx == 1 && spec.as_bytes()[0].is_ascii_alphabetic();
+        let after = &spec[colon_idx + 1..];
+        let after_has_sep = after.contains('\\') || after.contains('/');
+        if !is_drive_colon && !after_has_sep {
+            let raw_path = &spec[..colon_idx];
+            if raw_path.is_empty() {
+                return Err(Error::InvalidInput(format!(
+                    "missing source directory before `:` in `{spec}`"
+                )));
+            }
+            if after.is_empty() {
+                return Err(Error::InvalidInput(format!(
+                    "missing branch name after `:` in `{spec}`"
+                )));
+            }
+            return Ok(ImportSource {
+                path: PathBuf::from(raw_path),
+                branch: Some(after.to_owned()),
+            });
+        }
+    }
+    Ok(ImportSource {
+        path: PathBuf::from(spec),
+        branch: None,
+    })
+}
+
+/// Summary of one branch imported during `init --from`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportedBranchSummary {
+    pub branch: String,
+    pub source: PathBuf,
+    pub entries: u64,
+    pub root: String,
+    pub commit: Option<String>,
+}
+
+/// Result of importing one or more host directories into a new repository (`init --from`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportSummary {
-    /// Total entries imported (including the root directory).
+    /// Total entries imported across all source directories (including root directories).
     pub entries: u64,
-    /// Hex-encoded genesis filesystem root object ID.
+    /// Hex-encoded root object ID of the last imported tree (or empty genesis).
     pub root: String,
+    /// Per-directory imported branch details, in input order.
+    pub branches: Vec<ImportedBranchSummary>,
 }
 
 /// Result of SQLite incremental space reclamation (`compact`).
@@ -235,37 +290,53 @@ impl Repo {
         profile: PersistenceProfile,
         volume_size_bytes: u64,
     ) -> Result<Self> {
-        let (repo, _) = Self::init_inner(dir.as_ref(), None, profile, volume_size_bytes)?;
+        let (repo, _) = Self::init_inner(dir.as_ref(), &[], profile, volume_size_bytes)?;
         Ok(repo)
     }
 
-    /// Creates a new repository directory initialized from an existing host directory
-    /// using upstream `layerfs-project` streaming import (4-worker parallel CDC + packing).
+    /// Creates a new repository directory initialized from one existing host directory,
+    /// automatically creating a branch named after the directory's basename.
     pub fn init_from(
         dir: impl AsRef<Path>,
         source: impl AsRef<Path>,
         profile: PersistenceProfile,
         volume_size_bytes: u64,
     ) -> Result<(Self, ImportSummary)> {
-        let source = source.as_ref();
-        if !source.is_dir() {
-            return Err(Error::InvalidInput(format!(
-                "source directory does not exist or is not a directory: {}",
-                source.display()
-            )));
+        let one = ImportSource {
+            path: source.as_ref().to_path_buf(),
+            branch: None,
+        };
+        Self::init_from_many(dir, &[one], profile, volume_size_bytes)
+    }
+
+    /// Creates a new repository directory initialized from one or more host directories.
+    ///
+    /// Each source directory creates a branch (named by explicit `source.branch` or inferred
+    /// from the directory basename) with its imported tree committed on top of the shared
+    /// empty genesis layer. All inputs and branch names are validated upfront before creating
+    /// any directory or SQLite file so duplicate branch names or invalid sources leave zero
+    /// side effects on disk.
+    pub fn init_from_many(
+        dir: impl AsRef<Path>,
+        sources: &[ImportSource],
+        profile: PersistenceProfile,
+        volume_size_bytes: u64,
+    ) -> Result<(Self, ImportSummary)> {
+        if sources.is_empty() {
+            return Err(Error::InvalidInput(
+                "at least one `--from` source directory is required".into(),
+            ));
         }
-        Self::init_inner(dir.as_ref(), Some(source), profile, volume_size_bytes)
+        Self::init_inner(dir.as_ref(), sources, profile, volume_size_bytes)
     }
 
     fn init_inner(
         dir: &Path,
-        source: Option<&Path>,
+        sources: &[ImportSource],
         profile: PersistenceProfile,
         volume_size_bytes: u64,
     ) -> Result<(Self, ImportSummary)> {
         let dir = dir.to_path_buf();
-        let dir_existed = dir.exists();
-        std::fs::create_dir_all(&dir)?;
         let store_path = dir.join("store.sqlite");
         if store_path.exists() {
             return Err(Error::Conflict(format!(
@@ -273,7 +344,72 @@ impl Repo {
                 store_path.display()
             )));
         }
-        kernel_guard::check(&store_path).map_err(|u| Error::Unsupported(u.0))?;
+
+        // Validate every `--from` source and resolve/deduplicate branch names BEFORE creating
+        // any directory or SQLite file, guaranteeing zero side effects on validation errors.
+        let resolved_target = resolve_future_path(&dir);
+        let mut validated_sources: Vec<(PathBuf, String, HistoryName)> =
+            Vec::with_capacity(sources.len());
+        let mut seen_branches: std::collections::HashMap<String, PathBuf> =
+            std::collections::HashMap::with_capacity(sources.len());
+        for src in sources {
+            if !src.path.is_dir() {
+                return Err(Error::InvalidInput(format!(
+                    "source directory does not exist or is not a directory: {}",
+                    src.path.display()
+                )));
+            }
+            let canon_src = std::fs::canonicalize(&src.path).unwrap_or_else(|_| src.path.clone());
+            if path_starts_with_ci(&resolved_target, &canon_src) {
+                return Err(Error::InvalidInput(format!(
+                    "repository path {} cannot lie inside source directory {}",
+                    dir.display(),
+                    src.path.display()
+                )));
+            }
+            let branch_name = match &src.branch {
+                Some(explicit) => explicit.clone(),
+                None => canon_src
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "cannot infer branch name from directory {}; specify `<path>:<branch>` explicitly",
+                            src.path.display()
+                        ))
+                    })?,
+            };
+            if branch_name == "main" {
+                return Err(Error::InvalidInput(format!(
+                    "branch name \"main\" is reserved (from {}); specify `<path>:<branch>` with another name",
+                    src.path.display()
+                )));
+            }
+            let history_name = HistoryName::new(&branch_name).map_err(|_| {
+                Error::InvalidInput(format!(
+                    "invalid branch name {branch_name:?} (from {}); specify `<path>:<branch>` with a valid name",
+                    src.path.display()
+                ))
+            })?;
+            if let Some(previous) = seen_branches.insert(branch_name.clone(), src.path.clone()) {
+                return Err(Error::Conflict(format!(
+                    "duplicate branch name {branch_name:?} (from {} and {}); specify `<path>:<branch>` to disambiguate",
+                    previous.display(),
+                    src.path.display()
+                )));
+            }
+            validated_sources.push((src.path.clone(), branch_name, history_name));
+        }
+
+        let dir_existed = dir.exists();
+        std::fs::create_dir_all(&dir)?;
+        if let Err(err) = kernel_guard::check(&store_path).map_err(|u| Error::Unsupported(u.0)) {
+            if !dir_existed {
+                let _ = std::fs::remove_dir(&dir);
+            }
+            return Err(err);
+        }
 
         let binding_key = format!(
             "layerfs-win:{}",
@@ -319,17 +455,147 @@ impl Repo {
             let storage = Storage::new(handles.storage.clone())
                 .map_err(|e| Error::Other(format!("storage: {e:?}")))?;
 
-            let (stack, summary) = if let Some(src) = source {
+            // Always create the shared empty genesis layer on `main` first so all imported
+            // branches share a common merge base and root directory inode serial.
+            let scope = scope_for_seed(scope_seed);
+            let reservation = handles
+                .history
+                .reserve_inodes(&ReserveRequest {
+                    scope: scope.object(),
+                    count: 1,
+                })
+                .map_err(|e| Error::Other(format!("reserve root inode: {e:?}")))?;
+            let genesis_root_serial = reservation.start;
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let portable = PortableMetadata {
+                mode: 0o755,
+                mtime_seconds: now.as_secs() as i64,
+                mtime_nanoseconds: now.subsec_nanos(),
+            };
+
+            let reader = storage
+                .reader()
+                .map_err(|e| Error::Other(format!("reader: {e:?}")))?;
+            let save = storage
+                .begin_save()
+                .map_err(|e| Error::Other(format!("begin save: {e:?}")))?;
+            let genesis_root = {
+                let mut sink = save.sink();
+                let mut objects = FilesystemObjects::new(&reader, &mut sink);
+                let mode_bytes = portable
+                    .mode_bytes(InodeKind::Directory)
+                    .map_err(|e| Error::Other(format!("mode bytes: {e:?}")))?;
+                let mtime_bytes = portable
+                    .mtime_bytes()
+                    .map_err(|e| Error::Other(format!("mtime bytes: {e:?}")))?;
+                let mode_root = emit_value(&mut objects, &mode_bytes)
+                    .map_err(|e| Error::Other(format!("emit mode: {e:?}")))?;
+                let mtime_root = emit_value(&mut objects, &mtime_bytes)
+                    .map_err(|e| Error::Other(format!("emit mtime: {e:?}")))?;
+                let attr_key_mode = AttributeKey::new("portable".into(), b"mode".to_vec())
+                    .map_err(|e| Error::Other(format!("attr key: {e:?}")))?;
+                let attr_key_mtime = AttributeKey::new("portable".into(), b"mtime".to_vec())
+                    .map_err(|e| Error::Other(format!("attr key: {e:?}")))?;
+                let (dir_meta, _) = build_attribute_tree(
+                    &mut objects,
+                    [
+                        Ok(AttributeEntry {
+                            key: attr_key_mode,
+                            value_root: mode_root,
+                        }),
+                        Ok(AttributeEntry {
+                            key: attr_key_mtime,
+                            value_root: mtime_root,
+                        }),
+                    ]
+                    .into_iter(),
+                )
+                .map_err(|e| Error::Other(format!("attr tree: {e:?}")))?;
+
+                let root_inode = InodeUpdate {
+                    serial: genesis_root_serial,
+                    value: InodeValue {
+                        kind: InodeKind::Directory,
+                        content_root: ObjectId::for_bytes(b"new-directory"),
+                        metadata_root: InodeMetadata::Root(dir_meta),
+                        namespace_ref_count: 0,
+                    },
+                };
+                let root_dir = DirectoryUpdate {
+                    parent: genesis_root_serial,
+                    changes: Vec::new(),
+                };
+                let input = FilesystemInput {
+                    base: None,
+                    scope,
+                    root_serial: genesis_root_serial,
+                    directories: &[root_dir],
+                    inodes: &[root_inode],
+                    new_inodes: &[genesis_root_serial],
+                    resources: FilesystemResources::default(),
+                };
+                build_filesystem(&mut objects, &input, None)
+                    .map_err(|e| Error::Other(format!("build empty root: {e:?}")))?
+                    .root
+            };
+            save.finish()
+                .map_err(|e| Error::Other(format!("finish genesis save: {e:?}")))?;
+
+            let reader = storage
+                .reader()
+                .map_err(|e| Error::Other(format!("reader after save: {e:?}")))?;
+            let logical = logical_size(&reader, genesis_root)
+                .map_err(|e| Error::Other(format!("logical size: {e:?}")))?;
+            let stack = handles
+                .history
+                .initialize_layerstack(&StackInitialization {
+                    stack: stack_id,
+                    name: stack_name.clone(),
+                    scope: scope.object(),
+                    profile: profile_id(),
+                    genesis_root: genesis_root.0,
+                    logical,
+                })
+                .map_err(|e| Error::Other(format!("initialize layerstack: {e:?}")))?;
+
+            if validated_sources.is_empty() {
+                // Empty init: fork the default writable branch `work` from the genesis layer.
+                let default_name = HistoryName::new(DEFAULT_BRANCH)
+                    .map_err(|e| Error::InvalidInput(format!("default branch: {e:?}")))?;
+                handles
+                    .history
+                    .fork(&ForkRequest {
+                        stack: stack.id,
+                        branch: BranchId::named(stack.id, &default_name),
+                        name: default_name,
+                        source: ForkSource::Layer(stack.head_layer),
+                    })
+                    .map_err(|e| Error::Other(format!("fork default branch: {e:?}")))?;
+                return Ok(ImportSummary {
+                    entries: 1,
+                    root: encode_hex(genesis_root.0.as_bytes()),
+                    branches: Vec::new(),
+                });
+            }
+
+            let mut total_entries = 0u64;
+            let mut last_root = encode_hex(genesis_root.0.as_bytes());
+            let mut imported_branches = Vec::with_capacity(validated_sources.len());
+
+            for (src_path, branch_name, history_name) in &validated_sources {
                 let (imported, _) = Timing::disabled("layerfs.init_from", |timer| {
-                    import_project(
+                    import_tree(
                         &storage,
                         &handles.history,
-                        InitRequest {
-                            source: src,
+                        ImportTreeRequest {
+                            source: src_path,
                             acquisition: &handles.acquisition,
-                            stack: stack_id,
-                            name: stack_name.clone(),
+                            stack: stack.id,
                             scope_seed,
+                            root_serial: genesis_root_serial,
                             deadline: Instant::now() + Duration::from_secs(3600),
                         },
                         timer,
@@ -339,148 +605,80 @@ impl Repo {
                     ProjectError::BackingInsideSource => Error::InvalidInput(format!(
                         "repository path {} cannot lie inside source directory {}",
                         dir.display(),
-                        src.display()
+                        src_path.display()
                     )),
-                    ProjectError::InvalidInput => {
-                        Error::InvalidInput(format!("invalid source tree at {}", src.display()))
-                    }
+                    ProjectError::InvalidInput => Error::InvalidInput(format!(
+                        "invalid source tree at {}",
+                        src_path.display()
+                    )),
                     ProjectError::Unsupported => Error::Unsupported(format!(
                         "source tree {} contains unsupported entry types",
-                        src.display()
+                        src_path.display()
                     )),
-                    other => Error::Other(format!("import {}: {other}", src.display())),
+                    other => Error::Other(format!("import {}: {other}", src_path.display())),
                 })?;
+
+                let forked = handles
+                    .history
+                    .fork(&ForkRequest {
+                        stack: stack.id,
+                        branch: BranchId::named(stack.id, history_name),
+                        name: history_name.clone(),
+                        source: ForkSource::Layer(stack.head_layer),
+                    })
+                    .map_err(|e| Error::Other(format!("fork branch {branch_name}: {e:?}")))?;
+
+                let mut meta = CommitMeta::new(CommitVia::Files);
+                meta.message = Some(format!("import {}", src_path.display()));
+                meta.statistics = CommitStatistics {
+                    logical: imported.logical_bytes,
+                    new_canonical: imported.canonical_bytes,
+                    new_stored: imported.stored_bytes,
+                    new_metadata: imported.metadata_bytes,
+                };
+                let outcome = handles
+                    .history
+                    .commit_branch(&CommitRequest {
+                        branch: forked.branch.id,
+                        expected_head: forked.branch.head_commit,
+                        expected_base: forked.branch.base_layer,
+                        expected_root: forked.effective_root,
+                        candidate_root: imported.root,
+                        profile: profile_id(),
+                        scope: scope.object(),
+                        second_parent: None,
+                        meta,
+                        force: false,
+                    })
+                    .map_err(|e| Error::Other(format!("commit imported branch {branch_name}: {e:?}")))?;
+
+                let commit_hex = match outcome {
+                    CommitOutcome::Committed { record, .. } => {
+                        Some(encode_hex(record.id.as_slice()))
+                    }
+                    CommitOutcome::UpToDate { head, .. } => {
+                        head.map(|id| encode_hex(id.as_slice()))
+                    }
+                };
+                let root_hex = encode_hex(imported.root.as_bytes());
+                total_entries = total_entries.saturating_add(imported.entries);
+                last_root = root_hex.clone();
+                imported_branches.push(ImportedBranchSummary {
+                    branch: branch_name.clone(),
+                    source: src_path.clone(),
+                    entries: imported.entries,
+                    root: root_hex,
+                    commit: commit_hex,
+                });
                 // Best-effort reclaim of discarded acquisition working pages.
                 let _ = handles.reclaim_space(RECLAMATION_PAGE_LIMIT);
-                let summary = ImportSummary {
-                    entries: imported.entries,
-                    root: encode_hex(imported.root.as_bytes()),
-                };
-                (imported.stack, summary)
-            } else {
-                let scope = scope_for_seed(scope_seed);
-                let reservation = handles
-                    .history
-                    .reserve_inodes(&ReserveRequest {
-                        scope: scope.object(),
-                        count: 1,
-                    })
-                    .map_err(|e| Error::Other(format!("reserve root inode: {e:?}")))?;
-                let root_serial = reservation.start;
+            }
 
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default();
-                let portable = PortableMetadata {
-                    mode: 0o755,
-                    mtime_seconds: now.as_secs() as i64,
-                    mtime_nanoseconds: now.subsec_nanos(),
-                };
-
-                let reader = storage
-                    .reader()
-                    .map_err(|e| Error::Other(format!("reader: {e:?}")))?;
-                let save = storage
-                    .begin_save()
-                    .map_err(|e| Error::Other(format!("begin save: {e:?}")))?;
-                let built_root = {
-                    let mut sink = save.sink();
-                    let mut objects = FilesystemObjects::new(&reader, &mut sink);
-                    let mode_bytes = portable
-                        .mode_bytes(InodeKind::Directory)
-                        .map_err(|e| Error::Other(format!("mode bytes: {e:?}")))?;
-                    let mtime_bytes = portable
-                        .mtime_bytes()
-                        .map_err(|e| Error::Other(format!("mtime bytes: {e:?}")))?;
-                    let mode_root = emit_value(&mut objects, &mode_bytes)
-                        .map_err(|e| Error::Other(format!("emit mode: {e:?}")))?;
-                    let mtime_root = emit_value(&mut objects, &mtime_bytes)
-                        .map_err(|e| Error::Other(format!("emit mtime: {e:?}")))?;
-                    let attr_key_mode = AttributeKey::new("portable".into(), b"mode".to_vec())
-                        .map_err(|e| Error::Other(format!("attr key: {e:?}")))?;
-                    let attr_key_mtime = AttributeKey::new("portable".into(), b"mtime".to_vec())
-                        .map_err(|e| Error::Other(format!("attr key: {e:?}")))?;
-                    let (dir_meta, _) = build_attribute_tree(
-                        &mut objects,
-                        [
-                            Ok(AttributeEntry {
-                                key: attr_key_mode,
-                                value_root: mode_root,
-                            }),
-                            Ok(AttributeEntry {
-                                key: attr_key_mtime,
-                                value_root: mtime_root,
-                            }),
-                        ]
-                        .into_iter(),
-                    )
-                    .map_err(|e| Error::Other(format!("attr tree: {e:?}")))?;
-
-                    let root_inode = InodeUpdate {
-                        serial: root_serial,
-                        value: InodeValue {
-                            kind: InodeKind::Directory,
-                            content_root: ObjectId::for_bytes(b"new-directory"),
-                            metadata_root: InodeMetadata::Root(dir_meta),
-                            namespace_ref_count: 0,
-                        },
-                    };
-                    let root_dir = DirectoryUpdate {
-                        parent: root_serial,
-                        changes: Vec::new(),
-                    };
-                    let input = FilesystemInput {
-                        base: None,
-                        scope,
-                        root_serial,
-                        directories: &[root_dir],
-                        inodes: &[root_inode],
-                        new_inodes: &[root_serial],
-                        resources: FilesystemResources::default(),
-                    };
-                    build_filesystem(&mut objects, &input, None)
-                        .map_err(|e| Error::Other(format!("build empty root: {e:?}")))?
-                        .root
-                };
-                save.finish()
-                    .map_err(|e| Error::Other(format!("finish genesis save: {e:?}")))?;
-
-                let reader = storage
-                    .reader()
-                    .map_err(|e| Error::Other(format!("reader after save: {e:?}")))?;
-                let logical = logical_size(&reader, built_root)
-                    .map_err(|e| Error::Other(format!("logical size: {e:?}")))?;
-                let stack = handles
-                    .history
-                    .initialize_layerstack(&StackInitialization {
-                        stack: stack_id,
-                        name: stack_name.clone(),
-                        scope: scope.object(),
-                        profile: profile_id(),
-                        genesis_root: built_root.0,
-                        logical,
-                    })
-                    .map_err(|e| Error::Other(format!("initialize layerstack: {e:?}")))?;
-                let summary = ImportSummary {
-                    entries: 1,
-                    root: encode_hex(built_root.0.as_bytes()),
-                };
-                (stack, summary)
-            };
-
-            // Fork the default writable branch `work` from the genesis layer.
-            let default_name = HistoryName::new(DEFAULT_BRANCH)
-                .map_err(|e| Error::InvalidInput(format!("default branch: {e:?}")))?;
-            handles
-                .history
-                .fork(&ForkRequest {
-                    stack: stack.id,
-                    branch: BranchId::named(stack.id, &default_name),
-                    name: default_name,
-                    source: ForkSource::Layer(stack.head_layer),
-                })
-                .map_err(|e| Error::Other(format!("fork default branch: {e:?}")))?;
-            Ok(summary)
+            Ok(ImportSummary {
+                entries: total_entries,
+                root: last_root,
+                branches: imported_branches,
+            })
         })();
 
         let summary = match init_result {
@@ -638,6 +836,33 @@ impl Repo {
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Resolves a branch name when the caller omitted `--branch`:
+    /// uses `requested` if given, otherwise `"work"` if present, otherwise the sole branch
+    /// when exactly one branch exists.
+    pub fn resolve_default_branch(&self, requested: Option<&str>) -> Result<String> {
+        if let Some(name) = requested {
+            return Ok(name.to_owned());
+        }
+        let branches = self.branches()?;
+        if branches.iter().any(|b| b.name == DEFAULT_BRANCH) {
+            return Ok(DEFAULT_BRANCH.to_owned());
+        }
+        match branches.as_slice() {
+            [] => Err(Error::NotFound("repository has no branches".into())),
+            [only] => Ok(only.name.clone()),
+            many => {
+                let names = many
+                    .iter()
+                    .map(|b| b.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(Error::InvalidInput(format!(
+                    "multiple branches exist ({names}); specify `--branch <name>`"
+                )))
+            }
+        }
     }
 
     /// Configured virtual volume size.
@@ -1093,4 +1318,112 @@ fn decode_hex_array<const N: usize>(text: &str) -> Result<[u8; N]> {
             .map_err(|_| Error::InvalidInput(format!("invalid hex at byte {i}")))?;
     }
     Ok(out)
+}
+
+fn resolve_future_path(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut missing = Vec::new();
+    let mut cursor = abs.as_path();
+    while !cursor.exists() {
+        let Some(name) = cursor.file_name() else {
+            return abs;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            return abs;
+        };
+        cursor = parent;
+    }
+    let mut resolved = std::fs::canonicalize(cursor).unwrap_or_else(|_| cursor.to_path_buf());
+    for part in missing.into_iter().rev() {
+        resolved.push(part);
+    }
+    resolved
+}
+
+fn path_starts_with_ci(candidate: &Path, ancestor: &Path) -> bool {
+    let norm = |p: &Path| -> PathBuf {
+        let s = p.to_string_lossy();
+        let trimmed = s.strip_prefix("\\\\?\\").unwrap_or(&s);
+        #[cfg(windows)]
+        {
+            PathBuf::from(trimmed.to_ascii_lowercase())
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from(trimmed)
+        }
+    };
+    norm(candidate).starts_with(norm(ancestor))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_import_source, ImportSource};
+    use std::path::PathBuf;
+
+    #[test]
+    fn parse_import_source_handles_windows_paths_and_branch_suffixes() {
+        assert_eq!(
+            parse_import_source(r"F:\work\proj").unwrap(),
+            ImportSource {
+                path: PathBuf::from(r"F:\work\proj"),
+                branch: None,
+            }
+        );
+        assert_eq!(
+            parse_import_source(r"F:\work\proj:feat-a").unwrap(),
+            ImportSource {
+                path: PathBuf::from(r"F:\work\proj"),
+                branch: Some("feat-a".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse_import_source(r"\\?\C:\dir\sub").unwrap(),
+            ImportSource {
+                path: PathBuf::from(r"\\?\C:\dir\sub"),
+                branch: None,
+            }
+        );
+        assert_eq!(
+            parse_import_source(r"\\?\C:\dir\sub:v2").unwrap(),
+            ImportSource {
+                path: PathBuf::from(r"\\?\C:\dir\sub"),
+                branch: Some("v2".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse_import_source(r".\local\app:custom").unwrap(),
+            ImportSource {
+                path: PathBuf::from(r".\local\app"),
+                branch: Some("custom".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse_import_source("proj").unwrap(),
+            ImportSource {
+                path: PathBuf::from("proj"),
+                branch: None,
+            }
+        );
+        assert_eq!(
+            parse_import_source("proj:dev").unwrap(),
+            ImportSource {
+                path: PathBuf::from("proj"),
+                branch: Some("dev".to_owned()),
+            }
+        );
+        assert!(parse_import_source("").is_err());
+        assert!(parse_import_source(r"F:\work\proj:").is_err());
+        assert!(parse_import_source(":only-branch").is_err());
+    }
 }

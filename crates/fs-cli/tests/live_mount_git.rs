@@ -317,13 +317,13 @@ fn live_mount_hot_switch_merge_conflict_and_concurrent_io() {
     let repo_dir = tmp.0.join("repo");
     let mount_dir = tmp.0.join("mnt");
 
-    // 1. Initialize from seed directory (`init --from`).
+    // 1. Initialize from seed directory into explicit branch `work` (`init --from <dir>:work`).
     let init = Command::new(bin())
         .args([
             "init",
             repo_dir.to_str().unwrap(),
             "--from",
-            seed_dir.to_str().unwrap(),
+            &format!("{}:work", seed_dir.display()),
             "--disposable",
         ])
         .env("LAYERFS_MOUNTS_DIR", &mounts_dir)

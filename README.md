@@ -33,9 +33,9 @@ cargo build --release -p fs-cli
 ## Quick Start
 
 ```powershell
-# 1. Create an empty repository, or import an existing host directory via `--from`
+# 1. Create an empty repository, or import one/more host directories into branches via `--from`
 layerfs init F:\my-repo --durable --size 128G
-layerfs init F:\imported-repo --from F:\existing-project --durable
+layerfs init F:\imported-repo --from F:\proj-a --from F:\v2\proj-a:proj-a-v2 --durable
 
 # 2. Mount the default writable branch `work` to a drive letter or directory mount point
 layerfs --store F:\my-repo mount Z: --branch work
@@ -75,7 +75,7 @@ layerfs --store F:\my-repo compact
 
 | Command | Description |
 | --- | --- |
-| `layerfs init <path> [--from <dir>] [--durable\|--disposable] [--size <size>]` | Initialize an upstream-compatible LayerFS repository (optionally importing `<dir>`) |
+| `layerfs init <path> [--from <dir>[:<branch>] ...] [--durable\|--disposable] [--size <size>]` | Initialize an upstream-compatible LayerFS repository (importing one or more directories as branches) |
 | `layerfs branch [<name>] [--from <src>]` | List branches or fork a new branch |
 | `layerfs fork <name> [--from <src>]` | Alias for `branch <name> [--from <src>]` |
 | `layerfs checkout <branch>` | Verify a branch, or hot-switch the current mount when run inside one |

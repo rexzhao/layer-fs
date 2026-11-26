@@ -18,7 +18,9 @@ pub(crate) use import::namespace;
 pub use import::observe::{InitCounters, InitCounts, InitStep};
 #[cfg(any(unix, windows))]
 pub(crate) use import::scan;
-pub use init::{init, init_observed, InitRequest, Initialized};
+pub use init::{
+    import_tree, init, init_observed, ImportTreeRequest, ImportedTree, InitRequest, Initialized,
+};
 
 pub(crate) use import::work as namespace_work;
 pub use namespace_work::NamespaceWork;

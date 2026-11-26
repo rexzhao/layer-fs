@@ -62,6 +62,15 @@ impl ImportProgress {
     }
 }
 
+#[inline]
+fn serial_of(root_serial: u64, child_start: u64, id: u64) -> u64 {
+    if id == 0 {
+        root_serial
+    } else {
+        child_start + (id - 1)
+    }
+}
+
 /// Builds one logical namespace and returns its root with the tree save still
 /// open, so the caller removes working state before anything is published.
 pub(crate) fn build_namespace<'a>(
@@ -73,8 +82,37 @@ pub(crate) fn build_namespace<'a>(
     backing: &Backing<'_>,
     progress: &mut ImportProgress,
 ) -> Result<(ObjectId, Save<'a>), Failure> {
-    root_serial
-        .checked_add(scanned.entries)
+    build_namespace_with_children(
+        store,
+        provider,
+        scope,
+        root_serial,
+        root_serial.saturating_add(1),
+        scanned,
+        backing,
+        progress,
+    )
+}
+
+/// Builds one logical namespace where position `0` reuses `root_serial` and
+/// positions `1..` take consecutive serials starting at `child_start`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_namespace_with_children<'a>(
+    store: &'a Storage,
+    provider: &dyn AuthenticatedObjects,
+    scope: InodeScope,
+    root_serial: u64,
+    child_start: u64,
+    scanned: &Scanned,
+    backing: &Backing<'_>,
+    progress: &mut ImportProgress,
+) -> Result<(ObjectId, Save<'a>), Failure> {
+    let child_count = scanned.entries.saturating_sub(1);
+    if child_count > 0 && child_start <= root_serial {
+        return Err(Failure::InvalidInput);
+    }
+    child_start
+        .checked_add(child_count)
         .filter(|end| *end <= i64::MAX as u64)
         .ok_or(Failure::Capacity)?;
     progress.tick()?;
@@ -82,8 +120,17 @@ pub(crate) fn build_namespace<'a>(
     let built = {
         let mut sink = save.sink();
         let mut objects = FilesystemObjects::new(provider, &mut sink);
-        directories(&mut objects, root_serial, backing, progress)
-            .and_then(|()| table(&mut objects, scope, root_serial, scanned, backing, progress))
+        directories(&mut objects, root_serial, child_start, backing, progress).and_then(|()| {
+            table(
+                &mut objects,
+                scope,
+                root_serial,
+                child_start,
+                scanned,
+                backing,
+                progress,
+            )
+        })
     };
     let root = match save.take_failure() {
         Some(error) => Err(storage(error)),
@@ -96,6 +143,7 @@ pub(crate) fn build_namespace<'a>(
 fn directories(
     objects: &mut FilesystemObjects<'_>,
     root_serial: u64,
+    child_start: u64,
     backing: &Backing<'_>,
     progress: &mut ImportProgress,
 ) -> Result<(), Failure> {
@@ -130,7 +178,10 @@ fn directories(
                 Ok(binding) => {
                     let (name, id) = binding?;
                     bound += 1;
-                    Some(PathName::from_bytes(&name).map(|name| (name, root_serial + id)))
+                    Some(
+                        PathName::from_bytes(&name)
+                            .map(|name| (name, serial_of(root_serial, child_start, id))),
+                    )
                 }
                 Err(error) => {
                     failure = Some(error);
@@ -156,6 +207,7 @@ fn table(
     objects: &mut FilesystemObjects<'_>,
     scope: InodeScope,
     root_serial: u64,
+    child_start: u64,
     scanned: &Scanned,
     backing: &Backing<'_>,
     progress: &mut ImportProgress,
@@ -202,7 +254,7 @@ fn table(
                     }
                 };
                 return Ok(Some((
-                    root_serial + id,
+                    serial_of(root_serial, child_start, id),
                     InodeValue {
                         kind: entry.kind,
                         namespace_ref_count: count,

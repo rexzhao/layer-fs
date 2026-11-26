@@ -7,13 +7,16 @@ mod mountcmd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use fs_layerfs::{Error as LayerError, PersistenceProfile, Repo, DEFAULT_BRANCH};
+use fs_layerfs::{
+    parse_import_source, Error as LayerError, ImportSource, PersistenceProfile, Repo,
+    DEFAULT_BRANCH,
+};
 
 const USAGE: &str = "\
 layerfs [--store <dir>] [--branch <name>] <command> [args]
 
-  init <path> [--from <dir>] [--durable|--disposable] [--size <size>]
-                                  create a repository (optionally importing an existing directory)
+  init <path> [--from <dir>[:<branch>] ...] [--durable|--disposable] [--size <size>]
+                                  create a repository (optionally importing one or more directories as branches)
   branch [<name>] [--from <src>]  list branches, or fork a new branch from <src> (default: main)
   fork <name> [--from <src>]      alias for `branch <name> [--from <src>]`
   checkout <branch>               verify a branch; from inside a mount, hot-switch that mount to <branch>
@@ -106,7 +109,7 @@ fn parse_size(text: &str) -> Result<u64, Box<dyn std::error::Error>> {
 
 fn command_help(command: &str) -> Option<&'static str> {
     Some(match command {
-        "init" => "init <path> [--from <dir>] [--durable|--disposable] [--size <size>]\n  Create an upstream-compatible LayerFS repository with `main` layer stack and default writable\n  branch `work`. Pass `--from <dir>` to import an existing directory via upstream `layerfs-project`.\n  Defaults to `--durable` (SQLite WAL/FULL) and 128 GiB advertised size; `--disposable` uses WAL/OFF.",
+        "init" => "init <path> [--from <dir>[:<branch>] ...] [--durable|--disposable] [--size <size>]\n  Create an upstream-compatible LayerFS repository with `main` layer stack. Without `--from`,\n  creates an empty default branch `work`. With one or more `--from <dir>[:<branch>]` sources\n  (repeatable or space-separated), imports each directory into a branch named after the directory\n  basename (or the explicit `<branch>` suffix) with cross-branch CAS deduplication. Duplicate\n  branch names or invalid sources fail before creating any files.\n  Defaults to `--durable` (SQLite WAL/FULL) and 128 GiB advertised size; `--disposable` uses WAL/OFF.",
         "branch" => "branch [<name>] [--from <src>]\n  With no name: list `main` and all branches. With a name: fork a new branch from `<src>`\n  (default `main`).",
         "fork" => "fork <name> [--from <src>]\n  Fork a new writable branch `<name>` from `<src>` (default `main`).",
         "checkout" => "checkout <branch>\n  Verify `<branch>` exists; when run from inside a live mount, hot-switch that mount to `<branch>`.",
@@ -330,7 +333,7 @@ fn cmd_init(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut profile = PersistenceProfile::Durable;
     let mut volume_size = DEFAULT_VOLUME_SIZE_BYTES;
-    let mut from_dir: Option<PathBuf> = None;
+    let mut from_specs: Vec<String> = Vec::new();
     let mut positional: Option<PathBuf> = None;
     let mut i = 0;
     while i < arguments.len() {
@@ -344,14 +347,25 @@ fn cmd_init(
                 i += 1;
             }
             "--from" => {
-                let raw = arguments
-                    .get(i + 1)
-                    .ok_or_else(|| fs_cli::Failure::usage("--from requires a directory path"))?;
-                from_dir = Some(PathBuf::from(raw));
+                let first = arguments.get(i + 1).ok_or_else(|| {
+                    fs_cli::Failure::usage("--from requires at least one `<dir>[:<branch>]` path")
+                })?;
+                from_specs.push(first.clone());
                 i += 2;
+                // When the target repo path is already known (`init <path> --from d1 d2`), also
+                // accept space-separated `<dir>[:<branch>]` specs until the next option flag.
+                if positional.is_some() || explicit_store.is_some() {
+                    while let Some(next) = arguments.get(i) {
+                        if next.starts_with('-') {
+                            break;
+                        }
+                        from_specs.push(next.clone());
+                        i += 1;
+                    }
+                }
             }
             other if other.starts_with("--from=") => {
-                from_dir = Some(PathBuf::from(&other["--from=".len()..]));
+                from_specs.push(other["--from=".len()..].to_owned());
                 i += 1;
             }
             "--size" => {
@@ -369,6 +383,12 @@ fn cmd_init(
                 return Err(fs_cli::Failure::usage(format!("unknown init option {other:?}")).into());
             }
             other => {
+                if positional.is_some() {
+                    return Err(fs_cli::Failure::usage(format!(
+                        "unexpected extra positional argument {other:?}; pass additional import directories via `--from <dir>[:<branch>]`"
+                    ))
+                    .into());
+                }
                 positional = Some(PathBuf::from(other));
                 i += 1;
             }
@@ -378,22 +398,40 @@ fn cmd_init(
         .or_else(|| explicit_store.map(Path::to_path_buf))
         .ok_or_else(|| {
             fs_cli::Failure::usage(
-                "usage: layerfs init <path> [--from <dir>] [--durable|--disposable] [--size <size>]",
+                "usage: layerfs init <path> [--from <dir>[:<branch>] ...] [--durable|--disposable] [--size <size>]",
             )
         })?;
 
-    if let Some(source) = from_dir {
-        let (repo, summary) = Repo::init_from(&path, &source, profile, volume_size)?;
+    if !from_specs.is_empty() {
+        let sources: Vec<ImportSource> = from_specs
+            .iter()
+            .map(|spec| parse_import_source(spec))
+            .collect::<fs_layerfs::Result<_>>()?;
+        let (repo, summary) = Repo::init_from_many(&path, &sources, profile, volume_size)?;
         let stats = repo.stats()?;
+        let branch_names = summary
+            .branches
+            .iter()
+            .map(|b| b.branch.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         println!(
-            "initialized {} from {} (entries={}, profile={}, default branch={}, main={})",
+            "initialized {} (branches=[{branch_names}], entries={}, profile={}, main={})",
             path.display(),
-            source.display(),
             summary.entries,
             repo.profile().as_str(),
-            DEFAULT_BRANCH,
             short(&stats.head_layer),
         );
+        for item in &summary.branches {
+            println!(
+                "  branch {} <- {} (entries={}, commit={}, root={})",
+                item.branch,
+                item.source.display(),
+                item.entries,
+                item.commit.as_deref().map_or("-", short),
+                short(&item.root),
+            );
+        }
     } else {
         let repo = Repo::init(&path, profile, volume_size)?;
         let stats = repo.stats()?;
@@ -619,15 +657,12 @@ fn cmd_log(
     let named = arguments
         .first()
         .filter(|text| !text.starts_with('-') && text.parse::<usize>().is_err());
-    let branch = named
-        .map(String::as_str)
-        .or(active_branch)
-        .unwrap_or(DEFAULT_BRANCH);
+    let branch = repo.resolve_default_branch(named.map(String::as_str).or(active_branch))?;
     let limit = arguments
         .iter()
         .find_map(|text| text.parse::<usize>().ok())
         .unwrap_or(50);
-    let commits = repo.log(branch, limit)?;
+    let commits = repo.log(&branch, limit)?;
     if commits.is_empty() {
         println!("no commits on {branch}");
         return Ok(());
@@ -647,7 +682,7 @@ fn cmd_offline_status(
     repo: &Repo,
     active_branch: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let branch = active_branch.unwrap_or(DEFAULT_BRANCH);
+    let branch = repo.resolve_default_branch(active_branch)?;
     let Some(info) = repo.branches()?.into_iter().find(|b| b.name == branch) else {
         return Err(fs_cli::Failure::not_found(format!("branch {branch:?} not found")).into());
     };

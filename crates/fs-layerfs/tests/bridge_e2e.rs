@@ -297,8 +297,10 @@ fn init_from_host_directory_and_reclaim_space() {
     )
     .expect("init_from");
     assert_eq!(imported.entries, 6, "root + Nested + EmptyDir + 3 files");
+    assert_eq!(imported.branches.len(), 1);
+    assert_eq!(imported.branches[0].branch, "src_tree");
 
-    let ws = repo.open_workspace(DEFAULT_BRANCH).unwrap();
+    let ws = repo.open_workspace("src_tree").unwrap();
     let ops = ws.backend();
 
     let f_root = ops
@@ -337,4 +339,155 @@ fn init_from_host_directory_and_reclaim_space() {
     // Incremental SQLite space reclamation succeeds cleanly.
     let reclaimed = Repo::reclaim_space(&repo_dir, Some(64)).expect("reclaim_space");
     assert!(reclaimed.remaining_free_pages <= reclaimed.free_pages_before);
+}
+
+#[test]
+fn init_from_multiple_directories_branches_diff_merge_and_zero_side_effects() {
+    let tmp = TempDir::new("import-multi");
+    let v1_app = tmp.0.join("v1").join("app");
+    let v2_app = tmp.0.join("v2").join("app");
+    let docs = tmp.0.join("docs");
+    std::fs::create_dir_all(&v1_app).unwrap();
+    std::fs::create_dir_all(&v2_app).unwrap();
+    std::fs::create_dir_all(&docs).unwrap();
+
+    std::fs::write(v1_app.join("only_a.txt"), b"from v1\n").unwrap();
+    std::fs::write(v1_app.join("shared.bin"), vec![42u8; 64 * 1024]).unwrap();
+    std::fs::write(v2_app.join("only_b.txt"), b"from v2\n").unwrap();
+    std::fs::write(v2_app.join("shared.bin"), vec![42u8; 64 * 1024]).unwrap();
+    std::fs::write(docs.join("readme.md"), b"# docs\n").unwrap();
+
+    // 1. Duplicate inferred branch name (`app` vs `app`) fails with Conflict and ZERO side effects.
+    let dup_repo = tmp.0.join("dup-repo");
+    let dup_err = Repo::init_from_many(
+        &dup_repo,
+        &[
+            fs_layerfs::ImportSource {
+                path: v1_app.clone(),
+                branch: None,
+            },
+            fs_layerfs::ImportSource {
+                path: v2_app.clone(),
+                branch: None,
+            },
+        ],
+        PersistenceProfile::Disposable,
+        DEFAULT_VOLUME_SIZE_BYTES,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(dup_err, fs_layerfs::Error::Conflict(_)),
+        "expected Conflict for duplicate branch name, got {dup_err:?}"
+    );
+    assert!(
+        !dup_repo.exists(),
+        "duplicate branch failure must not create repo directory"
+    );
+
+    // 2. Explicit duplicate branch name (`same` vs `same`) fails with ZERO side effects.
+    let dup_explicit_repo = tmp.0.join("dup-explicit-repo");
+    let dup_explicit_err = Repo::init_from_many(
+        &dup_explicit_repo,
+        &[
+            fs_layerfs::ImportSource {
+                path: v1_app.clone(),
+                branch: Some("same".to_owned()),
+            },
+            fs_layerfs::ImportSource {
+                path: docs.clone(),
+                branch: Some("same".to_owned()),
+            },
+        ],
+        PersistenceProfile::Disposable,
+        DEFAULT_VOLUME_SIZE_BYTES,
+    )
+    .unwrap_err();
+    assert!(matches!(dup_explicit_err, fs_layerfs::Error::Conflict(_)));
+    assert!(!dup_explicit_repo.exists());
+
+    // 3. Multi-directory import with explicit `:branch` disambiguation + auto-inferred `docs`.
+    let repo_dir = tmp.0.join("multi-repo");
+    let (repo, summary) = Repo::init_from_many(
+        &repo_dir,
+        &[
+            fs_layerfs::ImportSource {
+                path: v1_app.clone(),
+                branch: Some("app-v1".to_owned()),
+            },
+            fs_layerfs::ImportSource {
+                path: v2_app.clone(),
+                branch: Some("app-v2".to_owned()),
+            },
+            fs_layerfs::ImportSource {
+                path: docs.clone(),
+                branch: None,
+            },
+        ],
+        PersistenceProfile::Disposable,
+        DEFAULT_VOLUME_SIZE_BYTES,
+    )
+    .expect("init_from_many");
+    let names: Vec<&str> = summary.branches.iter().map(|b| b.branch.as_str()).collect();
+    assert_eq!(names, vec!["app-v1", "app-v2", "docs"]);
+
+    // Verify each branch has its own files.
+    let ws1 = repo.open_workspace("app-v1").unwrap();
+    let f1 = ws1
+        .backend()
+        .create_or_open(&Path::new(b"/only_a.txt"), Disposition::Open)
+        .unwrap();
+    assert_eq!(
+        ws1.backend().read(f1.file_id, 0, f1.size as usize).unwrap(),
+        b"from v1\n"
+    );
+    ws1.close().unwrap();
+
+    let ws_docs = repo.open_workspace("docs").unwrap();
+    let fd = ws_docs
+        .backend()
+        .create_or_open(&Path::new(b"/readme.md"), Disposition::Open)
+        .unwrap();
+    assert_eq!(
+        ws_docs
+            .backend()
+            .read(fd.file_id, 0, fd.size as usize)
+            .unwrap(),
+        b"# docs\n"
+    );
+    ws_docs.close().unwrap();
+
+    // Verify `diff` and 3-way `merge` work across independently imported branches (shared genesis root_serial)!
+    let diffs = repo.diff_branches("app-v1", "docs").unwrap();
+    assert!(!diffs.is_empty(), "expected diff between app-v1 and docs");
+
+    let merged = repo
+        .merge("app-v1", "docs", "combined", Some("merge imported branches"))
+        .expect("merge imported branches");
+    assert!(
+        merged.conflicts.is_empty(),
+        "non-overlapping imported branches should merge cleanly: {:?}",
+        merged.conflicts
+    );
+    let ws_m = repo.open_workspace("combined").unwrap();
+    let ma = ws_m
+        .backend()
+        .create_or_open(&Path::new(b"/only_a.txt"), Disposition::Open)
+        .unwrap();
+    let md = ws_m
+        .backend()
+        .create_or_open(&Path::new(b"/readme.md"), Disposition::Open)
+        .unwrap();
+    assert_eq!(
+        ws_m.backend()
+            .read(ma.file_id, 0, ma.size as usize)
+            .unwrap(),
+        b"from v1\n"
+    );
+    assert_eq!(
+        ws_m.backend()
+            .read(md.file_id, 0, md.size as usize)
+            .unwrap(),
+        b"# docs\n"
+    );
+    ws_m.close().unwrap();
 }

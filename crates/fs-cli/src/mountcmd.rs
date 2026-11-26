@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use fs_layerfs::{Error as LayerError, Repo, WorkspaceHandle, DEFAULT_BRANCH};
+use fs_layerfs::{Error as LayerError, Repo, WorkspaceHandle};
 use fs_winfsp::abi::VolumeInfo;
 use fs_winfsp::loader::default_library;
 use fs_winfsp::mounted::mount_serving;
@@ -168,14 +168,11 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
         }
     };
 
-    let name = inline_branch
-        .or(branch)
-        .unwrap_or(DEFAULT_BRANCH)
-        .to_owned();
+    let requested_branch = inline_branch.or(branch).map(str::to_owned);
     let skip_gate = arguments.iter().any(|a| a == "--no-version-gate");
 
     if background {
-        return spawn_background_mount(&store, &mount_point, &name, skip_gate);
+        return spawn_background_mount(&store, &mount_point, requested_branch.as_deref(), skip_gate);
     }
 
     let ready_file = std::env::var_os(MOUNT_READY_ENV).map(PathBuf::from);
@@ -183,7 +180,7 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
     let result = mount_foreground(
         &store,
         &mount_point,
-        &name,
+        requested_branch.as_deref(),
         skip_gate,
         ready_file.as_deref(),
         &signaled_ready,
@@ -235,14 +232,15 @@ fn parse_ready_status(
     text: &str,
     store: &Path,
     mount_point: &Path,
-    branch: &str,
+    fallback_branch: &str,
 ) -> Result<(), Error> {
     let line = text.lines().next().unwrap_or("");
-    let mut parts = line.splitn(3, '\t');
+    let mut parts = line.splitn(4, '\t');
     match parts.next() {
         Some("OK") => {
             let pid = parts.next().unwrap_or("?");
             let profile = parts.next().unwrap_or("unknown");
+            let branch = parts.next().unwrap_or(fallback_branch);
             let wait_start = Instant::now();
             while wait_start.elapsed() < MOUNT_ACCESS_WAIT {
                 if std::fs::read_dir(mount_point).is_ok() {
@@ -270,7 +268,7 @@ fn parse_ready_status(
 fn spawn_background_mount(
     store: &Path,
     mount_point: &Path,
-    branch: &str,
+    branch: Option<&str>,
     skip_gate: bool,
 ) -> Result<(), Error> {
     use std::process::{Command, Stdio};
@@ -285,12 +283,10 @@ fn spawn_background_mount(
 
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
-    cmd.arg("--store")
-        .arg(store)
-        .arg("mount")
-        .arg(mount_point)
-        .arg("--branch")
-        .arg(branch);
+    cmd.arg("--store").arg(store).arg("mount").arg(mount_point);
+    if let Some(name) = branch {
+        cmd.arg("--branch").arg(name);
+    }
     if skip_gate {
         cmd.arg("--no-version-gate");
     }
@@ -310,16 +306,17 @@ fn spawn_background_mount(
 
     let mut child = cmd.spawn()?;
     let started = Instant::now();
+    let fallback_branch = branch.unwrap_or("?");
     while started.elapsed() < MOUNT_READY_TIMEOUT {
         if let Ok(text) = std::fs::read_to_string(&ready_path) {
             if text.starts_with("ERR\t") {
                 let _ = child.wait();
             }
-            return parse_ready_status(&text, store, mount_point, branch);
+            return parse_ready_status(&text, store, mount_point, fallback_branch);
         }
         if let Some(status) = child.try_wait()? {
             if let Ok(text) = std::fs::read_to_string(&ready_path) {
-                return parse_ready_status(&text, store, mount_point, branch);
+                return parse_ready_status(&text, store, mount_point, fallback_branch);
             }
             return Err(format!("background mount process exited prematurely ({status})").into());
         }
@@ -339,7 +336,7 @@ fn spawn_background_mount(
 fn mount_foreground(
     store: &Path,
     mount_point: &Path,
-    name: &str,
+    requested_branch: Option<&str>,
     skip_gate: bool,
     ready_file: Option<&Path>,
     signaled_ready: &Arc<std::sync::atomic::AtomicBool>,
@@ -368,13 +365,14 @@ fn mount_foreground(
     }
 
     let repo = Repo::open(store)?;
+    let name = repo.resolve_default_branch(requested_branch)?;
     let profile_str = repo.profile().as_str().to_owned();
     let volume_total = repo.volume_size_bytes();
     if let Some(warning) = volume_warning(store, volume_total) {
         eprintln!("{warning}");
     }
 
-    let initial_ws = Arc::new(repo.open_workspace(name)?);
+    let initial_ws = Arc::new(repo.open_workspace(&name)?);
 
     std::fs::create_dir_all(mounts_dir())?;
     let state = state_path(mount_point);
@@ -400,8 +398,8 @@ fn mount_foreground(
     let record = switched_record(
         &canonical(store),
         &canonical(mount_point),
-        name,
-        name,
+        &name,
+        &name,
         &pipe,
     );
     let mut record_handle = hold_record(&state, &record)?;
@@ -416,8 +414,8 @@ fn mount_foreground(
     let pipe_serving = Arc::new(PipeServing {
         store: canonical(store),
         current: RwLock::new(Current {
-            workspace: name.to_owned(),
-            branch: name.to_owned(),
+            workspace: name.clone(),
+            branch: name.clone(),
             handle: Arc::clone(&initial_ws),
         }),
         mount_point: canonical(mount_point),
@@ -442,7 +440,7 @@ fn mount_foreground(
     install_console_handler();
 
     let mut current_handle = initial_ws;
-    let mut previous_workspace = name.to_owned();
+    let mut previous_workspace = name.clone();
     let mut previous_handle: Option<Arc<WorkspaceHandle>> = None;
     let pending_switch: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
     let mut report;
@@ -474,7 +472,7 @@ fn mount_foreground(
                     if let Some(ready_path) = ready_file {
                         let _ = write_ready_status(
                             ready_path,
-                            &format!("OK\t{}\t{profile_str}\n", std::process::id()),
+                            &format!("OK\t{}\t{profile_str}\t{name}\n", std::process::id()),
                         );
                     }
                 }
