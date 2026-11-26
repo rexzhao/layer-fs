@@ -771,14 +771,17 @@ pub fn umount(
     let request = fs_cli::pipe::Request {
         v: fs_cli::pipe::PROTOCOL,
         op: "unmount".to_owned(),
-        args: serde_json::json!({ "wait_ms": UNMOUNT_WAIT.as_millis() as u64 }),
+        args: serde_json::json!({
+            "wait_ms": UNMOUNT_WAIT.as_millis() as u64,
+            "force": force,
+        }),
     };
     let answer = fs_cli::pipe_win::call(&pipe, &request, fs_cli::pipe_win::CONNECT_WAIT_MS);
     match answer {
         Ok(fs_cli::pipe::Response::Unmounted {}) => {}
         Ok(fs_cli::pipe::Response::HandlesOpen { handles }) => {
             return Err(fs_cli::Failure::in_use(format!(
-                "{} still has {handles} open handle(s); close them and try again",
+                "{} still has {handles} open file handle(s); close them or pass `--force`",
                 mount_point.display()
             ))
             .into())
@@ -1076,7 +1079,7 @@ impl fs_cli::pipe_win::Serving for PipeServing {
                 let handles = self
                     .0
                     .active_adapter()
-                    .map_or(0, |adapter| adapter.open_handles());
+                    .map_or(0, |adapter| adapter.open_handle_kinds().0);
                 match handle.status() {
                     Ok(status) => fs_cli::pipe::Response::Status {
                         workspace: status.branch.clone(),
@@ -1240,8 +1243,11 @@ impl fs_cli::pipe_win::Serving for PipeServing {
     }
 
     fn open_handles(&self) -> usize {
+        // Count open regular **file** handles only (matching D8 = B / `Gatekeeper::quiesce`):
+        // directory handles (shell CWD, Explorer, mount-point root) do not hold uncommitted data
+        // and must never block orderly unmount.
         self.active_adapter()
-            .map_or(0, |adapter| adapter.open_handles())
+            .map_or(0, |adapter| adapter.open_handle_kinds().0)
     }
 
     fn teardown_complete(&self) -> bool {

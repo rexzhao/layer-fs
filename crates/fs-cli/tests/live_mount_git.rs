@@ -745,4 +745,92 @@ fn live_mount_background_detach_error_propagation_and_umount() {
         "list after umount: {}",
         String::from_utf8_lossy(&list_after.stdout)
     );
+
+    // 8. Regression test: an open **directory** handle (e.g. mount root or shell CWD) must NOT
+    // block `layerfs umount`, while an open **regular file** handle refuses without `--force`
+    // and unmounts cleanly with `--force`.
+    let remount = Command::new(bin())
+        .args(["mount", mount_dir.to_str().unwrap(), "--branch", "work", "-d"])
+        .current_dir(&repo_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .env_remove("LAYERFS_STORE")
+        .output()
+        .expect("remount -d");
+    assert!(
+        remount.status.success(),
+        "remount failed: {}",
+        String::from_utf8_lossy(&remount.stderr)
+    );
+    bg_guard.armed = true;
+
+    // Hold a directory handle on the mount root via Win32 FILE_FLAG_BACKUP_SEMANTICS.
+    let dir_handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&mount_dir)
+            .expect("open mount root directory handle")
+    };
+    let umount_with_dir = Command::new(bin())
+        .args(["umount"])
+        .current_dir(&repo_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .env_remove("LAYERFS_STORE")
+        .output()
+        .expect("umount with open dir handle");
+    assert!(
+        umount_with_dir.status.success(),
+        "directory handle must NOT block umount: {}",
+        String::from_utf8_lossy(&umount_with_dir.stderr)
+    );
+    bg_guard.armed = false;
+    drop(dir_handle);
+
+    // Remount again and hold an open regular file handle.
+    let remount2 = Command::new(bin())
+        .args(["mount", mount_dir.to_str().unwrap(), "--branch", "work", "-d"])
+        .current_dir(&repo_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .env_remove("LAYERFS_STORE")
+        .output()
+        .expect("remount2 -d");
+    assert!(
+        remount2.status.success(),
+        "remount2 failed: {}",
+        String::from_utf8_lossy(&remount2.stderr)
+    );
+    bg_guard.armed = true;
+
+    let file_handle = std::fs::File::open(mount_dir.join("bg.txt")).expect("open regular file");
+    let umount_refused = Command::new(bin())
+        .args(["umount"])
+        .current_dir(&repo_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .env_remove("LAYERFS_STORE")
+        .output()
+        .expect("umount with open file");
+    assert_eq!(
+        umount_refused.status.code(),
+        Some(4),
+        "expected exit 4 when regular file handle is open, got {:?}, stderr={}",
+        umount_refused.status.code(),
+        String::from_utf8_lossy(&umount_refused.stderr)
+    );
+
+    let umount_forced = Command::new(bin())
+        .args(["umount", "--force"])
+        .current_dir(&repo_dir)
+        .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
+        .env_remove("LAYERFS_STORE")
+        .output()
+        .expect("umount --force with open file");
+    assert!(
+        umount_forced.status.success(),
+        "umount --force must unmount live mount even with open file handle: {}",
+        String::from_utf8_lossy(&umount_forced.stderr)
+    );
+    bg_guard.armed = false;
+    drop(file_handle);
 }

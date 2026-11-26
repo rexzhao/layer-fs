@@ -155,12 +155,21 @@ impl Server {
                     .get("wait_ms")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
-                while self.serving.open_handles() > 0 && std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                let handles = self.serving.open_handles();
+                let force = request
+                    .args
+                    .get("force")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let handles = if force {
+                    0
+                } else {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+                    while self.serving.open_handles() > 0 && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    self.serving.open_handles()
+                };
                 if handles > 0 {
                     Response::HandlesOpen { handles }
                 } else if self.serving.request_stop() {
