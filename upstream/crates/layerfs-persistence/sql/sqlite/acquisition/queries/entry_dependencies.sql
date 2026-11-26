@@ -1,0 +1,42 @@
+WITH input(slot,parent,name,position,kind,identity) AS (VALUES
+ (0,?2,?3,?4,?5,?6),
+ (1,?7,?8,?9,?10,?11),
+ (2,?12,?13,?14,?15,?16),
+ (3,?17,?18,?19,?20,?21),
+ (4,?22,?23,?24,?25,?26),
+ (5,?27,?28,?29,?30,?31),
+ (6,?32,?33,?34,?35,?36),
+ (7,?37,?38,?39,?40,?41),
+ (8,?42,?43,?44,?45,?46),
+ (9,?47,?48,?49,?50,?51),
+ (10,?52,?53,?54,?55,?56),
+ (11,?57,?58,?59,?60,?61),
+ (12,?62,?63,?64,?65,?66),
+ (13,?67,?68,?69,?70,?71),
+ (14,?72,?73,?74,?75,?76),
+ (15,?77,?78,?79,?80,?81),
+ (16,?82,?83,?84,?85,?86),
+ (17,?87,?88,?89,?90,?91),
+ (18,?92,?93,?94,?95,?96),
+ (19,?97,?98,?99,?100,?101),
+ (20,?102,?103,?104,?105,?106),
+ (21,?107,?108,?109,?110,?111),
+ (22,?112,?113,?114,?115,?116),
+ (23,?117,?118,?119,?120,?121),
+ (24,?122,?123,?124,?125,?126),
+ (25,?127,?128,?129,?130,?131),
+ (26,?132,?133,?134,?135,?136),
+ (27,?137,?138,?139,?140,?141),
+ (28,?142,?143,?144,?145,?146),
+ (29,?147,?148,?149,?150,?151),
+ (30,?152,?153,?154,?155,?156),
+ (31,?157,?158,?159,?160,?161)
+)
+SELECT min(slot) FROM input AS source WHERE kind IS NOT NULL AND (
+ EXISTS(SELECT 1 FROM init_entry WHERE operation_id=?1 AND parent_position=source.parent AND name=source.name)
+ OR (kind=2 AND position IS NOT NULL AND EXISTS(SELECT 1 FROM init_entry WHERE operation_id=?1 AND kind=2 AND position=source.position))
+ OR (identity IS NOT NULL AND position IS NOT NULL AND (
+  EXISTS(SELECT 1 FROM init_host_file WHERE operation_id=?1 AND device=substr(source.identity,1,8) AND inode=substr(source.identity,9,8))
+  OR EXISTS(SELECT 1 FROM init_host_file WHERE operation_id=?1 AND canonical_position=source.position)
+ ))
+)

@@ -145,14 +145,22 @@ fn a_marker_resumes_after_that_name() {
 }
 
 #[test]
-fn a_marker_naming_nothing_starts_from_the_beginning() {
-    let all = entries(&["alpha.txt", "beta"]);
-    let marker: Vec<u16> = "not-here".encode_utf16().collect();
-    let (_, _, names) = page(&all, 4096, Some(&marker));
+fn a_deleted_marker_advances_past_it_instead_of_looping() {
+    let all = entries(&["alpha.txt", "gamma"]);
+    let deleted_mid: Vec<u16> = "beta".encode_utf16().collect();
+    let (_, _, names) = page(&all, 4096, Some(&deleted_mid));
     assert_eq!(
         names,
-        vec!["alpha.txt".to_string(), "beta".to_string()],
-        "cell unknown marker: no entry matches, so the page restarts — not an empty page"
+        vec!["gamma".to_string()],
+        "deleted marker in the middle advances to the first entry strictly after it"
+    );
+
+    let deleted_end: Vec<u16> = "not-here".encode_utf16().collect();
+    let (_, transferred, names) = page(&all, 4096, Some(&deleted_end));
+    assert_eq!(transferred, 0);
+    assert!(
+        names.is_empty(),
+        "deleted marker past the last entry finishes enumeration instead of looping back to 0"
     );
 }
 

@@ -1,0 +1,23 @@
+[package]
+name = "fs-layerfs"
+description = "Windows CLI and WinFsp bridge over the upstream LayerFS v1.0.0 storage, workspace, and history engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+fs-semantics.workspace = true
+fs-winfsp.workspace = true
+layerfs-bridge = { path = "../../upstream/crates/layerfs-bridge" }
+layerfs-content = { path = "../../upstream/crates/layerfs-content" }
+layerfs-history = { path = "../../upstream/crates/layerfs-history" }
+layerfs-overlay = { path = "../../upstream/crates/layerfs-overlay" }
+layerfs-persistence = { path = "../../upstream/crates/layerfs-persistence" }
+layerfs-storage = { path = "../../upstream/crates/layerfs-storage" }
+layerfs-store-service = { path = "../../upstream/crates/layerfs-store-service" }
+layerfs-telemetry = { path = "../../upstream/crates/layerfs-telemetry" }
+layerfs-workspace = { path = "../../upstream/crates/layerfs-workspace" }
+serde.workspace = true
+serde_json.workspace = true

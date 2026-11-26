@@ -1,0 +1,914 @@
+//! Repository, branch, merge, diff, publish, and workspace lifecycle facade
+//! over the upstream LayerFS v1.0.0 storage and history crates.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+use layerfs_bridge::control::SdkValue;
+use layerfs_content::filesystem::attributes::{
+    build_attribute_tree, emit_value, AttributeEntry, AttributeKey, PortableMetadata,
+};
+use layerfs_content::filesystem::{
+    build_filesystem, profile_id, scope_for_seed, statistics::logical_size, DirectoryUpdate,
+    FilesystemInput, FilesystemObjects, FilesystemResources, InodeUpdate,
+};
+use layerfs_content::object::inode_leaf::{InodeKind, InodeMetadata, InodeValue};
+use layerfs_content::ObjectId;
+use layerfs_history::{
+    BranchId, CommitOutcome, ForkRequest, ForkSource, HistoryCatalog, HistoryCatalogConfig,
+    HistoryName, LayerStackId, LayerStackRecord, NodeId, ReserveRequest, StackInitialization,
+    WorkspaceId,
+};
+
+/// Tag byte of a `LayerStackId` (`layerfs_history::contract::identity::LAYER_STACK_TAG`).
+const LAYER_STACK_TAG: u8 = 0x31;
+use layerfs_overlay::ProfileConfig;
+use layerfs_persistence::{Handles, PersistenceConfig, SqlitePersistenceProfile};
+use layerfs_storage::{ReservationBlocks, Storage, StoragePolicy};
+use layerfs_store_service::bootstrap::{open_store_observed, OpenedStore};
+use layerfs_store_service::history::{branch, lookup};
+use layerfs_store_service::read::{compare, snapshot};
+use layerfs_store_service::store::{
+    BindRequest, BoundWorkspace, CommitOptions, Store,
+};
+use layerfs_store_service::{kernel_guard, Owner, OwnerConfig};
+use serde::{Deserialize, Serialize};
+
+use crate::backend::WinFspBackend;
+use crate::error::{Error, Result};
+
+/// Default advertised virtual volume size (128 GiB).
+pub const DEFAULT_VOLUME_SIZE_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+
+/// Default writable branch created on `init` (since `"main"` is the published layer line).
+pub const DEFAULT_BRANCH: &str = "work";
+
+/// Immutable object read cache budget (16 MiB).
+const STORE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// Overlay SQLite page cache (4 MiB).
+const OVERLAY_PAGER_KIB: u32 = 4096;
+/// Max concurrent workspaces bound per process.
+const MAX_WORKSPACES: usize = 32;
+
+/// Durability profile for the underlying SQLite Store.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PersistenceProfile {
+    /// WAL + `synchronous = FULL` (power-loss durable).
+    #[default]
+    Durable,
+    /// WAL + `synchronous = OFF` (fast, survives process exit, matches upstream 1.0.0 default).
+    Disposable,
+}
+
+impl PersistenceProfile {
+    fn to_sqlite(self) -> SqlitePersistenceProfile {
+        match self {
+            Self::Durable => SqlitePersistenceProfile::Durable,
+            Self::Disposable => SqlitePersistenceProfile::Disposable,
+        }
+    }
+
+    /// Human-readable name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::Disposable => "disposable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RepoMeta {
+    version: u32,
+    profile: PersistenceProfile,
+    volume_size_bytes: u64,
+    stack_name: String,
+    binding_key: String,
+    cursor_key_hex: String,
+    stack_id_hex: String,
+}
+
+/// Summary of one branch or `main`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchInfo {
+    pub name: String,
+    pub base: String,
+    pub head: Option<String>,
+    pub forked_from: Option<String>,
+}
+
+/// Summary of one commit in `log`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitInfo {
+    pub id: String,
+    pub root: String,
+    pub message: Option<String>,
+    pub created_ms: Option<i64>,
+    pub branch: Option<String>,
+}
+
+/// Summary of a workspace commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitSummary {
+    pub kind: String,
+    pub commit: Option<String>,
+    pub root: String,
+    pub conflicts: Vec<String>,
+}
+
+/// Summary of a branch merge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeOutcome {
+    pub kind: String,
+    pub branch: String,
+    pub fast_forward: bool,
+    pub head: Option<String>,
+    pub root: Option<String>,
+    pub conflicts: Vec<String>,
+}
+
+/// Summary of publishing a branch onto `main`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishOutcome {
+    pub kind: String,
+    pub layer: String,
+    pub overwrote_count: i64,
+}
+
+/// One changed path in `diff`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiffEntry {
+    pub path: String,
+    pub kind: String,
+}
+
+/// Store-level statistics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreStats {
+    pub profile: PersistenceProfile,
+    pub volume_size_bytes: u64,
+    pub store_file_bytes: u64,
+    pub branches: usize,
+    pub head_layer: String,
+    pub logical_bytes: u64,
+    pub canonical_bytes: u64,
+    pub stored_bytes: u64,
+}
+
+/// Live workspace status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceStatus {
+    pub branch: String,
+    pub base_layer: String,
+    pub head_commit: Option<String>,
+    pub effective_root: String,
+    pub dirty_inodes: u64,
+    pub dirty_entries: u64,
+    pub dirty: bool,
+}
+
+/// An opened LayerFS repository backed by upstream `layerfs-store-service`.
+pub struct Repo {
+    dir: PathBuf,
+    meta: RepoMeta,
+    opened: OpenedStore,
+    store: Arc<Store>,
+    owner: Option<Owner>,
+    stack_id: LayerStackId,
+    overlay_dir: PathBuf,
+}
+
+impl std::fmt::Debug for Repo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Repo")
+            .field("dir", &self.dir)
+            .field("profile", &self.meta.profile)
+            .finish()
+    }
+}
+
+impl Drop for Repo {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            let _ = owner.stop();
+        }
+        let _ = std::fs::remove_dir_all(&self.overlay_dir);
+    }
+}
+
+impl Repo {
+    /// Creates a new repository directory containing a standard upstream LayerFS
+    /// `store.sqlite`, an empty genesis LayerStack, and an initial writable branch (`work`).
+    pub fn init(
+        dir: impl AsRef<Path>,
+        profile: PersistenceProfile,
+        volume_size_bytes: u64,
+    ) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+        let store_path = dir.join("store.sqlite");
+        if store_path.exists() {
+            return Err(Error::Conflict(format!(
+                "store already exists at {}",
+                store_path.display()
+            )));
+        }
+        kernel_guard::check(&store_path).map_err(|u| Error::Unsupported(u.0))?;
+
+        let binding_key = format!(
+            "layerfs-win:{}",
+            dir.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("repo")
+        );
+        let seed_hash = blake3::hash(
+            format!(
+                "{}:{}",
+                binding_key,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+            .as_bytes(),
+        );
+        let cursor_key: [u8; 32] = *blake3::hash(b"cursor-key").as_bytes();
+        let scope_seed: [u8; 32] = *seed_hash.as_bytes();
+        let stack_name = HistoryName::new("default")
+            .map_err(|e| Error::InvalidInput(format!("stack name: {e:?}")))?;
+        let stack_id = LayerStackId::from_bytes({
+            let mut raw = [0u8; 17];
+            raw[0] = LAYER_STACK_TAG;
+            raw[1..].copy_from_slice(&scope_seed[..16]);
+            raw
+        })
+        .map_err(|e| Error::Other(format!("stack id: {e:?}")))?;
+
+        let history_cfg = HistoryCatalogConfig {
+            binding_key: binding_key.as_bytes().to_vec(),
+            cursor_key,
+            incarnation: 1,
+        };
+        let config =
+            PersistenceConfig::sqlite(&store_path).with_sqlite_profile(profile.to_sqlite());
+
+        {
+            let handles = Handles::create(config, StoragePolicy::frozen_default(), &history_cfg)
+                .map_err(|e| Error::Other(format!("create store: {e:?}")))?;
+            let storage = Storage::new(handles.storage.clone())
+                .map_err(|e| Error::Other(format!("storage: {e:?}")))?;
+            let scope = scope_for_seed(scope_seed);
+            let reservation = handles
+                .history
+                .reserve_inodes(&ReserveRequest {
+                    scope: scope.object(),
+                    count: 1,
+                })
+                .map_err(|e| Error::Other(format!("reserve root inode: {e:?}")))?;
+            let root_serial = reservation.start;
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let portable = PortableMetadata {
+                mode: 0o755,
+                mtime_seconds: now.as_secs() as i64,
+                mtime_nanoseconds: now.subsec_nanos(),
+            };
+
+            let reader = storage
+                .reader()
+                .map_err(|e| Error::Other(format!("reader: {e:?}")))?;
+            let save = storage
+                .begin_save()
+                .map_err(|e| Error::Other(format!("begin save: {e:?}")))?;
+            let built_root = {
+                let mut sink = save.sink();
+                let mut objects = FilesystemObjects::new(&reader, &mut sink);
+                let mode_bytes = portable
+                    .mode_bytes(InodeKind::Directory)
+                    .map_err(|e| Error::Other(format!("mode bytes: {e:?}")))?;
+                let mtime_bytes = portable
+                    .mtime_bytes()
+                    .map_err(|e| Error::Other(format!("mtime bytes: {e:?}")))?;
+                let mode_root = emit_value(&mut objects, &mode_bytes)
+                    .map_err(|e| Error::Other(format!("emit mode: {e:?}")))?;
+                let mtime_root = emit_value(&mut objects, &mtime_bytes)
+                    .map_err(|e| Error::Other(format!("emit mtime: {e:?}")))?;
+                let attr_key_mode = AttributeKey::new("portable".into(), b"mode".to_vec())
+                    .map_err(|e| Error::Other(format!("attr key: {e:?}")))?;
+                let attr_key_mtime = AttributeKey::new("portable".into(), b"mtime".to_vec())
+                    .map_err(|e| Error::Other(format!("attr key: {e:?}")))?;
+                let (dir_meta, _) = build_attribute_tree(
+                    &mut objects,
+                    [
+                        Ok(AttributeEntry {
+                            key: attr_key_mode,
+                            value_root: mode_root,
+                        }),
+                        Ok(AttributeEntry {
+                            key: attr_key_mtime,
+                            value_root: mtime_root,
+                        }),
+                    ]
+                    .into_iter(),
+                )
+                .map_err(|e| Error::Other(format!("attr tree: {e:?}")))?;
+
+                let root_inode = InodeUpdate {
+                    serial: root_serial,
+                    value: InodeValue {
+                        kind: InodeKind::Directory,
+                        content_root: ObjectId::for_bytes(b"new-directory"),
+                        metadata_root: InodeMetadata::Root(dir_meta),
+                        namespace_ref_count: 0,
+                    },
+                };
+                let root_dir = DirectoryUpdate {
+                    parent: root_serial,
+                    changes: Vec::new(),
+                };
+                let input = FilesystemInput {
+                    base: None,
+                    scope,
+                    root_serial,
+                    directories: &[root_dir],
+                    inodes: &[root_inode],
+                    new_inodes: &[root_serial],
+                    resources: FilesystemResources::default(),
+                };
+                build_filesystem(&mut objects, &input, None)
+                    .map_err(|e| Error::Other(format!("build empty root: {e:?}")))?
+                    .root
+            };
+            save.finish()
+                .map_err(|e| Error::Other(format!("finish genesis save: {e:?}")))?;
+
+            let reader = storage
+                .reader()
+                .map_err(|e| Error::Other(format!("reader after save: {e:?}")))?;
+            let logical = logical_size(&reader, built_root)
+                .map_err(|e| Error::Other(format!("logical size: {e:?}")))?;
+            let stack = handles
+                .history
+                .initialize_layerstack(&StackInitialization {
+                    stack: stack_id,
+                    name: stack_name.clone(),
+                    scope: scope.object(),
+                    profile: profile_id(),
+                    genesis_root: built_root.0,
+                    logical,
+                })
+                .map_err(|e| Error::Other(format!("initialize layerstack: {e:?}")))?;
+
+            // Fork the default writable branch `work` from the genesis layer.
+            let default_name = HistoryName::new(DEFAULT_BRANCH)
+                .map_err(|e| Error::InvalidInput(format!("default branch: {e:?}")))?;
+            handles
+                .history
+                .fork(&ForkRequest {
+                    stack: stack.id,
+                    branch: BranchId::named(stack.id, &default_name),
+                    name: default_name,
+                    source: ForkSource::Layer(stack.head_layer),
+                })
+                .map_err(|e| Error::Other(format!("fork default branch: {e:?}")))?;
+        }
+
+        let meta = RepoMeta {
+            version: 1,
+            profile,
+            volume_size_bytes,
+            stack_name: "default".to_owned(),
+            binding_key,
+            cursor_key_hex: encode_hex(&cursor_key),
+            stack_id_hex: encode_hex(&stack_id.to_bytes()),
+        };
+        let meta_json = serde_json::to_string_pretty(&meta)
+            .map_err(|e| Error::Other(format!("serialize repo.json: {e}")))?;
+        std::fs::write(dir.join("repo.json"), meta_json)?;
+
+        Self::open(dir)
+    }
+
+    /// Opens an existing repository directory.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        let meta_path = dir.join("repo.json");
+        let store_path = dir.join("store.sqlite");
+        if !meta_path.is_file() || !store_path.is_file() {
+            return Err(Error::NotFound(format!(
+                "no layerfs repository at {}",
+                dir.display()
+            )));
+        }
+        kernel_guard::check(&store_path).map_err(|u| Error::Unsupported(u.0))?;
+
+        let meta: RepoMeta = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)
+            .map_err(|e| Error::InvalidInput(format!("invalid repo.json: {e}")))?;
+        let cursor_key: [u8; 32] = decode_hex_array(&meta.cursor_key_hex)?;
+        let stack_id_bytes: [u8; 17] = decode_hex_array(&meta.stack_id_hex)?;
+        let stack_id = LayerStackId::from_bytes(stack_id_bytes)
+            .map_err(|e| Error::InvalidInput(format!("invalid stack id in repo.json: {e:?}")))?;
+
+        let config =
+            PersistenceConfig::sqlite(&store_path).with_sqlite_profile(meta.profile.to_sqlite());
+        let opened = open_store_observed(
+            config,
+            meta.binding_key.as_bytes(),
+            cursor_key,
+            MAX_WORKSPACES,
+            STORE_CACHE_BYTES,
+            ReservationBlocks::default(),
+        )
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("Busy") || msg.contains("locked") {
+                Error::Busy(format!("store open: {msg}"))
+            } else {
+                Error::Other(format!("store open: {msg}"))
+            }
+        })?;
+
+        let seq = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let overlay_dir = dir.join(".overlay-runtime").join(format!(
+            "s-{}-{seq}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&overlay_dir)?;
+        let template_path = overlay_dir.join("template.sqlite");
+        let owner = Owner::start(
+            &template_path,
+            ProfileConfig {
+                pager_kib: OVERLAY_PAGER_KIB,
+                max_pages: None,
+            },
+            OwnerConfig {
+                namespaces: MAX_WORKSPACES,
+            },
+        )
+        .map_err(|e| Error::Other(format!("start overlay owner: {e}")))?;
+
+        let store = Arc::clone(&opened.store);
+        Ok(Self {
+            dir,
+            meta,
+            opened,
+            store,
+            owner: Some(owner),
+            stack_id,
+            overlay_dir,
+        })
+    }
+
+    /// Repository directory path.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Configured virtual volume size.
+    #[must_use]
+    pub fn volume_size_bytes(&self) -> u64 {
+        self.meta.volume_size_bytes
+    }
+
+    /// Persistence profile (`durable` or `disposable`).
+    #[must_use]
+    pub fn profile(&self) -> PersistenceProfile {
+        self.meta.profile
+    }
+
+    /// Underlying SQLite version.
+    #[must_use]
+    pub fn sqlite_version(&self) -> &str {
+        &self.opened.sqlite_version
+    }
+
+    fn stack(&self) -> Result<LayerStackRecord> {
+        self.store
+            .history()
+            .layer_stack(self.stack_id)
+            .map_err(|e| Error::Other(format!("read layerstack: {e:?}")))?
+            .ok_or_else(|| Error::NotFound("repository layerstack missing".to_owned()))
+    }
+
+    /// Lists `main` and all branches.
+    pub fn branches(&self) -> Result<Vec<BranchInfo>> {
+        let stack = self.stack()?;
+        let val = branch::list(&self.store, &stack, 4096, 0, None).map_err(Error::from_sdk)?;
+        let Some(SdkValue::List(items)) = val.get("items") else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(BranchInfo {
+                name: item.get_text("name").unwrap_or_default().to_owned(),
+                base: item.get_text("base").unwrap_or_default().to_owned(),
+                head: item.get_text("head").map(str::to_owned),
+                forked_from: item.get_text("forkedFrom").map(str::to_owned),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Creates a new branch forked from `from` (defaults to `"main"`).
+    pub fn fork(&self, name: &str, from: Option<&str>) -> Result<BranchInfo> {
+        let stack = self.stack()?;
+        let val = branch::fork(&self.store, &stack, name, from).map_err(Error::from_sdk)?;
+        Ok(BranchInfo {
+            name: val.get_text("branch").unwrap_or(name).to_owned(),
+            base: val.get_text("base").unwrap_or_default().to_owned(),
+            head: val.get_text("head").map(str::to_owned),
+            forked_from: from.map(str::to_owned),
+        })
+    }
+
+    /// Three-way merges `left` and `right` into a new branch `into`.
+    pub fn merge(
+        &self,
+        left: &str,
+        right: &str,
+        into: &str,
+        message: Option<&str>,
+    ) -> Result<MergeOutcome> {
+        let stack = self.stack()?;
+        let val = branch::merge(&self.store, &stack, left, right, into, message, &[])
+            .map_err(Error::from_sdk)?;
+        let conflicts = match val.get("conflicts") {
+            Some(SdkValue::List(list)) => list
+                .iter()
+                .filter_map(|c| c.get_text("path").map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let fast_forward = matches!(val.get("fastForward"), Some(SdkValue::Bool(true)));
+        Ok(MergeOutcome {
+            kind: val.get_text("kind").unwrap_or("Merged").to_owned(),
+            branch: val.get_text("branch").unwrap_or(into).to_owned(),
+            fast_forward,
+            head: val.get_text("head").map(str::to_owned),
+            root: val.get_text("root").map(str::to_owned),
+            conflicts,
+        })
+    }
+
+    /// Publishes a branch's head (or a specific commit) onto `main` as a new Layer.
+    pub fn publish(&self, branch_name: &str, commit: Option<&str>) -> Result<PublishOutcome> {
+        let stack = self.stack()?;
+        let record = lookup::branch(&self.store, &stack, branch_name).map_err(Error::from_sdk)?;
+        let node = match commit {
+            Some(hex) => {
+                let bytes = decode_hex_vec(hex)?;
+                Some(
+                    NodeId::from_slice(&bytes)
+                        .map_err(|e| Error::InvalidInput(format!("invalid commit id: {e:?}")))?,
+                )
+            }
+            None => None,
+        };
+        let val = branch::publish(&self.store, &stack, &record, node).map_err(Error::from_sdk)?;
+        let kind = val.get_text("kind").unwrap_or("Unknown").to_owned();
+        let layer = val
+            .get("publishedLayer")
+            .and_then(|v| v.get_text("id"))
+            .or_else(|| val.get_text("layer"))
+            .or_else(|| val.get_text("headLayer"))
+            .unwrap_or_default()
+            .to_owned();
+        let overwrote_count = match val.get("overwroteCount") {
+            Some(SdkValue::Int(n)) => *n,
+            _ => 0,
+        };
+        Ok(PublishOutcome {
+            kind,
+            layer,
+            overwrote_count,
+        })
+    }
+
+    /// Lists commits on a branch, newest first.
+    pub fn log(&self, branch_name: &str, limit: usize) -> Result<Vec<CommitInfo>> {
+        let stack = self.stack()?;
+        let record = lookup::branch(&self.store, &stack, branch_name).map_err(Error::from_sdk)?;
+        let val = branch::list_commits(&self.store, &record, limit, 0).map_err(Error::from_sdk)?;
+        let Some(SdkValue::List(items)) = val.get("items") else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let created_ms = match item.get("createdMs") {
+                Some(SdkValue::Int(ms)) => Some(*ms),
+                _ => None,
+            };
+            out.push(CommitInfo {
+                id: item.get_text("commit").unwrap_or_default().to_owned(),
+                root: item.get_text("root").unwrap_or_default().to_owned(),
+                message: item.get_text("message").map(str::to_owned),
+                created_ms,
+                branch: item.get_text("branch").map(str::to_owned),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Diffs two branches (or `"main"`).
+    pub fn diff_branches(&self, left: &str, right: &str) -> Result<Vec<DiffEntry>> {
+        let stack = self.stack()?;
+        let reader = snapshot::reader(&self.store, &stack);
+        let left_snap = snapshot::resolve(&self.store, &stack, &reader, left).map_err(Error::from_sdk)?;
+        let right_snap = snapshot::resolve(&self.store, &stack, &reader, right).map_err(Error::from_sdk)?;
+        let req = compare::Request {
+            limit: 4096,
+            pos: 0,
+            cursor: None,
+            hunks: false,
+        };
+        let val = compare::diff_branches(
+            &self.store,
+            &reader,
+            (&left_snap, left),
+            (&right_snap, right),
+            Ok(req),
+        )
+        .map_err(Error::from_sdk)?;
+        let Some(SdkValue::List(items)) = val.get("items") else {
+            return Ok(Vec::new());
+        };
+        Ok(items
+            .iter()
+            .map(|item| DiffEntry {
+                path: item.get_text("path").unwrap_or_default().to_owned(),
+                kind: item.get_text("kind").unwrap_or_default().to_owned(),
+            })
+            .collect())
+    }
+
+    /// Repository and store statistics.
+    pub fn stats(&self) -> Result<StoreStats> {
+        let stack = self.stack()?;
+        let branches = self.branches()?.len();
+        let store_file_bytes = std::fs::metadata(self.dir.join("store.sqlite"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let stats = self
+            .store
+            .history()
+            .statistics()
+            .map_err(|e| Error::Other(format!("store statistics: {e:?}")))?;
+        Ok(StoreStats {
+            profile: self.meta.profile,
+            volume_size_bytes: self.meta.volume_size_bytes,
+            store_file_bytes,
+            branches,
+            head_layer: encode_hex(stack.head_layer.as_slice()),
+            logical_bytes: stats.logical,
+            canonical_bytes: stats.canonical,
+            stored_bytes: stats.stored,
+        })
+    }
+
+    /// Binds a writable workspace onto `branch_name` (ready to be mounted via WinFsp
+    /// or mutated programmatically).
+    pub fn open_workspace(&self, branch_name: &str) -> Result<WorkspaceHandle> {
+        if branch_name == branch::MAIN {
+            return Err(Error::InvalidInput(format!(
+                "\"{}\" is the published layer line; fork or use a writable branch (e.g. \"{}\")",
+                branch::MAIN,
+                DEFAULT_BRANCH
+            )));
+        }
+        let stack = self.stack()?;
+        let record = lookup::branch(&self.store, &stack, branch_name).map_err(Error::from_sdk)?;
+        let owner = self
+            .owner
+            .as_ref()
+            .ok_or_else(|| Error::Other("overlay owner is closed".to_owned()))?
+            .client();
+        let ws_seed = blake3::hash(
+            format!(
+                "ws:{}:{}:{}",
+                branch_name,
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+            .as_bytes(),
+        );
+        let workspace_id = WorkspaceId::from_authority(*ws_seed.as_bytes())
+            .map_err(|e| Error::Other(format!("workspace id: {e:?}")))?;
+        let bound = self
+            .store
+            .bind(
+                owner.clone(),
+                BindRequest {
+                    workspace: workspace_id,
+                    branch: record.id,
+                },
+            )
+            .map_err(|e| Error::Other(format!("bind workspace on {branch_name}: {e}")))?;
+
+        let gate = Arc::new(RwLock::new(()));
+        let workspace = Arc::new(bound.workspace);
+        let backend = WinFspBackend::new(Arc::clone(&workspace), Arc::clone(&gate));
+        Ok(WorkspaceHandle {
+            branch_name: branch_name.to_owned(),
+            store: Arc::clone(&self.store),
+            workspace,
+            owner,
+            gate,
+            backend,
+            logical_cache: Mutex::new(None),
+        })
+    }
+}
+
+/// An active mounted/open writable workspace bound to a branch.
+pub struct WorkspaceHandle {
+    branch_name: String,
+    store: Arc<Store>,
+    workspace: Arc<BoundWorkspace>,
+    owner: layerfs_store_service::OwnerClient,
+    gate: Arc<RwLock<()>>,
+    backend: WinFspBackend,
+    logical_cache: Mutex<Option<(Instant, u64)>>,
+}
+
+impl std::fmt::Debug for WorkspaceHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceHandle")
+            .field("branch", &self.branch_name)
+            .finish()
+    }
+}
+
+impl WorkspaceHandle {
+    /// Branch name this workspace is bound to.
+    #[must_use]
+    pub fn branch(&self) -> &str {
+        &self.branch_name
+    }
+
+    /// Returns a cloneable WinFsp `WorkspaceOps` backend for mounting.
+    #[must_use]
+    pub fn backend(&self) -> WinFspBackend {
+        self.backend.clone()
+    }
+
+    /// Current workspace status (head, root, dirty counts).
+    pub fn status(&self) -> Result<WorkspaceStatus> {
+        let snap = self
+            .workspace
+            .snapshot()
+            .map_err(|e| Error::Other(format!("workspace snapshot: {e}")))?;
+        let state = self
+            .owner
+            .state(self.workspace.route())
+            .map_err(|e| Error::Other(format!("overlay state: {e}")))?;
+        let dirty = state.dirty_inodes > 0 || state.dirty_directory_entries > 0;
+        Ok(WorkspaceStatus {
+            branch: self.branch_name.clone(),
+            base_layer: encode_hex(snap.branch.base_layer.as_slice()),
+            head_commit: snap.branch.head_commit.map(|c| encode_hex(c.as_slice())),
+            effective_root: encode_hex(snap.effective_root.as_bytes()),
+            dirty_inodes: state.dirty_inodes,
+            dirty_entries: state.dirty_directory_entries,
+            dirty,
+        })
+    }
+
+    /// Commits all uncommitted overlay changes incrementally into the Store
+    /// (with automatic 3-way merge if the branch head moved, unless `force`).
+    pub fn commit(&self, message: Option<&str>, force: bool) -> Result<CommitSummary> {
+        let _write_gate = self
+            .gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let options = CommitOptions {
+            force,
+            message: message.map(str::to_owned),
+        };
+        let success = self.workspace.commit_captured(&options).map_err(|failure| {
+            let msg = failure.to_string();
+            if msg.contains("Busy") || msg.contains("InFlight") {
+                Error::Busy(msg)
+            } else if msg.contains("Markers") || msg.contains("Conflict") {
+                Error::Conflict(msg)
+            } else {
+                Error::Other(msg)
+            }
+        })?;
+        self.backend.invalidate_cache();
+        *self
+            .logical_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        let conflicts: Vec<String> = success
+            .merge
+            .as_ref()
+            .map(|m| m.conflicts.iter().map(|c| c.path.clone()).collect())
+            .unwrap_or_default();
+
+        match success.history {
+            Some(CommitOutcome::Committed { record, .. }) => Ok(CommitSummary {
+                kind: "Committed".to_owned(),
+                commit: Some(encode_hex(record.id.as_slice())),
+                root: encode_hex(record.root.as_bytes()),
+                conflicts,
+            }),
+            Some(CommitOutcome::UpToDate { head, root }) => Err(Error::Conflict(format!(
+                "nothing to commit (up to date at root {}, head {})",
+                encode_hex(root.as_bytes()),
+                head.map_or_else(|| "none".to_owned(), |h| encode_hex(h.as_slice()))
+            ))),
+            None => Err(Error::Conflict(format!(
+                "merge conflict in {} file(s): {}",
+                conflicts.len(),
+                conflicts.join(", ")
+            ))),
+        }
+    }
+
+    /// Approximate logical bytes currently used (cached for 250 ms for Explorer `GetVolumeInfo`).
+    pub fn logical_bytes_cached(&self) -> u64 {
+        const TTL: Duration = Duration::from_millis(250);
+        let mut cache = self
+            .logical_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, bytes)) = *cache {
+            if at.elapsed() < TTL {
+                return bytes;
+            }
+        }
+        let bytes = self
+            .store
+            .history()
+            .statistics()
+            .map(|s| s.logical)
+            .unwrap_or(0);
+        *cache = Some((Instant::now(), bytes));
+        bytes
+    }
+
+    /// Cleanly closes the workspace and retires its overlay namespace (releasing files/locks).
+    pub fn close(self) -> Result<()> {
+        let route = self.workspace.route();
+        self.workspace
+            .close()
+            .map_err(|e| Error::Other(format!("close workspace: {e:?}")))?;
+        let _ = self.owner.retire_namespace(route.namespace());
+        Ok(())
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn decode_hex_vec(text: &str) -> Result<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return Err(Error::InvalidInput("odd-length hex string".to_owned()));
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for i in 0..text.len() / 2 {
+        let byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+            .map_err(|_| Error::InvalidInput("invalid hex character".to_owned()))?;
+        out.push(byte);
+    }
+    Ok(out)
+}
+
+fn decode_hex_array<const N: usize>(text: &str) -> Result<[u8; N]> {
+    if text.len() != N * 2 {
+        return Err(Error::InvalidInput(format!(
+            "expected {} hex chars, got {}",
+            N * 2,
+            text.len()
+        )));
+    }
+    let mut out = [0u8; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+            .map_err(|_| Error::InvalidInput(format!("invalid hex at byte {i}")))?;
+    }
+    Ok(out)
+}

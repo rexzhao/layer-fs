@@ -1,17 +1,22 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cas-core",
-    "crates/cas-store",
-    "crates/fs-namespace",
     "crates/fs-semantics",
-    "crates/fs-snapshot",
-    "crates/fs-overlay",
-    "crates/fs-workspace",
-    "crates/fs-api",
-    "crates/fs-cli",
     "crates/fs-windows",
     "crates/fs-winfsp",
+    "crates/fs-layerfs",
+    "crates/fs-cli",
+    "upstream/crates/layerfs-win32-host",
+    "upstream/crates/layerfs-telemetry",
+    "upstream/crates/layerfs-content",
+    "upstream/crates/layerfs-storage",
+    "upstream/crates/layerfs-history",
+    "upstream/crates/layerfs-persistence",
+    "upstream/crates/layerfs-overlay",
+    "upstream/crates/layerfs-workspace",
+    "upstream/crates/layerfs-bridge",
+    "upstream/crates/layerfs-store-service",
+    "upstream/crates/layerfs-project",
 ]
 
 [workspace.package]
@@ -21,20 +26,17 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-cas-core = { path = "crates/cas-core" }
-cas-store = { path = "crates/cas-store" }
-fs-namespace = { path = "crates/fs-namespace" }
 fs-semantics = { path = "crates/fs-semantics" }
 fs-windows = { path = "crates/fs-windows" }
 fs-winfsp = { path = "crates/fs-winfsp" }
-fs-snapshot = { path = "crates/fs-snapshot" }
-fs-overlay = { path = "crates/fs-overlay" }
-fs-workspace = { path = "crates/fs-workspace" }
-fs-api = { path = "crates/fs-api" }
+fs-layerfs = { path = "crates/fs-layerfs" }
 blake3 = "1.8.7"
-# Bundled SQLite: one version everywhere, no system-library dependency.
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-# The CLI's control pipe speaks one line of JSON per request (ADR-010 §10.2). A hand-written parser would need its own criteria set for "what counts as
-# valid JSON" — escapes, duplicate keys, huge numbers, UTF-8 boundaries — which is why the ruling was the library (547).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[profile.test]
+opt-level = 1
+
+[profile.test.package.zstd-sys]
+opt-level = 3

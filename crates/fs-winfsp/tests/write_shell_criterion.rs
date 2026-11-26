@@ -296,7 +296,9 @@ fn constrained_io_trims_instead_of_growing_the_file() {
 fn a_backend_that_accepts_and_drops_the_bytes_is_caught() {
     let request = fixture(b"0123456789", false);
     let before = write_disagreement_count();
+    fs_winfsp::callbacks::set_verify_writes_for_test(true);
     let (status, _, _) = write(&request, 4, b"abc", false, false);
+    fs_winfsp::callbacks::set_verify_writes_for_test(false);
 
     assert_eq!(
         status, NOT_IMPLEMENTED,

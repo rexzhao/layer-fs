@@ -1,115 +1,76 @@
-//! Command line interface for the Workspace CAS filesystem.
+//! Command line interface for LayerFS on Windows.
 //!
-//! Git-style and explicit: a *repository* is a directory, a *branch* is a named commit,
-//! and a *workspace* is where edits live until `commit`. The CLI keeps exactly one piece
-//! of state of its own — which workspace is current, in `<store>/cli/current` — because
-//! that is a convenience of this entry point, not a library concept (ADR-006 §13).
-//!
-//! Every command opens what it needs, does one thing, and exits: there are no open
-//! handles to leak and no session to corrupt.
+//! Powered by the upstream LayerFS core (`fs-layerfs`) with native Windows WinFsp mounting.
 
 mod mountcmd;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use fs_api::{ApiError, Repo, Workspace};
+use fs_layerfs::{Error as LayerError, PersistenceProfile, Repo, DEFAULT_BRANCH};
 
 const USAGE: &str = "\
-layerfs [--store <dir>] [--workspace <name>] <command> [args]
+layerfs [--store <dir>] [--branch <name>] <command> [args]
 
-  init <path>                     create a repository (store + scope + main branch)
-  branch [<name>] [--from <src>]  list branches, or create one
-  branch delete <name>            delete a branch (its history stays a GC root)
-  checkout <branch>               create or resume the workspace on a branch; from inside a mount, switch that mount
-  workspace discard <name>        drop a workspace's overlay and row (its branch is untouched)
+  init <path> [--durable|--disposable] [--size <size>]
+                                  create a repository (upstream LayerFS store + main stack + work branch)
+  branch [<name>] [--from <src>]  list branches, or fork a new branch from <src> (default: main)
+  fork <name> [--from <src>]      alias for `branch <name> [--from <src>]`
+  checkout <branch>               verify a branch; from inside a mount, hot-switch that mount to <branch>
+  commit [-m <message>] [--force] commit uncommitted changes on the mounted or selected branch
+  merge <left> <right> <into> [-m <message>]
+                                  3-way merge <left> and <right> into new branch <into>
+  publish <branch> [<commit>]     publish a branch's head (or commit) onto `main` as a new Layer
+  diff <left> <right>             list changed paths between two branches (or `main`)
+  log [<branch>] [<limit>]        list commits on a branch
+  status                          current branch, base layer, head commit, root, dirty counts & open handles
+  stats                           repository and storage statistics
 
-  commit -m <message> [--force]   publish the workspace as a commit
-  status                          workspace, branch, base commit, view root and dirty state
-  log [branch] [limit]            commit history
-  reset <commit> [--expect <c>]   move the branch head
-  restore <commit> [--discard]    replace the view with a commit's tree
-  revert                          undo the head with a new commit
+  mount <mount_point> [--branch <name>] [--no-version-gate]
+                                  mount a writable branch over WinFsp until `umount` stops it
+  umount <mount_point> [--force]  orderly unmount via the mount's control pipe (--force removes stale record)
+  list                            list mounts recorded under %LOCALAPPDATA%\\layerfs\\mounts
+  version                         WinFsp DLL version and ABI compatibility check
+  help [<command>]                show general usage or help for one command
 
-  verify [--deep]                 check objects and references
-  stats                           object and repository counts
-  gc [--dry-run]                  collect unreachable objects (offline: refuses while a writer holds the store)
-  snapshot [list | create | drop <root>]
-                                  named roots that keep a tree alive without moving a branch
-
-  mount <mount_point> [--workspace <name>] [--no-version-gate]
-                                  serve a workspace over WinFsp until `umount` asks it to stop (store from --store)
-  umount <mount_point> [--force]  ask a running mount to unmount (--force clears a stale record too)
-  list                            the mounts recorded under %LOCALAPPDATA%\\layerfs\\mounts
-  version                         the WinFsp DLL's version versus the layout this build was measured on
-
-Files are read and written **through the mount**, not through commands: this CLI has no file verbs at all.
-Run `layerfs <command> --help` for the arguments a command accepts.";
+Files are read and written through the mounted filesystem, not through CLI file verbs.
+Global option `--workspace <name>` is accepted as an alias for `--branch <name>`.";
 
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("layerfs: {error}");
-            // **Exit codes are part of the interface** (ADR-010 §8.3): a script has to tell "retry when the other process finishes" from "this command is
-            // wrong". Three layers can answer: a `Failure` from the CLI itself, an `ApiError` bubbled up from the core, and everything else (1).
             let code = exit_code(&*error);
             ExitCode::from(code)
         }
     }
 }
 
-/// The `--workspace` given on the command line, set once at startup.
-///
-/// Replaceable (ADR-010 §5): with `cli/current` gone, every command that needs a workspace takes it from the option, and a command that needs one
-/// without having it fails with [`fs_cli::NO_WORKSPACE`] — never with a guessed name.
-static WORKSPACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-
-/// The **exit code** a failure deserves (ADR-010 §8.3).
-///
-/// Collected in one function rather than sprinkled through the commands: a script's ability to tell "retry" from "fix your command" should not depend on which
-/// verb happened to translate the error. The distinction the ADR draws:
-///
-/// ```
-/// 2  usage        (a `Failure` the CLI raised itself)
-/// 3  not found    (store / workspace / branch / commit)
-/// 4  busy         (in use, waiting, offline maintenance)
-/// 5  conflict     (branch moved, nothing to commit, already exists)
-/// 1  anything else
-/// ```
+/// Exit codes:
+/// - 2: usage / invalid input
+/// - 3: not found
+/// - 4: busy / in use
+/// - 5: conflict (nothing to commit, already exists, merge conflict)
+/// - 1: other error
 fn exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
     if let Some(failure) = error.downcast_ref::<fs_cli::Failure>() {
         return failure.code;
     }
-    if let Some(api) = error.downcast_ref::<ApiError>() {
-        return match api {
-            ApiError::Workspace(fs_workspace::WorkspaceError::NotFound { .. }) => 3,
-            ApiError::Workspace(
-                fs_workspace::WorkspaceError::StoreInUse { .. }
-                | fs_workspace::WorkspaceError::Busy { .. },
-            ) => 4,
-            ApiError::Workspace(
-                fs_workspace::WorkspaceError::BranchMoved { .. }
-                | fs_workspace::WorkspaceError::NothingToCommit
-                | fs_workspace::WorkspaceError::AlreadyExists { .. }
-                | fs_workspace::WorkspaceError::WorkspaceDirty,
-            ) => 5,
-            _ => 1,
+    if let Some(err) = error.downcast_ref::<LayerError>() {
+        return match err {
+            LayerError::InvalidInput(_) => 2,
+            LayerError::NotFound(_) => 3,
+            LayerError::Busy(_) => 4,
+            LayerError::Conflict(_) => 5,
+            LayerError::Unsupported(_) | LayerError::Other(_) => 1,
         };
     }
     1
 }
 
-/// The default volume size a new store advertises: **128 GiB**.
-///
-/// A product decision, which is why it lives in the CLI: the store records what it was told, and a store that was never told reports this default so old
-/// repositories keep working.
 const DEFAULT_VOLUME_SIZE_BYTES: u64 = fs_cli::DEFAULT_VOLUME_SIZE_BYTES;
 
-/// Parses a size the way a person writes one: `128G`, `512GiB`, `256M`, or a bare byte count.
-///
-/// Every unit is **binary** (K = 1024), because that is what a volume size means everywhere else in this product; `GB` is accepted and read as GiB rather than
-/// rejected, since a user who types it means the same thing.
 fn parse_size(text: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let trimmed = text.trim();
     let (number, unit) = trimmed.split_at(
@@ -138,68 +99,54 @@ fn parse_size(text: &str) -> Result<u64, Box<dyn std::error::Error>> {
         .ok_or_else(|| fs_cli::Failure::usage(format!("size too large: {text:?}")).into())
 }
 
-/// The `--size` given to `init`, or the default.
-fn requested_volume_size(arguments: &[String]) -> Result<u64, Box<dyn std::error::Error>> {
-    match arguments
-        .iter()
-        .position(|argument| argument == "--size")
-        .and_then(|index| arguments.get(index + 1))
-    {
-        Some(text) => parse_size(text),
-        None => Ok(DEFAULT_VOLUME_SIZE_BYTES),
-    }
-}
-
-fn require_workspace() -> Result<String, Box<dyn std::error::Error>> {
-    match WORKSPACE.get().and_then(Option::clone) {
-        Some(name) => Ok(name),
-        None => Err(fs_cli::Failure::usage(fs_cli::NO_WORKSPACE).into()),
-    }
-}
-
-/// One command's help, or `None` when the name is not a command.
-///
-/// Kept next to the dispatch table so a renamed command cannot leave a stale entry behind: the criterion
-/// `docs_help::every_command_has_a_help_entry` walks the advertised commands and asks for each one.
 fn command_help(command: &str) -> Option<&'static str> {
     Some(match command {
-        "init" => "init <path>\n  Create a repository: a content-addressed store, a scope, the `main` branch and the\n  `main` workspace. Path defaults to --store.",
-        "branch" => "branch [<name>] [--from <src>]\n  With no name: list branches and their heads. With a name: create it from `main`\n  (or --from). `branch delete <name>` deletes the branch, never its history.",
-        "checkout" => "checkout <branch>\n  Create or resume the workspace named after <branch> (one workspace per branch). Run\n  from **inside a mount**, it switches that mount to the workspace — the first call for\n  a branch only creates the workspace; from then on it switches.",
-        "workspace" => "workspace discard <name>\n  Drop a workspace's overlay and its row. The branch is untouched.",
-        "commit" => "commit -m <message> [--force]\n  Publish what the workspace is serving as a commit on its branch. From inside a mount\n  the mount does the publishing, so the volume is not opened twice.",
-        "status" => "status\n  Workspace, branch, base commit, view root and dirty state. Inside a mount it is the\n  mount's own answer, over the control pipe.",
-        "log" => "log [branch] [limit]\n  Commit history. Naming a branch reads it without opening an overlay, so it works\n  while that branch is mounted.",
-        "reset" => "reset <commit> [--expect <head>]\n  Move the branch head, optionally refusing if the head is not what you expect.",
-        "restore" => "restore <commit> [--discard]\n  Replace the workspace's view with that commit's tree. Refused with exit 4 while\n  **files** are open on the mount; directory handles do not block. --discard allows\n  replacing uncommitted changes.",
-        "revert" => "revert [--branch <name>]\n  Undo the head with a new commit, so history grows instead of being rewritten.",
-        "verify" => "verify [--deep]\n  Check objects and references. --deep reads every object's bytes.",
-        "stats" => "stats\n  Object and repository counts.",
-        "gc" => "gc [--dry-run]\n  Collect unreachable objects. Offline: it refuses while a writer holds the store.",
-        "snapshot" => "snapshot [list | create | drop <root>]\n  Named roots keep a tree alive without moving a branch (useful before a restore).",
-        "mount" => "mount <mount_point> [--workspace <name>] [--no-version-gate]\n  Serve a workspace over WinFsp until `umount` asks it to stop. Needs --store.\n  <mount_point> is a drive letter (Z:) or a directory whose parent exists.\n  Ctrl-C in this console is an orderly stop (flush, unmount, remove the record).",
-        "umount" => "umount <mount_point> [--force]\n  Ask the mount to stop. Refuses (exit 4, with a count) while handles are open —\n  including a shell whose working directory is inside the mount. --force clears a\n  stale record of a mount whose process is gone.",
-        "list" => "list\n  The mounts recorded under %LOCALAPPDATA%\\layerfs\\mounts, with liveness.",
-        "version" => "version\n  The WinFsp DLL's version versus the layout this build was measured on.",
+        "init" => "init <path> [--durable|--disposable] [--size <size>]\n  Create an upstream-compatible LayerFS repository with `main` layer stack and default writable\n  branch `work`. Defaults to `--durable` (SQLite WAL/FULL) and 128 GiB advertised size.\n  Use `--disposable` for upstream WAL/OFF high-throughput mode.",
+        "branch" => "branch [<name>] [--from <src>]\n  With no name: list `main` and all branches. With a name: fork a new branch from `<src>`\n  (default `main`).",
+        "fork" => "fork <name> [--from <src>]\n  Fork a new writable branch `<name>` from `<src>` (default `main`).",
+        "checkout" => "checkout <branch>\n  Verify `<branch>` exists; when run from inside a live mount, hot-switch that mount to `<branch>`.",
+        "commit" => "commit [-m <message>] [--force]\n  Commit uncommitted changes on the currently mounted branch (over the control pipe).\n  `--force` overwrites if the branch head moved concurrently.",
+        "merge" => "merge <left> <right> <into> [-m <message>]\n  Perform a 3-way merge of branches `<left>` and `<right>` into a new branch `<into>`.",
+        "publish" => "publish <branch> [<commit>]\n  Publish `<branch>`'s head (or a specific commit id) onto `main` as the next immutable Layer.",
+        "diff" => "diff <left> <right>\n  Show changed paths between `<left>` and `<right>` (branches or `main`).",
+        "log" => "log [<branch>] [<limit>]\n  List commits on `<branch>` (default: mounted branch or `work`), newest first.",
+        "status" => "status\n  Show branch, base layer, head commit, effective root, dirty counts, and open handles.\n  Inside a mount, queries the live mount process over the control pipe.",
+        "stats" => "stats\n  Show repository profile, store file size, branch count, and logical/canonical/stored bytes.",
+        "mount" => "mount <mount_point> [--branch <name>] [--no-version-gate]\n  Mount a writable branch (default: `work`) via WinFsp at `<mount_point>` (drive letter like `Z:`\n  or directory path). Press Ctrl-C or run `layerfs umount <mount_point>` for orderly unmount.",
+        "umount" => "umount <mount_point> [--force]\n  Ask a running mount to unmount cleanly. Refuses (exit 4) while handles are open.\n  `--force` removes a stale mount record whose owner process is gone.",
+        "list" => "list\n  List mounts recorded under %LOCALAPPDATA%\\layerfs\\mounts with live/stale status.",
+        "version" => "version\n  Print WinFsp DLL version, calibrated ABI layout, and LayerFS core compatibility.",
+        "help" => "help [<command>]\n  Show the top-level usage summary or detailed help for one command.",
         _ => return None,
     })
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments: Vec<String> = std::env::args().skip(1).collect();
-    if arguments.is_empty() || arguments.iter().any(|a| a == "--help" || a == "-h") {
+    if arguments.is_empty() {
         println!("{USAGE}");
         return Ok(());
     }
+    if arguments.first().is_some_and(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+
     let explicit_store = take_option(&mut arguments, "--store").map(PathBuf::from);
     let explicit_store_was_given = explicit_store.is_some();
-    // Read **before** the command name is taken: `--workspace` is a global option (ADR-010 §5), not a subcommand flag.
-    let workspace_option = take_option(&mut arguments, "--workspace");
+    let branch_opt = take_option(&mut arguments, "--branch")
+        .or_else(|| take_option(&mut arguments, "--workspace"));
+
+    if arguments.is_empty() {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let command = arguments.remove(0);
-    // **`help` is a command, not a flag** (owner's request): `help` gives the map, `help <command>` gives that command's paragraphs.
+
+    // `layerfs <cmd> --help` or `layerfs help <cmd>`
     if command == "help" {
         match arguments.first().map(String::as_str) {
-            None => print!("{USAGE}"),
+            None => println!("{USAGE}"),
             Some(name) => match command_help(name) {
                 Some(text) => println!("{text}"),
                 None => {
@@ -212,89 +159,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-
-    // **Path discovery happens here, once** (ADR-010 §4.2): a command run from inside a mount works without saying so, and a command that names both
-    // explicitly keeps what it named. The three verbs that do not need a repository keep their place *before* this, so discovery costs them nothing.
-    let needs_repository = !matches!(
-        command.as_str(),
-        "mount" | "umount" | "list" | "version" | "init" | "gc"
-    ) && !fs_cli::FILE_COMMANDS.contains(&command.as_str());
-    let (store, workspace_option) = if needs_repository {
-        // **Three values, printed before any logic changes** (383/580): what the process thinks its directory is, what the record says the mount point is, and
-        // whether one starts with the other. The difference between them is the whole question — short (8.3) name, case, or a trailing separator.
-        if std::env::var_os("LAYERFS_DEBUG_DISCOVERY").is_some() {
-            if let Ok(cwd) = std::env::current_dir() {
-                let canonical = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
-                eprintln!(
-                    "discover-values: cwd={:?} canonical={:?} matches_in_records={:?}",
-                    cwd.display().to_string(),
-                    canonical.display().to_string(),
-                    mountcmd::live_records()
-                        .into_iter()
-                        .map(|(record, _)| format!(
-                            "{}->{}",
-                            record.mount_point.display(),
-                            cwd.starts_with(&record.mount_point)
-                        ))
-                        .collect::<Vec<_>>()
-                );
-            }
+    if arguments.iter().any(|a| a == "--help" || a == "-h") {
+        if let Some(text) = command_help(&command) {
+            println!("{text}");
+            return Ok(());
         }
-        let current = std::env::current_dir().ok();
-        let discovered = current.and_then(|cwd| {
-            fs_cli::discovery::discover(
-                &cwd,
-                fs_cli::winpaths::volume_root,
-                fs_cli::winpaths::is_volume_mount_point,
-                mountcmd::live_records,
-            )
-        });
-        if std::env::var_os("LAYERFS_DEBUG_DISCOVERY").is_some() {
-            eprintln!(
-                "discovery: cwd={:?} volume={:?} records={:?} found={:?}",
-                std::env::current_dir().ok(),
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|cwd| fs_cli::winpaths::volume_root(&cwd)),
-                mountcmd::live_records(),
-                discovered.as_ref().map(|record| record.store.clone())
-            );
-        }
-        let target = fs_cli::discovery::resolve(
-            explicit_store.as_deref(),
-            workspace_option.as_deref(),
-            discovered.as_ref(),
-        );
-        (target.store, target.workspace)
-    } else {
-        (
-            explicit_store.unwrap_or_else(|| PathBuf::from(".")),
-            workspace_option,
-        )
-    };
-    let _ = WORKSPACE.set(workspace_option.clone());
-    // **No store and no discovery is a usage error, not a store error** (ADR-010 §4.2 row 2). Falling through would open `.` and answer "store directory
-    // .\objects does not exist", which is true about the wrong thing: the command never said where to look, and that is what to fix.
-    if needs_repository
-        && !explicit_store_was_given
-        && store.as_os_str() == "."
-        && workspace_option.is_none()
-    {
-        return Err(fs_cli::Failure::usage(fs_cli::NO_WORKSPACE).into());
+        println!("{USAGE}");
+        return Ok(());
     }
 
-    // **`mount` needs to be told a store** (README card follow-up): it is excluded from `needs_repository` because it *serves* a store rather than opening a
-    // repository, so the guard above never reached it — and a bare `mount Z:` fell through to `.` and answered "store directory .\objects does not exist",
-    // a true sentence about the wrong thing. Discovery still counts: from inside a mount, the store comes from the record.
-    if command == "mount" && !explicit_store_was_given && store.as_os_str() == "." {
-        return Err(fs_cli::Failure::usage(
-            "mount needs a store: add `--store <dir>` (the repository to serve)",
-        )
-        .into());
-    }
-
-    // **The removed file commands answer before the store is touched** (A0c): with a `--store` that does not exist, "store does not exist" would be a
-    // true sentence about the wrong problem — the command is gone, and that is what the caller has to be told.
+    // Refuse legacy file verbs clearly before touching any store.
     if let Some(removed) = fs_cli::FILE_COMMANDS
         .iter()
         .find(|name| **name == command.as_str())
@@ -302,645 +176,459 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(fs_cli::Failure::usage(fs_cli::file_command_removed(removed)).into());
     }
 
-    if command == "init" {
-        // **Parsed before the store exists**: a typo in `--size` costs nothing, and the value is a product decision recorded in the store.
-        let volume_size = requested_volume_size(&arguments)?;
-        // The path is the first argument that is neither a flag nor the value of one: `--size 128G` must not become the repository path.
-        let size_position = arguments.iter().position(|argument| argument == "--size");
-        let path = arguments
-            .iter()
-            .enumerate()
-            .find(|(index, argument)| {
-                !argument.starts_with("--")
-                    && size_position.is_none_or(|position| *index != position + 1)
-            })
-            .map_or_else(|| store.clone(), |(_, argument)| PathBuf::from(argument));
-        let repo = Repo::create(&path)?;
-        repo.set_volume_size_bytes(volume_size)?;
-        let head = repo.branch_head("main")?;
-        // **`init` leaves the repository usable**, not merely created: a fresh store with no workspace makes the very next lifecycle command fail for a
-        // reason the user cannot see. Creating `main` is the same thing `checkout main` does, done once at the moment it is obviously wanted. No
-        // `cli/current` is written any more (ADR-010 §5): the workspace is named on the command line from now on.
-        let workspace = std::sync::Arc::new(repo).workspace_create("main", "main")?;
-        println!(
-            "initialised {} (main = {}, workspace {})",
-            path.display(),
-            short(&head),
-            workspace.name()
-        );
-        workspace.close()?;
-        return Ok(());
-    }
-
-    // `gc` runs **before** a `Repo` is opened: the collector takes the store exclusively, and a live
-    // `Repo` holds two connections to it, so opening first would make the collector refuse itself.
-    if command == "gc" {
-        return gc(&store, &arguments);
-    }
-
-    // The interactive entry points run **before** a `Repo` is opened: `mount` opens its own (it needs an `Arc` for the workspace), and
-    // `list`/`umount`/`version` need no store at all — opening one first made them fail on a directory that is not a repository.
+    // Standalone commands that don't require an existing repo via discovery:
     match command.as_str() {
-        "mount" => return mountcmd::mount(&store, workspace_option.as_deref(), &arguments),
+        "init" => return cmd_init(explicit_store.as_deref(), &arguments),
         "umount" => return mountcmd::umount(&arguments),
         "list" => return mountcmd::list(),
         "version" => return mountcmd::version(),
         _ => {}
     }
 
-    // **Inside a mount, `status` asks the mount** (ADR-010 §6): the overlay is held by the mount process, so opening it here would be refused — the same
-    // reason `checkout` asks the workspace *list*. The answer comes over the control pipe, which is also what makes it the mount's own view.
-    // **Inside a mount, `commit` and `snapshot` also ask the mount** (ADR-010 §10.3): the overlay is held by the mount process, so opening it here would be
-    // refused with `WorkspaceInUse` — and the answer has to come from the workspace that is actually serving the files.
-    if command == "commit" || command == "snapshot" {
-        if let Some(here) = mountcmd::mount_of_cwd() {
-            if !here.pipe.is_empty() {
-                let message = arguments
-                    .iter()
-                    .position(|argument| argument == "-m")
-                    .and_then(|index| arguments.get(index + 1))
-                    .cloned()
-                    .unwrap_or_default();
-                let force = arguments.iter().any(|argument| argument == "--force");
-                let request = fs_cli::pipe::Request {
-                    v: fs_cli::pipe::PROTOCOL,
-                    op: command.clone(),
-                    args: serde_json::json!({ "message": message, "force": force }),
-                };
-                return match fs_cli::pipe_win::call(
-                    &here.pipe,
-                    &request,
-                    fs_cli::pipe_win::CONNECT_WAIT_MS,
-                ) {
-                    Ok(fs_cli::pipe::Response::Failed {
-                        kind,
-                        detail,
-                        fields,
-                    }) if kind == "committed" || kind == "snapshotted" => {
-                        let named = fields
-                            .get("commit")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("");
-                        let root = fields
-                            .get("root")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("");
-                        if kind == "committed" {
-                            println!("commit {named}");
-                        } else {
-                            println!("snapshot {root}");
-                        }
-                        let _ = detail;
-                        Ok(())
-                    }
-                    Ok(fs_cli::pipe::Response::Failed { kind, detail, .. }) => {
-                        Err(format!("the mount refused `{command}` ({kind}): {detail}").into())
-                    }
-                    Ok(other) => Err(format!("the mount answered {other:?}").into()),
-                    Err(error) => Err(fs_cli::Failure::in_use(format!(
-                        "the mount at {} is not answering ({error})",
-                        here.mount_point.display()
-                    ))
-                    .into()),
-                };
+    // Discover active mount from CWD when `--store` / `--branch` are omitted.
+    let discovered = std::env::current_dir().ok().and_then(|cwd| {
+        fs_cli::discovery::discover(
+            &cwd,
+            fs_cli::winpaths::volume_root,
+            fs_cli::winpaths::is_volume_mount_point,
+            mountcmd::live_records,
+        )
+    });
+    let target = fs_cli::discovery::resolve(
+        explicit_store.as_deref(),
+        branch_opt.as_deref(),
+        discovered.as_ref(),
+    );
+    let store = target.store;
+    let active_branch = target.workspace;
+
+    if command == "mount" {
+        if !explicit_store_was_given && discovered.is_none() && store.as_os_str() == "." {
+            // Allow positional `mount <store> <mount_point>` fallback inside mountcmd, or error clearly.
+            if arguments.len() < 2 {
+                return Err(fs_cli::Failure::usage(
+                    "mount needs a store: add `--store <dir>` (the repository to serve)",
+                )
+                .into());
             }
         }
+        return mountcmd::mount(&store, active_branch.as_deref(), &arguments);
     }
 
-    if command == "restore" {
-        if let Some(here) = mountcmd::mount_of_cwd() {
-            if !here.pipe.is_empty() {
-                // `restore <commit> [--discard]` — the arguments travel as fields, not as a command line, because the mount answers an **outcome** (restored /
-                // refused with counts) and the CLI's job is to print it, not to re-derive it.
-                let commit = arguments
-                    .iter()
-                    .find(|argument| !argument.starts_with('-'))
-                    .cloned()
-                    .unwrap_or_default();
-                let discard = arguments.iter().any(|argument| argument == "--discard");
-                let request = fs_cli::pipe::Request {
-                    v: fs_cli::pipe::PROTOCOL,
-                    op: "restore".to_owned(),
-                    args: serde_json::json!({"commit": commit, "discard": discard}),
-                };
-                return match fs_cli::pipe_win::call(
-                    &here.pipe,
-                    &request,
-                    fs_cli::pipe_win::CONNECT_WAIT_MS,
-                ) {
-                    Ok(fs_cli::pipe::Response::Failed {
-                        kind,
-                        detail,
-                        fields,
-                    }) if kind == "restored" => {
-                        let dirs = fields
-                            .get("dirs_invalidated")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0);
-                        println!("restored {} to {detail}", here.workspace);
-                        if dirs > 0 {
-                            // **The count is part of the answer**: a shell whose cwd sits inside the mount has a handle that just went stale, and saying so is
-                            // the difference between "it worked" and "it worked and your next `dir` will complain until you `cd .`".
-                            println!("{}", fs_cli::dirs_invalidated(dirs as usize));
-                        }
-                        Ok(())
+    // Inside a live mount, route `status`, `commit`, and `checkout` directly to the mount's control pipe.
+    if let Some(here) = discovered.as_ref() {
+        if !here.pipe.is_empty() && !explicit_store_was_given {
+            match command.as_str() {
+                "status" => return pipe_status(here),
+                "commit" => return pipe_commit(here, &arguments),
+                "checkout" => {
+                    let target_branch = arguments
+                        .first()
+                        .ok_or_else(|| fs_cli::Failure::usage("expected `checkout <branch>`"))?;
+                    if here.workspace != *target_branch {
+                        return switch_mounted(here, target_branch);
                     }
-                    Ok(fs_cli::pipe::Response::RestoreRefused { files, dirs }) => {
-                        Err(fs_cli::Failure::in_use(fs_cli::restore_refusal(files, dirs)).into())
-                    }
-                    Ok(fs_cli::pipe::Response::Failed { kind, detail, .. }) => {
-                        Err(fs_cli::Failure::from_pipe_kind(&kind, detail).into())
-                    }
-                    Ok(other) => Err(format!("the mount answered {other:?}").into()),
-                    Err(error) => Err(fs_cli::Failure::in_use(format!(
-                        "the mount at {} is not answering ({error})",
+                    println!(
+                        "already serving {} at {}",
+                        here.workspace,
                         here.mount_point.display()
-                    ))
-                    .into()),
-                };
-            }
-        }
-    }
-
-    if command == "status" {
-        if let Some(here) = mountcmd::mount_of_cwd() {
-            if !here.pipe.is_empty() {
-                let request = fs_cli::pipe::Request {
-                    v: fs_cli::pipe::PROTOCOL,
-                    op: "status".to_owned(),
-                    args: serde_json::json!({}),
-                };
-                match fs_cli::pipe_win::call(
-                    &here.pipe,
-                    &request,
-                    fs_cli::pipe_win::CONNECT_WAIT_MS,
-                ) {
-                    Ok(fs_cli::pipe::Response::Status {
-                        workspace,
-                        branch,
-                        base_commit,
-                        base_root,
-                        dirty,
-                        handles,
-                    }) => {
-                        println!("workspace: {workspace}");
-                        println!("branch:    {branch}");
-                        println!("base:      {}", short(&base_commit));
-                        println!("root:      {}", short(&base_root));
-                        println!("dirty:     {}", if dirty { "yes" } else { "no" });
-                        println!("handles:   {handles}");
-                        return Ok(());
-                    }
-                    Ok(other) => {
-                        return Err(format!("the mount refused `status`: {other:?}").into());
-                    }
-                    Err(error) => {
-                        return Err(fs_cli::Failure::in_use(format!(
-                            "the mount at {} is not answering ({error})",
-                            here.mount_point.display()
-                        ))
-                        .into())
-                    }
+                    );
+                    return Ok(());
                 }
+                _ => {}
             }
         }
+    }
+
+    if !explicit_store_was_given && discovered.is_none() {
+        return Err(fs_cli::Failure::usage(
+            "no store specified; pass `--store <dir>` or run from inside a mounted volume",
+        )
+        .into());
     }
 
     let repo = Repo::open(&store)?;
     match command.as_str() {
-        "branch" => branch(&repo, &arguments),
-        "checkout" => checkout(&repo, &store, &arguments),
-        "snapshot" => snapshot(&repo, &store, &arguments),
-        "workspace" => workspace(&repo, &arguments),
-        "commit" => commit(&repo, &store, &arguments.clone()),
-        "status" => with_workspace(&repo, &store, |workspace| {
-            let status = workspace.status()?;
-            println!("workspace: {}", status.name);
-            println!("branch:    {}", status.branch);
-            println!("base:      {}", short(&status.base_commit));
-            println!("root:      {}", short(&status.base_root));
-            println!("dirty:     {}", if status.dirty { "yes" } else { "no" });
-            Ok(())
-        }),
-        "log" => log(&repo, &store, &arguments),
-        "reset" => reset(&repo, &store, &arguments),
-        "restore" => with_workspace(&repo, &store, |workspace| {
-            let commit = one(&arguments, "restore <commit> [--discard]")?;
-            let discard = arguments.iter().any(|a| a == "--discard");
-            workspace.restore(&commit, discard)?;
-            workspace.flush()?;
-            println!("restored {} to {}", workspace.name(), commit);
-            Ok(())
-        }),
-        "revert" => {
-            let branch = branch_for(&repo, &arguments, "--branch")?;
-            let info = repo.revert(&branch)?;
-            println!("{}: revert {}", branch, info.id);
-            Ok(())
+        "branch" => cmd_branch(&repo, &arguments),
+        "fork" => cmd_fork(&repo, &arguments),
+        "checkout" => cmd_checkout(&repo, &arguments),
+        "commit" => {
+            let branch = active_branch.as_deref().unwrap_or(DEFAULT_BRANCH);
+            Err(fs_cli::Failure::usage(format!(
+                "commit must be run from inside a mounted volume (branch {branch}) so uncommitted overlay changes are captured"
+            ))
+            .into())
         }
-        "verify" => verify(&repo, &arguments),
-        "stats" => {
-            let stats = repo.stats()?;
-            println!("objects:            {}", stats.objects);
-            println!("branches:           {}", stats.branches);
-            println!("commits:            {}", stats.commits);
-            println!("workspaces:         {}", stats.workspaces);
-            println!("snapshots:          {}", stats.snapshots);
-            println!("branch_log entries: {}", stats.branch_log_entries);
-            Ok(())
-        }
-        other => Err(format!("unknown command {other}; see --help").into()),
+        "merge" => cmd_merge(&repo, &arguments),
+        "publish" => cmd_publish(&repo, &arguments),
+        "diff" => cmd_diff(&repo, &arguments),
+        "log" => cmd_log(&repo, active_branch.as_deref(), &arguments),
+        "status" => cmd_offline_status(&repo, active_branch.as_deref()),
+        "stats" => cmd_stats(&repo),
+        other => Err(fs_cli::Failure::usage(format!("unknown command {other:?}; see `layerfs help`")).into()),
     }
 }
 
 // ------------------------------------------------------------------ commands
 
-/// `gc [--dry-run]`: the offline collector.
-///
-/// Refuses while any writer or workspace holds the store, which is ADR-008 §6.1's whole point; the
-/// error it prints is `StoreInUse` ("a maintainer is running, do not retry"), not `Busy`.
-/// `snapshot [list | drop <root>]`.
-///
-/// A snapshot is a root that keeps a tree alive without moving a branch; dropping one is how a user
-/// says "this tree may go", and the objects follow on the **next** collection rather than immediately.
-/// `workspace discard <name>`: remove a workspace row and its overlay.
-///
-/// Needed before `branch delete`, which refuses while a workspace is still on the branch: deleting the
-/// branch first would leave a workspace pointing at a name nobody has.
-fn workspace(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    match arguments.first().map(String::as_str) {
-        Some("discard") => {
-            let name = arguments
-                .get(1)
-                .ok_or("expected workspace discard <name>")?;
-            repo.workspace_discard(name)?;
-            println!("discarded workspace {name}");
-            Ok(())
-        }
-        other => Err(format!("unknown workspace action {other:?}").into()),
-    }
-}
-
-fn snapshot(
-    repo: &Repo,
-    _store: &std::path::Path,
+fn cmd_init(
+    explicit_store: Option<&Path>,
     arguments: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match arguments.first().map(String::as_str) {
-        None | Some("list") => {
-            let rows = repo.snapshots()?;
-            if rows.is_empty() {
-                println!("no snapshots");
-                return Ok(());
+    let mut profile = PersistenceProfile::Durable;
+    let mut volume_size = DEFAULT_VOLUME_SIZE_BYTES;
+    let mut positional: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < arguments.len() {
+        match arguments[i].as_str() {
+            "--durable" => {
+                profile = PersistenceProfile::Durable;
+                i += 1;
             }
-            for row in rows {
-                println!("{}	{}", row.root, row.workspace);
+            "--disposable" => {
+                profile = PersistenceProfile::Disposable;
+                i += 1;
             }
-            Ok(())
-        }
-        Some("create") => {
-            let name = require_workspace()?;
-            let mut workspace = repo.workspace_open(&name)?;
-            let root = workspace.snapshot()?;
-            workspace.close()?;
-            println!("snapshot {root}");
-            Ok(())
-        }
-        Some("drop") => {
-            let root = arguments.get(1).ok_or("expected snapshot drop <root>")?;
-            if repo.snapshot_drop(root)? {
-                println!("dropped {root}: its objects stay until the next gc");
-            } else {
-                return Err(format!("no snapshot for {root}").into());
+            "--size" => {
+                let raw = arguments
+                    .get(i + 1)
+                    .ok_or_else(|| fs_cli::Failure::usage("--size requires a value"))?;
+                volume_size = parse_size(raw)?;
+                i += 2;
             }
-            Ok(())
+            other if other.starts_with("--size=") => {
+                volume_size = parse_size(&other["--size=".len()..])?;
+                i += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(fs_cli::Failure::usage(format!("unknown init option {other:?}")).into());
+            }
+            other => {
+                positional = Some(PathBuf::from(other));
+                i += 1;
+            }
         }
-        Some(other) => Err(format!("unknown snapshot action {other}").into()),
     }
-}
+    let path = positional
+        .or_else(|| explicit_store.map(Path::to_path_buf))
+        .ok_or_else(|| fs_cli::Failure::usage("usage: layerfs init <path> [--durable|--disposable] [--size <size>]"))?;
 
-fn gc(store: &std::path::Path, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let dry_run = arguments.iter().any(|argument| argument == "--dry-run");
-    let summary = fs_api::gc(store, dry_run)?;
+    let repo = Repo::init(&path, profile, volume_size)?;
+    let stats = repo.stats()?;
     println!(
-        "gc: {} (repack_threshold {})",
-        if summary.dry_run { "dry run" } else { "done" },
-        summary.repack_threshold
+        "initialized {} (profile={}, default branch={}, main={})",
+        path.display(),
+        repo.profile().as_str(),
+        DEFAULT_BRANCH,
+        short(&stats.head_layer),
     );
-    println!("  marked objects:      {}", summary.marked_objects);
-    println!("  freed objects:       {}", summary.freed_objects);
-    if summary.dry_run {
-        println!("  planned objects:     {}", summary.planned_objects);
-    }
-    println!("  freed bytes:         {}", summary.freed_object_bytes);
-    println!("  reclaimed dead bytes:{}", summary.reclaimed_dead_bytes);
-    println!(
-        "  packs: {} deleted, {} repacked",
-        summary.packs_deleted, summary.packs_repacked
-    );
-    for pack in &summary.missing_packs {
-        println!("  warning: pack {pack} has a row but no file (not repaired: a missing file is a finding)");
-    }
     Ok(())
 }
 
-fn branch(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_branch(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if arguments.is_empty() {
-        for branch in repo.branches()? {
-            println!("{}\t{}", branch.name, branch.head);
+        for b in repo.branches()? {
+            let head = b.head.as_deref().map_or("-", short);
+            println!("{:<20} head={:<14} base={}", b.name, head, short(&b.base));
         }
         return Ok(());
     }
-    let name = &arguments[0];
-    let from = arguments
-        .iter()
-        .position(|a| a == "--from")
-        .and_then(|index| arguments.get(index + 1))
-        .map(String::as_str);
-    if name == "delete" {
-        let victim = arguments.get(1).ok_or("expected branch delete <name>")?;
-        repo.branch_delete(victim)?;
-        println!("deleted branch {victim} (its commits remain roots)");
-        return Ok(());
-    }
+    cmd_fork(repo, arguments)
+}
 
-    let created = repo.branch_create(name, from)?;
-    println!("{} -> {}", created.name, short(&created.head));
+fn cmd_fork(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut name: Option<&str> = None;
+    let mut from: Option<&str> = None;
+    let mut i = 0;
+    while i < arguments.len() {
+        match arguments[i].as_str() {
+            "--from" => {
+                from = Some(
+                    arguments
+                        .get(i + 1)
+                        .ok_or_else(|| fs_cli::Failure::usage("--from requires a branch name"))?
+                        .as_str(),
+                );
+                i += 2;
+            }
+            other if other.starts_with("--from=") => {
+                from = Some(&other["--from=".len()..]);
+                i += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(fs_cli::Failure::usage(format!("unknown option {other:?}")).into());
+            }
+            other => {
+                name = Some(other);
+                i += 1;
+            }
+        }
+    }
+    let name = name.ok_or_else(|| fs_cli::Failure::usage("expected `<name> [--from <src>]`"))?;
+    let info = repo.fork(name, from)?;
+    println!(
+        "forked {} (base={}, head={})",
+        info.name,
+        short(&info.base),
+        info.head.as_deref().map_or("-", short)
+    );
     Ok(())
 }
 
-fn checkout(
-    repo: &Repo,
-    _store: &Path,
-    arguments: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let branch = arguments.first().ok_or("expected checkout <branch>")?;
-    // The workspace is named after its branch: one workspace per branch, and a second `checkout` of the same branch resumes the first.
-    //
-    // **Existence is asked of the workspace *list*, not of `workspace_open`** (A3b): opening is what a mount holds, so asking it would make `checkout dev`
-    // fail exactly when `dev` is mounted — the case where the user most needs to be told it is already there and where.
-    let existing = repo
-        .workspaces()?
-        .into_iter()
-        .find(|workspace| &workspace.name == branch)
-        .or_else(|| {
-            repo.workspaces()
-                .ok()?
-                .into_iter()
-                .find(|workspace| &workspace.branch == branch)
-        });
-    let Some(existing) = existing else {
-        // No row: create it (the branch must exist, or `workspace_create` says so).
-        let created = match repo.workspace_create(branch, branch) {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                return Err(fs_cli::Failure::not_found(format!(
-                    "cannot create a workspace on {branch}: {error}; \
-                     if that branch does not exist, create it with `fs-cli branch {branch} --from main`"
-                ))
-                .into())
-            }
-        };
-        println!("on {} (workspace {})", created.branch(), created.name());
-        created.close()?;
-        return Ok(());
-    };
-
-    // The workspace exists. If it is **mounted**, say so and keep the mount: `checkout` is not a request to unmount anything (A3b).
-    // **A3b's third case, now a switch** (S3 §5.2): run from inside a mount, `checkout <b>` asks that mount to serve `b`. The CLI's own message used to be
-    // "unmount and mount again"; the mount can now do it without the user knowing the two steps.
-    if let Some(here) = mountcmd::mount_of_cwd() {
-        if here.workspace != existing.name {
-            return switch_mounted(&here, &existing.name);
-        }
+fn cmd_checkout(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let branch = arguments
+        .first()
+        .ok_or_else(|| fs_cli::Failure::usage("expected `checkout <branch>`"))?;
+    if !repo.branches()?.iter().any(|b| b.name == *branch) {
+        return Err(fs_cli::Failure::not_found(format!(
+            "branch {branch:?} not found; create it with `layerfs branch {branch}`"
+        ))
+        .into());
     }
-
-    match mountcmd::live_mount_of(&existing.name) {
+    match mountcmd::live_mount_of(branch) {
         Some((mount_point, pid)) => {
-            println!(
-                "on {} (workspace {}) — mounted at {mount_point} (pid {pid})",
-                existing.branch, existing.name
-            );
-            Ok(())
+            println!("branch {branch} is mounted at {mount_point} (pid {pid})");
         }
         None => {
-            let workspace = repo.workspace_open(&existing.name)?;
-            println!("on {} (workspace {})", workspace.branch(), workspace.name());
-            workspace.close()?;
-            Ok(())
+            println!(
+                "branch {branch} is ready; mount it with `layerfs --store {} mount <point> --branch {branch}`",
+                repo.dir().display()
+            );
         }
     }
+    Ok(())
 }
 
-fn commit(
+fn cmd_merge(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut message: Option<&str> = None;
+    let mut i = 0;
+    while i < arguments.len() {
+        match arguments[i].as_str() {
+            "-m" | "--message" => {
+                message = Some(
+                    arguments
+                        .get(i + 1)
+                        .ok_or_else(|| fs_cli::Failure::usage("-m requires a message"))?
+                        .as_str(),
+                );
+                i += 2;
+            }
+            other if other.starts_with('-') => {
+                return Err(fs_cli::Failure::usage(format!("unknown option {other:?}")).into());
+            }
+            other => {
+                positionals.push(other);
+                i += 1;
+            }
+        }
+    }
+    if positionals.len() != 3 {
+        return Err(
+            fs_cli::Failure::usage("usage: layerfs merge <left> <right> <into> [-m <message>]")
+                .into(),
+        );
+    }
+    let outcome = repo.merge(positionals[0], positionals[1], positionals[2], message)?;
+    if !outcome.conflicts.is_empty() {
+        for path in &outcome.conflicts {
+            println!("CONFLICT: {path}");
+        }
+        return Err(fs_cli::Failure::conflict(format!(
+            "merge into {} has {} conflict(s)",
+            outcome.branch,
+            outcome.conflicts.len()
+        ))
+        .into());
+    }
+    println!(
+        "{} {} (fast_forward={}, head={}, root={})",
+        outcome.kind,
+        outcome.branch,
+        outcome.fast_forward,
+        outcome.head.as_deref().map_or("-", short),
+        outcome.root.as_deref().map_or("-", short),
+    );
+    Ok(())
+}
+
+fn cmd_publish(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let branch = arguments
+        .first()
+        .ok_or_else(|| fs_cli::Failure::usage("usage: layerfs publish <branch> [<commit>]"))?;
+    let commit = arguments.get(1).map(String::as_str);
+    let outcome = repo.publish(branch, commit)?;
+    println!(
+        "published {} -> main layer {} (kind={}, overwrote={})",
+        branch,
+        short(&outcome.layer),
+        outcome.kind,
+        outcome.overwrote_count
+    );
+    Ok(())
+}
+
+fn cmd_diff(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.len() < 2 {
+        return Err(fs_cli::Failure::usage("usage: layerfs diff <left> <right>").into());
+    }
+    let diffs = repo.diff_branches(&arguments[0], &arguments[1])?;
+    if diffs.is_empty() {
+        println!("no differences");
+        return Ok(());
+    }
+    for d in diffs {
+        println!("{:<10} {}", d.kind, d.path);
+    }
+    Ok(())
+}
+
+fn cmd_log(
     repo: &Repo,
-    store: &Path,
+    active_branch: Option<&str>,
     arguments: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut message = None;
-    let mut force = false;
-    let mut index = 0;
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "-m" => {
-                message = arguments.get(index + 1).cloned();
-                index += 2;
-            }
-            "--force" => {
-                force = true;
-                index += 1;
-            }
-            other => return Err(format!("unexpected argument {other}; see --help").into()),
-        }
-    }
-    let message = message.ok_or("expected commit -m <message>")?;
-    with_workspace(repo, store, |workspace| {
-        let id = workspace.commit(&message, force)?;
-        println!("{}: {}", workspace.branch(), id);
-        Ok(())
-    })
-}
-
-fn log(repo: &Repo, _store: &Path, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    // `log [branch] [n]`: with a branch named on the command line no overlay is opened (A1), so `log dev` works while `dev` is mounted.
     let named = arguments
         .first()
         .filter(|text| !text.starts_with('-') && text.parse::<usize>().is_err());
-    let branch = match named {
-        Some(branch) => branch.clone(),
-        None => current_branch(repo)?,
-    };
+    let branch = named
+        .map(String::as_str)
+        .or(active_branch)
+        .unwrap_or(DEFAULT_BRANCH);
     let limit = arguments
         .iter()
         .find_map(|text| text.parse::<usize>().ok())
-        .unwrap_or(usize::MAX);
-    for info in repo.log(&branch)?.into_iter().take(limit) {
-        println!("{} {}", info.id, info.message);
+        .unwrap_or(50);
+    let commits = repo.log(branch, limit)?;
+    if commits.is_empty() {
+        println!("no commits on {branch}");
+        return Ok(());
+    }
+    for c in commits {
+        println!(
+            "{}  root={}  {}",
+            short(&c.id),
+            short(&c.root),
+            c.message.as_deref().unwrap_or("")
+        );
     }
     Ok(())
 }
 
-fn reset(
+fn cmd_offline_status(
     repo: &Repo,
-    _store: &Path,
-    arguments: &[String],
+    active_branch: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let commit = one(arguments, "reset <commit> [--expect <c>]")?;
-    let expect = arguments
-        .iter()
-        .position(|a| a == "--expect")
-        .and_then(|index| arguments.get(index + 1))
-        .map(String::as_str);
-    let branch = branch_for(repo, arguments, "--branch")?;
-    repo.reset(&branch, &commit, expect)?;
-    println!("{branch} -> {commit}");
-    Ok(())
-}
-
-fn verify(repo: &Repo, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let deep = arguments.iter().any(|a| a == "--deep");
-    let report = repo.verify(deep)?;
-    println!("objects:  {}", report.objects);
-    println!("roots:    {}", report.roots_checked);
-    if deep {
-        println!("inodes:   {}", report.inodes_checked);
-    }
-    println!(
-        "index:    {}",
-        if report.index_clean { "ok" } else { "broken" }
-    );
-    for dangling in &report.dangling {
-        println!("dangling: {} ({})", dangling.object, dangling.reason);
-    }
-    if report.is_clean() {
-        println!("ok");
-        Ok(())
-    } else {
-        Err(format!("{} problem(s) found", report.dangling.len()).into())
-    }
-}
-
-// ------------------------------------------------------------------ plumbing
-
-/// Runs `body` against the current workspace, opening and closing it around the call.
-fn with_workspace(
-    repo: &Repo,
-    _store: &Path,
-    body: impl FnOnce(&mut Workspace) -> Result<(), Box<dyn std::error::Error>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let name = require_workspace()?;
-    let mut workspace = match repo.workspace_open(&name) {
-        Ok(workspace) => workspace,
-        Err(error) => return Err(open_refusal(&name, error, "open")),
+    let branch = active_branch.unwrap_or(DEFAULT_BRANCH);
+    let Some(info) = repo.branches()?.into_iter().find(|b| b.name == branch) else {
+        return Err(fs_cli::Failure::not_found(format!("branch {branch:?} not found")).into());
     };
-    let outcome = body(&mut workspace);
-    workspace.close()?;
-    outcome
+    println!("branch:    {}", info.name);
+    println!("base:      {}", short(&info.base));
+    println!(
+        "head:      {}",
+        info.head.as_deref().map_or("(none)", short)
+    );
+    if let Some((mount_point, pid)) = mountcmd::live_mount_of(&info.name) {
+        println!("mounted:   {mount_point} (pid {pid})");
+    } else {
+        println!("mounted:   no");
+    }
+    Ok(())
 }
 
-/// Turns "cannot open this workspace" into a message that says **why** (A3, ADR-010 §8.2).
-///
-/// Two different situations hide behind one error: a workspace this machine is serving (there is a record with a mount point and a pid) and one held by a
-/// process with no record (another `fs-cli`). The first tells the user which mount to unmount; the second says so plainly. Rendering both the same way would
-/// lose the only part of the message that is actionable.
-fn open_refusal(workspace: &str, error: ApiError, command: &str) -> Box<dyn std::error::Error> {
-    if let Some((mount_point, pid)) = mountcmd::live_mount_of(workspace) {
-        return fs_cli::Failure::in_use(fs_cli::mounted_refusal(
-            command,
+fn cmd_stats(repo: &Repo) -> Result<(), Box<dyn std::error::Error>> {
+    let stats = repo.stats()?;
+    println!("profile:         {}", stats.profile.as_str());
+    println!("volume_size:     {} bytes", stats.volume_size_bytes);
+    println!("store_file:      {} bytes", stats.store_file_bytes);
+    println!("branches:        {}", stats.branches);
+    println!("head_layer:      {}", short(&stats.head_layer));
+    println!("logical_bytes:   {}", stats.logical_bytes);
+    println!("canonical_bytes: {}", stats.canonical_bytes);
+    println!("stored_bytes:    {}", stats.stored_bytes);
+    Ok(())
+}
+
+// ------------------------------------------------------------------ pipe helpers
+
+fn pipe_status(here: &fs_cli::discovery::Record) -> Result<(), Box<dyn std::error::Error>> {
+    let request = fs_cli::pipe::Request {
+        v: fs_cli::pipe::PROTOCOL,
+        op: "status".to_owned(),
+        args: serde_json::json!({}),
+    };
+    match fs_cli::pipe_win::call(&here.pipe, &request, fs_cli::pipe_win::CONNECT_WAIT_MS) {
+        Ok(fs_cli::pipe::Response::Status {
             workspace,
-            &mount_point,
-            pid,
-        ))
-        .into();
-    }
-    // Not found is not "in use": it keeps its own exit code and its own way out.
-    if matches!(
-        error,
-        ApiError::Workspace(fs_workspace::WorkspaceError::NotFound { .. })
-    ) {
-        return fs_cli::Failure::not_found(format!(
-            "no workspace {workspace}; `fs-cli checkout <branch>` creates one"
-        ))
-        .into();
-    }
-    // Anything else while such a workspace exists is the lock talking: another process has it open.
-    fs_cli::Failure::in_use(fs_cli::IN_USE_ELSEWHERE).into()
-}
-
-/// The branch a command works on: **`--branch`, or the workspace's branch** (ADR-010 §13 A1/A1b).
-///
-/// With `--branch` no overlay is opened at all, so `log`/`reset`/`revert` keep working while another process has the workspace mounted. The same has to
-/// be true of the fallback: `current_branch` reads the **workspace row** (via `workspaces()`), never the overlay, or `--workspace dev log` would fail
-/// exactly when `dev` is in use — which is the case that matters (A1b).
-fn branch_for(
-    repo: &Repo,
-    arguments: &[String],
-    flag: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    if let Some(index) = arguments.iter().position(|argument| argument == flag) {
-        if let Some(name) = arguments.get(index + 1) {
-            return Ok(name.clone());
+            branch,
+            base_commit,
+            base_root,
+            dirty,
+            handles,
+        }) => {
+            println!("workspace: {workspace}");
+            println!("branch:    {branch}");
+            println!("base:      {}", short(&base_commit));
+            println!("root:      {}", short(&base_root));
+            println!("dirty:     {}", if dirty { "yes" } else { "no" });
+            println!("handles:   {handles}");
+            Ok(())
         }
-    }
-    current_branch(repo)
-}
-
-fn current_branch(repo: &Repo) -> Result<String, Box<dyn std::error::Error>> {
-    let name = require_workspace()?;
-    // **The row, not the overlay** (A1b): opening the workspace would fail while it is mounted, and answering "which branch am I on" must not require
-    // the lock that a mount holds. The row is what `workspace_list` reads.
-    match repo.workspaces()?.into_iter().find(|row| row.name == name) {
-        Some(row) => Ok(row.branch),
-        None => Err(fs_cli::Failure::not_found(format!(
-            "no workspace {name}; `fs-cli checkout <branch>` creates one"
+        Ok(other) => Err(format!("the mount refused `status`: {other:?}").into()),
+        Err(error) => Err(fs_cli::Failure::in_use(format!(
+            "the mount at {} is not answering ({error})",
+            here.mount_point.display()
         ))
         .into()),
     }
 }
 
-/// The workspace this command runs against: **the `--workspace` option, or nothing** (ADR-010 §5).
-///
-/// `cli/current` is gone: a file that remembers a name for you is a second source of truth, and it made every command's behaviour depend on a store
-/// nobody mentioned. The `store` parameter stays only so the call sites read unchanged while the S0 sweep removes them one by one.
-fn short(id: &str) -> &str {
-    id.get(..12).unwrap_or(id)
+fn pipe_commit(
+    here: &fs_cli::discovery::Record,
+    arguments: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let message = arguments
+        .iter()
+        .position(|a| a == "-m" || a == "--message")
+        .and_then(|i| arguments.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let force = arguments.iter().any(|a| a == "--force");
+    let request = fs_cli::pipe::Request {
+        v: fs_cli::pipe::PROTOCOL,
+        op: "commit".to_owned(),
+        args: serde_json::json!({ "message": message, "force": force }),
+    };
+    match fs_cli::pipe_win::call(&here.pipe, &request, fs_cli::pipe_win::CONNECT_WAIT_MS) {
+        Ok(fs_cli::pipe::Response::Failed { kind, fields, .. }) if kind == "committed" => {
+            let commit = fields
+                .get("commit")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let root = fields
+                .get("root")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            println!("commit {} (root {})", short(commit), short(root));
+            Ok(())
+        }
+        Ok(fs_cli::pipe::Response::Failed { kind, detail, .. }) => {
+            Err(fs_cli::Failure::from_pipe_kind(&kind, detail).into())
+        }
+        Ok(other) => Err(format!("the mount answered {other:?}").into()),
+        Err(error) => Err(fs_cli::Failure::in_use(format!(
+            "the mount at {} is not answering ({error})",
+            here.mount_point.display()
+        ))
+        .into()),
+    }
 }
 
-fn take_option(arguments: &mut Vec<String>, name: &str) -> Option<String> {
-    let prefix = format!("{name}=");
-    if let Some(index) = arguments.iter().position(|a| a.starts_with(&prefix)) {
-        let value = arguments[index][prefix.len()..].to_owned();
-        arguments.remove(index);
-        return Some(value);
-    }
-    let index = arguments.iter().position(|a| a == name)?;
-    arguments.remove(index);
-    if index < arguments.len() {
-        Some(arguments.remove(index))
-    } else {
-        None
-    }
-}
-
-fn one(arguments: &[String], usage: &str) -> Result<String, Box<dyn std::error::Error>> {
-    match arguments {
-        [first, ..] if !first.starts_with("--") => Ok(first.clone()),
-        _ => Err(format!("expected {usage}").into()),
-    }
-}
-
-/// Asks the mount that contains the current directory to serve `workspace` instead (S3 §5.2).
-///
-/// Two steps before the ask, both required:
-///
-/// 1. **this process must leave the volume**: the CLI's own cwd is a directory handle on `U:` once it is inside, and a switch would then find a handle it can
-///    never get rid of. The cwd is moved to the store first;
-/// 2. the ask goes over the **control pipe**, because the mount is what owns the volume.
 fn switch_mounted(
     here: &fs_cli::discovery::Record,
-    workspace: &str,
+    branch: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Step 1: out of the volume. The store directory is on a normal volume and always exists (the record names it).
     std::env::set_current_dir(&here.store).map_err(|error| {
         fs_cli::Failure::in_use(format!(
             "cannot step out of {} ({error}); run this from outside the mount",
@@ -950,7 +638,7 @@ fn switch_mounted(
     let request = fs_cli::pipe::Request {
         v: fs_cli::pipe::PROTOCOL,
         op: "switch".to_owned(),
-        args: serde_json::json!({ "workspace": workspace }),
+        args: serde_json::json!({ "workspace": branch }),
     };
     match fs_cli::pipe_win::call(&here.pipe, &request, fs_cli::pipe_win::CONNECT_WAIT_MS) {
         Ok(fs_cli::pipe::Response::Switched {
@@ -979,5 +667,27 @@ fn switch_mounted(
             here.mount_point.display()
         ))
         .into()),
+    }
+}
+
+// ------------------------------------------------------------------ helpers
+
+fn short(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
+}
+
+fn take_option(arguments: &mut Vec<String>, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    if let Some(index) = arguments.iter().position(|a| a.starts_with(&prefix)) {
+        let value = arguments[index][prefix.len()..].to_owned();
+        arguments.remove(index);
+        return Some(value);
+    }
+    let index = arguments.iter().position(|a| a == name)?;
+    arguments.remove(index);
+    if index < arguments.len() {
+        Some(arguments.remove(index))
+    } else {
+        None
     }
 }

@@ -1,0 +1,257 @@
+//! End-to-end tests for `fs-layerfs`: upstream LayerFS storage + history + WinFspBackend.
+
+use std::path::PathBuf;
+
+use fs_layerfs::{PersistenceProfile, Repo, DEFAULT_BRANCH, DEFAULT_VOLUME_SIZE_BYTES};
+use fs_semantics::disposition::Disposition;
+use fs_winfsp::ops::{Attributes, Kind, Path, WorkspaceOps};
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "fs-layerfs-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn full_lifecycle_create_write_case_fold_rename_commit_fork_merge_publish_diff() {
+    let tmp = TempDir::new("lifecycle");
+    let repo_dir = tmp.0.join("repo");
+
+    let repo = Repo::init(
+        &repo_dir,
+        PersistenceProfile::Disposable,
+        DEFAULT_VOLUME_SIZE_BYTES,
+    )
+    .expect("init repo");
+
+    // Open default writable branch `work`.
+    let ws = repo.open_workspace(DEFAULT_BRANCH).expect("open work");
+    let ops = ws.backend();
+
+    // Create subdirectory and file (case-preserving).
+    let dir_id = ops.mkdir(&Path::new(b"/SubDir")).expect("mkdir /SubDir");
+    assert_eq!(ops.open_dir(&Path::new(b"/subdir")).unwrap(), dir_id);
+
+    let created = ops
+        .create_or_open(&Path::new(b"/SubDir/ReadMe.txt"), Disposition::Create)
+        .expect("create file");
+    assert_eq!(created.kind, Kind::File);
+
+    // Case-insensitive collision on Create must fail with NameCollision!
+    let err = ops
+        .create_or_open(&Path::new(b"/subdir/readme.txt"), Disposition::Create)
+        .unwrap_err();
+    assert_eq!(err, fs_winfsp::OpsError::NameCollision);
+
+    // Write and read back through FileId.
+    let payload = b"hello from upstream layerfs on windows!";
+    assert_eq!(ops.write(created.file_id, 0, payload).unwrap(), payload.len());
+    assert_eq!(ops.read(created.file_id, 0, payload.len()).unwrap(), payload);
+
+    // ReadOnly attribute maps to POSIX write bit.
+    ops.set_attributes(created.file_id, Attributes(0x01)).unwrap();
+    let info = ops.get_info(created.file_id).unwrap();
+    assert_ne!(info.attributes.0 & 0x01, 0);
+    ops.set_attributes(created.file_id, Attributes(0x00)).unwrap();
+
+    // Case-only rename in same directory works!
+    let renamed = ops
+        .rename(&Path::new(b"/subdir/readme.txt"), &Path::new(b"/SubDir/README.md"), false)
+        .expect("case rename");
+    assert_eq!(renamed.file_id, created.file_id);
+    let entries = ops.read_dir(dir_id).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, b"README.md");
+
+    // Commit changes to `work`.
+    let committed = ws.commit(Some("initial commit"), false).expect("commit");
+    assert_eq!(committed.kind, "Committed");
+    assert!(committed.commit.is_some());
+    ws.close().expect("close work");
+
+    // Fork two branches from `work`, edit different files, merge, diff, publish to `main`.
+    repo.fork("feat-a", Some("work")).expect("fork feat-a");
+    repo.fork("feat-b", Some("work")).expect("fork feat-b");
+
+    {
+        let wa = repo.open_workspace("feat-a").unwrap();
+        let a_ops = wa.backend();
+        let f = a_ops
+            .create_or_open(&Path::new(b"/a.txt"), Disposition::Create)
+            .unwrap();
+        a_ops.write(f.file_id, 0, b"branch a").unwrap();
+        wa.commit(Some("add a"), false).unwrap();
+        wa.close().unwrap();
+    }
+    {
+        let wb = repo.open_workspace("feat-b").unwrap();
+        let b_ops = wb.backend();
+        let f = b_ops
+            .create_or_open(&Path::new(b"/b.txt"), Disposition::Create)
+            .unwrap();
+        b_ops.write(f.file_id, 0, b"branch b").unwrap();
+        wb.commit(Some("add b"), false).unwrap();
+        wb.close().unwrap();
+    }
+
+    let merged = repo
+        .merge("feat-a", "feat-b", "merged", Some("merge a and b"))
+        .expect("3-way merge");
+    assert_eq!(merged.kind, "Merged");
+    assert!(merged.conflicts.is_empty());
+
+    let diffs = repo.diff_branches("work", "merged").expect("diff");
+    let diff_paths: Vec<&str> = diffs.iter().map(|d| d.path.as_str()).collect();
+    assert!(diff_paths.contains(&"/a.txt"));
+    assert!(diff_paths.contains(&"/b.txt"));
+
+    let published = repo.publish("merged", None).expect("publish to main");
+    assert_eq!(published.kind, "Added");
+
+    // Reopen repo from disk and verify merged files are readable!
+    drop(repo);
+    let reopened = Repo::open(&repo_dir).expect("reopen repo");
+    let wm = reopened.open_workspace("merged").unwrap();
+    let m_ops = wm.backend();
+    let a = m_ops
+        .create_or_open(&Path::new(b"/A.TXT"), Disposition::Open)
+        .unwrap();
+    assert_eq!(m_ops.read(a.file_id, 0, 8).unwrap(), b"branch a");
+    let b = m_ops
+        .create_or_open(&Path::new(b"/B.TXT"), Disposition::Open)
+        .unwrap();
+    assert_eq!(m_ops.read(b.file_id, 0, 8).unwrap(), b"branch b");
+    wm.close().unwrap();
+}
+
+#[test]
+fn durable_profile_init_and_reopen() {
+    let tmp = TempDir::new("durable");
+    let repo_dir = tmp.0.join("repo");
+    let repo = Repo::init(
+        &repo_dir,
+        PersistenceProfile::Durable,
+        DEFAULT_VOLUME_SIZE_BYTES,
+    )
+    .expect("init durable");
+    assert_eq!(repo.profile(), PersistenceProfile::Durable);
+    let ws = repo.open_workspace(DEFAULT_BRANCH).unwrap();
+    let ops = ws.backend();
+    let f = ops
+        .create_or_open(&Path::new(b"/durable.bin"), Disposition::Create)
+        .unwrap();
+    ops.write(f.file_id, 0, b"durable payload").unwrap();
+    ws.commit(Some("durable"), false).unwrap();
+    ws.close().unwrap();
+    drop(repo);
+
+    let reopened = Repo::open(&repo_dir).unwrap();
+    assert_eq!(reopened.profile(), PersistenceProfile::Durable);
+    let ws2 = reopened.open_workspace(DEFAULT_BRANCH).unwrap();
+    let f2 = ws2
+        .backend()
+        .create_or_open(&Path::new(b"/durable.bin"), Disposition::Open)
+        .unwrap();
+    assert_eq!(
+        ws2.backend().read(f2.file_id, 0, 15).unwrap(),
+        b"durable payload"
+    );
+    ws2.close().unwrap();
+}
+
+#[test]
+fn remove_pagination_resize_times_and_windowed_io() {
+    let tmp = TempDir::new("edgecases");
+    let repo_dir = tmp.0.join("repo");
+    let repo = Repo::init(
+        &repo_dir,
+        PersistenceProfile::Disposable,
+        DEFAULT_VOLUME_SIZE_BYTES,
+    )
+    .expect("init repo");
+    let ws = repo.open_workspace(DEFAULT_BRANCH).unwrap();
+    let ops = ws.backend();
+
+    // 1. Pagination beyond PAGE_ROWS (64): create 100 files in one directory.
+    let big_dir = ops.mkdir(&Path::new(b"/many")).unwrap();
+    for i in 0..100 {
+        let p = format!("/many/file-{i:03}.txt");
+        ops.create_or_open(&Path::new(p.as_bytes()), Disposition::Create)
+            .unwrap();
+    }
+    let entries = ops.read_dir(big_dir).unwrap();
+    assert_eq!(entries.len(), 100, "read_dir must paginate past 64 rows");
+
+    // 2. Non-empty directory cannot be removed.
+    let binding = ops.dir_binding(&Path::new(b"/many")).unwrap();
+    assert_eq!(
+        ops.remove_at(binding.binding.0, &binding.binding.1, big_dir),
+        Err(fs_winfsp::OpsError::NotEmpty)
+    );
+
+    // 3. Remove one file with guard check (wrong expected_id fails, right succeeds).
+    let target = ops
+        .create_or_open(&Path::new(b"/many/FILE-050.TXT"), Disposition::Open)
+        .unwrap();
+    assert!(matches!(
+        ops.remove_at(target.binding.0, &target.binding.1, target.file_id + 999),
+        Err(fs_winfsp::OpsError::InvalidRecord(_))
+    ));
+    ops.remove_at(target.binding.0, &target.binding.1, target.file_id)
+        .unwrap();
+    assert_eq!(ops.read_dir(big_dir).unwrap().len(), 99);
+
+    // 4. Empty directory can be removed.
+    let empty_dir = ops.mkdir(&Path::new(b"/EmptyDir")).unwrap();
+    let empty_bind = ops.dir_binding(&Path::new(b"/emptydir")).unwrap();
+    ops.remove_at(empty_bind.binding.0, &empty_bind.binding.1, empty_dir)
+        .unwrap();
+    assert_eq!(
+        ops.open_dir(&Path::new(b"/EmptyDir")),
+        Err(fs_winfsp::OpsError::NotFound)
+    );
+
+    // 5. set_size shrink + zero-extend + large multi-window I/O (1.5 MiB).
+    let big = ops
+        .create_or_open(&Path::new(b"/big.bin"), Disposition::Create)
+        .unwrap();
+    let payload: Vec<u8> = (0..1_500_000usize).map(|i| (i % 251) as u8).collect();
+    assert_eq!(ops.write(big.file_id, 0, &payload).unwrap(), payload.len());
+    assert_eq!(ops.read(big.file_id, 0, payload.len()).unwrap(), payload);
+
+    ops.set_size(big.file_id, 10).unwrap();
+    assert_eq!(ops.get_info(big.file_id).unwrap().size, 10);
+    assert_eq!(ops.read(big.file_id, 0, 10).unwrap(), &payload[..10]);
+
+    ops.set_size(big.file_id, 20).unwrap();
+    let extended = ops.read(big.file_id, 0, 20).unwrap();
+    assert_eq!(&extended[..10], &payload[..10]);
+    assert_eq!(&extended[10..20], &[0u8; 10]);
+
+    // 6. set_times persists mtime.
+    let ts_ns: i64 = 1_700_000_000_123_456_789;
+    ops.set_times(big.file_id, None, Some(ts_ns), None, None)
+        .unwrap();
+    let info = ops.get_info(big.file_id).unwrap();
+    assert_eq!(info.times.written, ts_ns);
+
+    ws.commit(Some("edgecases"), false).unwrap();
+    ws.close().unwrap();
+}

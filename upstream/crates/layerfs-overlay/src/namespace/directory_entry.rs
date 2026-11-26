@@ -1,0 +1,97 @@
+//! Bounded current namespace inputs over an exact unchanged base source.
+use crate::{
+    db::{integer, unsigned},
+    sql, BaseSource, DirectoryEntry, Generation, Overlay, OverlayError, OverlayResult,
+    StatementKind,
+};
+fn decode(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirectoryEntry> {
+    Ok(DirectoryEntry {
+        inherited: row.get(3)?,
+        parent: unsigned(row, 0)?,
+        name: row.get(1)?,
+        serial: row
+            .get::<_, Option<i64>>(2)?
+            .map(|v| u64::try_from(v).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, v)))
+            .transpose()?,
+    })
+}
+impl Overlay {
+    pub fn source_directory_entry_window(
+        &self,
+        source: BaseSource,
+        parent: u64,
+        after: Option<&[u8]>,
+    ) -> OverlayResult<crate::DirectoryEntryWindow> {
+        let state = self.source_state(source)?;
+        let parent_inode = self.inode_at(parent, state.active, state.installed)?;
+        let active = self.source_directory_entries(source, parent, state.active, after)?;
+        let captured = if let Some(generation) = state.captured.or(state.consolidating) {
+            self.source_directory_entries(source, parent, generation, after)?
+        } else {
+            Vec::new()
+        };
+        Ok(crate::DirectoryEntryWindow {
+            source,
+            parent,
+            parent_inode,
+            active,
+            captured,
+        })
+    }
+    pub fn source_directory_entry(
+        &self,
+        source: BaseSource,
+        parent: u64,
+        name: &[u8],
+    ) -> OverlayResult<Option<DirectoryEntry>> {
+        if name.is_empty() || name.len() > 255 {
+            return Err(OverlayError::Invalid("source name"));
+        }
+        let state = self.source_state(source)?;
+        self.query(
+            StatementKind::DirectoryEntry,
+            sql::DIRECTORY_ENTRY_LOOKUP,
+            &[&integer(parent)?, &name, &state.active.0, &state.installed],
+            32 + name.len() as u64,
+            |row| {
+                Ok(DirectoryEntry {
+                    inherited: row.get(1)?,
+                    parent,
+                    name: name.to_vec(),
+                    serial: row
+                        .get::<_, Option<i64>>(0)?
+                        .map(|v| {
+                            u64::try_from(v)
+                                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, v))
+                        })
+                        .transpose()?,
+                })
+            },
+        )
+        .map(|mut rows| rows.pop())
+    }
+    pub fn source_directory_entries(
+        &self,
+        source: BaseSource,
+        parent: u64,
+        generation: Generation,
+        after: Option<&[u8]>,
+    ) -> OverlayResult<Vec<DirectoryEntry>> {
+        let state = self.source_state(source)?;
+        if generation != state.active && Some(generation) != state.captured.or(state.consolidating)
+        {
+            return Err(OverlayError::Stale);
+        }
+        let after = after.unwrap_or(&[]);
+        if after.len() > 255 {
+            return Err(OverlayError::Invalid("source name cursor"));
+        }
+        self.query(
+            StatementKind::DirectoryEntry,
+            sql::SOURCE_NAMES,
+            &[&generation.0, &integer(parent)?, &after],
+            24 + after.len() as u64,
+            decode,
+        )
+    }
+}

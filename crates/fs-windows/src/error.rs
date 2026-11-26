@@ -56,18 +56,18 @@ impl NtStatus {
             Self::ObjectNameCollision => 0xC000_0035,
             Self::ObjectNameNotFound => 0xC000_0034,
             Self::ObjectPathNotFound => 0xC000_003A,
-            Self::NotADirectory => 0xC000_010F,
+            Self::NotADirectory => 0xC000_0103,
             Self::FileIsADirectory => 0xC000_00BA,
-            Self::DeletePending => 0xC000_0051,
+            Self::DeletePending => 0xC000_0056,
             Self::SharingViolation => 0xC000_0043,
             Self::AccessDenied => 0xC000_0022,
             Self::DirectoryNotEmpty => 0xC000_0101,
             Self::InvalidParameter => 0xC000_000D,
             Self::EndOfFile => 0xC000_0011,
-            Self::FileTooLarge => 0xC000_0093,
+            Self::FileTooLarge => 0xC000_0904,
             Self::DiskFull => 0xC000_007F,
             Self::NotSupported => 0xC000_00BB,
-            Self::InternalError => 0xC000_0001,
+            Self::InternalError => 0xC000_00E5,
         }
     }
 

@@ -17,11 +17,11 @@ use std::collections::BTreeSet;
 
 /// The two directories instantiations live in. Both are asserted to exist: a moved directory would otherwise leave the
 /// scanner checking one half and passing.
-const INSTANTIATION_DIRS: [&str; 2] = ["tests", "../fs-api/tests"];
+const INSTANTIATION_DIRS: [&str; 2] = ["tests", "../fs-layerfs/tests"];
 /// Where the scenario functions are defined.
 const DEFINITIONS_FILE: &str = "src/scenarios.rs";
 /// The two backends every scenario must be instantiated with.
-const BACKENDS: [&str; 2] = ["MockBackend", "ApiBackend"];
+const BACKENDS: [&str; 2] = ["MockBackend", "WinFspBackend"];
 
 fn hits(text: &str, needle: &str) -> usize {
     text.match_indices(needle).count()
@@ -151,7 +151,7 @@ fn the_scanner_reports_missing_pairs_by_name() {
         .clone();
     let without: BTreeSet<(String, String)> = found
         .iter()
-        .filter(|(name, backend)| !(name == &victim && backend == "ApiBackend"))
+        .filter(|(name, backend)| !(name == &victim && backend == "WinFspBackend"))
         .cloned()
         .collect();
     let missing: Vec<String> = definitions
@@ -165,7 +165,7 @@ fn the_scanner_reports_missing_pairs_by_name() {
         .collect();
     assert_eq!(
         missing,
-        vec![format!("{victim} <-> ApiBackend")],
+        vec![format!("{victim} <-> WinFspBackend")],
         "cell control: exactly the planted pair is named — the message is per (scenario, backend), not a total"
     );
 

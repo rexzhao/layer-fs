@@ -49,8 +49,12 @@ pub struct Handle {
     pub share: Mask,
     /// `FILE_FLAG_DELETE_ON_CLOSE`: the entry goes away when the **last** handle closes.
     pub delete_on_close: bool,
-    /// How many opens this handle stands for: one entry, many file objects.
+    /// How many kernel file objects refer to this entry (incremented on open, decremented on Close).
     pub refs: usize,
+    /// How many user-mode handles are still open (incremented on open, decremented on Cleanup or Close).
+    /// Windows Cache Manager (`Cc`) may keep kernel file objects alive after `Cleanup` until `Close`;
+    /// `umount` and `quiesce` check `active_refs` so cached files do not block orderly unmount after all user handles closed.
+    pub active_refs: usize,
     /// Whether the entry this handle names is a **directory** (S3 card §3.2).
     ///
     /// Needed because `restore` / `switch` block on **file** handles only (D8 = B): the shell that starts the command holds a directory handle on the volume
@@ -169,7 +173,9 @@ impl HandleTable {
             .find(|(_, handle)| handle.file_id == file_id)
             .map(|(id, _)| *id)
         {
-            self.handles.get_mut(&existing_id).expect("just found").refs += 1;
+            let entry = self.handles.get_mut(&existing_id).expect("just found");
+            entry.refs += 1;
+            entry.active_refs += 1;
             if delete_on_close {
                 self.pending.insert(file_id);
             }
@@ -185,6 +191,7 @@ impl HandleTable {
                 share,
                 delete_on_close,
                 refs: 1,
+                active_refs: 1,
                 is_dir,
             },
         );
@@ -216,16 +223,21 @@ impl HandleTable {
         self.handles.get(&handle_id)
     }
 
-    /// How many handles are open right now.
-    ///
-    /// This is the number `status.handles` reports and the number a **remote** `umount` refuses on (ADR-010 §7.2): the caller that asks over the pipe cannot
-    /// see who has a file open, so the answer has to come from the mount that can.
-    ///
-    /// **All** handles, directories included — `umount` must wait for those too, because unmounting destroys the volume the directory lives on. Only
-    /// `restore` / `switch` draw the line the other way; see [`Self::file_handles`].
+    /// Marks one user-mode handle as closed (`IRP_MJ_CLEANUP`) while keeping kernel file-object
+    /// refs alive until `IRP_MJ_CLOSE` (e.g. while Windows Cache Manager retains a section).
+    pub fn cleanup(&mut self, handle_id: HandleId) {
+        if let Some(handle) = self.handles.get_mut(&handle_id) {
+            handle.active_refs = handle.active_refs.saturating_sub(1);
+        }
+    }
+
+    /// How many handles currently have open user-mode references.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.handles.len()
+        self.handles
+            .values()
+            .filter(|handle| handle.active_refs > 0)
+            .count()
     }
 
     /// How many **file** handles are open, and how many directory handles (S3 card §3.2, D8 = B).
@@ -235,11 +247,10 @@ impl HandleTable {
     #[must_use]
     pub fn handle_kinds(&self) -> (usize, usize) {
         self.handles.values().fold((0, 0), |(files, dirs), handle| {
-            // **Counted as `refs`**, because the table holds one entry per object while the report has to mean "how many opens".
             if handle.is_dir {
-                (files, dirs + handle.refs)
+                (files, dirs + handle.active_refs)
             } else {
-                (files + handle.refs, dirs)
+                (files + handle.active_refs, dirs)
             }
         })
     }
@@ -291,6 +302,7 @@ impl HandleTable {
         if let Some(handle) = self.handles.get_mut(&handle_id) {
             if handle.refs > 1 {
                 handle.refs -= 1;
+                handle.active_refs = handle.active_refs.min(handle.refs);
                 return Ok(CloseEffect::Nothing);
             }
         }

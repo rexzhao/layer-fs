@@ -1,31 +1,13 @@
-# Mount-level criteria, one at a time.
-#
-# Every test in these binaries mounts a volume (a drive letter or a directory on the host) and then talks to WinFsp through it. Running several at once makes the
-# *fixture* the variable: a letter can stay occupied a moment too long, a mount point can be briefly unusable right after a remount, and a handle's `Close` can
-# arrive later than the next test expects. All three were observed as "fails in the full run, passes alone", and the honest reading is "these cannot run in
-# parallel", not "the product is flaky".
-#
-# Syntax note: nextest's `binary(...)` matches the **binary name**, not `crate::binary` — and it takes a glob (an earlier version passed a regex, which quietly
-# matched nothing, so the group looked configured while every mount test still ran in parallel).
+# Live WinFsp mount tests run sequentially (one mount at a time).
 [test-groups]
 mounts = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = '''
-binary(=restore_live)
-| binary(=control_pipe)
-| binary(=mount_cli)
-| binary(=discovery_live)
-| binary(=handle_identity)
-| binary(=volume_size)
+binary(=live_mount_git)
 | binary(mounted_*)
 | binary(mount_*)
 | binary(admission_*)
 | binary(=registry_lifetime)
 '''
-test-group = 'mounts'
-
-# Crash/recovery criteria spawn processes and kill them; two of those at once is another environment variable nobody controls.
-[[profile.default.overrides]]
-filter = 'test(~crash)'
 test-group = 'mounts'

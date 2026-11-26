@@ -1,0 +1,254 @@
+//! READDIR as owner visits that record no request source. A reading visit is
+//! one read-only job: the open descriptor's fence, the position of the
+//! kernel offset, and one window of current local names with their kinds.
+//! Inherited names and kinds are merged inside the job when the canonical
+//! cache holds them; otherwise the request merges them outside the owner
+//! over one Store reader, at the base root the visit named. The request then
+//! fills its reply and a publishing visit records exactly the accepted
+//! names. Nothing is held between the two visits or after the reply.
+use crate::{BaseView, SourceView, Workspace, WorkspaceResult};
+use layerfs_content::{object::inode_leaf::InodeKind, ContentError};
+use layerfs_overlay::{
+    KernelCookieOffer, KernelDirectoryCursor, KernelDirectoryPage, KernelMount, Overlay,
+    OverlayError, OverlayResult, PAGE_ROWS,
+};
+use std::{fmt, sync::Arc};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelDirectoryEntry {
+    pub name: Vec<u8>,
+    pub serial: u64,
+    pub kind: InodeKind,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelDirectoryListing {
+    pub entries: Vec<KernelDirectoryEntry>,
+    pub continuation: Option<Vec<u8>>,
+    pub visited: usize,
+}
+/// One READDIR reading visit as one read-only owner job.
+#[derive(Clone)]
+pub struct KernelDirectoryVisit {
+    mount: KernelMount,
+    serial: u64,
+    handle: u64,
+    offset: u64,
+    after: Option<Vec<u8>>,
+    resident: BaseView,
+}
+/// What the reading visit found, as plain values its request owns.
+#[derive(Clone, Debug)]
+pub struct KernelDirectoryWindow {
+    pub page: KernelDirectoryPage,
+    /// The merged names of the window, when memory answered every inherited
+    /// name and kind inside the job.
+    pub listing: Option<KernelDirectoryListing>,
+    /// The offsets the reply may hand out. Absent when the job decided that
+    /// the window lists no name.
+    pub offer: Option<KernelCookieOffer>,
+}
+/// The entries one reply may offer, in order, with their offsets.
+#[derive(Clone, Debug)]
+pub struct KernelDirectoryBatch {
+    pub entries: Vec<KernelDirectoryEntry>,
+    /// Where the request's next window continues when this one lists none.
+    pub continuation: Option<Vec<u8>>,
+    /// The offset of the first entry; each next entry's is one more.
+    pub first: u64,
+    /// The offer whose fresh range the offsets are, to publish the accepted
+    /// names with. None: the offsets are those of an already published
+    /// reply with these names, and nothing is published. An offer that
+    /// rewinds is published even when the reply accepts none of the names.
+    pub publish: Option<KernelCookieOffer>,
+}
+impl fmt::Debug for KernelDirectoryVisit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KernelDirectoryVisit")
+            .field("mount", &self.mount)
+            .field("serial", &self.serial)
+            .field("handle", &self.handle)
+            .field("offset", &self.offset)
+            .field("after", &self.after)
+            .finish_non_exhaustive()
+    }
+}
+impl Workspace {
+    /// `resident` answers from memory only. No I/O here. `after` continues
+    /// an earlier window of the same request past names that listed nothing.
+    pub fn kernel_directory_visit(
+        &self,
+        resident: Arc<crate::CanonicalClient>,
+        mount: KernelMount,
+        serial: u64,
+        handle: u64,
+        offset: u64,
+        after: Option<Vec<u8>>,
+    ) -> WorkspaceResult<KernelDirectoryVisit> {
+        let base = self.base()?;
+        if mount.engine() != self.route().engine()
+            || mount.root_serial() != base.root().root_inode().serial()
+        {
+            return Err(OverlayError::Stale.into());
+        }
+        Ok(KernelDirectoryVisit {
+            mount,
+            serial,
+            handle,
+            offset,
+            after,
+            resident: base.with_client(resident),
+        })
+    }
+}
+impl KernelDirectoryVisit {
+    pub const fn mount(&self) -> KernelMount {
+        self.mount
+    }
+
+    /// The visit always answers: what memory does not hold of the base is
+    /// left to the one read that follows outside the owner. The reuse lookup
+    /// is skipped only when the job itself found that no name is listed.
+    /// An offset from before the handle's last rewind lists nothing.
+    pub fn perform(&self, db: &Overlay) -> OverlayResult<KernelDirectoryWindow> {
+        let page = db.read_kernel_directory_visit(
+            self.mount,
+            self.serial,
+            self.handle,
+            self.offset,
+            self.after.as_deref(),
+        )?;
+        if *page.cursor() == KernelDirectoryCursor::Rewound {
+            return Ok(KernelDirectoryWindow {
+                page,
+                listing: Some(KernelDirectoryListing {
+                    entries: Vec::new(),
+                    continuation: None,
+                    visited: 0,
+                }),
+                offer: None,
+            });
+        }
+        let listing = (self.resident.identity().0.to_bytes() == page.source().root())
+            .then(|| listing(&self.resident, &page).ok())
+            .flatten();
+        let offer = match &listing {
+            Some(listing) if listing.entries.is_empty() => None,
+            _ => Some(db.offer_kernel_cookies(&page)?),
+        };
+        Ok(KernelDirectoryWindow {
+            page,
+            listing,
+            offer,
+        })
+    }
+}
+impl KernelDirectoryWindow {
+    /// The request's offset was handed out before the handle was last
+    /// listed from offset 0: it is refused, and the window lists nothing.
+    pub fn rewound(&self) -> bool {
+        *self.page.cursor() == KernelDirectoryCursor::Rewound
+    }
+    /// The entries this window may offer and their offsets. `base` is the
+    /// Workspace's base over an admitted Store reader and is required when
+    /// the visit left the merge undone; it is read at the root the visit
+    /// named, never at a later one.
+    ///
+    /// A published reply of this open directory that was listed after the
+    /// same name and whose names these entries begin with is reused: the
+    /// batch is exactly its names at its offsets. Otherwise the offsets are
+    /// the offer's fresh range.
+    pub fn finish(self, base: Option<&BaseView>) -> WorkspaceResult<KernelDirectoryBatch> {
+        let listing = match self.listing {
+            Some(listing) => listing,
+            None => {
+                let base = base.ok_or(ContentError::InvalidRecord(
+                    "kernel directory window without its base",
+                ))?;
+                listing(&*base.at(self.page.source().root())?, &self.page)?
+            }
+        };
+        let mut entries = listing.entries;
+        let (first, publish) = match self.offer {
+            None if entries.is_empty() => (0, None),
+            None => {
+                return Err(
+                    ContentError::InvalidRecord("kernel directory names without offsets").into(),
+                )
+            }
+            Some(offer) => match offer.existing() {
+                Some((first, names))
+                    if names.len() <= entries.len()
+                        && names
+                            .iter()
+                            .zip(&entries)
+                            .all(|(name, entry)| *name == entry.name) =>
+                {
+                    entries.truncate(names.len());
+                    (first, None)
+                }
+                _ => (offer.first(), Some(offer)),
+            },
+        };
+        Ok(KernelDirectoryBatch {
+            entries,
+            continuation: listing.continuation,
+            first,
+            publish,
+        })
+    }
+}
+/// One window's merged names over `base`, which must be the page's own base
+/// root. This issues no SQL and acquires no kernel lookup reference. An
+/// empty result with a continuation needs another window of the same request.
+fn listing(base: &BaseView, page: &KernelDirectoryPage) -> WorkspaceResult<KernelDirectoryListing> {
+    let view = SourceView {
+        base: base.clone(),
+        source: page.source(),
+    };
+    if page.local.parent != page.directory().serial()
+        || page.local_kinds.len() > 2 * PAGE_ROWS
+        || page
+            .local_kinds
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+    {
+        return Err(ContentError::InvalidRecord("kernel directory page identity").into());
+    }
+    if let Some(inode) = &page.local.parent_inode {
+        if inode.nlink == 0 && inode.serial != view.root_serial() {
+            // Rmdir/replacement removes only an empty directory. An open
+            // descriptor retains that proved-empty view; ordinary unowned
+            // namespace listing still refuses a removed serial.
+            if inode.kind != layerfs_overlay::InodeKind::Directory || inode.entries != 0 {
+                return Err(ContentError::InvalidRecord("removed kernel directory").into());
+            }
+            return Ok(KernelDirectoryListing {
+                entries: Vec::new(),
+                continuation: None,
+                visited: 0,
+            });
+        }
+    }
+    let listing =
+        view.list_from_window(page.local.parent, page.after.as_deref(), page.local.clone())?;
+    let mut entries = Vec::with_capacity(listing.entries.len());
+    for (name, serial) in listing.entries {
+        let kind = match page
+            .local_kinds
+            .binary_search_by_key(&serial, |entry| entry.0)
+        {
+            Ok(index) => match page.local_kinds[index].1 {
+                layerfs_overlay::InodeKind::File => InodeKind::RegularFile,
+                layerfs_overlay::InodeKind::Directory => InodeKind::Directory,
+                layerfs_overlay::InodeKind::Symlink => InodeKind::Symlink,
+            },
+            Err(_) => view.base().inode(serial)?.value.kind,
+        };
+        entries.push(KernelDirectoryEntry { name, serial, kind });
+    }
+    Ok(KernelDirectoryListing {
+        entries,
+        continuation: listing.continuation,
+        visited: listing.visited,
+    })
+}

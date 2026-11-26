@@ -1,0 +1,217 @@
+//! Typed storage failures, including the unknown-persistence-outcome boundary.
+//!
+//! There is one attempt per operation. A failure is returned to the caller
+//! unchanged; a failure that leaves the persistence outcome unproven is reported
+//! as [`StorageError::UnknownOutcome`] and never triggers a resend, a polling
+//! loop or destructive cleanup on a guess.
+
+use std::fmt;
+
+use layerfs_content::{ContentError, ObjectId};
+
+/// Failures produced by the physical storage component.
+#[derive(Debug)]
+pub enum StorageError {
+    /// One persistence attempt met a held write lock before any effect.
+    Busy,
+    /// A canonical construction, framing or read check failed.
+    Content(ContentError),
+    /// The host filesystem refused a physical Store reservation.
+    Io(std::io::Error),
+    /// The requested object is not stored.
+    ObjectMissing(ObjectId),
+    /// The identity exists only in saves outside this reader's publication scope.
+    Unpublished(ObjectId),
+    /// Stored bytes differ from the bytes offered under the same identity.
+    Collision(ObjectId),
+    /// A direct logical dependency is not stored and not in the current batch.
+    MissingDependency {
+        /// The object whose reference is unresolved.
+        object: ObjectId,
+        /// The unresolved direct reference.
+        reference: ObjectId,
+    },
+    /// A location lies outside the retained-pack ceiling of this read.
+    VisibilityCeiling {
+        /// Pack the record lives in.
+        pack_id: i64,
+        /// Highest pack this read may observe.
+        ceiling: i64,
+    },
+    /// Another writer holds the Store's write ownership.
+    OwnershipUnavailable,
+    /// The Store holds packs from a save whose cleanup did not complete.
+    ///
+    /// The publication watermark is behind the highest pack, so those packs are
+    /// unowned: neither published nor deleted. Writes are refused until a
+    /// separately requested inspection establishes a safe state.
+    UninspectedState {
+        /// Highest published pack id.
+        ceiling: i64,
+        /// Highest pack id present.
+        highest_pack_id: i64,
+    },
+    /// The requested policy or profile is not implemented by this slice.
+    UnsupportedPolicy {
+        /// The rejected field or profile.
+        field: &'static str,
+    },
+    /// A physical framing, locator or cardinality invariant failed.
+    Integrity(&'static str),
+    /// A declared bound would be exceeded.
+    CapacityExceeded {
+        /// The bounded resource.
+        what: &'static str,
+        /// The declared limit.
+        limit: u64,
+        /// The requested or observed size.
+        actual: u64,
+    },
+    /// Acknowledgement was not established, so the write may have committed.
+    UnknownOutcome {
+        /// The failure that prevented acknowledgement.
+        original: Box<StorageError>,
+    },
+    /// The failed save's cleanup did not complete; both errors are retained.
+    CleanupFailed {
+        /// The failure that ended the operation.
+        original: Box<StorageError>,
+        /// The failure observed while cleaning up.
+        cleanup: Box<StorageError>,
+    },
+    /// The operation was ended by an explicit abort before success.
+    Aborted,
+}
+
+impl StorageError {
+    /// True when this failure leaves the persistence outcome unproven.
+    pub fn is_unknown_outcome(&self) -> bool {
+        match self {
+            Self::UnknownOutcome { .. } => true,
+            Self::CleanupFailed { original, cleanup } => {
+                original.is_unknown_outcome() || cleanup.is_unknown_outcome()
+            }
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for StorageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Busy => formatter.write_str("Store busy before effect"),
+            Self::Content(error) => write!(formatter, "content: {error}"),
+            Self::Io(error) => write!(formatter, "physical Store I/O: {error}"),
+            Self::ObjectMissing(id) => write!(formatter, "object {id} is not stored"),
+            Self::Unpublished(id) => {
+                write!(formatter, "object {id} is not published to this reader")
+            }
+            Self::Collision(id) => write!(formatter, "identity collision for {id}"),
+            Self::MissingDependency { object, reference } => {
+                write!(formatter, "{object} depends on missing {reference}")
+            }
+            Self::VisibilityCeiling { pack_id, ceiling } => {
+                write!(
+                    formatter,
+                    "pack {pack_id} beyond retained ceiling {ceiling}"
+                )
+            }
+            Self::OwnershipUnavailable => formatter.write_str("save ownership unavailable"),
+            Self::UninspectedState {
+                ceiling,
+                highest_pack_id,
+            } => write!(
+                formatter,
+                "Store holds uninspected packs: published through {ceiling}, present through \
+                 {highest_pack_id}"
+            ),
+            Self::UnsupportedPolicy { field } => {
+                write!(formatter, "unsupported storage policy: {field}")
+            }
+            Self::Integrity(what) => write!(formatter, "storage integrity: {what}"),
+            Self::CapacityExceeded {
+                what,
+                limit,
+                actual,
+            } => {
+                write!(
+                    formatter,
+                    "bounded capacity {what} limit {limit} exceeded by {actual}"
+                )
+            }
+            Self::UnknownOutcome { original } => {
+                write!(formatter, "unknown persistence outcome after: {original}")
+            }
+            Self::CleanupFailed { original, cleanup } => {
+                write!(formatter, "cleanup failed after {original}: {cleanup}")
+            }
+            Self::Aborted => formatter.write_str("save aborted before success"),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+impl From<ContentError> for StorageError {
+    fn from(error: ContentError) -> Self {
+        Self::Content(error)
+    }
+}
+
+/// Result alias for this component.
+pub type StorageResult<T> = Result<T, StorageError>;
+
+impl From<crate::port::PersistenceError> for StorageError {
+    fn from(error: crate::port::PersistenceError) -> Self {
+        if error == crate::port::PersistenceError::Busy {
+            return Self::Busy;
+        }
+        let uncertain = error == crate::port::PersistenceError::Uncertain;
+        let original = Self::Io(std::io::Error::other(error));
+        if uncertain {
+            Self::UnknownOutcome {
+                original: Box::new(original),
+            }
+        } else {
+            original
+        }
+    }
+}
+
+/// Maps one Store read failure onto the provider contract's error classes.
+///
+/// `MissingObject` is the answer for absence and for nothing else, because a
+/// caller-authorized value root is allowed to name an object this Store does
+/// not hold (`admission-and-persistence.md`). Every other failure - a corrupt
+/// locator or pack, a private or out-of-range record, a capacity
+/// refusal, an engine failure - reaches C1 as a distinguishable
+/// [`ContentError::ProviderFailure`] instead of masquerading as absence, which
+/// is the distinction a later adapter needs between "this root is not in this
+/// Store" and "this Store is corrupt".
+pub(crate) fn provider_error(error: StorageError) -> ContentError {
+    provider_error_ref(&error)
+}
+
+pub(crate) fn provider_error_ref(error: &StorageError) -> ContentError {
+    match error {
+        StorageError::ObjectMissing(_) => ContentError::MissingObject,
+        StorageError::Content(content) => content.clone(),
+        StorageError::Integrity(what) => ContentError::ProviderFailure { what },
+        StorageError::CapacityExceeded { what, .. } => ContentError::ProviderFailure { what },
+        StorageError::UnsupportedPolicy { field } => ContentError::ProviderFailure { what: field },
+        StorageError::VisibilityCeiling { .. } | StorageError::Unpublished(_) => {
+            ContentError::ProviderFailure {
+                what: "record outside the publication scope",
+            }
+        }
+        StorageError::Collision(_) => ContentError::ProviderFailure {
+            what: "identity collision",
+        },
+        StorageError::MissingDependency { .. } => ContentError::ProviderFailure {
+            what: "missing dependency",
+        },
+        _ => ContentError::ProviderFailure {
+            what: "store read failure",
+        },
+    }
+}

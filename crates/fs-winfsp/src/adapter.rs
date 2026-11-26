@@ -21,7 +21,7 @@ use crate::ops::{
 /// These used to be process-wide `OnceLock`s. That worked for exactly one mount and made every test share one configuration —
 /// and worse, a lookup with no configuration returned **the previous configuration** instead of nothing (352: a process-wide
 /// static invents an answer where `None` is the truth). They live here now because they belong to the mount.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct AdapterConfig {
     /// The volume answer (`GetVolumeInfo`). Configuration, not state: it is decided before the mount starts and does not
     /// change while it runs — which is why it belongs to the mount rather than to the process.
@@ -204,7 +204,7 @@ impl<B: WorkspaceOps> Adapter<B> {
     /// This mount's configuration.
     #[must_use]
     pub fn config(&self) -> AdapterConfig {
-        self.config
+        self.config.clone()
     }
 
     /// The backend, for the operations that are path-based by nature.
@@ -354,6 +354,15 @@ impl<B: WorkspaceOps> Adapter<B> {
     /// [`OpsError::NotFound`] for an unknown handle.
     pub fn set_attributes(&self, handle: HandleId, attributes: Attributes) -> OpsResult<()> {
         self.ops.set_attributes(self.file_of(handle)?, attributes)
+    }
+
+    /// Marks the handle's entry delete-pending (phase one of two-phase deletion).
+    ///
+    /// # Errors
+    ///
+    /// [`OpsError::AccessDenied`] without `DELETE` access, [`OpsError::NotFound`] for an unknown handle.
+    pub fn cleanup(&self, handle: HandleId) {
+        self.handles.lock().expect("handle table").cleanup(handle);
     }
 
     /// Marks the handle's entry delete-pending (phase one of two-phase deletion).

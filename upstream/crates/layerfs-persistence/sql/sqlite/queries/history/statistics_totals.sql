@@ -1,0 +1,1 @@
+SELECT logical,canonical,stored,metadata,(SELECT page_count FROM pragma_page_count),(SELECT freelist_count FROM pragma_freelist_count),(SELECT page_size FROM pragma_page_size),init_entries,init_files,init_bytes,init_canonical,init_stored,init_metadata,init_millis FROM store_totals WHERE id=1;

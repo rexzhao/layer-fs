@@ -1,0 +1,32 @@
+//! Complete-file construction, chunking, extent mapping and logical reads.
+//!
+//! Entry module: declarations and re-exports only.
+
+pub mod cdc;
+pub mod edit;
+pub mod mapping;
+
+mod construction;
+pub(crate) use construction::bytes as content;
+pub(crate) use construction::chunk_runs;
+mod read;
+pub(crate) use construction::runs;
+mod view;
+
+pub use content::{
+    classify, construct_bytes, construct_bytes_with_predecessor, construct_stream,
+    encode_whole_file, encode_whole_file_payload, inspect, whole_file_payload, ConstructedFile,
+    FileContent,
+};
+pub use edit::{
+    apply_edits, apply_edits_backed, apply_indexed_edits_view_backed, Edit, EditCounters,
+    EditObjects, EditRecordApply, EditRecordChange, EditRecordExpected, EditRecordKey, EditRequest,
+    EditSequence, EditSource, IndexedEditBacking, IndexedEditRequest, IndexedEditSource,
+    EDIT_DEFERRED_LIMIT,
+};
+pub use mapping::{Extent, ExtentBuilder, ExtentCursor, PredecessorBase, ReadCounters};
+pub use read::{read_all, read_all_bounded, read_range};
+pub use runs::{
+    construct_runs, construct_runs_with_predecessor, FileRun, FileRuns, RunConstruction,
+};
+pub use view::FileView;

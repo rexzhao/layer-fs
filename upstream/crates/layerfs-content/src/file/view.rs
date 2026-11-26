@@ -1,0 +1,134 @@
+//! One operation-local authenticated view of an immutable base.
+//!
+//! The base root is acquired and classified exactly once per operation; every
+//! later read works from that classification and asks the provider only for the
+//! mapping pages and payloads it actually needs. A range read appends to its sink
+//! in logical order, and an extent walk visits one decoded leaf at a time, so a
+//! whole-file pass never holds the mapping.
+
+use std::io::Write;
+use std::ops::Range;
+
+use layerfs_telemetry::timer::{Active, TimingScope};
+
+use crate::error::{ContentError, ContentResult};
+use crate::file::content::{self, FileContent};
+use crate::file::mapping::{self, FileState};
+use crate::object::{AuthenticatedObjects, ObjectId};
+
+/// Immutable, already-authenticated base of one operation.
+pub struct FileView {
+    root: ObjectId,
+    canonical: Vec<u8>,
+    content: FileContent,
+}
+
+impl FileView {
+    /// Acquires and classifies the base root once.
+    pub fn open(
+        reader: &dyn AuthenticatedObjects,
+        root: ObjectId,
+        scope: TimingScope<'_>,
+    ) -> ContentResult<Self> {
+        scope.run(|open| {
+            let canonical = open
+                .child("edit.base_read")
+                .run(|_| reader.read_canonical(root))?;
+            Self::from_canonical(root, canonical)
+        })
+    }
+
+    /// Classifies a base root already read: `canonical` must be the
+    /// authenticated canonical bytes of `root`, as a provider returned them,
+    /// for a caller that read several roots in one demand.
+    pub fn from_canonical(root: ObjectId, canonical: Vec<u8>) -> ContentResult<Self> {
+        let content = content::classify(&canonical)?;
+        Ok(Self {
+            root,
+            canonical,
+            content,
+        })
+    }
+
+    /// Identity of the base this view was opened on.
+    pub const fn root(&self) -> ObjectId {
+        self.root
+    }
+
+    /// Logical byte length of the base.
+    pub const fn logical_len(&self) -> u64 {
+        self.content.logical_len()
+    }
+
+    /// Recorded representation of the base.
+    pub const fn content(&self) -> FileContent {
+        self.content
+    }
+
+    /// File state of a chunked base.
+    pub fn file_state(&self) -> ContentResult<Option<FileState>> {
+        match self.content {
+            FileContent::Chunked(state) => Ok(Some(state)),
+            FileContent::WholeFile { .. } => Ok(None),
+        }
+    }
+
+    /// A forward cursor over the extents of a chunked base, at its first
+    /// extent; none for a whole-file base, which has no extents. Reads
+    /// nothing until the cursor is advanced.
+    pub fn extents(&self) -> Option<mapping::ExtentCursor> {
+        match self.content {
+            FileContent::Chunked(state) => Some(mapping::ExtentCursor::new(state)),
+            FileContent::WholeFile { .. } => None,
+        }
+    }
+
+    /// Whole-file payload of a non-chunked base.
+    pub fn whole_file_bytes(&self) -> ContentResult<Option<&[u8]>> {
+        match self.content {
+            FileContent::WholeFile { .. } => Ok(Some(
+                content::whole_file_payload(&self.canonical)?
+                    .ok_or(ContentError::WrongLogicalRole)?,
+            )),
+            FileContent::Chunked(_) => Ok(None),
+        }
+    }
+
+    /// Reads one logical base range, appending it to `sink`.
+    ///
+    /// The caller supplies the timing scope the navigation and payload waves run
+    /// under, so the mapping reads this view issues are attributed to that node
+    /// rather than silently taking the caller's own duration.
+    pub fn read_range(
+        &self,
+        reader: &dyn AuthenticatedObjects,
+        range: Range<u64>,
+        sink: &mut dyn Write,
+        scope: &TimingScope<'_, Active>,
+    ) -> ContentResult<()> {
+        if range.start > range.end || range.end > self.logical_len() {
+            return Err(ContentError::InvalidRange {
+                start: range.start,
+                end: range.end,
+                length: self.logical_len(),
+            });
+        }
+        if range.start == range.end {
+            return Ok(());
+        }
+        match self.content {
+            FileContent::WholeFile { .. } => {
+                let payload = self
+                    .whole_file_bytes()?
+                    .ok_or(ContentError::WrongLogicalRole)?;
+                let slice = payload
+                    .get(range.start as usize..range.end as usize)
+                    .ok_or(ContentError::InvalidRecord("whole-file range"))?;
+                sink.write_all(slice).map_err(|_| ContentError::Io)
+            }
+            FileContent::Chunked(state) => {
+                mapping::read_range(reader, state, range, sink, scope).map(|_| ())
+            }
+        }
+    }
+}

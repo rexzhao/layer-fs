@@ -1,0 +1,20 @@
+[package]
+name = "layerfs-overlay"
+description = "Daemon-owned disposable SQLite overlay, indexed state and bounded jobs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3 = { version = "1.8", default-features = false }
+rusqlite = { version = "=0.40.2", features = ["cache", "limits", "blob"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "=0.31.3", default-features = false, features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+layerfs-win32-host = { path = "../layerfs-win32-host" }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+rusqlite = { version = "=0.40.2", features = ["bundled"] }

@@ -1,0 +1,297 @@
+//! Record reconstruction: one stored record to its canonical object.
+//!
+//! Every intermediate is authenticated. The pack header and group directory are
+//! validated before a body is touched, a compressed body is checked against its
+//! declared decoded length, the record grammar is validated before use, and the
+//! rebuilt canonical object must match the length recorded for its locator. A
+//! corrupt record is an error and never selects another decoder. A PREFIX record
+//! is decoded only against the exact base payload the resolver reconstructed and
+//! authenticated; there is no trial decode and no fallback.
+
+use layerfs_content::encode_whole_file_payload;
+use layerfs_content::file::mapping::encode_chunk_object;
+use layerfs_content::ObjectRole;
+
+use crate::encoding::codec::{CodecProfile, DecompressionWorkspace};
+use crate::encoding::delta::record;
+use crate::error::{StorageError, StorageResult};
+use crate::location::ObjectLocation;
+use crate::pack::assemble::FULL_TAG as ORDINARY_FULL_TAG;
+use crate::pack::layout::{record_range, GroupCodec, PackLane};
+use crate::policy::{StorageCapacities, CANONICAL_LIMIT};
+
+#[derive(Debug)]
+struct DecodedEntry {
+    body: Vec<u8>,
+    touched: std::cell::Cell<u64>,
+}
+
+/// Bounded cache of decoded ordinary-lane group bodies, keyed by locator group.
+///
+/// One cache belongs to its supplied reader/save owner; dependency discovery and
+/// reconstruction share it. Retention never exceeds DECODED_GROUP_CACHE_BYTES.
+/// Only the least-recent entries needed for admission are released. Every
+/// ordinary group is immutable before its locator is readable. A hit avoids
+/// decompression but still undergoes the caller's frame/record/identity checks.
+#[derive(Debug, Default)]
+pub struct GroupCache {
+    bodies: std::collections::BTreeMap<(i64, usize), DecodedEntry>,
+    retained: usize,
+    clock: std::cell::Cell<u64>,
+}
+
+impl GroupCache {
+    /// An empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Borrows retained input and records its recency in this owner.
+    pub fn get(&self, pack_id: i64, group_number: usize) -> Option<&[u8]> {
+        let entry = self.bodies.get(&(pack_id, group_number))?;
+        let next = self.clock.get().saturating_add(1);
+        self.clock.set(next);
+        entry.touched.set(next);
+        Some(&entry.body)
+    }
+
+    /// Retains authenticated decoded input within the same byte allowance.
+    /// Duplicate immutable input is idempotent; changed or oversized input fails.
+    pub fn insert(
+        &mut self,
+        pack_id: i64,
+        group_number: usize,
+        body: Vec<u8>,
+    ) -> StorageResult<()> {
+        let limit = crate::policy::DECODED_GROUP_CACHE_BYTES;
+        if pack_id <= 0 || body.is_empty() {
+            return Err(StorageError::Integrity("decoded group cache input"));
+        }
+        if body.len() > limit {
+            return Err(StorageError::CapacityExceeded {
+                what: "decoded group cache",
+                limit: limit as u64,
+                actual: body.len() as u64,
+            });
+        }
+        if let Some(prior) = self.get(pack_id, group_number) {
+            if prior != body {
+                return Err(StorageError::Integrity("immutable decoded group changed"));
+            }
+            return Ok(());
+        }
+        while self.retained + body.len() > limit {
+            let victim = self
+                .bodies
+                .iter()
+                .min_by_key(|(key, entry)| (entry.touched.get(), **key))
+                .map(|(key, _)| *key)
+                .ok_or(StorageError::Integrity("decoded group cache victim"))?;
+            let entry = self
+                .bodies
+                .remove(&victim)
+                .ok_or(StorageError::Integrity("decoded group cache victim"))?;
+            self.retained -= entry.body.len();
+        }
+        let next = self.clock.get().saturating_add(1);
+        self.clock.set(next);
+        self.retained += body.len();
+        self.bodies.insert(
+            (pack_id, group_number),
+            DecodedEntry {
+                body,
+                touched: std::cell::Cell::new(next),
+            },
+        );
+        Ok(())
+    }
+
+    /// Bytes of decoded bodies this cache currently retains.
+    pub fn retained_bytes(&self) -> usize {
+        self.retained
+    }
+}
+
+pub(crate) fn decode_selected_group(
+    selected: crate::encoding::GroupSlice<'_>,
+    location: &ObjectLocation,
+    capacities: &StorageCapacities,
+    base: Option<&[u8]>,
+    workspace: &mut DecompressionWorkspace,
+    groups: &mut GroupCache,
+    group_decodes: &mut u64,
+) -> StorageResult<Vec<u8>> {
+    let canonical_length = location.canonical_length;
+    if canonical_length == 0 || canonical_length > CANONICAL_LIMIT {
+        return Err(StorageError::Integrity("canonical length"));
+    }
+    let crate::encoding::GroupSlice {
+        header,
+        view,
+        bytes: selected,
+    } = selected;
+    if selected.len() != view.end - view.start {
+        return Err(StorageError::Integrity("selected group length"));
+    }
+    match header.lane {
+        PackLane::Ordinary => {
+            // A group body cached by this wave is served as it stands; otherwise it
+            // is decompressed once and retained. Either way the length check below
+            // still runs against the body this record is framed in, so a cached
+            // body can never answer for a group whose decoded width differs.
+            let body: &[u8] = match view.codec {
+                GroupCodec::Raw => selected,
+                GroupCodec::Zstandard => {
+                    match groups.get(location.pack_id, location.group_number) {
+                        Some(cached) => cached,
+                        None => {
+                            let decompressed =
+                                workspace.decompress_group(selected, view.decoded_length)?;
+                            *group_decodes = group_decodes.saturating_add(1);
+                            groups.insert(location.pack_id, location.group_number, decompressed)?;
+                            groups
+                                .get(location.pack_id, location.group_number)
+                                .ok_or(StorageError::Integrity("decoded group cache"))?
+                        }
+                    }
+                }
+            };
+            if body.len() != view.decoded_length {
+                return Err(StorageError::Integrity("group body length"));
+            }
+            let bytes = framed_record(body, location.record_number)?;
+            if bytes.first() != Some(&ORDINARY_FULL_TAG) {
+                return Err(StorageError::Integrity("record tag is not FULL"));
+            }
+            let canonical = bytes[1..].to_vec();
+            if canonical.len() != canonical_length {
+                return Err(StorageError::Integrity("ordinary record length"));
+            }
+            Ok(canonical)
+        }
+        PackLane::Chunk => {
+            if view.codec != GroupCodec::Raw {
+                return Err(StorageError::Integrity("chunk group codec"));
+            }
+            let bytes = framed_record(selected, location.record_number)?;
+            let parsed = record::parse_chunk(bytes)?;
+            let raw = decode_payload(
+                PackLane::Chunk,
+                parsed.tag,
+                parsed.raw_length,
+                parsed.frame,
+                base,
+                capacities,
+                workspace,
+            )?;
+            let canonical = encode_chunk_object(&raw)?;
+            if canonical.len() != canonical_length {
+                return Err(StorageError::Integrity("chunk record length"));
+            }
+            Ok(canonical)
+        }
+        PackLane::WholeFile => {
+            if view.codec != GroupCodec::Raw {
+                return Err(StorageError::Integrity("compact group codec"));
+            }
+            // The group's own directory carries the record boundaries, so the
+            // record is extracted exactly as a chunk group's is. The compact
+            // record inside has no length fields of its own; `parse` re-derives
+            // the raw length from the canonical length the locator records.
+            let bytes = framed_record(selected, location.record_number)?;
+            let parsed = record::parse(PackLane::WholeFile, bytes, canonical_length)?;
+            let raw = decode_payload(
+                PackLane::WholeFile,
+                parsed.tag,
+                parsed.raw_length,
+                parsed.frame,
+                base,
+                capacities,
+                workspace,
+            )?;
+            let canonical = encode_whole_file_payload(&raw)?;
+            if canonical.len() != canonical_length {
+                return Err(StorageError::Integrity("whole-file record length"));
+            }
+            Ok(canonical)
+        }
+        PackLane::Singleton => {
+            if view.codec != GroupCodec::Raw || location.record_number != 0 {
+                return Err(StorageError::Integrity("singleton record framing"));
+            }
+            let bytes = framed_record(selected, 0)?;
+            let parsed = record::parse(PackLane::Singleton, bytes, canonical_length)?;
+            let raw = decode_payload(
+                PackLane::Singleton,
+                parsed.tag,
+                parsed.raw_length,
+                parsed.frame,
+                base,
+                capacities,
+                workspace,
+            )?;
+            let canonical = match location.role {
+                ObjectRole::WholeFile => encode_whole_file_payload(&raw)?,
+                ObjectRole::Chunk => encode_chunk_object(&raw)?,
+                _ => return Err(StorageError::Integrity("singleton record role")),
+            };
+            if canonical.len() != canonical_length {
+                return Err(StorageError::Integrity("singleton record length"));
+            }
+            Ok(canonical)
+        }
+    }
+}
+
+fn decode_payload(
+    lane: PackLane,
+    tag: u8,
+    raw_length: usize,
+    frame: &[u8],
+    base: Option<&[u8]>,
+    capacities: &StorageCapacities,
+    workspace: &mut DecompressionWorkspace,
+) -> StorageResult<Vec<u8>> {
+    if record::is_stored(tag) {
+        // A stored record is the payload: its bytes are returned as they stand,
+        // and the declared raw length is checked against them rather than trusted.
+        // No codec call is made and no base is consulted - a stored record that
+        // carries one is a framing this reader refuses instead of guessing at.
+        if base.is_some() {
+            return Err(StorageError::Integrity("stored record with base bytes"));
+        }
+        if frame.len() != raw_length || raw_length == 0 {
+            return Err(StorageError::Integrity("stored record length"));
+        }
+        return Ok(frame.to_vec());
+    }
+    let profile = match lane {
+        PackLane::Chunk => CodecProfile::chunk(),
+        _ => CodecProfile::whole_file(capacities),
+    };
+    match (tag == record::PREFIX_TAG, base) {
+        (true, Some(base)) => workspace.decompress_prefix(profile, frame, raw_length, base),
+        (false, None) => workspace.decompress(profile, frame, raw_length),
+        (true, None) => Err(StorageError::Integrity("prefix record without base bytes")),
+        (false, Some(_)) => Err(StorageError::Integrity("FULL record with base bytes")),
+    }
+}
+
+/// Extracts one framed record from a group body.
+pub fn framed_record(group: &[u8], ordinal: usize) -> StorageResult<&[u8]> {
+    if group.len() < 4 {
+        return Err(StorageError::Integrity("group framing"));
+    }
+    let count = u32::from_le_bytes(
+        group[..4]
+            .try_into()
+            .map_err(|_| StorageError::Integrity("group record count"))?,
+    ) as usize;
+    let ends = group
+        .get(4..4 + 4 * count)
+        .ok_or(StorageError::Integrity("group record directory"))?;
+    let (start, end) = record_range(count, ends, group.len(), ordinal)?;
+    group
+        .get(start..end)
+        .ok_or(StorageError::Integrity("record range"))
+}

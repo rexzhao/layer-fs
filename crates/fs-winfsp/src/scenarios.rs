@@ -171,7 +171,7 @@ pub fn scenario_remove_non_empty_directory<B: WorkspaceOps>(backend: &B) {
 
     // And the empty case still works, so the rule is "non-empty", not "directories".
     backend
-        .remove_at(1, b"a", child.file_id)
+        .remove_at(dir, b"a", child.file_id)
         .expect("remove the child");
     backend
         .remove_at(0, b"d", dir)

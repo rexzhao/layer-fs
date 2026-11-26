@@ -422,6 +422,10 @@ impl WorkspaceOps for Box<dyn WorkspaceOps + Send + Sync> {
         (**self).open_dir(path)
     }
 
+    fn dir_binding(&self, path: &Path<'_>) -> Option<DirOutcome> {
+        (**self).dir_binding(path)
+    }
+
     fn read(&self, file_id: u64, offset: u64, len: usize) -> OpsResult<Vec<u8>> {
         (**self).read(file_id, offset, len)
     }

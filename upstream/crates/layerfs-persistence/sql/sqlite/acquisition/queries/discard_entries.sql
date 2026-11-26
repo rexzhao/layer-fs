@@ -1,0 +1,1 @@
+DELETE FROM init_entry WHERE operation_id=?1 AND (parent_position,name)<=(?2,?3) RETURNING length(name)+coalesce(length(host_path),0)+coalesce(length(host_identity),0)+32+coalesce(length(content_root),0)

@@ -1,0 +1,193 @@
+//! Fixed retained-input cursor; no backing rows or ownership acquisition.
+use crate::{CapturedReader, LocalRead, OverlayError, OverlayResult, RUN_BYTES};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CellMetadata {
+    pub offset: u64,
+    pub length: u64,
+    /// No validity mask: every stored byte is a written byte.
+    pub dense: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Probe {
+    pub after: u64,
+    pub ready: bool,
+    pub cell: Option<CellMetadata>,
+}
+/// Forward-only scan of one exact captured regular file. The caller supplies
+/// its already checked logical size, including authenticated base facts when
+/// there is no local inode row. This value acquires/releases no reader owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapturedRunCursor {
+    pub(crate) reader: CapturedReader,
+    pub(crate) serial: u64,
+    pub(crate) at: u64,
+    pub(crate) size: u64,
+    pub(crate) probes: [Probe; 4],
+    pub(crate) generations: [i64; 4],
+    pub(crate) layer_count: Option<usize>,
+    pub(crate) shapes: bool,
+}
+impl CapturedRunCursor {
+    /// Start a new stable read pass at a requested position. SQLite's existing
+    /// signed offset format applies; there is no smaller total file/run limit.
+    pub fn new(
+        reader: CapturedReader,
+        serial: u64,
+        offset: u64,
+        logical_size: u64,
+    ) -> OverlayResult<Self> {
+        crate::db::integer(serial)?;
+        crate::db::integer(logical_size)?;
+        if serial == 0 || offset > logical_size {
+            return Err(OverlayError::Invalid("captured run input"));
+        }
+        // A row that holds the first byte starts no earlier than its slot.
+        let after = offset - offset % RUN_BYTES as u64;
+        Ok(Self {
+            reader,
+            serial,
+            at: offset,
+            size: logical_size,
+            probes: [Probe {
+                after,
+                ..Probe::default()
+            }; 4],
+            generations: [0; 4],
+            layer_count: None,
+            shapes: false,
+        })
+    }
+    /// The same pass for a caller that needs only which bytes are local. Live
+    /// dense rows of the newest layer are then reported as `Local` without
+    /// their payload; every other shape is still a composed window.
+    pub const fn shapes_only(mut self) -> Self {
+        self.shapes = true;
+        self
+    }
+    pub const fn is_shapes_only(self) -> bool {
+        self.shapes
+    }
+    pub const fn reader(self) -> CapturedReader {
+        self.reader
+    }
+    pub const fn serial(self) -> u64 {
+        self.serial
+    }
+    pub const fn offset(self) -> u64 {
+        self.at
+    }
+    pub const fn logical_size(self) -> u64 {
+        self.size
+    }
+    /// Checks strict forward metadata progress of a Continue reply at the same
+    /// logical position. Existing layer identities and completed probes stay
+    /// fixed; incomplete seeks never retreat and at least one seek advances.
+    /// This is a cursor invariant, not proof of provider I/O or authority.
+    pub fn metadata_advanced_from(self, previous: Self) -> bool {
+        if self.reader != previous.reader
+            || self.serial != previous.serial
+            || self.at != previous.at
+            || self.size != previous.size
+            || self.shapes != previous.shapes
+            || self.layer_count.is_none()
+            || previous.layer_count.is_some_and(|count| {
+                self.layer_count != Some(count) || self.generations != previous.generations
+            })
+        {
+            return false;
+        }
+        let mut advanced = false;
+        for (before, after) in previous.probes.iter().zip(&self.probes) {
+            if after.after < before.after || (before.ready && after != before) {
+                return false;
+            }
+            if before.cell.is_some() && before.cell != after.cell {
+                return false;
+            }
+            advanced |= after.after > before.after;
+        }
+        advanced
+    }
+    /// Skip an already-owned input interval while preserving every forward
+    /// metadata seek/lookahead. A backwards pass requires a new cursor.
+    pub fn seek_forward(self, to: u64) -> OverlayResult<Self> {
+        if to < self.at || to > self.size {
+            return Err(OverlayError::Invalid("captured run seek"));
+        }
+        Ok(self.advance(to))
+    }
+    pub(crate) fn advance(mut self, to: u64) -> Self {
+        self.at = to;
+        let floor = to - to % RUN_BYTES as u64;
+        for probe in &mut self.probes {
+            if probe
+                .cell
+                .is_some_and(|cell| cell.offset + cell.length <= to)
+            {
+                probe.cell = None;
+                probe.ready = false;
+            }
+            probe.after = probe.after.max(floor);
+        }
+        self
+    }
+}
+/// A gap is inherited unless actual retained layer EOF/cutoff establishes zero.
+/// Neither kind interprets missing physical cells as immutable zero evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapturedGap {
+    Inherited,
+    Zero,
+}
+/// One bounded SQL-owner unit. Continue is normal metadata cursor progress,
+/// never a replay after failure. Window retains the existing decided-byte mask.
+#[derive(Clone, Debug)]
+pub enum CapturedRunStep {
+    Continue(CapturedRunCursor),
+    Gap {
+        kind: CapturedGap,
+        offset: u64,
+        length: u64,
+        next: CapturedRunCursor,
+    },
+    Window {
+        read: Box<LocalRead>,
+        next: CapturedRunCursor,
+    },
+    /// Only for a shapes-only cursor: every byte of the interval is a live
+    /// written byte of the newest layer. No payload is read or returned.
+    Local {
+        offset: u64,
+        length: u64,
+        next: CapturedRunCursor,
+    },
+    /// Every byte of the interval is supplied by one reference piece: the
+    /// committed bytes of content root `root` from `source_offset`. The
+    /// newest layer that decides the interval does so by that piece, and no
+    /// newer layer holds a cell or a piece over it.
+    Reference {
+        offset: u64,
+        length: u64,
+        root: [u8; 32],
+        source_offset: u64,
+        next: CapturedRunCursor,
+    },
+    End,
+}
+/// Exact metadata row visits for this unit. SQL VM/value/BLOB work and byte
+/// composition remain separately observable through their existing counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CapturedRunWork {
+    pub metadata_rows: u64,
+    pub stale_rows: u64,
+}
+#[derive(Clone, Debug)]
+pub struct CapturedRunReply {
+    pub step: CapturedRunStep,
+    pub work: CapturedRunWork,
+    /// Some layer of the file holds reference pieces: a later unit of the
+    /// pass may be a `Reference` step or a window with reference ranges. It
+    /// is the same for every unit of one pass that is not the end.
+    pub referenced: bool,
+}

@@ -1,0 +1,52 @@
+//! Filesystem trees: checked logical inputs, sorted COW and bounded reads.
+//!
+//! Entry module: declarations and re-exports only.
+
+pub mod attributes;
+pub mod decoded;
+pub mod directory;
+pub mod identity;
+pub mod inode;
+pub mod input;
+pub mod limits;
+pub mod objects;
+pub mod path;
+pub mod qualify;
+pub mod read;
+pub mod references;
+pub mod root;
+pub mod rows;
+pub mod sorted;
+mod state;
+pub mod statistics;
+pub mod symlink;
+pub mod update;
+pub mod validate;
+
+pub use identity::{InodeIdentity, InodeScope};
+pub use input::{
+    DirectoryUpdate, FilesystemInput, FilesystemResources, InodeUpdate, StreamedFilesystemInput,
+};
+pub use objects::{FilesystemObjects, FilesystemPhases, ObjectWork};
+pub use path::{LogicalPath, PathName};
+pub use qualify::{qualify_root, QualificationWork, QualifiedRoot, RootContext};
+pub use read::{DirectoryListing, FilesystemRead, FilesystemReadWork, Resolved, Stat};
+pub use root::{profile_id, scope_for_seed, FilesystemRoot, FilesystemRootId};
+pub use rows::{check_input, DirectoryRowSource, InodeRowSource, PreparedRows, SerialRowSource};
+pub use rows::{
+    check_streamed_input, DirectoryChangeLookup, DirectoryChangeSource, DirectoryHeader,
+    DirectoryHeaderSource, PreparedDirectoryStreams, StreamedRowSource,
+};
+pub use sorted::{DirectoryRoot, SortedWork, MAXIMUM_SCRATCH_BYTES};
+pub use symlink::SymlinkTarget;
+pub use update::{
+    build_filesystem, build_filesystem_streamed, build_filesystem_streamed_timed,
+    build_filesystem_timed, update_filesystem, update_filesystem_streamed,
+    update_filesystem_streamed_timed, update_filesystem_timed, FilesystemResult,
+    FilesystemUpdateCounters,
+};
+pub use update::{
+    build_filesystem_streamed_backed, build_filesystem_streamed_backed_timed,
+    update_filesystem_streamed_backed, update_filesystem_streamed_backed_timed,
+};
+pub use validate::{check, CheckedInput, FilesystemTopology};

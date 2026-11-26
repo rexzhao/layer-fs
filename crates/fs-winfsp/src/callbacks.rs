@@ -108,7 +108,7 @@ fn list_entries(adapter: &crate::DynAdapter, dir_id: u64) -> Vec<ListEntry> {
     let Ok(items) = adapter.backend().read_dir(dir_id) else {
         return Vec::new();
     };
-    items
+    let mut entries: Vec<ListEntry> = items
         .into_iter()
         .filter_map(|item| {
             let info = adapter.backend().get_info(item.file_id).ok()?;
@@ -119,7 +119,9 @@ fn list_entries(adapter: &crate::DynAdapter, dir_id: u64) -> Vec<ListEntry> {
                 info,
             ))
         })
-        .collect()
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
 }
 
 /// The `ReadDirectory` body with the entries handed in — the resume, the framing and the count are all here.
@@ -136,6 +138,8 @@ pub unsafe fn read_directory_from(
     bytes_transferred: *mut u32,
 ) -> i32 {
     // A non-null marker means the caller wants to resume after that name; we index by position, so translate it.
+    // If the marker entry was deleted mid-enumeration, advance to the first entry strictly greater than it
+    // (or `entries.len()` if none) instead of restarting at 0, which would loop forever.
     let start = if marker.is_null() {
         0usize
     } else {
@@ -146,7 +150,13 @@ pub unsafe fn read_directory_from(
         entries
             .iter()
             .position(|(candidate, _)| candidate.as_slice() == name)
-            .map_or(0, |index| index + 1)
+            .map(|index| index + 1)
+            .unwrap_or_else(|| {
+                entries
+                    .iter()
+                    .position(|(candidate, _)| candidate.as_slice() > name)
+                    .unwrap_or(entries.len())
+            })
     };
 
     // SAFETY: `buffer` is valid for `length` bytes per the caller's contract.
@@ -196,7 +206,7 @@ pub unsafe fn read_directory_from(
 pub unsafe fn get_volume_info_shell(adapter: Option<&crate::DynAdapter>, out: *mut c_void) -> i32 {
     VOLUME_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let config = adapter.map(|adapter| adapter.config());
-    let volume = config.and_then(|config| config.volume);
+    let volume = config.as_ref().and_then(|config| config.volume);
     let capacity_source = config.and_then(|config| config.capacity);
     // SAFETY: the caller's contract covers `out`; the size is the structure's own, because the dispatcher always passes an
     // 88-byte local (`fsop.c:1245-1260`).
@@ -226,7 +236,7 @@ pub unsafe fn get_volume_info_shell(adapter: Option<&crate::DynAdapter>, out: *m
 /// the mount fail, and the reported free space should say so at the same moment rather than after a remount.
 ///
 /// `None` means "cannot be asked" (no store path, or the call failed): the caller then keeps whatever the configuration supplied.
-pub type CapacitySource = &'static (dyn Fn() -> Option<(u64, u64)> + Send + Sync);
+pub type CapacitySource = std::sync::Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync>;
 
 #[cfg(windows)]
 mod capacity_api {
@@ -490,13 +500,14 @@ pub unsafe fn set_file_size_shell(
             Err(_) => OURS_OBJECT_NAME_NOT_FOUND,
         };
     }
-    if adapter.backend().set_size(entry.file_id, new_size).is_err() {
+    if let Err(err) = adapter.backend().set_size(entry.file_id, new_size) {
         // Nothing is written into the caller's buffer on failure: a half-updated record is worse than none.
-        return NOT_IMPLEMENTED;
+        return crate::error::to_status_of(&err).code() as i32;
     }
     // Read back through the **same** backend: this is where "accepted" becomes "is".
-    let Some(node) = adapter.backend().get_info(entry.file_id).ok() else {
-        return NOT_IMPLEMENTED;
+    let node = match adapter.backend().get_info(entry.file_id) {
+        Ok(node) => node,
+        Err(err) => return crate::error::to_status_of(&err).code() as i32,
     };
     if node.size != new_size {
         // The backend said yes and the store says otherwise. Refusing is the only honest answer, and it is counted so the two
@@ -593,12 +604,20 @@ struct Shared {
     refs: usize,
 }
 
-static CONTEXTS: std::sync::Mutex<Option<std::collections::BTreeMap<u64, Shared>>> =
-    std::sync::Mutex::new(None);
+#[derive(Default)]
+struct ContextTables {
+    contexts: std::collections::BTreeMap<u64, Shared>,
+    by_file: std::collections::BTreeMap<u64, u64>,
+    closed: std::collections::BTreeSet<u64>,
+}
 
-/// `file_id -> context id`, so a second open of the **same entry** shares the context instead of minting a new one.
-static CONTEXT_BY_FILE: std::sync::Mutex<Option<std::collections::BTreeMap<u64, u64>>> =
-    std::sync::Mutex::new(None);
+static CONTEXT_TABLES: std::sync::Mutex<Option<ContextTables>> = std::sync::Mutex::new(None);
+
+fn lock_tables() -> std::sync::MutexGuard<'static, Option<ContextTables>> {
+    CONTEXT_TABLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// The next id to hand out. Never reused, so a stale id can never be mistaken for a fresh one.
 static NEXT_CONTEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -621,10 +640,10 @@ pub fn acquire_release_counts() -> (usize, usize) {
 /// The table as `(id, refs)` pairs: the reading that says whether a zero-reference entry was left behind.
 #[must_use]
 pub fn context_table() -> Vec<(u64, usize)> {
-    CONTEXTS
-        .lock()
-        .expect("contexts")
-        .get_or_insert_with(std::collections::BTreeMap::new)
+    let mut guard = lock_tables();
+    let tables = guard.get_or_insert_with(ContextTables::default);
+    tables
+        .contexts
         .iter()
         .map(|(id, shared)| (*id, shared.refs))
         .collect()
@@ -633,13 +652,9 @@ pub fn context_table() -> Vec<(u64, usize)> {
 /// How many live references the table currently carries (the sum of every `refs`).
 #[must_use]
 pub fn live_reference_count() -> usize {
-    CONTEXTS
-        .lock()
-        .expect("contexts")
-        .get_or_insert_with(std::collections::BTreeMap::new)
-        .values()
-        .map(|shared| shared.refs)
-        .sum()
+    let mut guard = lock_tables();
+    let tables = guard.get_or_insert_with(ContextTables::default);
+    tables.contexts.values().map(|shared| shared.refs).sum()
 }
 
 /// How many releases arrived for an id that was never handed out.
@@ -654,21 +669,20 @@ pub fn stale_release_count() -> usize {
     STALE_RELEASES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Stores a context and returns the id the OS will carry for it.
-fn register_context(entry: EntryContext) -> u64 {
+/// Stores a context under an already-held table lock and returns its id.
+fn register_locked(tables: &mut ContextTables, entry: EntryContext) -> u64 {
     ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let id = NEXT_CONTEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    CONTEXTS
-        .lock()
-        .expect("contexts")
-        .get_or_insert_with(std::collections::BTreeMap::new)
-        .insert(id, Shared { entry, refs: 1 });
-    CONTEXT_BY_FILE
-        .lock()
-        .expect("context index")
-        .get_or_insert_with(std::collections::BTreeMap::new)
-        .insert(entry.file_id, id);
+    tables.contexts.insert(id, Shared { entry, refs: 1 });
+    tables.by_file.insert(entry.file_id, id);
     id
+}
+
+/// Stores a context and returns the id the OS will carry for it.
+fn register_context(entry: EntryContext) -> u64 {
+    let mut guard = lock_tables();
+    let tables = guard.get_or_insert_with(ContextTables::default);
+    register_locked(tables, entry)
 }
 
 /// The id for `entry`, **reusing the one already handed out for that entry** and bumping its reference count.
@@ -676,38 +690,24 @@ fn register_context(entry: EntryContext) -> u64 {
 /// This is the shape the FSD expects (one context per entry, one close per file object); the key is the entry's `file_id`, which is already the
 /// fold-insensitive identity the rest of this layer uses.
 fn acquire_context(entry: EntryContext) -> u64 {
-    let existing = CONTEXT_BY_FILE
-        .lock()
-        .expect("context index")
-        .get_or_insert_with(std::collections::BTreeMap::new)
-        .get(&entry.file_id)
-        .copied();
-    let Some(id) = existing else {
-        return register_context(entry);
-    };
-    let mut guard = CONTEXTS.lock().expect("contexts");
-    let table = guard.get_or_insert_with(std::collections::BTreeMap::new);
-    match table.get_mut(&id) {
-        Some(shared) => {
+    let mut guard = lock_tables();
+    let tables = guard.get_or_insert_with(ContextTables::default);
+    if let Some(&id) = tables.by_file.get(&entry.file_id) {
+        if let Some(shared) = tables.contexts.get_mut(&id) {
             shared.refs += 1;
             ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some()
                 && ACQUIRES.load(std::sync::atomic::Ordering::Relaxed) <= 40
             {
-                // **Which caller acquires twice** can only be seen with the id and the file id side by side.
                 eprintln!(
                     "acquire: id={id} file_id={} refs={}",
                     entry.file_id, shared.refs
                 );
             }
-            id
-        }
-        // The index pointed at a context that is gone: fall back to a fresh one rather than inventing a live entry.
-        None => {
-            drop(guard);
-            register_context(entry)
+            return id;
         }
     }
+    register_locked(tables, entry)
 }
 
 /// The context behind `context`, if the id was really handed out.
@@ -718,12 +718,9 @@ fn entry_of(context: *const c_void) -> Option<EntryContext> {
     if id == 0 {
         return None;
     }
-    CONTEXTS
-        .lock()
-        .expect("contexts")
-        .get_or_insert_with(std::collections::BTreeMap::new)
-        .get(&id)
-        .map(|shared| shared.entry)
+    let mut guard = lock_tables();
+    let tables = guard.get_or_insert_with(ContextTables::default);
+    tables.contexts.get(&id).map(|shared| shared.entry)
 }
 
 /// Releases a context from the direct tests, through the same table `close_shell` uses.
@@ -747,26 +744,12 @@ pub fn register_context_for_test(entry: EntryContext) -> *mut c_void {
 /// The table is process-wide (the callbacks have no place to keep a per-mount one), so without this a mount that leaves contexts behind would
 /// make the next mount start with them. Clearing at teardown is what keeps the residue **bounded by one mount** instead of accumulating.
 pub fn clear_contexts() {
-    CONTEXTS
-        .lock()
-        .expect("contexts")
-        .get_or_insert_with(std::collections::BTreeMap::new)
-        .clear();
-    CLOSED_CONTEXTS
-        .lock()
-        .expect("closed contexts")
-        .get_or_insert_with(std::collections::BTreeSet::new)
-        .clear();
+    let mut guard = lock_tables();
+    let tables = guard.get_or_insert_with(ContextTables::default);
+    tables.contexts.clear();
+    tables.by_file.clear();
+    tables.closed.clear();
 }
-
-/// Ids that were handed out and then **closed**.
-///
-/// A close frees the context, but Windows can still be *in flight* with that handle: the measured shape is a cached read of 128 KiB arriving after
-/// `Close` (the cache manager's read-ahead, or the two dispatcher threads processing out of order — the pairing instrument distinguishes them, the
-/// answer to the caller does not). The lookup distinguishes "closed" from "never existed", which is the difference between answering a dead handle
-/// and inventing one.
-static CLOSED_CONTEXTS: std::sync::Mutex<Option<std::collections::BTreeSet<u64>>> =
-    std::sync::Mutex::new(None);
 
 /// The **one** place WinFsp's path bytes are turned into the bytes the backends parse (517/518).
 ///
@@ -793,12 +776,12 @@ fn eof_on_closed() -> bool {
 /// Whether `context` names a handle that was handed out and has since been closed.
 fn is_closed(context: *const c_void) -> bool {
     let id = context as usize as u64;
-    id != 0
-        && CLOSED_CONTEXTS
-            .lock()
-            .expect("closed contexts")
-            .get_or_insert_with(std::collections::BTreeSet::new)
-            .contains(&id)
+    if id == 0 {
+        return false;
+    }
+    let mut guard = lock_tables();
+    let tables = guard.get_or_insert_with(ContextTables::default);
+    tables.closed.contains(&id)
 }
 
 /// Removes the context behind `context`, or `None` when the id was never handed out (a stale close).
@@ -825,9 +808,9 @@ fn release_context(context: *const c_void) -> Release {
     if id == 0 {
         return Release::Unknown;
     }
-    let mut guard = CONTEXTS.lock().expect("contexts");
-    let table = guard.get_or_insert_with(std::collections::BTreeMap::new);
-    let (remaining, shared_entry) = match table.get_mut(&id) {
+    let mut guard = lock_tables();
+    let tables = guard.get_or_insert_with(ContextTables::default);
+    let (remaining, shared_entry) = match tables.contexts.get_mut(&id) {
         Some(shared) => {
             shared.refs -= 1;
             (shared.refs, shared.entry)
@@ -835,31 +818,21 @@ fn release_context(context: *const c_void) -> Release {
         None => return Release::Unknown,
     };
     if remaining > 0 {
-        // Another file object still refers to this context: nothing dies yet, and a read arriving now is legitimate.
-        // **The refs value is the reading that settles it** (`LAYERFS_DEBUG_HANDLES=1`): `1` means this release really was the last one and something else kept a
-        // stale reference; `2` means a second holder exists and never releases. Those have different fixes, so the number is printed, not guessed.
         if std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some() {
             eprintln!("release: id={id} still_shared refs={remaining}");
         }
         return Release::StillShared(shared_entry);
     }
-    let entry = table.remove(&id).map(|shared| shared.entry);
-    drop(guard);
-    if let Some(entry) = entry {
-        CONTEXT_BY_FILE
-            .lock()
-            .expect("context index")
-            .get_or_insert_with(std::collections::BTreeMap::new)
-            .remove(&entry.file_id);
-        CLOSED_CONTEXTS
-            .lock()
-            .expect("closed contexts")
-            .get_or_insert_with(std::collections::BTreeSet::new)
-            .insert(id);
-        return Release::Freed(entry);
+    let entry = tables
+        .contexts
+        .remove(&id)
+        .map(|shared| shared.entry)
+        .expect("a context that reached zero references must still be in the table");
+    if tables.by_file.get(&entry.file_id) == Some(&id) {
+        tables.by_file.remove(&entry.file_id);
     }
-    // Unreachable: `remaining == 0` and the map held the id (it was just borrowed), so `remove` returned it.
-    unreachable!("a context that reached zero references must still be in the table")
+    tables.closed.insert(id);
+    Release::Freed(entry)
 }
 
 ///
@@ -1055,33 +1028,27 @@ unsafe fn open_like(
                     }
                     (file_id, found)
                 })
-                .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
-            // The name is taken: `FILE_CREATE` means **fail if it exists**, and that is a collision, not a silent open.
-            Err(crate::ops::OpsError::NameCollision) => Err(OURS_OBJECT_NAME_COLLISION),
-            Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
+                .map_err(|err| crate::error::to_status_of(&err).code() as i32),
+            Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
         },
         MakeVerb::OpenDirectory => match adapter
             .backend()
             .open_dir(&crate::ops::Path::new(path.as_bytes()))
         {
-            Ok(file_id) => adapter
-                .backend()
-                .get_info(file_id)
-                .map(|_| {
-                    let found = adapter
-                        .backend()
-                        .dir_binding(&crate::ops::Path::new(path.as_bytes()));
-                    if let Some(ref outcome) = found {
-                        if outcome.id != file_id {
-                            eprintln!(
-                                "open: dir_binding id {} disagrees with the door's {file_id}",
-                                outcome.id
-                            );
-                        }
+            Ok(file_id) => {
+                let found = adapter
+                    .backend()
+                    .dir_binding(&crate::ops::Path::new(path.as_bytes()));
+                if let Some(ref outcome) = found {
+                    if outcome.id != file_id {
+                        eprintln!(
+                            "open: dir_binding id {} disagrees with the door's {file_id}",
+                            outcome.id
+                        );
                     }
-                    (file_id, found)
-                })
-                .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
+                }
+                Ok((file_id, found))
+            }
             // Windows opens a directory with `FILE_OPEN_IF`, which means "open it, or make it": the make half is `mkdir`, and doing it here is
             // what keeps the 2x2 from needing a fifth verb.
             Err(crate::ops::OpsError::NotFound)
@@ -1091,17 +1058,16 @@ unsafe fn open_like(
                     .backend()
                     .mkdir(&crate::ops::Path::new(path.as_bytes()))
                 {
-                    Ok(file_id) => adapter
-                        .backend()
-                        .get_info(file_id)
-                        .map(|_| (file_id, None))
-                        .map_err(|_| OURS_OBJECT_NAME_NOT_FOUND),
-                    Err(crate::ops::OpsError::NameCollision) => Err(OURS_OBJECT_NAME_COLLISION),
-                    Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
+                    Ok(file_id) => {
+                        let found = adapter
+                            .backend()
+                            .dir_binding(&crate::ops::Path::new(path.as_bytes()));
+                        Ok((file_id, found))
+                    }
+                    Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
                 }
             }
-            Err(crate::ops::OpsError::NotADirectory) => Err(OURS_NOT_A_DIRECTORY),
-            Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
+            Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
         },
         MakeVerb::File => match adapter
             .backend()
@@ -1115,23 +1081,14 @@ unsafe fn open_like(
                     binding: outcome.binding,
                 }),
             )),
-            // **A directory opened without `FILE_DIRECTORY_FILE`.** Windows does open directories with a plain `FILE_OPEN` (that is how it walks into
-            // one before creating a child), and the file door correctly refuses it — so the directory door gets the second attempt. Without this
-            // fallback the open of a perfectly good directory answers NotADirectory, and every child operation under it fails with
-            // "path not found" (measured: `/d` Open -> NotADirectory, then `/d/a` -> NotFound, four calls in a row).
-            // **`NotFound` gets the same second attempt** (515). The file door says "no such name" for a path that a directory door answers happily: the
-            // root is the case that broke a whole mount, because a bare `/` has no name for some backends while still being the root. `NotADirectory`
-            // means "that is a directory, and I will not open it"; `NotFound` means "I cannot see it" — and for a directory, both are the same
-            // situation seen by a door that is not allowed to look. Measured: `Create("\\", FILE_OPEN)` answered `0xC0000034`, after which WinFsp
-            // synthesised `0xC000003A` for every child and no file could be created through the mount.
+            // **A directory opened without `FILE_DIRECTORY_FILE`.** Windows does open directories with a plain `FILE_OPEN`,
+            // and the file door refuses it with `NotADirectory` — so the directory door gets the second attempt.
             Err(crate::ops::OpsError::NotADirectory) => {
                 match adapter
                     .backend()
                     .open_dir(&crate::ops::Path::new(path.as_bytes()))
                 {
                     Ok(file_id) => {
-                        // The binding comes with an identity, and the identity must agree with the id the door just answered: same question twice,
-                        // answered together so a disagreement is visible.
                         let found = adapter
                             .backend()
                             .dir_binding(&crate::ops::Path::new(path.as_bytes()));
@@ -1145,11 +1102,10 @@ unsafe fn open_like(
                         }
                         Ok((file_id, found))
                     }
-                    Err(crate::ops::OpsError::NotADirectory) => Err(OURS_NOT_A_DIRECTORY),
-                    Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
+                    Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
                 }
             }
-            Err(_) => Err(OURS_OBJECT_NAME_NOT_FOUND),
+            Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
         },
     };
     let (file_id, binding) = match outcome {
@@ -1159,25 +1115,22 @@ unsafe fn open_like(
             return status;
         }
     };
-    // **The kind the caller asked for must be the kind it gets.** Windows expresses it in the create options (`FILE_DIRECTORY_FILE` or
-    // `FILE_NON_DIRECTORY_FILE`), and ignoring it is how a *file* got created over a directory's name: the third `Create` in the real trace
-    // carried `FILE_NON_DIRECTORY_FILE` for a name that was a directory, and answering it through the file door replaced the directory with an
-    // empty file — after which every child of it was "not found".
-    if let Ok(node) = adapter.backend().get_info(file_id) {
-        let is_directory = node.kind == crate::ops::Kind::Directory;
-        if wants_directory && !is_directory {
-            return OURS_NOT_A_DIRECTORY;
+    // Read current metadata once, verify the requested kind matches, and build the FileInfo record.
+    let node = match adapter.backend().get_info(file_id) {
+        Ok(node) => node,
+        Err(err) => {
+            OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return crate::error::to_status_of(&err).code() as i32;
         }
-        if expects_file && is_directory {
-            return OURS_IS_A_DIRECTORY;
-        }
+    };
+    let is_directory = node.kind == crate::ops::Kind::Directory;
+    if wants_directory && !is_directory {
+        return OURS_NOT_A_DIRECTORY;
+    }
+    if expects_file && is_directory {
+        return OURS_IS_A_DIRECTORY;
     }
     let _ = disposition;
-    // The record is built from **current** metadata, read at return time — not from whatever the outcome remembered.
-    let Some(node) = adapter.backend().get_info(file_id).ok() else {
-        OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return OURS_OBJECT_NAME_NOT_FOUND;
-    };
     let Ok(record) = crate::file_info::file_info(&node) else {
         OPEN_EXITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
@@ -1389,14 +1342,14 @@ pub unsafe fn can_delete_shell(adapter: Option<&crate::DynAdapter>, context: *co
             }
             0
         }
-        Err(_) => OURS_OBJECT_NAME_NOT_FOUND,
+        Err(err) => crate::error::to_status_of(&err).code() as i32,
     }
 }
 
 /// `SetBasicInfo`'s two sentinels, both **"leave this alone"** — and they are different values, which is exactly the kind of thing that has to be read
 /// from the header rather than assumed.
 ///
-/// `FileAttributes == 0xFFFFFFFF` (`INVALID_FILE_ATTRIBUTES`) means "do not change the attributes"; a time of `0` means "do not change this time".
+/// `FileAttributes == 0xFFFFFFFF` (`INVALID_FILE_ATTRIBUTES`) means "do not change the attributes"; a time of `0` (or `-1`/`-2` i.e. `u64::MAX`/`u64::MAX - 1`) means "do not change this time".
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 
 /// The `SetBasicInfo` **shell**: attributes first, then the four timestamps — each field independently optional.
@@ -1428,43 +1381,52 @@ pub unsafe fn set_basic_info_shell(
         // The adapter accepts only the four writable bits; `DIRECTORY`/`NORMAL` are derived, so masking them off here is what keeps a caller that
         // passes the ordinary "normal file" value from being refused.
         let writable = file_attributes & fs_semantics::attributes::WRITABLE;
-        if adapter
+        if let Err(err) = adapter
             .backend()
             .set_attributes(entry.file_id, crate::ops::Attributes(writable))
-            .is_err()
         {
-            return NOT_IMPLEMENTED;
+            return crate::error::to_status_of(&err).code() as i32;
         }
     }
-    // A zero means "leave this one alone"; the four are independent.
-    let as_time = |raw: u64| {
-        if raw == 0 {
-            None
+    // Windows FILETIME (100ns ticks since 1601) -> Unix nanoseconds (`i64`).
+    // Sentinels: `0`, `u64::MAX` (-1: disable auto-update), `u64::MAX - 1` (-2: re-enable auto-update) all mean "leave alone".
+    let as_time = |raw: u64| -> Result<Option<i64>, i32> {
+        if raw == 0 || raw >= u64::MAX - 1 {
+            Ok(None)
         } else {
-            Some(i64::try_from(raw).unwrap_or(i64::MAX))
+            fs_windows::time::filetime_to_unix_ns(raw)
+                .map(Some)
+                .map_err(|_| OURS_INVALID_PARAMETER)
         }
     };
-    // Only call the backend when at least one timestamp actually changed: a call whose four fields are all "leave alone" would be a write with no
-    // reason, and on a read-only backend it would turn a perfectly valid attribute-only call into a failure.
-    let touches_time =
-        creation_time != 0 || last_access_time != 0 || last_write_time != 0 || change_time != 0;
-    if touches_time
-        && adapter
+    let created = match as_time(creation_time) {
+        Ok(t) => t,
+        Err(status) => return status,
+    };
+    let accessed = match as_time(last_access_time) {
+        Ok(t) => t,
+        Err(status) => return status,
+    };
+    let written = match as_time(last_write_time) {
+        Ok(t) => t,
+        Err(status) => return status,
+    };
+    let changed = match as_time(change_time) {
+        Ok(t) => t,
+        Err(status) => return status,
+    };
+    if created.is_some() || accessed.is_some() || written.is_some() || changed.is_some() {
+        if let Err(err) = adapter
             .backend()
-            .set_times(
-                entry.file_id,
-                as_time(last_access_time),
-                as_time(last_write_time),
-                as_time(change_time),
-                as_time(creation_time),
-            )
-            .is_err()
-    {
-        return NOT_IMPLEMENTED;
+            .set_times(entry.file_id, accessed, written, changed, created)
+        {
+            return crate::error::to_status_of(&err).code() as i32;
+        }
     }
     if !out.is_null() {
-        let Ok(info) = adapter.backend().get_info(entry.file_id) else {
-            return OURS_OBJECT_NAME_NOT_FOUND;
+        let info = match adapter.backend().get_info(entry.file_id) {
+            Ok(info) => info,
+            Err(err) => return crate::error::to_status_of(&err).code() as i32,
         };
         let Ok(record) = crate::file_info::file_info(&info) else {
             return NOT_IMPLEMENTED;
@@ -1522,10 +1484,7 @@ pub unsafe fn rename_shell(
     }
     match adapter.rename(from.as_bytes(), to.as_bytes(), replace_if_exists != 0) {
         Ok(_) => 0,
-        Err(crate::ops::OpsError::NameCollision) => OURS_OBJECT_NAME_COLLISION,
-        Err(crate::ops::OpsError::NotEmpty) => OURS_DIRECTORY_NOT_EMPTY,
-        Err(crate::ops::OpsError::NotFound) => OURS_OBJECT_NAME_NOT_FOUND,
-        Err(_) => NOT_IMPLEMENTED,
+        Err(err) => crate::error::to_status_of(&err).code() as i32,
     }
 }
 
@@ -1555,24 +1514,30 @@ pub unsafe fn cleanup_shell(
     if context.is_null() {
         return OURS_INVALID_PARAMETER;
     }
-    if flags & FSP_CLEANUP_DELETE == 0 {
-        // A cleanup for any other reason (a handle simply closing) has nothing to mark.
-        return 0;
-    }
-    // SAFETY: the caller guarantees `context` came from our own `Box<EntryContext>`.
     let Some(entry) = entry_of(context) else {
-        return NOT_IMPLEMENTED;
+        return if flags & FSP_CLEANUP_DELETE == 0 {
+            0
+        } else {
+            NOT_IMPLEMENTED
+        };
     };
-    let entry = &entry;
     let Some(adapter) = adapter else {
-        return NOT_IMPLEMENTED;
+        return if flags & FSP_CLEANUP_DELETE == 0 {
+            0
+        } else {
+            NOT_IMPLEMENTED
+        };
     };
-    match adapter.set_delete(entry.handle) {
-        Ok(()) => 0,
-        // No `DELETE` access on this handle, or the handle is unknown: a typed refusal, not a silent success that would leave the
-        // caller believing the entry is going away.
-        Err(_) => NOT_IMPLEMENTED,
-    }
+    let status = if flags & FSP_CLEANUP_DELETE != 0 {
+        match adapter.set_delete(entry.handle) {
+            Ok(()) => 0,
+            Err(_) => NOT_IMPLEMENTED,
+        }
+    } else {
+        0
+    };
+    adapter.cleanup(entry.handle);
+    status
 }
 
 /// How many times `Cleanup` was entered.
@@ -1671,7 +1636,7 @@ pub unsafe fn read_shell(
     // "padding is the caller's job" contract: at EOF `want` becomes 0 and the answer is a genuine zero-byte read.
     let size = match adapter.backend().get_info(entry.file_id) {
         Ok(info) => info.size,
-        Err(_) => return OURS_OBJECT_NAME_NOT_FOUND,
+        Err(err) => return crate::error::to_status_of(&err).code() as i32,
     };
     let remaining = size.saturating_sub(offset);
     let len = (length as u64).min(remaining) as usize;
@@ -1679,7 +1644,7 @@ pub unsafe fn read_shell(
         Ok(bytes) => bytes,
         // A directory cannot be read through a file handle: that is a typed refusal, not an empty read.
         Err(crate::ops::OpsError::IsADirectory) => return NOT_IMPLEMENTED,
-        Err(_) => return OURS_OBJECT_NAME_NOT_FOUND,
+        Err(err) => return crate::error::to_status_of(&err).code() as i32,
     };
     let taken = bytes.len().min(len);
     // SAFETY: `buffer` is valid for `length >= taken` bytes per the caller's contract.
@@ -1746,12 +1711,12 @@ pub unsafe fn overwrite_shell(
     };
     let before = match adapter.backend().get_info(entry.file_id) {
         Ok(info) => info,
-        Err(_) => return OURS_OBJECT_NAME_NOT_FOUND,
+        Err(err) => return crate::error::to_status_of(&err).code() as i32,
     };
     // Truncation first: it is the operation the caller actually asked for, and a failed attribute write must not leave a file that is
     // neither old nor new.
-    if adapter.backend().set_size(entry.file_id, 0).is_err() {
-        return NOT_IMPLEMENTED;
+    if let Err(err) = adapter.backend().set_size(entry.file_id, 0) {
+        return crate::error::to_status_of(&err).code() as i32;
     }
     // `FILE_ATTRIBUTE_NORMAL` (0x80) and `DIRECTORY` (0x10) are **derived**, never stored: masking them off here is what keeps a caller
     // that passes the ordinary "normal file" value from being refused by the attribute validator.
@@ -1761,16 +1726,15 @@ pub unsafe fn overwrite_shell(
     } else {
         before.attributes.0 & fs_semantics::attributes::WRITABLE | requested
     };
-    if adapter
+    if let Err(err) = adapter
         .backend()
         .set_attributes(entry.file_id, crate::ops::Attributes(stored))
-        .is_err()
     {
-        return NOT_IMPLEMENTED;
+        return crate::error::to_status_of(&err).code() as i32;
     }
     let after = match adapter.backend().get_info(entry.file_id) {
         Ok(info) => info,
-        Err(_) => return NOT_IMPLEMENTED,
+        Err(err) => return crate::error::to_status_of(&err).code() as i32,
     };
     // Read both back: the size **and** the attribute bits, since "replace vs merge" is the whole question this callback asks.
     if after.size != 0 || after.attributes.0 & fs_semantics::attributes::WRITABLE != stored {
@@ -1851,7 +1815,7 @@ pub unsafe fn write_shell(
     };
     let before = match adapter.backend().get_info(entry.file_id) {
         Ok(info) => info,
-        Err(_) => return OURS_OBJECT_NAME_NOT_FOUND,
+        Err(err) => return crate::error::to_status_of(&err).code() as i32,
     };
     // `WriteToEndOfFile` is signalled by `Offset == u64::MAX`; the header says so explicitly.
     let mut at = if write_to_end_of_file {
@@ -1870,22 +1834,24 @@ pub unsafe fn write_shell(
     let bytes = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), len) };
     let written = match adapter.backend().write(entry.file_id, at, bytes) {
         Ok(written) => written.min(len),
-        Err(_) => return NOT_IMPLEMENTED,
-    };
-    // Read the bytes **back** and compare: the size alone cannot catch a dropped write that stayed inside the file, and that is
-    // exactly the silent case this check exists for (`before.size` and `after.size` are equal whether the bytes landed or not).
-    let echo = match adapter.backend().read(entry.file_id, at, written) {
-        Ok(bytes) => bytes,
-        Err(_) => return NOT_IMPLEMENTED,
+        Err(err) => return crate::error::to_status_of(&err).code() as i32,
     };
     let after = match adapter.backend().get_info(entry.file_id) {
         Ok(info) => info,
-        Err(_) => return NOT_IMPLEMENTED,
+        Err(err) => return crate::error::to_status_of(&err).code() as i32,
     };
-    let expected = before.size.max(at.saturating_add(written as u64));
-    if echo.as_slice() != &bytes[..written.min(bytes.len())] || after.size != expected {
-        WRITE_DISAGREEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return NOT_IMPLEMENTED;
+    // Optional read-back verification (diagnostic/test mode only): doing an unlocked read+memcmp on every
+    // production write doubles I/O cost and produces false positives under concurrent writers.
+    if verify_writes_enabled() {
+        let echo = match adapter.backend().read(entry.file_id, at, written) {
+            Ok(bytes) => bytes,
+            Err(err) => return crate::error::to_status_of(&err).code() as i32,
+        };
+        let expected = before.size.max(at.saturating_add(written as u64));
+        if echo.as_slice() != &bytes[..written.min(bytes.len())] || after.size != expected {
+            WRITE_DISAGREEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return NOT_IMPLEMENTED;
+        }
     }
     if !bytes_written.is_null() {
         // SAFETY: writable out-pointer per WinFsp's contract.
@@ -1904,6 +1870,19 @@ pub unsafe fn write_shell(
     }
     let _ = &mut at;
     0
+}
+
+static VERIFY_WRITES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn verify_writes_enabled() -> bool {
+    VERIFY_WRITES.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("LAYERFS_VERIFY_WRITES").is_some_and(|v| v != "0")
+}
+
+/// Enables/disables diagnostic write read-back verification in tests.
+#[doc(hidden)]
+pub fn set_verify_writes_for_test(enabled: bool) {
+    VERIFY_WRITES.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// How many times `Write` was entered.
@@ -2113,7 +2092,7 @@ fn build_volume_descriptor() -> &'static [u8] {
 
 #[cfg(not(windows))]
 fn volume_descriptor() -> &'static [u8] {
-    build_volume_descriptor()
+    &[]
 }
 
 /// The descriptor both security doors answer, exposed so a criterion can check its **shape** without a mount.

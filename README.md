@@ -1,196 +1,96 @@
-# layerfs
+# LayerFS for Windows
 
-A workspace CAS filesystem for Windows: your files live in a content-addressed store, and a user-mode
-file system (WinFsp) serves them at a drive letter or a directory. `commit` publishes what you have,
-`restore` puts an older tree back, and `checkout` switches which workspace is being served — all while
-programs read and write the volume the ordinary way.
+A general-purpose **Windows native LayerFS CLI + WinFsp filesystem** built directly on top of the upstream [Ephemeral-AI-Lab/layerfs](https://github.com/Ephemeral-AI-Lab/layerfs) v1.0.0 core engine.
 
-This is the user guide. Architecture and the reasoning behind the design live in `docs/` (`docs/adr`,
-`docs/reports`).
+## Architecture
 
----
-
-## What it is (and is not)
-
-- **Is**: a local, single-machine file system whose history is content-addressed; every commit is a tree
-  you can go back to, and a workspace is where uncommitted edits sit.
-- **Is not**: a network share, a backup tool, or a replacement for `git`. It does not merge; two branches
-  diverging is a situation you resolve by hand.
-- **Files are read and written through the mount.** The CLI has no file verbs at all, so there is nothing to
-  learn beyond the lifecycle commands below.
+- **Upstream LayerFS Core (`upstream/crates/layerfs-*`)**: Reuses the upstream content-addressed storage (CAS), zstd + prefix-delta pack engine, SQLite persistence (`Durable` WAL/FULL and `Disposable` WAL/OFF), copy-on-write overlay, incremental commits, 3-way branch merging, and history catalog **without modifying the core storage format** (100% compatible with Linux/macOS LayerFS stores).
+- **Win32 Host Shim (`upstream/crates/layerfs-win32-host`)**: Minimal safe Win32 FFI wrapper (NTFS/ReFS detection, file identity, volume free space) so upstream `layerfs-overlay` and `layerfs-store-service` retain `#![forbid(unsafe_code)]`.
+- **Windows Bridge (`crates/fs-layerfs`)**: Bridges upstream `BoundWorkspace` + `layerfs-store-service` to `fs-winfsp::WorkspaceOps`, handling Windows case-insensitive / case-preserving lookup, `READONLY` ↔ POSIX write-bit mapping, windowed I/O, paginated directory listing, and commit publication gating.
+- **WinFsp Native Adapter (`crates/fs-winfsp`, `crates/fs-windows`, `crates/fs-semantics`)**: Native Windows WinFsp filesystem callbacks, NTSTATUS mapping, FILETIME conversion, handle & delete-on-close semantics, and mount admission control.
+- **CLI (`crates/fs-cli`, binary `layerfs`)**: General-purpose command-line interface with named-pipe control channel and automatic mount discovery when invoked inside a mounted directory/drive.
 
 ## Requirements
 
-- **Windows 10/11**, 64-bit.
-- **WinFsp** installed (the build checks the DLL version against the ABI layout it was measured on; a
-  mismatch is refused instead of misbehaving). Standard user is enough — no administrator rights.
-- Rust toolchain to build.
+- Windows 10 / 11 x64
+- [WinFsp](https://winfsp.dev/) 2.x installed (`C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll`)
+- Rust toolchain (1.85+)
 
 ## Build
 
 ```powershell
-cargo build --release
+cargo build --release -p fs-cli
+# Binary: target\release\layerfs.exe
 ```
 
-The binary is `target\release\fs-cli.exe`. The examples below call it `layerfs`; rename the file or add
-its directory to `PATH` if you prefer that name.
-
-## Quick start
-
-Every line below was run on a real machine before it was written here.
+## Quick Start
 
 ```powershell
-layerfs init F:\repo                     # create a store; creates the `main` branch and workspace
-                                         # add `--size 512M` to advertise a smaller volume (default 128 GiB)
-layerfs --store F:\repo mount Z: --workspace main
-                                         # serve `main` at Z: (Ctrl-C in that window = clean unmount)
-dir Z:\                                   # use it like any other drive
-echo hello > Z:\hello.txt
-type Z:\hello.txt                         # hello
+# 1. Create a repository (defaults to --durable SQLite WAL/FULL; use --disposable for WAL/OFF)
+layerfs init F:\my-repo --durable --size 128G
 
-layerfs --store F:\repo branch feat --from main
-layerfs --store F:\repo checkout feat     # creates the `feat` workspace (first use; not a switch)
-                                         # exit 0, prints `on feat (workspace feat)`
+# 2. Mount the default writable branch `work` to a drive letter or directory mount point
+layerfs --store F:\my-repo mount Z: --branch work
+# (or mount to a non-existent directory path, e.g. F:\mnt\work)
 
+# 3. Use any Windows app, shell, or Git directly inside Z:\
 cd Z:\
-layerfs --store F:\repo commit -m "first"  # publish what the mount is serving
-layerfs status                             # run inside the mount: no --workspace needed
-layerfs --store F:\repo checkout feat      # run inside the mount: **switches** the mount to feat
-cd %USERPROFILE%                           # leave the volume before asking it to stop
-layerfs umount Z:                          # if it reports open handles, see "Stopping a mount"
+git init
+echo hello > README.md
+git add .
+git commit -m "initial"
+
+# 4. Inspect and commit changes inside the mount (auto-discovered from current directory)
+layerfs status
+layerfs commit -m "first snapshot"
+
+# 5. Fork, branch, diff, 3-way merge, and publish to `main`
+layerfs --store F:\my-repo fork feat-a --from work
+layerfs --store F:\my-repo fork feat-b --from work
+layerfs --store F:\my-repo branch
+layerfs --store F:\my-repo merge feat-a feat-b merged -m "merge features"
+layerfs --store F:\my-repo diff work merged
+layerfs --store F:\my-repo publish merged
+
+# 6. Hot-switch a live mount to another branch (from inside the mount)
+layerfs checkout feat-a
+
+# 7. Orderly unmount
+cd F:\
+layerfs umount Z:
 ```
 
-Two things in that sequence are easy to trip over, and both are deliberate:
+## Commands
 
-- **the first `checkout <branch>` creates the workspace** (it does not switch anything); from then on,
-  running it from inside a mount switches that mount;
-- **a command that needs a workspace and is not inside a mount must be told one**
-  (`--workspace <name>`), because there is no ambient "current workspace" any more.
+| Command | Description |
+| --- | --- |
+| `layerfs init <path> [--durable\|--disposable] [--size <size>]` | Initialize an upstream-compatible LayerFS repository (`main` stack + `work` branch) |
+| `layerfs branch [<name>] [--from <src>]` | List branches or fork a new branch |
+| `layerfs fork <name> [--from <src>]` | Alias for `branch <name> [--from <src>]` |
+| `layerfs checkout <branch>` | Verify a branch, or hot-switch the current mount when run inside one |
+| `layerfs commit [-m <msg>] [--force]` | Commit uncommitted changes on the mounted branch |
+| `layerfs merge <left> <right> <into> [-m <msg>]` | 3-way merge `<left>` and `<right>` into `<into>` |
+| `layerfs publish <branch> [<commit>]` | Publish a branch commit onto `main` as the next immutable Layer |
+| `layerfs diff <left> <right>` | Show changed paths between two branches (or `main`) |
+| `layerfs log [<branch>] [<limit>]` | List commits on a branch |
+| `layerfs status` | Show live mount status (inside mount) or branch status (offline) |
+| `layerfs stats` | Repository profile, file size, and logical/canonical/stored byte counts |
+| `layerfs mount <point> [--branch <name>] [--no-version-gate]` | Mount a branch via WinFsp |
+| `layerfs umount <point> [--force]` | Orderly unmount via control pipe |
+| `layerfs list` | List recorded mounts and liveness |
+| `layerfs version` | Check WinFsp DLL version and ABI compatibility |
 
-## Mount points: drive letter or directory
+## Testing
 
-| | Drive letter (`Z:`) | Directory (`F:\mnt`) |
-|---|---|---|
-| Created by | WinFsp picks the volume | WinFsp creates the directory |
-| Path discovery inside it | volume label is `layerfs` | detected by the mount point being a volume mount point |
-| Notes | the letter must be free | the **parent** must exist, the directory itself must **not** |
+```powershell
+# Core bridge + Windows semantics + WinFsp + CLI (including live WinFsp mount + git commit test)
+cargo nextest run -p fs-semantics -p fs-windows -p fs-winfsp -p fs-layerfs -p fs-cli --test-threads=1
 
-Both behave the same once mounted. A directory mount point is visible in the host volume, so "the
-directory exists" is *not* a sign the volume is up — `layerfs list` or a successful write is.
-
-## What blocks a `restore` or a `checkout` (a switch)
-
-- **Open file handles block it.** You get exit code 4 and a message that counts **files** separately from
-  directories; nothing is changed, and the view is exactly what it was. Close the files and try again.
-- **Directory handles do not block it.** A shell whose working directory is inside the mount holds one, so
-  counting those would make switching impossible. You get a number and a hint instead:
-  `N directory handles (…) now point at the old view; run `cd .` in them to refresh`.
-- **The switch takes about 30 ms**, during which the mount point is not usable. The control channel
-  (which `status`/`commit`/`restore` use inside a mount) is **serial**: it answers again as soon as the
-  switch is done, but not during it. That is the honest answer — the mount really is in transition.
-- **Your shell does not break.** `bash`, `cmd` and PowerShell started inside the old volume keep running;
-  their next command may see the old view until `cd .` refreshes it.
-- **If the new volume cannot come up, the switch rolls back**: exit 1, the old workspace is serving again,
-  and what you wrote before the switch is still there.
-
-## Stopping a mount
-
-- `layerfs umount Z:` — asks the mount to unmount. It **refuses (exit 4, with a count) while any handle is
-  open, including a directory handle a shell holds because its working directory is inside the mount**.
-  Close those and ask again.
-- **A small count can remain right after reading or writing through the mount** (measured on this build:
-  `still has 1 open handle(s)`, even with no shell inside the volume). The way out is the mount's own
-  console: **Ctrl-C in the window running `mount`** stops it without waiting for handles, because the user
-  in front of it asked for that.
-- `layerfs umount Z: --force` — clears a **stale record** (a mount whose process died). It says so plainly:
-  the record is gone, the volume may still be attached.
-- **Ctrl-C** in the mount's console is an orderly stop: flush, unmount, remove the record.
-
-## Troubleshooting
-
-| What you see | What it means | Way out |
-|---|---|---|
-| `0xC0000035` from `mount` | the drive letter is taken, often by a dead mount's leftover | `layerfs umount <point> --force`, or pick another letter |
-| `0xC0000022` from `mount` | the slot is a real volume (a partition or an optical drive) | use a free letter, or a directory mount point |
-| `database is locked` (exit 4) | another process is using that workspace | close it, or `checkout` a different branch |
-| `workspace X is mounted at Y (pid N)` (exit 4) | the workspace is being served right now | use that mount, or unmount it first |
-| `no workspace specified` | the command is outside a mount and has no `--workspace` | add `--workspace <name>` or `cd` into a mount |
-| `mount needs a store: add --store <dir>` (exit 2) | `mount` was given no repository (it is not implied by the current directory) | add `--store`, or run it from inside a mount |
-| `refusing to mount: winfsp … was not the layout …` | the installed WinFsp differs from the measured ABI | install the version named in the message, or `--no-version-gate` if you know what you are doing |
-
-Mount records live in `%LOCALAPPDATA%\layerfs\mounts\` (override with `LAYERFS_MOUNTS_DIR`). A record is
-held open by its mount and removed when the process dies, so a leftover record means a power cut —
-`umount --force` is the way out.
-
-## Commands at a glance
-
-| Command | What it does |
-|---|---|
-| `init <path> [--size N]` | create a store, a scope and the `main` branch; `--size` sets the volume size (default 128 GiB) |
-| `branch [<name>] [--from <src>]` | list branches, or create one |
-| `branch delete <name>` | delete a branch (its history stays a GC root) |
-| `checkout <branch>` | create or resume the workspace on a branch; inside a mount, **switch** it |
-| `workspace discard <name>` | drop a workspace's overlay and row |
-| `commit -m <message> [--force]` | publish the workspace as a commit |
-| `status` | workspace, branch, base commit, view root, dirty state |
-| `log [branch] [limit]` | commit history |
-| `reset <commit> [--expect <c>]` | move the branch head |
-| `restore <commit> [--discard]` | replace the view with a commit's tree |
-| `revert` | undo the head with a new commit |
-| `verify [--deep]` | check objects and references |
-| `stats` | object and repository counts |
-| `gc [--dry-run]` | collect unreachable objects (offline; refuses while a writer holds the store) |
-| `snapshot [list \| create \| drop <root>]` | keep a tree alive without moving a branch |
-| `mount <point> [--workspace <n>] [--no-version-gate]` | serve a workspace over WinFsp |
-| `umount <point> [--force]` | ask a mount to stop (or clear a stale record) |
-| `list` | the recorded mounts |
-| `version` | the WinFsp DLL version versus the measured layout |
-
-`layerfs --help` is the single source of truth for this table. `layerfs help <command>` describes one
-command's arguments and the notes that matter for it (what blocks a `restore`, what a switch does to open
-handles, and so on).
-
-## Exit codes
-
-```
-0  success
-2  usage       (the command line itself is wrong)
-3  not found   (store / workspace / branch / commit)
-4  busy        (in use, another process holds it, handles still open)
-5  conflict    (branch moved, nothing to commit, already exists)
-1  anything else
+# Upstream Windows-adapted core crates
+cargo nextest run --tests -p layerfs-persistence -p layerfs-store-service -p layerfs-overlay -p layerfs-workspace
 ```
 
-## What the volume reports
+## License
 
-The volume is **virtual**: its size is what `init` recorded (`--size`, default **128 GiB**), not the size of the disk the store
-lives on. Usage is the **logical size of everything the view shows** — files only, each name counted (two names pointing at
-the same content each count), history excluded — and free space is the difference, never below zero.
-
-Two things worth knowing when you compare with Explorer:
-
-- **Explorer rounds to 4 KiB.** The product's own figure is byte-exact (a 5-byte file adds 5), but Windows rounds the number it
-  displays up to the allocation unit, so the same 5 bytes show as 4096. That is the shell, not the accounting.
-- **The number refreshes at most every 250 ms.** The shell asks for the volume's size many times per second and the answer costs a
-tree walk, so the reading is cached for a quarter of a second; a copy shows up on the next refresh, not instantly.
-
-If the host volume has less free space than the advertised size, `init` and `mount` print a warning naming both numbers and
-**carry on**: a write that cannot be satisfied fails on its own, and a full disk is not a reason to refuse to mount.
-
-## Known limitations
-
-- **Several mounts in one session can go half-dead** (a known family, tracked in
-  `docs/reports/known-issues.md`); a fresh `layerfs` invocation is the workaround.
-- **No merge**: diverging branches are resolved by hand.
-- **No change notification**: another process's write can take until you re-open to become visible in
-  some tools.
-- **One mount per process**: the CLI serves a single mount and exits when it stops.
-
-## Where to read more
-
-- `docs/adr/ADR-010-cli-behavior.md` — why the CLI looks the way it does (and what it no longer has).
-- `docs/adr/ADR-009-winfsp-frontend.md` — the WinFsp frontend the mount is built on.
-- `docs/adr/ADR-006-workspace-overlay.md` — what a workspace is, and how an overlay relates to a commit.
-- `docs/adr/ADR-008-pack-gc.md` — the store's pack format and garbage collection.
-- `docs/reports/known-issues.md` — what is known to be broken, with the evidence.
-- `docs/reports/` — everything else that was measured.
+- This repository's Windows adapter and CLI crates are dual-licensed under MIT OR Apache-2.0.
+- Adapted upstream LayerFS crates under `upstream/` retain their original MIT license (`upstream/LICENSE`).

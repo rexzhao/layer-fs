@@ -1,0 +1,7 @@
+[package]
+name = "layerfs-win32-host"
+description = "Minimal Windows host file-identity and volume-capacity primitives for upstream LayerFS crates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"

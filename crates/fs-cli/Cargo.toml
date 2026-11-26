@@ -1,33 +1,25 @@
 [package]
 name = "fs-cli"
-description = "Command line interface for the Workspace CAS filesystem."
+description = "Command line interface for LayerFS on Windows (upstream LayerFS core + WinFsp)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "fs-cli"
+name = "layerfs"
 path = "src/main.rs"
 
-# The vocabulary lives in a library so the criteria can assert the **same constants** the binary prints (ADR-010 §8.2).
 [lib]
 name = "fs_cli"
 path = "src/lib.rs"
 
 [dependencies]
-fs-api.workspace = true
-fs-workspace.workspace = true
-# The mount subcommands drive the WinFsp frontend directly (B-24); `fs-api` supplies the backend they hand it.
+fs-layerfs.workspace = true
 fs-winfsp.workspace = true
-# One line of JSON per control request (ADR-010 §10.2); the ruling was the library, not a hand-written parser (547).
 serde.workspace = true
 serde_json.workspace = true
 
-[dev-dependencies]
-rusqlite.workspace = true
-
-# The control pipe (ADR-010 §10.2): named pipes, the current user's SID for the DACL, and the console handler live behind these.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
