@@ -64,8 +64,27 @@ mod win32 {
         _pad: [u8; 2],
     }
 
+    #[repr(C)]
+    struct FileZeroDataInformation {
+        file_offset: i64,
+        beyond_final_zero: i64,
+    }
+
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+    const FSCTL_SET_ZERO_DATA: u32 = 0x0009_80C8;
+
     #[link(name = "kernel32")]
     extern "system" {
+        fn DeviceIoControl(
+            device: *mut c_void,
+            io_control_code: u32,
+            in_buffer: *const c_void,
+            in_buffer_size: u32,
+            out_buffer: *mut c_void,
+            out_buffer_size: u32,
+            bytes_returned: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
         fn CreateFileW(
             file_name: *const u16,
             desired_access: u32,
@@ -273,6 +292,63 @@ mod win32 {
             _ => None,
         })
     }
+
+    pub(super) fn set_sparse_file(file: &File) -> io::Result<()> {
+        let mut returned: u32 = 0;
+        // SAFETY: `file` owns a valid writable Win32 file handle; `FSCTL_SET_SPARSE`
+        // takes no input/output buffers when setting the sparse attribute.
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle().cast::<c_void>(),
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = offset.saturating_add(length);
+        let Ok(file_offset) = i64::try_from(offset) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"));
+        };
+        let Ok(beyond_final_zero) = i64::try_from(end) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "range overflow"));
+        };
+        let range = FileZeroDataInformation {
+            file_offset,
+            beyond_final_zero,
+        };
+        let mut returned: u32 = 0;
+        // SAFETY: `file` owns a valid writable handle and `range` matches `FILE_ZERO_DATA_INFORMATION`.
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle().cast::<c_void>(),
+                FSCTL_SET_ZERO_DATA,
+                (&range as *const FileZeroDataInformation).cast::<c_void>(),
+                std::mem::size_of::<FileZeroDataInformation>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 /// Queries physical identity and allocation size for an already-open file handle.
@@ -337,5 +413,33 @@ pub fn local_filesystem_kind(path: &Path) -> io::Result<Option<&'static str>> {
             io::ErrorKind::Unsupported,
             "layerfs-win32-host is Windows-only",
         ))
+    }
+}
+
+/// Marks `file` as a Windows NTFS/ReFS sparse file (`FSCTL_SET_SPARSE`) so arbitrary
+/// large offsets allocate zero disk blocks for unwritten holes.
+pub fn set_sparse_file(file: &File) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        win32::set_sparse_file(file)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+/// Releases disk clusters for `[offset, offset + length)` inside a sparse file
+/// (`FSCTL_SET_ZERO_DATA`).
+pub fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        win32::punch_hole(file, offset, length)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (file, offset, length);
+        Ok(())
     }
 }

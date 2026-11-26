@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use fs_layerfs::{
-    parse_import_source, Error as LayerError, ImportSource, PersistenceProfile, Repo,
-    DEFAULT_BRANCH,
+    parse_cache_size, parse_import_source, Error as LayerError, ImportSource, PersistenceProfile,
+    Repo, DEFAULT_BRANCH,
 };
 
 const USAGE: &str = "\
-layerfs [--store <dir>] [--branch <name>] <command> [args]
+layerfs [--store <dir>] [--branch <name>] [--cache <size>] <command> [args]
 
   init <path> [--from <dir>[:<branch>] ...] [--durable|--disposable] [--size <size>]
                                   create a repository (optionally importing one or more directories as branches)
@@ -30,7 +30,7 @@ layerfs [--store <dir>] [--branch <name>] <command> [args]
   stats                           repository and storage statistics
   compact [--pages <n>]           reclaim free SQLite pages in store.sqlite (upstream incremental vacuum)
 
-  mount <mount_point> [--branch <name>] [-d|--background] [--no-version-gate]
+  mount <mount_point> [--branch <name>] [--cache <size>] [-d|--background] [--no-version-gate]
                                   mount a writable branch over WinFsp (`-d` detaches after ready)
   umount [<mount_point>] [--force]
                                   orderly unmount via the mount's control pipe (--force removes stale record)
@@ -121,7 +121,7 @@ fn command_help(command: &str) -> Option<&'static str> {
         "status" => "status\n  Show branch, base layer, head commit, effective root, dirty counts, and open handles.\n  Inside a mount, queries the live mount process over the control pipe.",
         "stats" => "stats\n  Show repository profile, store file size, branch count, and logical/canonical/stored bytes.",
         "compact" => "compact [--pages <n>]\n  Reclaim free SQLite pages in store.sqlite using upstream bounded incremental vacuum.\n  Logical objects and history are unchanged.",
-        "mount" => "mount <mount_point> [--branch <name>] [-d|--background|--detach] [--no-version-gate]\n  Mount a writable branch (default: `work`) via WinFsp at `<mount_point>` (drive letter like `Z:`\n  or directory path). Defaults to foreground (Ctrl-C or `layerfs umount <mount_point>` to stop);\n  pass `-d` / `--background` / `--detach` to detach into the background once mounted.",
+        "mount" => "mount <mount_point> [--branch <name>] [--cache <size>] [-d|--background|--detach] [--no-version-gate]\n  Mount a writable branch (default: `work`, or the sole branch) via WinFsp at `<mount_point>`\n  (drive letter like `Z:` or directory path). Defaults to foreground (Ctrl-C or `layerfs umount`\n  to stop); pass `-d` / `--background` / `--detach` to detach into the background once mounted.\n  `--cache <size>` (or `LAYERFS_CACHE_SIZE`, default 128M) sets the read object cache budget.",
         "umount" => "umount [<mount_point>] [--force]\n  Ask a running mount to unmount cleanly (uncommitted ephemeral-overlay edits are discarded unless\n  committed first, matching upstream LayerFS). Refuses (exit 4) while regular file handles are open;\n  directory handles do not block unmount.\n  Omit `<mount_point>` inside a store directory (when it has one live mount) to unmount it automatically.\n  `--force` forces unmount even with open file handles, or removes a stale record whose owner is gone.",
         "list" => "list\n  List mounts recorded under %LOCALAPPDATA%\\layerfs\\mounts with live/stale status.",
         "version" => "version\n  Print WinFsp DLL version, calibrated ABI layout, and LayerFS core compatibility.",
@@ -145,6 +145,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let explicit_store_was_given = explicit_store.is_some();
     let branch_opt = take_option(&mut arguments, "--branch")
         .or_else(|| take_option(&mut arguments, "--workspace"));
+    let cache_bytes = take_option(&mut arguments, "--cache")
+        .map(|raw| parse_cache_size(&raw))
+        .transpose()?;
 
     if arguments.is_empty() {
         println!("{USAGE}");
@@ -248,7 +251,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut idx = 0;
             while idx < arguments.len() {
                 match arguments[idx].as_str() {
-                    "--branch" | "--workspace" => idx += 2,
+                    "--branch" | "--workspace" | "--cache" => idx += 2,
                     other if other.starts_with('-') => idx += 1,
                     _ => {
                         positional_count += 1;
@@ -264,7 +267,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
         }
-        return mountcmd::mount(&store, active_branch.as_deref(), &arguments);
+        return mountcmd::mount(&store, active_branch.as_deref(), cache_bytes, &arguments);
     }
 
     // Inside a live mount, route `status`, `commit`, and `checkout` directly to the mount's control pipe.
@@ -303,7 +306,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return cmd_compact(&store, &arguments);
     }
 
-    let repo = Repo::open(&store)?;
+    let repo = Repo::open_with_cache(&store, cache_bytes)?;
     match command.as_str() {
         "branch" => cmd_branch(&repo, &arguments),
         "fork" => cmd_fork(&repo, &arguments),
@@ -703,6 +706,7 @@ fn cmd_offline_status(
 fn cmd_stats(repo: &Repo) -> Result<(), Box<dyn std::error::Error>> {
     let stats = repo.stats()?;
     println!("profile:         {}", stats.profile.as_str());
+    println!("object_cache:    {} bytes", repo.cache_bytes());
     println!("volume_size:     {} bytes", stats.volume_size_bytes);
     println!("store_file:      {} bytes", stats.store_file_bytes);
     println!("branches:        {}", stats.branches);

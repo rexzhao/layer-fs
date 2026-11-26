@@ -7,5 +7,6 @@ pub(crate) mod digest;
 pub(crate) mod layers;
 pub(crate) mod pieces;
 pub(crate) mod runs;
+pub(crate) mod store;
 pub(crate) mod stream;
 pub(crate) use access::check;

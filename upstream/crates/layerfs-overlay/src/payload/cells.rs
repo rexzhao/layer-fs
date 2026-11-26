@@ -14,13 +14,6 @@ pub(crate) struct Window {
     pub mask: Box<[u8; MASK_BYTES]>,
 }
 impl Stored {
-    pub fn decode(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Self> {
-        Ok(Self {
-            epoch: row.get(first)?,
-            data: row.get(first + 1)?,
-            validity: row.get(first + 2)?,
-        })
-    }
     /// Whether stored byte `index` is a written byte.
     pub fn valid(&self, index: usize) -> bool {
         match &self.validity {

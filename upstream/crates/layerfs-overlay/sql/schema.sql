@@ -38,9 +38,10 @@ CREATE TABLE fs_data (
     cell_offset INTEGER NOT NULL CHECK(cell_offset>=0 AND cell_offset%4096=0),
     epoch INTEGER NOT NULL CHECK(epoch>=0),
     -- One cell at most, or a dense run of whole cells inside one aligned 32768-byte slot.
-    data BLOB NOT NULL CHECK(length(data) BETWEEN 1 AND 32768 AND (length(data)<=4096 OR
-        (validity IS NULL AND length(data)%4096=0 AND cell_offset/32768=(cell_offset+length(data)-1)/32768))),
-    validity BLOB CHECK(validity IS NULL OR length(validity)=(length(data)+7)/8),
+    -- Payload bytes live in the loose sparse-file sidecar (`<overlay>.blobs`); SQLite keeps only length & mask.
+    data_len INTEGER NOT NULL CHECK(data_len BETWEEN 1 AND 32768 AND (data_len<=4096 OR
+        (validity IS NULL AND data_len%4096=0 AND cell_offset/32768=(cell_offset+data_len-1)/32768))),
+    validity BLOB CHECK(validity IS NULL OR length(validity)=(data_len+7)/8),
     UNIQUE(inode,generation,cell_offset)
 ) STRICT;
 CREATE TABLE fs_truncate (

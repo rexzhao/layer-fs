@@ -35,7 +35,7 @@ const COUNTS: &str = "SELECT
     (SELECT count(*) FROM fs_inode),
     (SELECT count(*) FROM fs_entry),
     (SELECT count(*) FROM fs_data),
-    (SELECT coalesce(sum(length(data)+ifnull(length(validity),0)),0) FROM fs_data),
+    (SELECT coalesce(sum(data_len+ifnull(length(validity),0)),0) FROM fs_data),
     (SELECT count(*) FROM fs_truncate),
     (SELECT count(*) FROM commit_record),
     (SELECT coalesce(sum(length(value)),0) FROM commit_record),

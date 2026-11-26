@@ -616,10 +616,18 @@ fn live_mount_background_detach_error_propagation_and_umount() {
         String::from_utf8_lossy(&bad.stderr)
     );
 
-    // 3. Background mount (`-d`) from INSIDE the store directory without `--store`!
+    // 3. Background mount (`-d`) from INSIDE the store directory without `--store`, with explicit `--cache 64M`!
     // Must return immediately once WinFsp is ready (Command::output must not hang).
     let bg = Command::new(bin())
-        .args(["mount", mount_dir.to_str().unwrap(), "--branch", "work", "-d"])
+        .args([
+            "mount",
+            mount_dir.to_str().unwrap(),
+            "--branch",
+            "work",
+            "--cache",
+            "64M",
+            "-d",
+        ])
         .current_dir(&repo_dir)
         .env("LAYERFS_MOUNTS_DIR", &mounts_dir)
         .env_remove("LAYERFS_STORE")
@@ -633,7 +641,7 @@ fn live_mount_background_detach_error_propagation_and_umount() {
     );
     let bg_stdout = String::from_utf8_lossy(&bg.stdout);
     assert!(
-        bg_stdout.contains("in background (pid "),
+        bg_stdout.contains("in background (pid ") && bg_stdout.contains("cache=64MiB"),
         "unexpected mount -d output: {bg_stdout}"
     );
 

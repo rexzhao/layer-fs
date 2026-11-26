@@ -105,13 +105,18 @@ impl Overlay {
     ) -> OverlayResult<()> {
         match stored {
             Some((data, validity)) => {
-                let bound = 40 + data.len() + validity.as_ref().map_or(0, Vec::len);
+                let data_len = data.len() as i64;
+                self.payload_store.borrow().check_quota(data.len() as u64)?;
+                let bound = 48 + validity.as_ref().map_or(0, Vec::len);
                 self.execute(
                     StatementKind::Payload,
                     sql::CELL_PUT,
-                    &[&serial, &gen, &cell, &epoch, &data, &validity],
+                    &[&serial, &gen, &cell, &epoch, &data_len, &validity],
                     bound as u64,
                 )?;
+                let mut store = self.payload_store.borrow_mut();
+                store.write_at(serial, gen, cell as u64, &data, true)?;
+                store.note_bytes_added(data.len() as u64);
             }
             None => {
                 self.execute(

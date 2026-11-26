@@ -50,6 +50,7 @@ pub struct Overlay {
     pub(crate) issued: RefCell<Vec<i64>>,
     pub(super) profile: DatabaseProfile,
     pub(super) allocation: crate::database::physical::Allocation,
+    pub(crate) payload_store: RefCell<crate::payload::store::PayloadStore>,
 }
 /// An atomic job starts its SQLite transaction at its first writing statement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +93,7 @@ impl Overlay {
     /// Checked close retaining only the physical file identity, for an immutable
     /// template observed after readiness. The returned handle has no connection.
     pub fn close_database_file(self) -> OverlayResult<crate::ClosedFile> {
+        self.payload_store.borrow_mut().cleanup_all();
         self.connection.flush_prepared_statement_cache();
         let open = self.open.into_inner();
         self.connection
@@ -313,6 +315,7 @@ impl Overlay {
                 Ok(_) => {
                     self.transaction.set(Transaction::None);
                     self.open.borrow_mut().commit();
+                    self.payload_store.borrow_mut().commit_pending();
                     return Ok(value);
                 }
                 Err(cause) if cause.is_sqlite_full() || cause.capacity_io() => cause,
@@ -328,6 +331,7 @@ impl Overlay {
             Ok(value) => {
                 self.transaction.set(Transaction::None);
                 self.open.borrow_mut().commit();
+                self.payload_store.borrow_mut().commit_pending();
                 return Ok(value);
             }
             Err(cause) => self.failed(cause),
@@ -352,6 +356,7 @@ impl Overlay {
         self.orphan_seen.set(orphans);
         self.pieces_seen.set(pieces);
         self.open.borrow_mut().rollback();
+        self.payload_store.borrow_mut().rollback_pending();
         self.open.borrow_mut().mount = mount;
         self.workspace.set(workspace);
         for revision in issued {

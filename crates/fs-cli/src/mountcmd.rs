@@ -114,16 +114,29 @@ pub fn version() -> Result<(), Error> {
     Ok(())
 }
 
-/// `layerfs --store <dir> mount <mount_point> [--branch <name>] [-d|--background|--detach] [--no-version-gate]`
-pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result<(), Error> {
+/// `layerfs --store <dir> mount <mount_point> [--branch <name>] [--cache <size>] [-d|--background|--detach] [--no-version-gate]`
+pub fn mount(
+    store: &Path,
+    branch: Option<&str>,
+    cache_bytes: Option<usize>,
+    arguments: &[String],
+) -> Result<(), Error> {
     let mut positional: Vec<&String> = Vec::new();
     let mut inline_branch: Option<&str> = None;
+    let mut inline_cache: Option<usize> = cache_bytes;
     let mut background = false;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--branch" | "--workspace" => {
                 inline_branch = arguments.get(index + 1).map(String::as_str);
+                index += 2;
+            }
+            "--cache" => {
+                let raw = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| fs_cli::Failure::usage("--cache requires a size (e.g. 256M)"))?;
+                inline_cache = Some(fs_layerfs::parse_cache_size(raw)?);
                 index += 2;
             }
             "-d" | "--background" | "--detach" => {
@@ -137,6 +150,10 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
             }
             other if other.starts_with("--workspace=") => {
                 inline_branch = Some(&other["--workspace=".len()..]);
+                index += 1;
+            }
+            other if other.starts_with("--cache=") => {
+                inline_cache = Some(fs_layerfs::parse_cache_size(&other["--cache=".len()..])?);
                 index += 1;
             }
             other if other.starts_with('-') => {
@@ -162,7 +179,7 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
         }
         _ => {
             return Err(fs_cli::Failure::usage(
-                "usage: layerfs --store <store> mount <mount_point> [--branch <name>] [-d|--background]",
+                "usage: layerfs --store <store> mount <mount_point> [--branch <name>] [--cache <size>] [-d|--background]",
             )
             .into())
         }
@@ -172,7 +189,13 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
     let skip_gate = arguments.iter().any(|a| a == "--no-version-gate");
 
     if background {
-        return spawn_background_mount(&store, &mount_point, requested_branch.as_deref(), skip_gate);
+        return spawn_background_mount(
+            &store,
+            &mount_point,
+            requested_branch.as_deref(),
+            inline_cache,
+            skip_gate,
+        );
     }
 
     let ready_file = std::env::var_os(MOUNT_READY_ENV).map(PathBuf::from);
@@ -181,6 +204,7 @@ pub fn mount(store: &Path, branch: Option<&str>, arguments: &[String]) -> Result
         &store,
         &mount_point,
         requested_branch.as_deref(),
+        inline_cache,
         skip_gate,
         ready_file.as_deref(),
         &signaled_ready,
@@ -235,12 +259,13 @@ fn parse_ready_status(
     fallback_branch: &str,
 ) -> Result<(), Error> {
     let line = text.lines().next().unwrap_or("");
-    let mut parts = line.splitn(4, '\t');
+    let mut parts = line.splitn(5, '\t');
     match parts.next() {
         Some("OK") => {
             let pid = parts.next().unwrap_or("?");
             let profile = parts.next().unwrap_or("unknown");
             let branch = parts.next().unwrap_or(fallback_branch);
+            let cache_mib = parts.next().unwrap_or("?");
             let wait_start = Instant::now();
             while wait_start.elapsed() < MOUNT_ACCESS_WAIT {
                 if std::fs::read_dir(mount_point).is_ok() {
@@ -249,7 +274,7 @@ fn parse_ready_status(
                 std::thread::sleep(MOUNT_READY_POLL);
             }
             println!(
-                "mounted {} at {} in background (pid {pid}, branch {branch}, profile={profile}); stop with `layerfs umount {}`",
+                "mounted {} at {} in background (pid {pid}, branch {branch}, profile={profile}, cache={cache_mib}MiB); stop with `layerfs umount {}`",
                 store.display(),
                 mount_point.display(),
                 mount_point.display()
@@ -269,6 +294,7 @@ fn spawn_background_mount(
     store: &Path,
     mount_point: &Path,
     branch: Option<&str>,
+    cache_bytes: Option<usize>,
     skip_gate: bool,
 ) -> Result<(), Error> {
     use std::process::{Command, Stdio};
@@ -286,6 +312,9 @@ fn spawn_background_mount(
     cmd.arg("--store").arg(store).arg("mount").arg(mount_point);
     if let Some(name) = branch {
         cmd.arg("--branch").arg(name);
+    }
+    if let Some(bytes) = cache_bytes {
+        cmd.arg("--cache").arg(bytes.to_string());
     }
     if skip_gate {
         cmd.arg("--no-version-gate");
@@ -337,6 +366,7 @@ fn mount_foreground(
     store: &Path,
     mount_point: &Path,
     requested_branch: Option<&str>,
+    cache_bytes: Option<usize>,
     skip_gate: bool,
     ready_file: Option<&Path>,
     signaled_ready: &Arc<std::sync::atomic::AtomicBool>,
@@ -364,7 +394,8 @@ fn mount_foreground(
         }
     }
 
-    let repo = Repo::open(store)?;
+    let repo = Repo::open_with_cache(store, cache_bytes)?;
+    let cache_mib = repo.cache_bytes() / (1024 * 1024);
     let name = repo.resolve_default_branch(requested_branch)?;
     let profile_str = repo.profile().as_str().to_owned();
     let volume_total = repo.volume_size_bytes();
@@ -404,7 +435,7 @@ fn mount_foreground(
     );
     let mut record_handle = hold_record(&state, &record)?;
     println!(
-        "mounting {} at {} (branch {name}, profile={profile_str}); stop with `layerfs umount {}`",
+        "mounting {} at {} (branch {name}, profile={profile_str}, cache={cache_mib}MiB); stop with `layerfs umount {}`",
         store.display(),
         mount_point.display(),
         mount_point.display()
@@ -472,7 +503,10 @@ fn mount_foreground(
                     if let Some(ready_path) = ready_file {
                         let _ = write_ready_status(
                             ready_path,
-                            &format!("OK\t{}\t{profile_str}\t{name}\n", std::process::id()),
+                            &format!(
+                                "OK\t{}\t{profile_str}\t{name}\t{cache_mib}\n",
+                                std::process::id()
+                            ),
                         );
                     }
                 }

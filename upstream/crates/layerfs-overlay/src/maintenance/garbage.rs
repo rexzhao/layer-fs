@@ -11,7 +11,7 @@ impl Overlay {
         let mut bytes = 0;
         let count = match item.phase {
             0 => {
-                let rows=self.query(StatementKind::Reclaim,"SELECT inode,cell_offset,length(data)+ifnull(length(validity),0)
+                let rows=self.query(StatementKind::Reclaim,"SELECT inode,cell_offset,data_len+ifnull(length(validity),0)
                     FROM fs_data INDEXED BY fs_data_generation WHERE generation=?1 AND (inode,cell_offset)>(?2,?3)
                     ORDER BY inode,cell_offset LIMIT 14", &[&gen,&item.cursor,&item.aux],32,
                     |r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,unsigned(r,2)?)))?;
@@ -27,6 +27,7 @@ impl Overlay {
                         &[serial, &gen, cell],
                         32,
                     )?;
+                    self.payload_store.borrow_mut().note_bytes_dropped(*size);
                     bytes += size;
                 }
                 if let Some((serial, cell, _)) = rows.last() {
@@ -101,6 +102,9 @@ impl Overlay {
                         &[serial, &gen],
                         24,
                     )?;
+                    self.payload_store
+                        .borrow_mut()
+                        .defer_remove_layer(*serial, gen, true);
                 }
                 if let Some(serial) = rows.last() {
                     self.advance_item(item, 3, *serial, -1, &[])?
@@ -128,12 +132,12 @@ impl Overlay {
             .pop();
         let mut bytes = 0;
         let count = if item.kind == STALE {
-            let rows=self.query(StatementKind::Reclaim,"SELECT cell_offset,epoch,length(data)+ifnull(length(validity),0)
+            let rows=self.query(StatementKind::Reclaim,"SELECT cell_offset,epoch,data_len,data_len+ifnull(length(validity),0)
                 FROM fs_data WHERE inode=?1 AND generation=?2 AND cell_offset>?3 ORDER BY cell_offset LIMIT 14",
                 &[&item.resource,&item.target,&item.cursor],32,
-                |r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,unsigned(r,2)?)))?;
-            let rows = &rows[..PAGE.fit(rows.iter().map(|row| row.2)).0];
-            for (cell, stamp, size) in rows {
+                |r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,unsigned(r,2)?,unsigned(r,3)?)))?;
+            let rows = &rows[..PAGE.fit(rows.iter().map(|row| row.3)).0];
+            for (cell, stamp, data_len, size) in rows {
                 let stale = match layer {
                     Some(ref layer) => self.stale(item.resource, layer, *cell, *stamp)?,
                     None => true,
@@ -141,10 +145,19 @@ impl Overlay {
                 if stale {
                     self.execute(StatementKind::Reclaim,"DELETE FROM fs_data WHERE inode=?1 AND generation=?2 AND cell_offset=?3 AND epoch=?4",
                         &[&item.resource,&item.target,cell,stamp],40)?;
+                    let mut store = self.payload_store.borrow_mut();
+                    store.note_bytes_dropped(*size);
+                    store.defer_punch_hole(
+                        item.resource,
+                        item.target,
+                        *cell as u64,
+                        *data_len,
+                        true,
+                    );
                     bytes += size;
                 }
             }
-            if let Some((cell, _, _)) = rows.last() {
+            if let Some((cell, _, _, _)) = rows.last() {
                 self.advance_item(item, item.phase, *cell, -1, &[])?
             }
             rows.len()

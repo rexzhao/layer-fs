@@ -98,7 +98,8 @@ impl Overlay {
         if offset % CELL_BYTES as u64 != 0 {
             return Ok(None);
         }
-        let Some((shape, stored)) = self.covering(integer(serial)?, generation.0, cell)? else {
+        let serial_key = integer(serial)?;
+        let Some((shape, stored)) = self.covering(serial_key, generation.0, cell)? else {
             return Ok(None);
         };
         // A wide row is dense: its cell is whole.
@@ -106,7 +107,13 @@ impl Overlay {
             Some(stored) => stored,
             None => crate::cells::Stored {
                 epoch: shape.epoch,
-                data: self.row_bytes(shape.row, cell - shape.offset, CELL_BYTES as i64)?,
+                data: self.row_bytes(
+                    serial_key,
+                    generation.0,
+                    shape.offset,
+                    cell - shape.offset,
+                    CELL_BYTES as i64,
+                )?,
                 validity: None,
             },
         };

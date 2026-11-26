@@ -7,7 +7,6 @@ use crate::{
     sql, BaseSource, Capture, InodeKind, LocalRead, Overlay, OverlayError, OverlayResult,
     StatementKind, CELL_BYTES, READ_WINDOW, RUN_BYTES,
 };
-use rusqlite::blob::Blob;
 
 const CELL: u64 = CELL_BYTES as u64;
 const RUN: u64 = RUN_BYTES as u64;
@@ -38,9 +37,6 @@ impl Overlay {
             .write_input_bytes
             .saturating_add(bytes.len() as u64);
         self.payload_work.set(observed);
-        // One handle serves every in-place write of this window. A commit
-        // needs it closed, so it never outlives this call.
-        let mut blob = None;
         // Row shapes of the slots ahead, read once for at most one read
         // window of them, and where that read ends. A slot's write changes
         // rows of its own slot only, and a partly covered first cell is
@@ -72,30 +68,25 @@ impl Overlay {
                     ahead_to = (end - end % CELL).min(window);
                     ahead = self.shapes(serial, layer.gen, at as i64, ahead_to as i64)?;
                 }
-                self.write_whole(serial, layer, at as i64, source, &ahead, &mut blob)?;
+                self.write_whole(serial, layer, at as i64, source, &ahead)?;
             } else {
                 let low = (at - cell) as usize;
-                self.write_part(serial, layer, cell as i64, low, source, &mut blob)?;
+                self.write_part(serial, layer, cell as i64, low, source)?;
             }
             at = to;
         }
-        match blob {
-            Some(open) => open.close().map_err(|cause| self.failed(cause.into())),
-            None => Ok(()),
-        }
+        Ok(())
     }
     /// Whole cells `[from, from + source.len())` inside one slot. `ahead`
     /// holds the shapes of the layer's rows from that slot on, as they are
     /// stored now.
-    #[allow(clippy::too_many_arguments)]
-    fn write_whole<'a>(
-        &'a self,
+    fn write_whole(
+        &self,
         serial: i64,
         layer: &Layer,
         from: i64,
         source: &[u8],
         ahead: &[Shape],
-        blob: &mut Option<Blob<'a>>,
     ) -> OverlayResult<()> {
         let to = from + source.len() as i64;
         let part = |low: i64, high: i64| &source[(low - from) as usize..(high - from) as usize];
@@ -113,13 +104,19 @@ impl Overlay {
                 // garbage in the way; a live one takes its part in place.
                 if live {
                     low = shape.end().min(to);
-                    self.write_in_place(blob, shape.row, from - shape.offset, part(from, low))?;
+                    self.write_in_place(
+                        serial,
+                        layer.gen,
+                        shape.offset,
+                        from - shape.offset,
+                        part(from, low),
+                    )?;
                 } else {
                     self.drop_row(shape.row)?;
                 }
             } else if live && shape.wide() && shape.end() > to {
                 high = shape.offset;
-                self.write_in_place(blob, shape.row, 0, part(high, to))?;
+                self.write_in_place(serial, layer.gen, shape.offset, 0, part(high, to))?;
             } else {
                 inside += 1;
                 same = (live && !shape.masked).then_some(shape);
@@ -131,8 +128,11 @@ impl Overlay {
         if let Some(shape) =
             same.filter(|shape| inside == 1 && shape.offset == low && shape.length == high - low)
         {
-            return self.write_in_place(blob, shape.row, 0, part(low, high));
+            return self.write_in_place(serial, layer.gen, shape.offset, 0, part(low, high));
         }
+        let slice = part(low, high);
+        let data_len = slice.len() as i64;
+        self.payload_store.borrow().check_quota(slice.len() as u64)?;
         if inside != 0 {
             self.execute(
                 StatementKind::Payload,
@@ -149,23 +149,24 @@ impl Overlay {
                 &layer.gen,
                 &low,
                 &layer.epoch,
-                &part(low, high),
+                &data_len,
                 &None::<Vec<u8>>,
             ],
-            40 + (high - low) as u64,
+            48,
         )?;
+        let mut store = self.payload_store.borrow_mut();
+        store.write_at(serial, layer.gen, low as u64, slice, true)?;
+        store.note_bytes_added(slice.len() as u64);
         Ok(())
     }
     /// Bytes `[low, low + source.len())` of one partly covered cell.
-    #[allow(clippy::too_many_arguments)]
-    fn write_part<'a>(
-        &'a self,
+    fn write_part(
+        &self,
         serial: i64,
         layer: &Layer,
         cell: i64,
         low: usize,
         source: &[u8],
-        blob: &mut Option<Blob<'a>>,
     ) -> OverlayResult<()> {
         let mut old = None;
         if let Some((shape, stored)) = self.covering(serial, layer.gen, cell)? {
@@ -173,7 +174,7 @@ impl Overlay {
             if shape.wide() {
                 if live {
                     let at = cell - shape.offset + low as i64;
-                    return self.write_in_place(blob, shape.row, at, source);
+                    return self.write_in_place(serial, layer.gen, shape.offset, at, source);
                 }
                 // The upsert replaces a row of one cell, not a wider one.
                 self.drop_row(shape.row)?;
@@ -326,35 +327,60 @@ impl Overlay {
                     &(start as i64),
                 ],
                 48,
-                |row| Ok((row.get::<_, i64>(0)?, Stored::decode(row, 1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
             )?;
-            for (cell, stored) in rows {
-                if self.stale(serial, layer, cell, stored.epoch)? {
+            for (cell, epoch, data_len, validity) in rows {
+                if self.stale(serial, layer, cell, epoch)? {
                     continue;
                 }
                 let cell = cell as u64;
                 let from = start.max(cell);
-                let to = end.min(cell + stored.data.len() as u64);
+                let to = end.min(cell + data_len as u64);
                 if from >= to {
                     continue;
                 }
+                let slice = self.payload_store.borrow_mut().read_exact(
+                    serial,
+                    layer.gen,
+                    from,
+                    (to - from) as usize,
+                )?;
                 let slots = (from - start) as usize..(to - start) as usize;
                 // A dense row over bytes no higher layer decided is one copy.
-                if stored.validity.is_none() && decided[slots.clone()].iter().all(|slot| *slot == 0)
-                {
-                    let source = &stored.data[(from - cell) as usize..(to - cell) as usize];
-                    read.data[slots.clone()].copy_from_slice(source);
+                if validity.is_none() && decided[slots.clone()].iter().all(|slot| *slot == 0) {
+                    read.data[slots.clone()].copy_from_slice(&slice);
                     decided[slots.clone()].fill(1);
                     copied += slots.len() as u64;
                     open -= slots.len();
                     continue;
                 }
+                let stored = Stored {
+                    epoch,
+                    data: slice,
+                    validity,
+                };
                 for at in from..to {
-                    let (slot, index) = ((at - start) as usize, (at - cell) as usize);
-                    if decided[slot] == 0 && stored.valid(index) {
-                        read.data[slot] = stored.data[index];
+                    let slot_idx = (at - start) as usize;
+                    let cell_idx = (at - cell) as usize;
+                    let slice_idx = (at - from) as usize;
+                    if decided[slot_idx] == 0
+                        && match &stored.validity {
+                            None => true,
+                            Some(mask) => mask
+                                .get(cell_idx / 8)
+                                .is_some_and(|b| b & (1 << (cell_idx % 8)) != 0),
+                        }
+                    {
+                        read.data[slot_idx] = stored.data[slice_idx];
                         copied += 1;
-                        decided[slot] = 1;
+                        decided[slot_idx] = 1;
                         open -= 1;
                     }
                 }

@@ -10,8 +10,9 @@ pub mod repo;
 pub use backend::WinFspBackend;
 pub use error::{Error, Result};
 pub use repo::{
-    parse_import_source, BranchInfo, CommitInfo, CommitSummary, DiffEntry, ImportSource,
-    ImportSummary, ImportedBranchSummary, MergeOutcome, PersistenceProfile, PublishOutcome,
-    ReclaimSummary, Repo, StoreStats, WorkspaceHandle, WorkspaceStatus, DEFAULT_BRANCH,
-    DEFAULT_VOLUME_SIZE_BYTES,
+    parse_cache_size, parse_import_source, resolve_store_cache_bytes, BranchInfo, CommitInfo,
+    CommitSummary, DiffEntry, ImportSource, ImportSummary, ImportedBranchSummary, MergeOutcome,
+    PersistenceProfile, PublishOutcome, ReclaimSummary, Repo, StoreStats, WorkspaceHandle,
+    WorkspaceStatus, CACHE_SIZE_ENV, DEFAULT_BRANCH, DEFAULT_STORE_CACHE_BYTES,
+    DEFAULT_VOLUME_SIZE_BYTES, MIN_STORE_CACHE_BYTES,
 };

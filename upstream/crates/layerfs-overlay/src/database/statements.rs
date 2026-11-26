@@ -8,43 +8,39 @@ pub(crate) const INODE_LOOKUP: &str =
 pub(crate) const INODE_CAPTURE: &str =
     "SELECT inode,kind,mode,mtime_seconds,mtime_nanoseconds,nlink,size,inherited_cutoff,born,entries,subdirs
     FROM fs_inode INDEXED BY fs_inode_capture WHERE generation=?1 AND inode>?2 ORDER BY inode LIMIT 64";
-/// The last row at or before cell ?4 in its slot, which starts at ?3. A row
-/// of one cell at ?4 returns its bytes and mask; any other row only its
-/// shape, so a wide row is never loaded to learn that it is there.
-pub(crate) const CELL_COVER: &str = "SELECT rowid,cell_offset,epoch,length(data),
-    CASE WHEN cell_offset=?4 AND length(data)<=4096 THEN data END,
+/// The last row at or before cell ?4 in its slot, which starts at ?3.
+/// Payload bytes live in the loose-file sidecar; SQLite returns shape & validity mask only.
+pub(crate) const CELL_COVER: &str = "SELECT rowid,cell_offset,epoch,data_len,
     CASE WHEN cell_offset=?4 THEN validity END FROM fs_data
     WHERE inode=?1 AND generation=?2 AND cell_offset>=?3 AND cell_offset<=?4
     ORDER BY cell_offset DESC LIMIT 1";
 /// Shapes of the rows whose first cell lies in [?3, ?4); no bytes are loaded.
 pub(crate) const CELL_SHAPES: &str =
-    "SELECT rowid,cell_offset,epoch,length(data),length(validity) FROM fs_data
+    "SELECT rowid,cell_offset,epoch,data_len,length(validity) FROM fs_data
     WHERE inode=?1 AND generation=?2 AND cell_offset>=?3 AND cell_offset<?4
     ORDER BY cell_offset";
 pub(crate) const CELL_PUT: &str =
-    "INSERT INTO fs_data(inode,generation,cell_offset,epoch,data,validity) VALUES(?1,?2,?3,?4,?5,?6)
+    "INSERT INTO fs_data(inode,generation,cell_offset,epoch,data_len,validity) VALUES(?1,?2,?3,?4,?5,?6)
     ON CONFLICT(inode,generation,cell_offset) DO UPDATE SET epoch=excluded.epoch,
-    data=excluded.data,validity=excluded.validity";
+    data_len=excluded.data_len,validity=excluded.validity";
 pub(crate) const CELL_DROP: &str =
     "DELETE FROM fs_data WHERE inode=?1 AND generation=?2 AND cell_offset=?3";
 pub(crate) const CELLS_DROP: &str = "DELETE FROM fs_data
     WHERE inode=?1 AND generation=?2 AND cell_offset>=?3 AND cell_offset<?4";
 pub(crate) const ROW_DROP: &str = "DELETE FROM fs_data WHERE rowid=?1";
 /// Cuts a dense row to its first ?2 bytes.
-pub(crate) const ROW_KEEP: &str = "UPDATE fs_data SET data=substr(data,1,?2) WHERE rowid=?1";
+pub(crate) const ROW_KEEP: &str = "UPDATE fs_data SET data_len=?2 WHERE rowid=?1";
 pub(crate) const ROW_MOVE: &str = "UPDATE fs_data SET generation=?2,epoch=?3 WHERE rowid=?1";
-/// ?3 bytes of a row from its byte ?2, counted from one.
-pub(crate) const ROW_SLICE: &str = "SELECT substr(data,?2,?3) FROM fs_data WHERE rowid=?1";
 /// Rows that hold a byte of [?5, ?4): a row can start as early as its slot,
-/// ?3, and one that ends at or before ?5 is passed over without its bytes.
-pub(crate) const CELL_RANGE: &str = "SELECT cell_offset,epoch,data,validity FROM fs_data
+/// ?3, and one that ends at or before ?5 is passed over.
+pub(crate) const CELL_RANGE: &str = "SELECT cell_offset,epoch,data_len,validity FROM fs_data
     WHERE inode=?1 AND generation=?2 AND cell_offset>=?3 AND cell_offset<?4
-    AND cell_offset+length(data)>?5 ORDER BY cell_offset";
+    AND cell_offset+data_len>?5 ORDER BY cell_offset";
 /// The next row at or after ?3 that reaches past cell ?5.
 pub(crate) const CAPTURED_CELL_METADATA: &str =
-    "SELECT cell_offset,epoch,length(data),length(validity) FROM fs_data
+    "SELECT cell_offset,epoch,data_len,length(validity) FROM fs_data
     WHERE inode=?1 AND generation=?2 AND cell_offset>=?3 AND cell_offset<?4
-    AND cell_offset+length(data)>?5 ORDER BY cell_offset LIMIT 1";
+    AND cell_offset+data_len>?5 ORDER BY cell_offset LIMIT 1";
 /// The last piece of one layer that starts at or before byte ?3.
 pub(crate) const PIECE_COVER: &str =
     "SELECT file_offset,length,epoch,source,source_offset FROM fs_data_ref

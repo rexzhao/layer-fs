@@ -105,14 +105,48 @@ fn init_profiles_branch_fork_log_diff_stats_and_exit_codes() {
         String::from_utf8_lossy(&fork.stderr)
     );
 
-    // 4. Stats shows profile=durable and 64 GiB.
+    // 4. Stats shows profile=durable, default 128 MiB cache, and 64 GiB volume; `--cache` and `LAYERFS_CACHE_SIZE` override it.
     let stats = run_cli(&["--store", &repo_str, "stats"], &mounts);
     assert!(stats.status.success());
     let s_out = String::from_utf8_lossy(&stats.stdout);
     assert!(s_out.contains("profile:         durable"), "stats: {s_out}");
     assert!(
+        s_out.contains(&format!(
+            "object_cache:    {} bytes",
+            128usize * 1024 * 1024
+        )),
+        "stats: {s_out}"
+    );
+    assert!(
         s_out.contains(&(64u64 * 1024 * 1024 * 1024).to_string()),
         "stats: {s_out}"
+    );
+
+    let stats_flag = run_cli(&["--store", &repo_str, "--cache", "256M", "stats"], &mounts);
+    assert!(stats_flag.status.success());
+    assert!(
+        String::from_utf8_lossy(&stats_flag.stdout).contains(&format!(
+            "object_cache:    {} bytes",
+            256usize * 1024 * 1024
+        )),
+        "stats --cache 256M: {}",
+        String::from_utf8_lossy(&stats_flag.stdout)
+    );
+
+    let stats_env = Command::new(bin())
+        .args(["--store", &repo_str, "stats"])
+        .env("LAYERFS_MOUNTS_DIR", &mounts)
+        .env("LAYERFS_CACHE_SIZE", "64M")
+        .output()
+        .expect("stats via LAYERFS_CACHE_SIZE");
+    assert!(stats_env.status.success());
+    assert!(
+        String::from_utf8_lossy(&stats_env.stdout).contains(&format!(
+            "object_cache:    {} bytes",
+            64usize * 1024 * 1024
+        )),
+        "stats LAYERFS_CACHE_SIZE=64M: {}",
+        String::from_utf8_lossy(&stats_env.stdout)
     );
 
     // 5. Diff identical branches reports no differences.

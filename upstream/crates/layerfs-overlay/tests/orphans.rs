@@ -180,7 +180,8 @@ fn unowned_unlinked_payload_is_reclaimed_live_but_its_namespace_tombstone_remain
     let source = db.acquire_base_source(1).unwrap();
     let mut f = File::new(&db, source, 4, Vec::new());
     f.write(0, &pattern(131072, 3));
-    let allocated = db.pages().unwrap();
+    let before = db.resources().unwrap();
+    assert!(before.counts.payload_bytes >= 131072);
     let mut inode = f.inode(131072);
     inode.nlink = 0;
     let p = db
@@ -196,7 +197,18 @@ fn unowned_unlinked_payload_is_reclaimed_live_but_its_namespace_tombstone_remain
     maintain(&db);
     assert!(db.source_read(source, 4, 0, 1).is_err());
     assert_eq!(db.inode(4).unwrap().unwrap().nlink, 0);
-    assert!(db.pages().unwrap().1 > allocated.1);
+    let after = db.resources().unwrap();
+    assert_eq!(after.counts.payload_cells, 0);
+    assert_eq!(after.counts.payload_bytes, 0);
+    let blob_file = temp
+        .0
+        .join("overlay.sqlite.blobs")
+        .join("04")
+        .join("i4_g1.dat");
+    assert!(
+        !blob_file.exists(),
+        "loose payload file must be removed on live reclaim"
+    );
     db.release_base_source(source).unwrap();
     let capture = db.capture().unwrap();
     db.resolve_failed_capture(capture).unwrap();
@@ -681,7 +693,7 @@ fn a_failed_release_keeps_exact_custody_until_terminal_file_disposal() {
             ))
         })
         .expect("the page quota is reached by payload");
-    let rows = (0..65536)
+    let rows = (0..200_000)
         .find(|at| full(put(&db, source, plain(10_000 + at, 0, 1), None)))
         .expect("the page quota is reached by rows");
     let removed = (2800..4000)

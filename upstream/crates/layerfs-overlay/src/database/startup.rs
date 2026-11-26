@@ -185,6 +185,10 @@ fn initialize(path: &Path, config: ProfileConfig, template: Option<&Path>) -> Cr
             issued: Default::default(),
             profile,
             allocation: allocation.take().expect("allocation created"),
+            payload_store: RefCell::new(crate::payload::store::PayloadStore::new(
+                path,
+                config.max_pages,
+            )),
         })
     })();
     let physical = result

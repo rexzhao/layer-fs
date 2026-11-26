@@ -8,7 +8,7 @@ use crate::{
 /// One page of a layer's payload rows: `PAGE.cells` rows at most, so fewer
 /// rows are all the layer holds.
 const LAYER_PAYLOAD_PAGE: &str =
-    "SELECT cell_offset,length(data)+ifnull(length(validity),0) FROM fs_data
+    "SELECT cell_offset,data_len+ifnull(length(validity),0) FROM fs_data
             WHERE inode=?1 AND generation=?2 ORDER BY cell_offset LIMIT 14";
 const _: () = assert!(PAGE.cells == 14);
 /// Step calls one releasing job makes: two for the orphan and two for each
@@ -297,7 +297,7 @@ impl Overlay {
         }
         let rows = self.query(
             StatementKind::Reclaim,
-            "SELECT cell_offset,length(data)+ifnull(length(validity),0) FROM fs_data
+            "SELECT cell_offset,data_len+ifnull(length(validity),0) FROM fs_data
             WHERE inode=?1 AND generation=-1 ORDER BY cell_offset LIMIT 14",
             &[&serial],
             16,
@@ -313,6 +313,7 @@ impl Overlay {
                     &[&serial, &DOMAIN, cell],
                     32,
                 )?;
+                self.payload_store.borrow_mut().note_bytes_dropped(*size);
                 bytes += size;
             }
             return Ok(dropped(page, fit, bytes));
@@ -348,6 +349,9 @@ impl Overlay {
             &[&serial],
             16,
         )?;
+        self.payload_store
+            .borrow_mut()
+            .defer_remove_layer(serial, DOMAIN, true);
         {
             let mut state = self.open.borrow_mut();
             state.orphans.remove(serial);
@@ -405,10 +409,15 @@ impl Overlay {
                     &[&serial, &gen, cell],
                     32,
                 )?;
+                self.payload_store.borrow_mut().note_bytes_dropped(*size);
                 bytes += size;
             }
             return Ok(dropped(page, fit, bytes));
         }
+        // All `fs_data` rows for `(serial, gen)` are now gone; schedule deleting its loose file on commit.
+        self.payload_store
+            .borrow_mut()
+            .defer_remove_layer(serial, gen, true);
         if self.pieces_seen.get() {
             let pieces = self.drop_pieces(serial, gen, page.rows)?;
             if pieces != 0 {

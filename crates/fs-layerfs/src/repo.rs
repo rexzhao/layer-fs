@@ -52,12 +52,75 @@ pub const DEFAULT_VOLUME_SIZE_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 /// Default writable branch created on `init` (since `"main"` is the published layer line).
 pub const DEFAULT_BRANCH: &str = "work";
 
-/// Immutable object read cache budget (16 MiB).
-const STORE_CACHE_BYTES: usize = 16 * 1024 * 1024;
-/// Overlay SQLite page cache (4 MiB).
+/// Default immutable object read cache budget (128 MiB).
+pub const DEFAULT_STORE_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// Minimum allowed immutable object read cache budget (4 MiB).
+pub const MIN_STORE_CACHE_BYTES: usize = 4 * 1024 * 1024;
+/// Environment variable overriding the default object read cache size (e.g. `256M`, `1G`).
+pub const CACHE_SIZE_ENV: &str = "LAYERFS_CACHE_SIZE";
+/// Overlay SQLite page cache (4 MiB — metadata only, payloads live in loose sparse files).
 const OVERLAY_PAGER_KIB: u32 = 4096;
 /// Max concurrent workspaces bound per process.
 const MAX_WORKSPACES: usize = 32;
+
+/// Parses a human-readable cache size string (e.g. `128M`, `512MiB`, `1G`, or byte count).
+pub fn parse_cache_size(text: &str) -> Result<usize> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidInput("cache size cannot be empty".into()));
+    }
+    let split = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(split);
+    let value: u64 = number
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("invalid cache size {text:?}")))?;
+    let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "invalid cache size unit {other:?} in {text:?} (use K, M, G, or bytes)"
+            )))
+        }
+    };
+    let bytes = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| Error::InvalidInput(format!("cache size too large: {text:?}")))?;
+    let bytes = usize::try_from(bytes)
+        .map_err(|_| Error::InvalidInput(format!("cache size overflows usize: {text:?}")))?;
+    if bytes < MIN_STORE_CACHE_BYTES {
+        return Err(Error::InvalidInput(format!(
+            "cache size {text:?} is below minimum ({} MiB)",
+            MIN_STORE_CACHE_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Resolves the active object read cache budget from explicit argument, `LAYERFS_CACHE_SIZE`,
+/// or [`DEFAULT_STORE_CACHE_BYTES`].
+pub fn resolve_store_cache_bytes(explicit: Option<usize>) -> Result<usize> {
+    if let Some(bytes) = explicit {
+        if bytes < MIN_STORE_CACHE_BYTES {
+            return Err(Error::InvalidInput(format!(
+                "cache size {bytes} bytes is below minimum ({} MiB)",
+                MIN_STORE_CACHE_BYTES / (1024 * 1024)
+            )));
+        }
+        return Ok(bytes);
+    }
+    if let Some(raw) = std::env::var_os(CACHE_SIZE_ENV) {
+        let text = raw.to_string_lossy();
+        if !text.trim().is_empty() {
+            return parse_cache_size(&text);
+        }
+    }
+    Ok(DEFAULT_STORE_CACHE_BYTES)
+}
 
 /// Durability profile for the underlying SQLite Store.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -262,6 +325,7 @@ pub struct Repo {
     owner: Option<Owner>,
     stack_id: LayerStackId,
     overlay_dir: PathBuf,
+    cache_bytes: usize,
 }
 
 impl std::fmt::Debug for Repo {
@@ -758,8 +822,13 @@ impl Repo {
         })
     }
 
-    /// Opens an existing repository directory.
+    /// Opens an existing repository directory using `LAYERFS_CACHE_SIZE` or the default cache budget.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_cache(dir, None)
+    }
+
+    /// Opens an existing repository directory with an optional explicit object read cache budget.
+    pub fn open_with_cache(dir: impl AsRef<Path>, cache_bytes: Option<usize>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let meta_path = dir.join("repo.json");
         let store_path = dir.join("store.sqlite");
@@ -771,6 +840,7 @@ impl Repo {
         }
         kernel_guard::check(&store_path).map_err(|u| Error::Unsupported(u.0))?;
 
+        let active_cache = resolve_store_cache_bytes(cache_bytes)?;
         let meta: RepoMeta = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)
             .map_err(|e| Error::InvalidInput(format!("invalid repo.json: {e}")))?;
         let cursor_key: [u8; 32] = decode_hex_array(&meta.cursor_key_hex)?;
@@ -785,7 +855,7 @@ impl Repo {
             meta.binding_key.as_bytes(),
             cursor_key,
             MAX_WORKSPACES,
-            STORE_CACHE_BYTES,
+            active_cache,
             ReservationBlocks::default(),
         )
         .map_err(|e| {
@@ -829,7 +899,14 @@ impl Repo {
             owner: Some(owner),
             stack_id,
             overlay_dir,
+            cache_bytes: active_cache,
         })
+    }
+
+    /// Active immutable object read cache size in bytes.
+    #[must_use]
+    pub fn cache_bytes(&self) -> usize {
+        self.cache_bytes
     }
 
     /// Repository directory path.
@@ -1425,5 +1502,17 @@ mod tests {
         assert!(parse_import_source("").is_err());
         assert!(parse_import_source(r"F:\work\proj:").is_err());
         assert!(parse_import_source(":only-branch").is_err());
+    }
+
+    #[test]
+    fn parse_cache_size_validates_units_and_minimum() {
+        use super::{parse_cache_size, MIN_STORE_CACHE_BYTES};
+        assert_eq!(parse_cache_size("64M").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_cache_size("256MiB").unwrap(), 256 * 1024 * 1024);
+        assert_eq!(parse_cache_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_cache_size("4096K").unwrap(), MIN_STORE_CACHE_BYTES);
+        assert!(parse_cache_size("1M").is_err());
+        assert!(parse_cache_size("").is_err());
+        assert!(parse_cache_size("128X").is_err());
     }
 }

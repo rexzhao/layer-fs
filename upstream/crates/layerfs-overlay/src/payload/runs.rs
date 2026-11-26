@@ -5,7 +5,6 @@ use crate::{
     layers::Layer,
     sql, Overlay, OverlayError, OverlayResult, StatementKind, CELL_BYTES, RUN_BYTES,
 };
-use rusqlite::blob::Blob;
 
 const CELL: i64 = CELL_BYTES as i64;
 const RUN: i64 = RUN_BYTES as i64;
@@ -56,7 +55,7 @@ pub(crate) fn slot(cell: i64) -> i64 {
 impl Overlay {
     /// The row that occupies `cell` in one layer: the last row at or before
     /// it in its slot, when it reaches the cell. A row of one cell comes
-    /// with its bytes; a wider row is never loaded.
+    /// with its bytes from the loose-file sidecar; a wider row is never loaded.
     pub(crate) fn covering(
         &self,
         serial: i64,
@@ -70,21 +69,31 @@ impl Overlay {
                 &[&serial, &gen, &slot(cell), &cell],
                 40,
                 |row| {
-                    let validity: Option<Vec<u8>> = row.get(5)?;
+                    let validity: Option<Vec<u8>> = row.get(4)?;
                     let shape = Shape::decode(row, validity.is_some())?;
-                    let data: Option<Vec<u8>> = row.get(4)?;
-                    Ok((
-                        shape,
-                        data.map(|data| Stored {
-                            epoch: shape.epoch,
-                            data,
-                            validity,
-                        }),
-                    ))
+                    Ok((shape, validity))
                 },
             )?
             .pop();
-        Ok(found.filter(|(shape, _)| shape.end() > cell))
+        let Some((shape, validity)) = found.filter(|(shape, _)| shape.end() > cell) else {
+            return Ok(None);
+        };
+        let stored = if shape.offset == cell && !shape.wide() {
+            let data = self.payload_store.borrow_mut().read_exact(
+                serial,
+                gen,
+                cell as u64,
+                shape.length as usize,
+            )?;
+            Some(Stored {
+                epoch: shape.epoch,
+                data,
+                validity,
+            })
+        } else {
+            None
+        };
+        Ok(Some((shape, stored)))
     }
     /// Shapes of the rows of one layer that occupy a cell of `[from, to)`,
     /// in order. The range is one slot, or the slots of one read window
@@ -111,21 +120,25 @@ impl Overlay {
         self.execute(StatementKind::Payload, sql::ROW_DROP, &[&row], 8)?;
         Ok(())
     }
-    /// `length` stored bytes of one row from byte `from` of its data.
-    pub(crate) fn row_bytes(&self, row: i64, from: i64, length: i64) -> OverlayResult<Vec<u8>> {
-        self.query(
-            StatementKind::Payload,
-            sql::ROW_SLICE,
-            &[&row, &(from + 1), &length],
-            24,
-            |row| row.get(0),
-        )?
-        .pop()
-        .ok_or(OverlayError::Invalid("stored row"))
+    /// `length` stored bytes of one row from byte `from` of its data in the loose-file sidecar.
+    pub(crate) fn row_bytes(
+        &self,
+        serial: i64,
+        gen: i64,
+        row_offset: i64,
+        from: i64,
+        length: i64,
+    ) -> OverlayResult<Vec<u8>> {
+        self.payload_store.borrow_mut().read_exact(
+            serial,
+            gen,
+            (row_offset + from) as u64,
+            length as usize,
+        )
     }
     /// A new dense row at cell `at` that takes over `length` bytes of a
-    /// dense row from that cell on, with the row's stamp. The caller cuts
-    /// or drops the row in the same job.
+    /// dense row from that cell on, with the row's stamp. The bytes already
+    /// sit at offset `at` in `(serial, gen)`'s loose file, so only metadata updates.
     pub(crate) fn part(
         &self,
         (serial, gen): (i64, i64),
@@ -133,23 +146,22 @@ impl Overlay {
         at: i64,
         length: i64,
     ) -> OverlayResult<()> {
-        let data = self.row_bytes(shape.row, at - shape.offset, length)?;
         self.execute(
             StatementKind::Payload,
             sql::CELL_PUT,
-            &[&serial, &gen, &at, &shape.epoch, &data, &None::<Vec<u8>>],
-            40 + data.len() as u64,
+            &[&serial, &gen, &at, &shape.epoch, &length, &None::<Vec<u8>>],
+            40,
         )?;
         Ok(())
     }
-    /// Overwrites bytes of one live dense row where they are stored. The row
-    /// keeps its length, stamp and index entries and no trigger runs. This is
-    /// not a statement: it is refused unless an earlier statement of the same
-    /// job has passed admission and begun the transaction.
-    pub(crate) fn write_in_place<'a>(
-        &'a self,
-        blob: &mut Option<Blob<'a>>,
-        row: i64,
+    /// Overwrites bytes of one live dense row in place inside the loose-file sidecar.
+    /// Refused unless an earlier statement of the same job has passed admission and begun
+    /// the transaction.
+    pub(crate) fn write_in_place(
+        &self,
+        serial: i64,
+        gen: i64,
+        row_offset: i64,
         at: i64,
         bytes: &[u8],
     ) -> OverlayResult<()> {
@@ -157,18 +169,13 @@ impl Overlay {
         if !self.writing() {
             return Err(OverlayError::Invalid("in-place write before admission"));
         }
-        let written = match blob {
-            Some(open) => open.reopen(row),
-            None => self
-                .connection
-                .blob_open(rusqlite::MAIN_DB, "fs_data", "data", row, false)
-                .map(|open| *blob = Some(open)),
-        }
-        .and_then(|()| match blob {
-            Some(open) => open.write_at(bytes, at as usize),
-            None => Err(rusqlite::Error::InvalidQuery),
-        });
-        written.map_err(|cause| self.failed(cause.into()))
+        self.payload_store.borrow_mut().write_at(
+            serial,
+            gen,
+            (row_offset + at) as u64,
+            bytes,
+            true,
+        )
     }
     /// Removes cells `[from, to)` from one live dense row. What it holds
     /// below and above stays, as rows of their own with the same stamp.
@@ -235,6 +242,14 @@ impl Overlay {
             for shape in &above {
                 self.drop_row(shape.row)?;
             }
+            self.payload_store.borrow_mut().copy_between_layers(
+                serial,
+                lower.gen,
+                upper.gen,
+                old.offset as u64,
+                old.length as usize,
+                true,
+            )?;
             self.execute(
                 StatementKind::Payload,
                 sql::ROW_MOVE,
@@ -247,7 +262,7 @@ impl Overlay {
             Some(stored) => stored,
             None => Stored {
                 epoch: old.epoch,
-                data: self.row_bytes(old.row, 0, old.length)?,
+                data: self.row_bytes(serial, lower.gen, old.offset, 0, old.length)?,
                 validity: None,
             },
         };
