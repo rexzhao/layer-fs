@@ -411,3 +411,53 @@ fn read_directory_shell_caches_snapshot_across_pages() {
 
     fs_winfsp::callbacks::release_context_for_test(context);
 }
+
+#[test]
+fn read_shell_past_eof_returns_status_end_of_file_and_flush_populates_file_info() {
+    use fs_semantics::disposition::Disposition;
+    use fs_winfsp::abi::FileInfo;
+    use fs_winfsp::callbacks::{flush_shell, read_shell, OURS_END_OF_FILE};
+    use fs_winfsp::ops::{Path as OpsPath, WorkspaceOps};
+
+    let mock = fs_winfsp::MockBackend::new();
+    let opened = mock
+        .create_or_open(&OpsPath::new(b"/data.bin"), Disposition::Create)
+        .unwrap();
+    mock.write(opened.file_id, 0, b"hello world").unwrap();
+
+    let adapter = fs_winfsp::DynAdapter::new(Box::new(mock));
+    let context = fs_winfsp::callbacks::register_context_for_test(
+        fs_winfsp::callbacks::EntryContext {
+            file_id: opened.file_id,
+            handle: fs_winfsp::handles::HandleId::from_raw(101),
+        },
+    );
+
+    // 1. Read starting at EOF must return STATUS_END_OF_FILE with 0 bytes transferred.
+    let mut buf = [0xAAu8; 64];
+    let mut transferred = u32::MAX;
+    let status = unsafe {
+        read_shell(
+            Some(&adapter),
+            context,
+            buf.as_mut_ptr().cast::<c_void>(),
+            11,
+            64,
+            std::ptr::addr_of_mut!(transferred),
+        )
+    };
+    assert_eq!(status, OURS_END_OF_FILE);
+    assert_eq!(transferred, 0);
+
+    // 2. File-level Flush must populate FileInfo with the real size (never leave it zeroed!).
+    let mut info_out = FileInfo::zeroed();
+    let flush_status = unsafe { flush_shell(Some(&adapter), context, &mut info_out) };
+    assert_eq!(flush_status, 0);
+    assert_eq!(info_out.file_size, 11);
+
+    // 3. Volume-level Flush (null context + null info_out) also succeeds cleanly.
+    let vol_flush_status = unsafe { flush_shell(Some(&adapter), std::ptr::null(), std::ptr::null_mut()) };
+    assert_eq!(vol_flush_status, 0);
+
+    fs_winfsp::callbacks::release_context_for_test(context);
+}

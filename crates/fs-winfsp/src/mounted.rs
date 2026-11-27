@@ -527,17 +527,13 @@ mod platform {
 
     unsafe extern "system" fn flush_trampoline(
         file_system: *mut c_void,
-        _file_context: *mut c_void,
-        _file_info: *mut crate::abi::FileInfo,
+        file_context: *mut c_void,
+        file_info: *mut crate::abi::FileInfo,
     ) -> i32 {
         let adapter = crate::registry::mounts().get(file_system as usize);
-        let Some(adapter) = adapter else {
-            return crate::callbacks::NOT_IMPLEMENTED;
-        };
-        match adapter.backend().flush() {
-            Ok(()) => 0,
-            Err(_) => crate::callbacks::NOT_IMPLEMENTED,
-        }
+        // SAFETY: WinFsp's contract — `file_context` is null (volume flush) or ours, and
+        // `file_info` (when non-null) is writable for `size_of::<FileInfo>()` bytes.
+        unsafe { crate::callbacks::flush_shell(adapter.as_deref(), file_context, file_info) }
     }
 
     /// `Close`: `(FSP_FILE_SYSTEM*, PVOID FileContext)` — `winfsp.h:420`.

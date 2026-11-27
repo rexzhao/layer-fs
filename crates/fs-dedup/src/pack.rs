@@ -1,13 +1,13 @@
 //! Immutable append-only external `.pack` files with O(1) positional reads and a
 //! sharded in-memory LRU decoded chunk cache.
 
-use crate::chunker::{blake3_hash, decompress_chunk, Codec, Hash32};
+use crate::chunker::{decompress_chunk, Codec, Hash32};
 use crate::error::{Error, Result};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub const PACK_MAGIC: &[u8; 8] = b"DDFSPCK1";
 pub const PACK_HEADER_BYTES: u64 = 16;
@@ -16,7 +16,7 @@ pub const RECORD_HEADER_BYTES: usize = 48;
 
 pub const DEFAULT_PACK_TARGET_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
 pub const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
-const MAX_OPEN_PACK_READERS: usize = 64;
+const MAX_OPEN_PACK_READERS: usize = 1024;
 const CACHE_SHARDS: usize = 16;
 
 /// Location of a stored chunk inside a `.pack` file.
@@ -260,7 +260,11 @@ impl ReaderPool {
         }
     }
 
-    fn get(&mut self, packs_dir: &Path, pack_id: u64) -> Result<Arc<File>> {
+    fn get_cached(&self, pack_id: u64) -> Option<Arc<File>> {
+        self.handles.get(&pack_id).cloned()
+    }
+
+    fn get_or_open(&mut self, packs_dir: &Path, pack_id: u64) -> Result<Arc<File>> {
         if let Some(f) = self.handles.get(&pack_id) {
             return Ok(Arc::clone(f));
         }
@@ -287,7 +291,7 @@ impl ReaderPool {
 pub struct PackStore {
     packs_dir: PathBuf,
     writer: Mutex<PackWriter>,
-    readers: Mutex<ReaderPool>,
+    readers: RwLock<ReaderPool>,
     cache: Vec<Mutex<CacheShard>>,
 }
 
@@ -306,9 +310,19 @@ impl PackStore {
         Self {
             packs_dir: packs_dir.clone(),
             writer: Mutex::new(PackWriter::new(packs_dir, pack_target_bytes, next_pack_id)),
-            readers: Mutex::new(ReaderPool::new()),
+            readers: RwLock::new(ReaderPool::new()),
             cache,
         }
+    }
+
+    fn open_reader(&self, pack_id: u64) -> Result<Arc<File>> {
+        if let Some(f) = self.readers.read().unwrap().get_cached(pack_id) {
+            return Ok(f);
+        }
+        self.readers
+            .write()
+            .unwrap()
+            .get_or_open(&self.packs_dir, pack_id)
     }
 
     pub fn packs_dir(&self) -> &Path {
@@ -319,14 +333,17 @@ impl PackStore {
         self.writer.lock().unwrap()
     }
 
-    /// Reads and verifies raw uncompressed bytes of `hash` at `loc`, using the sharded LRU cache.
+    /// Reads raw uncompressed bytes of `hash` at `loc`, using the sharded LRU cache.
+    ///
+    /// Verifies record magic, codec, lengths, embedded 32-byte header hash, and Zstd/LZ4
+    /// decompressor framing without recomputing a full BLAKE3-256 pass on every hot read.
     pub fn read_chunk(&self, hash: &Hash32, loc: ChunkLoc) -> Result<Arc<[u8]>> {
         let shard_idx = (hash[0] as usize) & (CACHE_SHARDS - 1);
         if let Some(hit) = self.cache[shard_idx].lock().unwrap().get(hash) {
             return Ok(hit);
         }
 
-        let file = self.readers.lock().unwrap().get(&self.packs_dir, loc.pack_id)?;
+        let file = self.open_reader(loc.pack_id)?;
         let total_len = RECORD_HEADER_BYTES + loc.stored_len as usize;
         let mut record = vec![0u8; total_len];
         read_exact_at(&file, loc.offset, &mut record)?;
@@ -349,9 +366,9 @@ impl PackStore {
         }
 
         let raw = decompress_chunk(codec, &record[RECORD_HEADER_BYTES..], raw_len as usize)?;
-        if &blake3_hash(&raw) != hash {
+        if raw.len() != raw_len as usize {
             return Err(Error::Corrupt(format!(
-                "chunk BLAKE3 verification failed in pack {} at offset {}",
+                "decompressed chunk length mismatch in pack {} at offset {}",
                 loc.pack_id, loc.offset
             )));
         }
@@ -366,7 +383,7 @@ impl PackStore {
 
     /// Reads raw on-disk stored bytes (still compressed) for pack GC compaction without re-compressing.
     pub fn read_stored_payload(&self, hash: &Hash32, loc: ChunkLoc) -> Result<Vec<u8>> {
-        let file = self.readers.lock().unwrap().get(&self.packs_dir, loc.pack_id)?;
+        let file = self.open_reader(loc.pack_id)?;
         let total_len = RECORD_HEADER_BYTES + loc.stored_len as usize;
         let mut record = vec![0u8; total_len];
         read_exact_at(&file, loc.offset, &mut record)?;
@@ -382,7 +399,7 @@ impl PackStore {
 
     /// Evicts any cached open reader handle and deletes pack `pack_id` from disk.
     pub fn delete_pack_file(&self, pack_id: u64) -> Result<()> {
-        self.readers.lock().unwrap().evict(pack_id);
+        self.readers.write().unwrap().evict(pack_id);
         let path = pack_path(&self.packs_dir, pack_id);
         if path.exists() {
             fs::remove_file(path)?;

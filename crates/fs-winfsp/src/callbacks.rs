@@ -1728,7 +1728,23 @@ pub unsafe fn read_shell(
         Ok(info) => info.size,
         Err(err) => return crate::error::to_status_of(&err).code() as i32,
     };
-    let remaining = size.saturating_sub(offset);
+    if length == 0 {
+        if !bytes_transferred.is_null() {
+            // SAFETY: writable out-pointer per WinFsp's contract.
+            unsafe { std::ptr::write(bytes_transferred, 0) };
+        }
+        return 0;
+    }
+    if offset >= size {
+        // WinFsp Read contract (`memfs.cpp:1455`, `passthrough.c:327`): reading at or past EOF
+        // returns `STATUS_END_OF_FILE` (`0xC0000011`) with 0 bytes transferred.
+        if !bytes_transferred.is_null() {
+            // SAFETY: writable out-pointer per WinFsp's contract.
+            unsafe { std::ptr::write(bytes_transferred, 0) };
+        }
+        return OURS_END_OF_FILE;
+    }
+    let remaining = size - offset;
     let len = (length as u64).min(remaining) as usize;
     let bytes = match adapter.backend().read(entry.file_id, offset, len) {
         Ok(bytes) => bytes,
@@ -2019,6 +2035,45 @@ pub const OURS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 pub const OURS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 /// `STATUS_INVALID_PARAMETER`.
 pub const OURS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+/// `STATUS_END_OF_FILE` — returned by `Read` when `offset >= file_size` (`memfs.cpp:1455`).
+pub const OURS_END_OF_FILE: i32 = 0xC000_0011u32 as i32;
+
+/// The `Flush` **shell**: flushes backend state and (for file-level flushes) populates `info_out`
+/// per `winfsp.h:481-493` so WinFsp's kernel metadata cache is never overwritten with zeros.
+///
+/// # Safety
+///
+/// `context` is null (volume flush) or an opaque token; `info_out` (when not null) must be
+/// writable for `size_of::<FileInfo>()` bytes.
+pub unsafe fn flush_shell(
+    adapter: Option<&crate::DynAdapter>,
+    context: *const c_void,
+    info_out: *mut FileInfo,
+) -> i32 {
+    let Some(adapter) = adapter else {
+        return NOT_IMPLEMENTED;
+    };
+    if let Err(err) = adapter.backend().flush() {
+        return crate::error::to_status_of(&err).code() as i32;
+    }
+    if !context.is_null() && !info_out.is_null() {
+        let Some(entry) = entry_of(context) else {
+            return NOT_IMPLEMENTED;
+        };
+        let info = match adapter.backend().get_info(entry.file_id) {
+            Ok(info) => info,
+            Err(err) => return crate::error::to_status_of(&err).code() as i32,
+        };
+        let Ok(record) = crate::file_info::file_info(&info) else {
+            return NOT_IMPLEMENTED;
+        };
+        // SAFETY: `info_out` is non-null and writable per WinFsp's contract.
+        if !unsafe { write_file_info(info_out, record) } {
+            return OURS_INVALID_PARAMETER;
+        }
+    }
+    0
+}
 
 /// How many times `GetVolumeInfo` was called — the cheapest "did the OS talk to us at all" probe.
 static VOLUME_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
