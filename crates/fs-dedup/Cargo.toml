@@ -1,0 +1,27 @@
+[package]
+name = "fs-dedup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Streamlined multi-workspace deduplicating WinFsp filesystem for large Unity repositories"
+
+[lib]
+name = "fs_dedup"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dedupfs"
+path = "src/main.rs"
+
+[dependencies]
+blake3.workspace = true
+fs-semantics.workspace = true
+fs-windows.workspace = true
+fs-winfsp.workspace = true
+layerfs-win32-host = { path = "../../upstream/crates/layerfs-win32-host" }
+lz4_flex = "0.11"
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zstd-sys = "2"

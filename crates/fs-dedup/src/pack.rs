@@ -1,0 +1,392 @@
+//! Immutable append-only external `.pack` files with O(1) positional reads and a
+//! sharded in-memory LRU decoded chunk cache.
+
+use crate::chunker::{blake3_hash, decompress_chunk, Codec, Hash32};
+use crate::error::{Error, Result};
+use std::collections::{HashMap, VecDeque};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+pub const PACK_MAGIC: &[u8; 8] = b"DDFSPCK1";
+pub const PACK_HEADER_BYTES: u64 = 16;
+pub const RECORD_MAGIC: u32 = 0x4348_4E4B; // "CHNK"
+pub const RECORD_HEADER_BYTES: usize = 48;
+
+pub const DEFAULT_PACK_TARGET_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
+pub const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+const MAX_OPEN_PACK_READERS: usize = 64;
+const CACHE_SHARDS: usize = 16;
+
+/// Location of a stored chunk inside a `.pack` file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChunkLoc {
+    pub pack_id: u64,
+    pub offset: u64,
+    pub raw_len: u32,
+    pub stored_len: u32,
+    pub codec: Codec,
+}
+
+/// Read-at helper using positional OS I/O (lock-free concurrent reads on Windows & Unix).
+pub fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> Result<()> {
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
+
+    while !buf.is_empty() {
+        #[cfg(windows)]
+        let n = file.seek_read(buf, offset)?;
+        #[cfg(unix)]
+        let n = file.read_at(buf, offset)?;
+        if n == 0 {
+            return Err(Error::Corrupt(format!(
+                "unexpected EOF reading pack at offset {offset}"
+            )));
+        }
+        offset += n as u64;
+        buf = &mut buf[n..];
+    }
+    Ok(())
+}
+
+/// Returns the filename path of pack `pack_id` inside `packs_dir`.
+pub fn pack_path(packs_dir: &Path, pack_id: u64) -> PathBuf {
+    packs_dir.join(format!("{pack_id:08}.pack"))
+}
+
+struct ActiveWriter {
+    pack_id: u64,
+    writer: BufWriter<File>,
+    offset: u64,
+}
+
+/// Append-only pack writer serialized by an internal mutex; automatically rolls to a new
+/// pack file when `pack_target_bytes` is reached.
+pub struct PackWriter {
+    packs_dir: PathBuf,
+    pack_target_bytes: u64,
+    next_pack_id: u64,
+    active: Option<ActiveWriter>,
+    /// Newly created or grown packs since the last `take_pack_updates()` call: `(pack_id, size_bytes, sealed)`.
+    pending_packs: HashMap<u64, (u64, bool)>,
+}
+
+impl PackWriter {
+    pub fn new(packs_dir: PathBuf, pack_target_bytes: u64, next_pack_id: u64) -> Self {
+        Self {
+            packs_dir,
+            pack_target_bytes: pack_target_bytes.max(1024 * 1024),
+            next_pack_id: next_pack_id.max(1),
+            active: None,
+            pending_packs: HashMap::new(),
+        }
+    }
+
+    fn ensure_open(&mut self) -> Result<&mut ActiveWriter> {
+        if self.active.is_none() {
+            fs::create_dir_all(&self.packs_dir)?;
+            let pack_id = self.next_pack_id;
+            self.next_pack_id += 1;
+            let path = pack_path(&self.packs_dir, pack_id);
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)?;
+            let mut hdr = [0u8; 16];
+            hdr[..8].copy_from_slice(PACK_MAGIC);
+            hdr[8..16].copy_from_slice(&pack_id.to_le_bytes());
+            file.write_all(&hdr)?;
+            self.pending_packs.insert(pack_id, (PACK_HEADER_BYTES, false));
+            self.active = Some(ActiveWriter {
+                pack_id,
+                writer: BufWriter::with_capacity(1024 * 1024, file),
+                offset: PACK_HEADER_BYTES,
+            });
+        }
+        Ok(self.active.as_mut().unwrap())
+    }
+
+    /// Appends one chunk record and returns its `ChunkLoc`.
+    pub fn append(
+        &mut self,
+        hash: &Hash32,
+        codec: Codec,
+        raw_len: u32,
+        stored: &[u8],
+    ) -> Result<ChunkLoc> {
+        let stored_len = u32::try_from(stored.len())
+            .map_err(|_| Error::InvalidInput("chunk payload exceeds u32".into()))?;
+        let record_bytes = RECORD_HEADER_BYTES as u64 + u64::from(stored_len);
+
+        // Roll pack if current active pack is non-empty and adding this record exceeds target.
+        if let Some(active) = &self.active {
+            if active.offset > PACK_HEADER_BYTES
+                && active.offset.saturating_add(record_bytes) > self.pack_target_bytes
+            {
+                self.seal_active()?;
+            }
+        }
+
+        let active = self.ensure_open()?;
+        let offset = active.offset;
+        let pack_id = active.pack_id;
+
+        let mut header = [0u8; RECORD_HEADER_BYTES];
+        header[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+        header[4] = codec as u8;
+        header[5] = 0; // flags
+        header[6..8].copy_from_slice(&0u16.to_le_bytes());
+        header[8..12].copy_from_slice(&raw_len.to_le_bytes());
+        header[12..16].copy_from_slice(&stored_len.to_le_bytes());
+        header[16..48].copy_from_slice(hash);
+
+        active.writer.write_all(&header)?;
+        active.writer.write_all(stored)?;
+        active.offset += record_bytes;
+        let new_offset = active.offset;
+        self.pending_packs.insert(pack_id, (new_offset, false));
+
+        Ok(ChunkLoc {
+            pack_id,
+            offset,
+            raw_len,
+            stored_len,
+            codec,
+        })
+    }
+
+    /// Flushes buffered bytes of the active pack so readers immediately observe appended records.
+    pub fn flush(&mut self) -> Result<()> {
+        if let Some(active) = &mut self.active {
+            active.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Flushes and seals the active pack.
+    pub fn seal_active(&mut self) -> Result<()> {
+        if let Some(mut active) = self.active.take() {
+            active.writer.flush()?;
+            self.pending_packs.insert(active.pack_id, (active.offset, true));
+        }
+        Ok(())
+    }
+
+    /// Drains pack size/seal updates to persist in `meta.sqlite`.
+    pub fn take_pack_updates(&mut self) -> Vec<(u64, u64, bool)> {
+        self.pending_packs
+            .drain()
+            .map(|(id, (size, sealed))| (id, size, sealed))
+            .collect()
+    }
+
+    /// Resumes writing into an existing unsealed pack if one exists (optional optimization).
+    pub fn resume_pack(&mut self, pack_id: u64, size_bytes: u64) -> Result<()> {
+        let path = pack_path(&self.packs_dir, pack_id);
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        file.set_len(size_bytes)?;
+        file.seek(SeekFrom::End(0))?;
+        self.active = Some(ActiveWriter {
+            pack_id,
+            writer: BufWriter::with_capacity(1024 * 1024, file),
+            offset: size_bytes,
+        });
+        if self.next_pack_id <= pack_id {
+            self.next_pack_id = pack_id + 1;
+        }
+        Ok(())
+    }
+}
+
+struct CacheShard {
+    map: HashMap<Hash32, Arc<[u8]>>,
+    order: VecDeque<Hash32>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl CacheShard {
+    fn new(limit: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn get(&self, hash: &Hash32) -> Option<Arc<[u8]>> {
+        self.map.get(hash).cloned()
+    }
+
+    fn insert(&mut self, hash: Hash32, data: Arc<[u8]>) {
+        if self.limit == 0 || data.len() > self.limit {
+            return;
+        }
+        if self.map.contains_key(&hash) {
+            return;
+        }
+        while self.bytes.saturating_add(data.len()) > self.limit {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.map.remove(&evicted) {
+                self.bytes = self.bytes.saturating_sub(old.len());
+            }
+        }
+        self.bytes += data.len();
+        self.order.push_back(hash);
+        self.map.insert(hash, data);
+    }
+}
+
+struct ReaderPool {
+    handles: HashMap<u64, Arc<File>>,
+    order: VecDeque<u64>,
+}
+
+impl ReaderPool {
+    fn new() -> Self {
+        Self {
+            handles: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, packs_dir: &Path, pack_id: u64) -> Result<Arc<File>> {
+        if let Some(f) = self.handles.get(&pack_id) {
+            return Ok(Arc::clone(f));
+        }
+        while self.handles.len() >= MAX_OPEN_PACK_READERS {
+            if let Some(old) = self.order.pop_front() {
+                self.handles.remove(&old);
+            } else {
+                break;
+            }
+        }
+        let f = Arc::new(File::open(pack_path(packs_dir, pack_id))?);
+        self.handles.insert(pack_id, Arc::clone(&f));
+        self.order.push_back(pack_id);
+        Ok(f)
+    }
+
+    fn evict(&mut self, pack_id: u64) {
+        self.handles.remove(&pack_id);
+        self.order.retain(|&id| id != pack_id);
+    }
+}
+
+/// Thread-safe pack store supporting concurrent cached chunk reads and serialized pack appends.
+pub struct PackStore {
+    packs_dir: PathBuf,
+    writer: Mutex<PackWriter>,
+    readers: Mutex<ReaderPool>,
+    cache: Vec<Mutex<CacheShard>>,
+}
+
+impl PackStore {
+    pub fn open(
+        packs_dir: PathBuf,
+        pack_target_bytes: u64,
+        next_pack_id: u64,
+        cache_bytes: usize,
+    ) -> Self {
+        let per_shard = cache_bytes / CACHE_SHARDS;
+        let mut cache = Vec::with_capacity(CACHE_SHARDS);
+        for _ in 0..CACHE_SHARDS {
+            cache.push(Mutex::new(CacheShard::new(per_shard)));
+        }
+        Self {
+            packs_dir: packs_dir.clone(),
+            writer: Mutex::new(PackWriter::new(packs_dir, pack_target_bytes, next_pack_id)),
+            readers: Mutex::new(ReaderPool::new()),
+            cache,
+        }
+    }
+
+    pub fn packs_dir(&self) -> &Path {
+        &self.packs_dir
+    }
+
+    pub fn writer(&self) -> std::sync::MutexGuard<'_, PackWriter> {
+        self.writer.lock().unwrap()
+    }
+
+    /// Reads and verifies raw uncompressed bytes of `hash` at `loc`, using the sharded LRU cache.
+    pub fn read_chunk(&self, hash: &Hash32, loc: ChunkLoc) -> Result<Arc<[u8]>> {
+        let shard_idx = (hash[0] as usize) & (CACHE_SHARDS - 1);
+        if let Some(hit) = self.cache[shard_idx].lock().unwrap().get(hash) {
+            return Ok(hit);
+        }
+
+        let file = self.readers.lock().unwrap().get(&self.packs_dir, loc.pack_id)?;
+        let total_len = RECORD_HEADER_BYTES + loc.stored_len as usize;
+        let mut record = vec![0u8; total_len];
+        read_exact_at(&file, loc.offset, &mut record)?;
+
+        let magic = u32::from_le_bytes(record[0..4].try_into().unwrap());
+        if magic != RECORD_MAGIC {
+            return Err(Error::Corrupt(format!(
+                "bad chunk record magic in pack {} at offset {}",
+                loc.pack_id, loc.offset
+            )));
+        }
+        let codec = Codec::from_u8(record[4])?;
+        let raw_len = u32::from_le_bytes(record[8..12].try_into().unwrap());
+        let stored_len = u32::from_le_bytes(record[12..16].try_into().unwrap());
+        if raw_len != loc.raw_len || stored_len != loc.stored_len || &record[16..48] != hash {
+            return Err(Error::Corrupt(format!(
+                "chunk header mismatch in pack {} at offset {}",
+                loc.pack_id, loc.offset
+            )));
+        }
+
+        let raw = decompress_chunk(codec, &record[RECORD_HEADER_BYTES..], raw_len as usize)?;
+        if &blake3_hash(&raw) != hash {
+            return Err(Error::Corrupt(format!(
+                "chunk BLAKE3 verification failed in pack {} at offset {}",
+                loc.pack_id, loc.offset
+            )));
+        }
+
+        let arc: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
+        self.cache[shard_idx]
+            .lock()
+            .unwrap()
+            .insert(*hash, Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    /// Reads raw on-disk stored bytes (still compressed) for pack GC compaction without re-compressing.
+    pub fn read_stored_payload(&self, hash: &Hash32, loc: ChunkLoc) -> Result<Vec<u8>> {
+        let file = self.readers.lock().unwrap().get(&self.packs_dir, loc.pack_id)?;
+        let total_len = RECORD_HEADER_BYTES + loc.stored_len as usize;
+        let mut record = vec![0u8; total_len];
+        read_exact_at(&file, loc.offset, &mut record)?;
+        let magic = u32::from_le_bytes(record[0..4].try_into().unwrap());
+        if magic != RECORD_MAGIC || &record[16..48] != hash {
+            return Err(Error::Corrupt(format!(
+                "corrupt record during GC in pack {} at offset {}",
+                loc.pack_id, loc.offset
+            )));
+        }
+        Ok(record[RECORD_HEADER_BYTES..].to_vec())
+    }
+
+    /// Evicts any cached open reader handle and deletes pack `pack_id` from disk.
+    pub fn delete_pack_file(&self, pack_id: u64) -> Result<()> {
+        self.readers.lock().unwrap().evict(pack_id);
+        let path = pack_path(&self.packs_dir, pack_id);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+}

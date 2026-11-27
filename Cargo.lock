@@ -378,6 +378,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-dedup"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fs-semantics",
+ "fs-windows",
+ "fs-winfsp",
+ "layerfs-win32-host",
+ "lz4_flex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "zstd-sys",
+]
+
+[[package]]
 name = "fs-layerfs"
 version = "0.1.0"
 dependencies = [

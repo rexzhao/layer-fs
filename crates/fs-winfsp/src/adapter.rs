@@ -162,6 +162,17 @@ impl<B: WorkspaceOps> Adapter<B> {
         self.handles.lock().expect("handle table").handle_kinds()
     }
 
+    /// True when at least one handle is currently open on `file_id`.
+    #[must_use]
+    pub fn has_open_handles(&self, file_id: u64) -> bool {
+        !self
+            .handles
+            .lock()
+            .expect("handle table")
+            .handles_of(file_id)
+            .is_empty()
+    }
+
     /// Takes a **ticket** for one path-entering callback (S3 card §3.2).
     ///
     /// The ticket must be held for the whole callback — resolve, backend call, handle registration — because that is the window a `restore` has to exclude: a

@@ -7,6 +7,7 @@ members = [
     "crates/fs-layerfs",
     "crates/fs-cli",
     "crates/chunk-bench",
+    "crates/fs-dedup",
     "upstream/crates/layerfs-win32-host",
     "upstream/crates/layerfs-telemetry",
     "upstream/crates/layerfs-content",
