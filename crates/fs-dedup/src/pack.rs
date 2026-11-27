@@ -206,7 +206,7 @@ impl PackWriter {
 }
 
 struct CacheShard {
-    map: HashMap<Hash32, Arc<[u8]>>,
+    map: HashMap<Hash32, (Arc<[u8]>, bool)>,
     order: VecDeque<Hash32>,
     bytes: usize,
     limit: usize,
@@ -222,28 +222,42 @@ impl CacheShard {
         }
     }
 
-    fn get(&self, hash: &Hash32) -> Option<Arc<[u8]>> {
-        self.map.get(hash).cloned()
+    /// CLOCK-LRU lookup: marks the hit entry referenced so hot chunks get second chances.
+    fn get(&mut self, hash: &Hash32) -> Option<Arc<[u8]>> {
+        if let Some((data, referenced)) = self.map.get_mut(hash) {
+            *referenced = true;
+            return Some(Arc::clone(data));
+        }
+        None
     }
 
     fn insert(&mut self, hash: Hash32, data: Arc<[u8]>) {
         if self.limit == 0 || data.len() > self.limit {
             return;
         }
-        if self.map.contains_key(&hash) {
+        if let Some((_, referenced)) = self.map.get_mut(&hash) {
+            *referenced = true;
             return;
         }
         while self.bytes.saturating_add(data.len()) > self.limit {
-            let Some(evicted) = self.order.pop_front() else {
+            let Some(cand) = self.order.pop_front() else {
                 break;
             };
-            if let Some(old) = self.map.remove(&evicted) {
+            if let Some((_, referenced)) = self.map.get_mut(&cand) {
+                if *referenced {
+                    // Second chance: clear reference bit and re-queue at tail.
+                    *referenced = false;
+                    self.order.push_back(cand);
+                    continue;
+                }
+            }
+            if let Some((old, _)) = self.map.remove(&cand) {
                 self.bytes = self.bytes.saturating_sub(old.len());
             }
         }
         self.bytes += data.len();
         self.order.push_back(hash);
-        self.map.insert(hash, data);
+        self.map.insert(hash, (data, true));
     }
 }
 
@@ -264,9 +278,9 @@ impl ReaderPool {
         self.handles.get(&pack_id).cloned()
     }
 
-    fn get_or_open(&mut self, packs_dir: &Path, pack_id: u64) -> Result<Arc<File>> {
-        if let Some(f) = self.handles.get(&pack_id) {
-            return Ok(Arc::clone(f));
+    fn insert_opened(&mut self, pack_id: u64, file: Arc<File>) -> Arc<File> {
+        if let Some(existing) = self.handles.get(&pack_id) {
+            return Arc::clone(existing);
         }
         while self.handles.len() >= MAX_OPEN_PACK_READERS {
             if let Some(old) = self.order.pop_front() {
@@ -275,10 +289,9 @@ impl ReaderPool {
                 break;
             }
         }
-        let f = Arc::new(File::open(pack_path(packs_dir, pack_id))?);
-        self.handles.insert(pack_id, Arc::clone(&f));
+        self.handles.insert(pack_id, Arc::clone(&file));
         self.order.push_back(pack_id);
-        Ok(f)
+        file
     }
 
     fn evict(&mut self, pack_id: u64) {
@@ -319,10 +332,9 @@ impl PackStore {
         if let Some(f) = self.readers.read().unwrap().get_cached(pack_id) {
             return Ok(f);
         }
-        self.readers
-            .write()
-            .unwrap()
-            .get_or_open(&self.packs_dir, pack_id)
+        // Open pack file OUTSIDE the pool write lock so concurrent threads never serialize on `CreateFileW`.
+        let opened = Arc::new(File::open(pack_path(&self.packs_dir, pack_id))?);
+        Ok(self.readers.write().unwrap().insert_opened(pack_id, opened))
     }
 
     pub fn packs_dir(&self) -> &Path {

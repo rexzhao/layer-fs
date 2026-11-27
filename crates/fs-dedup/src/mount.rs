@@ -162,6 +162,8 @@ pub fn run_mount(
                             break;
                         }
                         drop(guard);
+                        // Persist any buffered foreground overlay size/mtime updates before dedup scan.
+                        let _ = d_adapter.backend().flush();
                         if let Ok(sum) = d_store.dedup_workspace(Some(&d_ws), idle, |w, inode| {
                             w == ws_id && d_adapter.has_open_handles(inode)
                         }) {
@@ -213,6 +215,7 @@ pub fn run_mount(
             }
 
             stop_flag.store(true, Ordering::SeqCst);
+            let _ = adapter.backend().flush();
             let _ = fs::remove_file(&rec_path);
             if let Some(h) = dedup_handle {
                 let _ = h.join();

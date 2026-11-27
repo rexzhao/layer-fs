@@ -162,15 +162,13 @@ impl<B: WorkspaceOps> Adapter<B> {
         self.handles.lock().expect("handle table").handle_kinds()
     }
 
-    /// True when at least one handle is currently open on `file_id`.
+    /// True when at least one handle is currently open on `file_id` (O(1)).
     #[must_use]
     pub fn has_open_handles(&self, file_id: u64) -> bool {
-        !self
-            .handles
+        self.handles
             .lock()
             .expect("handle table")
-            .handles_of(file_id)
-            .is_empty()
+            .has_open_handles(file_id)
     }
 
     /// Takes a **ticket** for one path-entering callback (S3 card §3.2).

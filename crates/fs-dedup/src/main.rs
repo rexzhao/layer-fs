@@ -93,6 +93,7 @@ fn print_help() {
            dedupfs stats\n  \
            dedupfs dedup [ws] [--idle 0]\n  \
            dedupfs gc [--threshold 30]\n  \
+           dedupfs fsck [--fix]\n  \
            dedupfs mount <ws> <mount_point> [--cache 256M] [--dedup-interval 60] [--dedup-idle 30] [--info-timeout 5000]\n  \
            dedupfs umount <mount_point> [--force]"
     );
@@ -588,6 +589,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sum.moved_chunks,
                 fmt_bytes(sum.reclaimed_disk_bytes),
             );
+        }
+        "fsck" => {
+            let mut fix = false;
+            for arg in args.iter().skip(1) {
+                match arg.as_str() {
+                    "--fix" => fix = true,
+                    other => {
+                        return Err(format!(
+                            "unexpected argument {other:?}; usage: dedupfs [--store <dir>] fsck [--fix]"
+                        )
+                        .into());
+                    }
+                }
+            }
+            let store_dir = discover_store(explicit_store.as_deref())?;
+            let store = DedupStore::open(&store_dir)?;
+            let sum = store.fsck(fix)?;
+            println!(
+                "fsck ({}): scanned {} files ({} chunk refs, {} stored chunks)",
+                if fix { "fix" } else { "check" },
+                sum.files_scanned,
+                sum.chunk_refs_counted,
+                sum.total_chunks,
+            );
+            println!(
+                "  missing_chunks={} mismatched_refcounts={} orphan_chunks={} pack_accounting_diffs={}",
+                sum.missing_chunks,
+                sum.mismatched_refcounts,
+                sum.orphan_chunks,
+                sum.pack_accounting_fixed,
+            );
+            if sum.missing_chunks > 0 {
+                return Err(format!("fsck found {} missing chunk(s)", sum.missing_chunks).into());
+            }
         }
         "mount" => {
             let mut opts = MountOptions {

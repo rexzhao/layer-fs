@@ -395,6 +395,59 @@ pub trait WorkspaceOps {
     ///
     /// [`OpsError::Other`] when the backend reports a failure that has no dedicated variant.
     fn flush(&self) -> OpsResult<()>;
+
+    /// Flushes one file's pending data and metadata to durable storage.
+    /// Defaults to volume-wide [`Self::flush`].
+    ///
+    /// # Errors
+    ///
+    /// [`OpsError::Other`] when the backend reports a failure.
+    fn flush_file(&self, _file_id: u64) -> OpsResult<()> {
+        self.flush()
+    }
+
+    /// Reads up to `dst.len()` bytes at `offset` directly into `dst`, returning the number of bytes written.
+    /// Defaults to [`Self::read`] + copy; backends can override for zero-copy reads into WinFsp buffers.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::read`].
+    fn read_into(&self, file_id: u64, offset: u64, dst: &mut [u8]) -> OpsResult<usize> {
+        if dst.is_empty() {
+            return Ok(0);
+        }
+        let bytes = self.read(file_id, offset, dst.len())?;
+        let n = bytes.len().min(dst.len());
+        dst[..n].copy_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+
+    /// Lists a directory's children together with their `NodeInfo` in one pass, avoiding N+1 `get_info` calls.
+    /// Defaults to [`Self::read_dir`] + [`Self::get_info`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::read_dir`].
+    fn read_dir_with_info(&self, dir_id: u64) -> OpsResult<Vec<(Vec<u8>, NodeInfo)>> {
+        let items = self.read_dir(dir_id)?;
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            if let Ok(info) = self.get_info(item.file_id) {
+                out.push((item.name, info));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Returns `true` if `dir_id` has no child entries. Defaults to [`Self::read_dir`]; backends can
+    /// override with an O(1) `EXISTS (... LIMIT 1)` query.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::read_dir`].
+    fn is_dir_empty(&self, dir_id: u64) -> OpsResult<bool> {
+        Ok(self.read_dir(dir_id)?.is_empty())
+    }
 }
 
 /// A boxed backend is a backend: the mount entry point does not know which concrete type it was given, and saying so once here
@@ -471,6 +524,22 @@ impl WorkspaceOps for Box<dyn WorkspaceOps + Send + Sync> {
 
     fn flush(&self) -> OpsResult<()> {
         (**self).flush()
+    }
+
+    fn flush_file(&self, file_id: u64) -> OpsResult<()> {
+        (**self).flush_file(file_id)
+    }
+
+    fn read_into(&self, file_id: u64, offset: u64, dst: &mut [u8]) -> OpsResult<usize> {
+        (**self).read_into(file_id, offset, dst)
+    }
+
+    fn read_dir_with_info(&self, dir_id: u64) -> OpsResult<Vec<(Vec<u8>, NodeInfo)>> {
+        (**self).read_dir_with_info(dir_id)
+    }
+
+    fn is_dir_empty(&self, dir_id: u64) -> OpsResult<bool> {
+        (**self).is_dir_empty(dir_id)
     }
 }
 

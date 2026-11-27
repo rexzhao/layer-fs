@@ -14,7 +14,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const MAX_OPEN_OVERLAY_HANDLES: usize = 64;
+const MAX_OPEN_OVERLAY_HANDLES: usize = 256;
 
 #[cfg(windows)]
 fn apply_share_mode(opts: &mut OpenOptions) {
@@ -237,8 +237,55 @@ impl OverlayStore {
         Ok(buf)
     }
 
-    /// Positional write to an overlay file, returning the new file length.
-    pub fn write_at(
+    /// Positional read directly into caller's `dst` buffer (zero intermediate allocation).
+    pub fn read_into_known_len(
+        &self,
+        ws_id: u64,
+        inode_id: u64,
+        known_len: Option<u64>,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<usize> {
+        #[cfg(windows)]
+        use std::os::windows::fs::FileExt;
+        #[cfg(unix)]
+        use std::os::unix::fs::FileExt;
+
+        if dst.is_empty() {
+            return Ok(0);
+        }
+        let Some(file) = self.get_cached_existing(ws_id, inode_id)? else {
+            return Ok(0);
+        };
+        let file_len = match known_len {
+            Some(l) => l,
+            None => file.metadata()?.len(),
+        };
+        if offset >= file_len {
+            return Ok(0);
+        }
+        let to_read = (file_len - offset).min(dst.len() as u64) as usize;
+        let mut done = 0usize;
+        while done < to_read {
+            #[cfg(windows)]
+            let n = file.seek_read(&mut dst[done..to_read], offset + done as u64)?;
+            #[cfg(unix)]
+            let n = file.read_at(&mut dst[done..to_read], offset + done as u64)?;
+            if n == 0 {
+                break;
+            }
+            done += n;
+        }
+        if known_len.is_some() && done < to_read {
+            // Sparse tail past physical EOF reads as zeros up to `to_read`.
+            dst[done..to_read].fill(0);
+            return Ok(to_read);
+        }
+        Ok(done)
+    }
+
+    /// Positional write to an overlay file, returning `offset + data.len()` without an extra `metadata()` syscall.
+    pub fn write_at_fast(
         &self,
         ws_id: u64,
         inode_id: u64,
@@ -261,6 +308,27 @@ impl OverlayStore {
             pos += n as u64;
             rem = &rem[n..];
         }
+        Ok(pos)
+    }
+
+    /// Flushes OS buffers for an open overlay file to durable storage (`FlushFileBuffers` / `fdatasync`).
+    pub fn sync_data(&self, ws_id: u64, inode_id: u64) -> Result<()> {
+        if let Some(file) = self.pool.lock().unwrap().get((ws_id, inode_id)) {
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    /// Positional write to an overlay file, returning the new file length.
+    pub fn write_at(
+        &self,
+        ws_id: u64,
+        inode_id: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u64> {
+        let _ = self.write_at_fast(ws_id, inode_id, offset, data)?;
+        let file = self.get_cached_rw(ws_id, inode_id)?;
         Ok(file.metadata()?.len())
     }
 

@@ -121,19 +121,18 @@ pub unsafe fn read_directory_shell(
 /// A name that the backend cannot answer metadata for is **left out** rather than listed with invented numbers: a dirent record
 /// with a made-up size/timestamp is worse than a missing row, because nothing downstream can tell the difference.
 fn list_entries(adapter: &crate::DynAdapter, dir_id: u64) -> Vec<ListEntry> {
-    let Ok(items) = adapter.backend().read_dir(dir_id) else {
+    let Ok(items) = adapter.backend().read_dir_with_info(dir_id) else {
         return Vec::new();
     };
     let mut children: Vec<ListEntry> = items
         .into_iter()
-        .filter_map(|item| {
-            let info = adapter.backend().get_info(item.file_id).ok()?;
-            Some((
-                String::from_utf8_lossy(&item.name)
+        .map(|(name, info)| {
+            (
+                String::from_utf8_lossy(&name)
                     .encode_utf16()
                     .collect::<Vec<u16>>(),
                 info,
-            ))
+            )
         })
         .collect();
     children.sort_by(|a, b| a.0.cmp(&b.0));
@@ -651,15 +650,21 @@ struct Shared {
     dir_snapshot: Option<std::sync::Arc<Vec<ListEntry>>>,
 }
 
+const MAX_CLOSED_CONTEXT_IDS: usize = 16_384;
+
+fn debug_handles_enabled() -> bool {
+    static DEBUG_HANDLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG_HANDLES.get_or_init(|| std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some())
+}
+
 fn cached_dir_snapshot(context_id: u64) -> Option<std::sync::Arc<Vec<ListEntry>>> {
     if context_id == 0 {
         return None;
     }
-    let mut guard = lock_tables();
-    let tables = guard.get_or_insert_with(ContextTables::default);
-    tables
-        .contexts
-        .get(&context_id)
+    let guard = read_tables();
+    guard
+        .as_ref()
+        .and_then(|tables| tables.contexts.get(&context_id))
         .and_then(|shared| shared.dir_snapshot.clone())
 }
 
@@ -667,7 +672,7 @@ fn store_dir_snapshot(context_id: u64, snapshot: std::sync::Arc<Vec<ListEntry>>)
     if context_id == 0 {
         return;
     }
-    let mut guard = lock_tables();
+    let mut guard = write_tables();
     let tables = guard.get_or_insert_with(ContextTables::default);
     if let Some(shared) = tables.contexts.get_mut(&context_id) {
         shared.dir_snapshot = Some(snapshot);
@@ -676,16 +681,36 @@ fn store_dir_snapshot(context_id: u64, snapshot: std::sync::Arc<Vec<ListEntry>>)
 
 #[derive(Default)]
 struct ContextTables {
-    contexts: std::collections::BTreeMap<u64, Shared>,
-    by_file: std::collections::BTreeMap<u64, u64>,
-    closed: std::collections::BTreeSet<u64>,
+    contexts: std::collections::HashMap<u64, Shared>,
+    by_file: std::collections::HashMap<u64, u64>,
+    closed: std::collections::HashSet<u64>,
+    closed_order: std::collections::VecDeque<u64>,
 }
 
-static CONTEXT_TABLES: std::sync::Mutex<Option<ContextTables>> = std::sync::Mutex::new(None);
+impl ContextTables {
+    fn record_closed(&mut self, id: u64) {
+        if self.closed.insert(id) {
+            self.closed_order.push_back(id);
+            while self.closed_order.len() > MAX_CLOSED_CONTEXT_IDS {
+                if let Some(old) = self.closed_order.pop_front() {
+                    self.closed.remove(&old);
+                }
+            }
+        }
+    }
+}
 
-fn lock_tables() -> std::sync::MutexGuard<'static, Option<ContextTables>> {
+static CONTEXT_TABLES: std::sync::RwLock<Option<ContextTables>> = std::sync::RwLock::new(None);
+
+fn read_tables() -> std::sync::RwLockReadGuard<'static, Option<ContextTables>> {
     CONTEXT_TABLES
-        .lock()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write_tables() -> std::sync::RwLockWriteGuard<'static, Option<ContextTables>> {
+    CONTEXT_TABLES
+        .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -710,21 +735,25 @@ pub fn acquire_release_counts() -> (usize, usize) {
 /// The table as `(id, refs)` pairs: the reading that says whether a zero-reference entry was left behind.
 #[must_use]
 pub fn context_table() -> Vec<(u64, usize)> {
-    let mut guard = lock_tables();
-    let tables = guard.get_or_insert_with(ContextTables::default);
-    tables
-        .contexts
-        .iter()
-        .map(|(id, shared)| (*id, shared.refs))
-        .collect()
+    let guard = read_tables();
+    guard.as_ref().map_or_else(Vec::new, |tables| {
+        let mut pairs: Vec<(u64, usize)> = tables
+            .contexts
+            .iter()
+            .map(|(id, shared)| (*id, shared.refs))
+            .collect();
+        pairs.sort_unstable_by_key(|(id, _)| *id);
+        pairs
+    })
 }
 
 /// How many live references the table currently carries (the sum of every `refs`).
 #[must_use]
 pub fn live_reference_count() -> usize {
-    let mut guard = lock_tables();
-    let tables = guard.get_or_insert_with(ContextTables::default);
-    tables.contexts.values().map(|shared| shared.refs).sum()
+    let guard = read_tables();
+    guard
+        .as_ref()
+        .map_or(0, |tables| tables.contexts.values().map(|s| s.refs).sum())
 }
 
 /// How many releases arrived for an id that was never handed out.
@@ -757,7 +786,7 @@ fn register_locked(tables: &mut ContextTables, entry: EntryContext) -> u64 {
 
 /// Stores a context and returns the id the OS will carry for it.
 fn register_context(entry: EntryContext) -> u64 {
-    let mut guard = lock_tables();
+    let mut guard = write_tables();
     let tables = guard.get_or_insert_with(ContextTables::default);
     register_locked(tables, entry)
 }
@@ -767,14 +796,13 @@ fn register_context(entry: EntryContext) -> u64 {
 /// This is the shape the FSD expects (one context per entry, one close per file object); the key is the entry's `file_id`, which is already the
 /// fold-insensitive identity the rest of this layer uses.
 fn acquire_context(entry: EntryContext) -> u64 {
-    let mut guard = lock_tables();
+    let mut guard = write_tables();
     let tables = guard.get_or_insert_with(ContextTables::default);
     if let Some(&id) = tables.by_file.get(&entry.file_id) {
         if let Some(shared) = tables.contexts.get_mut(&id) {
             shared.refs += 1;
             ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some()
-                && ACQUIRES.load(std::sync::atomic::Ordering::Relaxed) <= 40
+            if debug_handles_enabled() && ACQUIRES.load(std::sync::atomic::Ordering::Relaxed) <= 40
             {
                 eprintln!(
                     "acquire: id={id} file_id={} refs={}",
@@ -795,9 +823,11 @@ fn entry_of(context: *const c_void) -> Option<EntryContext> {
     if id == 0 {
         return None;
     }
-    let mut guard = lock_tables();
-    let tables = guard.get_or_insert_with(ContextTables::default);
-    tables.contexts.get(&id).map(|shared| shared.entry)
+    let guard = read_tables();
+    guard
+        .as_ref()
+        .and_then(|tables| tables.contexts.get(&id))
+        .map(|shared| shared.entry)
 }
 
 /// Releases a context from the direct tests, through the same table `close_shell` uses.
@@ -821,11 +851,12 @@ pub fn register_context_for_test(entry: EntryContext) -> *mut c_void {
 /// The table is process-wide (the callbacks have no place to keep a per-mount one), so without this a mount that leaves contexts behind would
 /// make the next mount start with them. Clearing at teardown is what keeps the residue **bounded by one mount** instead of accumulating.
 pub fn clear_contexts() {
-    let mut guard = lock_tables();
+    let mut guard = write_tables();
     let tables = guard.get_or_insert_with(ContextTables::default);
     tables.contexts.clear();
     tables.by_file.clear();
     tables.closed.clear();
+    tables.closed_order.clear();
 }
 
 /// The **one** place WinFsp's path bytes are turned into the bytes the backends parse (517/518).
@@ -856,9 +887,10 @@ fn is_closed(context: *const c_void) -> bool {
     if id == 0 {
         return false;
     }
-    let mut guard = lock_tables();
-    let tables = guard.get_or_insert_with(ContextTables::default);
-    tables.closed.contains(&id)
+    let guard = read_tables();
+    guard
+        .as_ref()
+        .is_some_and(|tables| tables.closed.contains(&id))
 }
 
 /// Removes the context behind `context`, or `None` when the id was never handed out (a stale close).
@@ -885,7 +917,7 @@ fn release_context(context: *const c_void) -> Release {
     if id == 0 {
         return Release::Unknown;
     }
-    let mut guard = lock_tables();
+    let mut guard = write_tables();
     let tables = guard.get_or_insert_with(ContextTables::default);
     let (remaining, shared_entry) = match tables.contexts.get_mut(&id) {
         Some(shared) => {
@@ -895,7 +927,7 @@ fn release_context(context: *const c_void) -> Release {
         None => return Release::Unknown,
     };
     if remaining > 0 {
-        if std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some() {
+        if debug_handles_enabled() {
             eprintln!("release: id={id} still_shared refs={remaining}");
         }
         return Release::StillShared(shared_entry);
@@ -908,7 +940,7 @@ fn release_context(context: *const c_void) -> Release {
     if tables.by_file.get(&entry.file_id) == Some(&id) {
         tables.by_file.remove(&entry.file_id);
     }
-    tables.closed.insert(id);
+    tables.record_closed(id);
     Release::Freed(entry)
 }
 
@@ -1424,10 +1456,8 @@ pub unsafe fn can_delete_shell(adapter: Option<&crate::DynAdapter>, context: *co
             // refused inside the close, and Windows had already told the caller it worked. `CanDelete` is the question the FSD asks **before** the
             // disposition is set, so the emptiness rule belongs here as well as at the removal.
             if info.kind == crate::Kind::Directory {
-                if let Ok(entries) = adapter.backend().read_dir(entry.file_id) {
-                    if !entries.is_empty() {
-                        return OURS_DIRECTORY_NOT_EMPTY;
-                    }
+                if let Ok(false) = adapter.backend().is_dir_empty(entry.file_id) {
+                    return OURS_DIRECTORY_NOT_EMPTY;
                 }
             }
             0
@@ -1746,24 +1776,16 @@ pub unsafe fn read_shell(
     }
     let remaining = size - offset;
     let len = (length as u64).min(remaining) as usize;
-    let bytes = match adapter.backend().read(entry.file_id, offset, len) {
-        Ok(bytes) => bytes,
+    // SAFETY: `buffer` is valid for `length >= len` bytes per the caller's contract.
+    let out = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), len) };
+    let taken = match adapter.backend().read_into(entry.file_id, offset, out) {
+        Ok(n) => n.min(len),
         // A directory cannot be read through a file handle: that is a typed refusal, not an empty read.
         Err(crate::ops::OpsError::IsADirectory) => return NOT_IMPLEMENTED,
         Err(err) => return crate::error::to_status_of(&err).code() as i32,
     };
-    let taken = bytes.len().min(len);
-    // SAFETY: `buffer` is valid for `length >= taken` bytes per the caller's contract.
-    let out = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), taken) };
-    out.copy_from_slice(&bytes[..taken]);
-    // EOF: the rest of the buffer is **zeros** (a stale buffer would leak the previous file), but the **count is what was actually
-    // read** — reporting the padded length would tell Windows there is more data, and it would ask again forever (the first version of
-    // this function did exactly that and ended in an out-of-memory panic).
     if taken < len {
-        // SAFETY: the same buffer, the remaining range.
-        let tail =
-            unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>().add(taken), len - taken) };
-        tail.fill(0);
+        out[taken..].fill(0);
     }
     if !bytes_transferred.is_null() {
         // SAFETY: writable out-pointer per WinFsp's contract.
@@ -1981,8 +2003,10 @@ pub unsafe fn write_shell(
 static VERIFY_WRITES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn verify_writes_enabled() -> bool {
+    static ENV_VERIFY_WRITES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     VERIFY_WRITES.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var_os("LAYERFS_VERIFY_WRITES").is_some_and(|v| v != "0")
+        || *ENV_VERIFY_WRITES
+            .get_or_init(|| std::env::var_os("LAYERFS_VERIFY_WRITES").is_some_and(|v| v != "0"))
 }
 
 /// Enables/disables diagnostic write read-back verification in tests.
@@ -2053,13 +2077,19 @@ pub unsafe fn flush_shell(
     let Some(adapter) = adapter else {
         return NOT_IMPLEMENTED;
     };
-    if let Err(err) = adapter.backend().flush() {
+    if context.is_null() {
+        if let Err(err) = adapter.backend().flush() {
+            return crate::error::to_status_of(&err).code() as i32;
+        }
+        return 0;
+    }
+    let Some(entry) = entry_of(context) else {
+        return NOT_IMPLEMENTED;
+    };
+    if let Err(err) = adapter.backend().flush_file(entry.file_id) {
         return crate::error::to_status_of(&err).code() as i32;
     }
-    if !context.is_null() && !info_out.is_null() {
-        let Some(entry) = entry_of(context) else {
-            return NOT_IMPLEMENTED;
-        };
+    if !info_out.is_null() {
         let info = match adapter.backend().get_info(entry.file_id) {
             Ok(info) => info,
             Err(err) => return crate::error::to_status_of(&err).code() as i32,

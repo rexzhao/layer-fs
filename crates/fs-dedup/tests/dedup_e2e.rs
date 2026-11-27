@@ -190,6 +190,9 @@ fn import_cross_workspace_dedup_cow_clone_background_dedup_and_gc() {
         .unwrap();
     bf.write(f_dup.file_id, 0, &yaml).unwrap();
 
+    // Flush buffered overlay metadata before running background dedup directly on `store`.
+    bf.flush().unwrap();
+
     // Background dedup skips busy inodes when `is_busy` reports true!
     let busy_sum = store
         .dedup_workspace(Some("feature"), 0, |_, id| id == f_prefab.file_id)
@@ -577,6 +580,7 @@ fn directory_filters_exclude_on_import_and_skip_dedup_at_runtime() {
         .create_or_open(&OpsPath::new(b"/Assets/new.txt"), Disposition::Create)
         .unwrap();
     backend.write(f_new.file_id, 0, b"real-asset-change").unwrap();
+    backend.flush().unwrap();
 
     let dsum = store
         .dedup_workspace(Some("unity"), 0, |_, _| false)
@@ -699,4 +703,139 @@ fn overlay_pooled_handles_support_concurrent_reads_and_clean_eviction_on_delete(
             .exists(),
         "overlay file must be deleted cleanly after pool eviction"
     );
+}
+
+#[test]
+fn parallel_import_preserves_exact_refcounts_and_fsck_repairs_drift() {
+    let tmp = TempDir::new("p0_refcounts_fsck");
+    let store_dir = tmp.0.join("store");
+    let src = tmp.0.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // Create 60 duplicate files sharing the exact same payload across 8 parallel import workers
+    // (including a larger file that shares chunks with smaller files to stress out-of-order commits).
+    let shared_block = b"DEDUP-SHARED-CHUNK-DATA-0123456789ABCDEF".repeat(8000); // ~320 KiB
+    let mut big_with_shared = shared_block.clone();
+    big_with_shared.extend_from_slice(&vec![0xABu8; 2 * 1024 * 1024]);
+    std::fs::write(src.join("00_big.bin"), &big_with_shared).unwrap();
+    for i in 1..=60 {
+        std::fs::write(src.join(format!("dup_{i:02}.bin")), &shared_block).unwrap();
+    }
+
+    let store = DedupStore::init(&store_dir, StoreConfig::default()).unwrap();
+    let sum = store.import_dir(&src, "ws", 8, None).unwrap();
+    assert_eq!(sum.files, 61);
+
+    // `fsck(false)` must report zero missing chunks, zero mismatched refcounts, and zero orphans!
+    let check = store.fsck(false).unwrap();
+    assert_eq!(check.files_scanned, 61);
+    assert_eq!(check.missing_chunks, 0);
+    assert_eq!(check.mismatched_refcounts, 0);
+    assert_eq!(check.orphan_chunks, 0);
+    assert_eq!(check.pack_accounting_fixed, 0);
+
+    // Deliberately corrupt a refcount in SQLite and verify `fsck(true)` detects and repairs it!
+    {
+        let conn = store.open_conn().unwrap();
+        conn.execute("UPDATE chunks SET refcount = 1", []).unwrap();
+    }
+    let broken = store.fsck(false).unwrap();
+    assert!(broken.mismatched_refcounts > 0);
+
+    let fixed = store.fsck(true).unwrap();
+    assert!(fixed.mismatched_refcounts > 0);
+    let after = store.fsck(false).unwrap();
+    assert_eq!(after.mismatched_refcounts, 0);
+    assert_eq!(after.missing_chunks, 0);
+    assert_eq!(after.pack_accounting_fixed, 0);
+}
+
+#[test]
+fn batched_write_prefix_cow_read_into_and_dir_negative_cache() {
+    let tmp = TempDir::new("p1_p2_cow_neg_cache");
+    let store_dir = tmp.0.join("store");
+    let src = tmp.0.join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+
+    // Create a multi-chunk (~2 MiB) pseudo-random file so it spans many chunks in packs.
+    let mut big = vec![0u8; 2 * 1024 * 1024];
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for b in &mut big {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = (x & 0xff) as u8;
+    }
+    std::fs::write(src.join("sub").join("multi.bin"), &big).unwrap();
+
+    let store = DedupStore::init(&store_dir, StoreConfig::default()).unwrap();
+    store.import_dir(&src, "ws", 4, None).unwrap();
+
+    let backend = DedupWorkspaceBackend::open(store.clone(), "ws").unwrap();
+
+    // 1. Directory `complete` negative cache: read_dir loads /sub completely.
+    let sub_id = backend.open_dir(&OpsPath::new(b"/sub")).unwrap();
+    let entries = backend.read_dir_with_info(sub_id).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].1.size, big.len() as u64);
+
+    // Missing lookup must hit negative cache and return NotFound.
+    assert!(backend
+        .create_or_open(&OpsPath::new(b"/sub/missing.meta"), Disposition::Open)
+        .is_err());
+
+    // Creating that file must invalidate/update the negative cache so Open finds it.
+    let created = backend
+        .create_or_open(&OpsPath::new(b"/sub/missing.meta"), Disposition::Create)
+        .unwrap();
+    backend.write(created.file_id, 0, b"hello-meta").unwrap();
+    assert_eq!(backend.get_info(created.file_id).unwrap().size, 10);
+
+    // `read_dir_with_info` must reflect buffered dirty write size immediately even before flush!
+    let entries2 = backend.read_dir_with_info(sub_id).unwrap();
+    let meta_entry = entries2
+        .iter()
+        .find(|(name, _)| name.as_slice() == b"missing.meta")
+        .unwrap();
+    assert_eq!(meta_entry.1.size, 10);
+
+    // Per-file flush persists metadata + syncs data cleanly.
+    backend.flush_file(created.file_id).unwrap();
+
+    // Removing the file must return NotFound on subsequent open (negative cache stays consistent).
+    backend
+        .remove_at(created.binding.0, &created.binding.1, created.file_id)
+        .unwrap();
+    assert!(backend
+        .create_or_open(&OpsPath::new(b"/sub/missing.meta"), Disposition::Open)
+        .is_err());
+
+    // 2. Zero-copy `read_into` across multi-chunk boundaries using binary search over chunk_offsets.
+    let multi = backend
+        .create_or_open(&OpsPath::new(b"/sub/multi.bin"), Disposition::Open)
+        .unwrap();
+    let mut slice_buf = vec![0u8; 300_000];
+    let n = backend
+        .read_into(multi.file_id, 900_000, &mut slice_buf)
+        .unwrap();
+    assert_eq!(n, 300_000);
+    assert_eq!(&slice_buf[..], &big[900_000..1_200_000]);
+
+    // 3. Prefix-only CoW truncation on pack-backed multi-chunk file (`set_size`).
+    let prefix_len = 500_000usize;
+    backend.set_size(multi.file_id, prefix_len as u64).unwrap();
+    assert_eq!(
+        backend.get_info(multi.file_id).unwrap().size,
+        prefix_len as u64
+    );
+    let mut got_prefix = vec![0u8; prefix_len];
+    let n2 = backend.read_into(multi.file_id, 0, &mut got_prefix).unwrap();
+    assert_eq!(n2, prefix_len);
+    assert_eq!(&got_prefix[..], &big[..prefix_len]);
+
+    // Refcounts must remain exact after prefix CoW released all pack chunks!
+    let check = store.fsck(false).unwrap();
+    assert_eq!(check.missing_chunks, 0);
+    assert_eq!(check.mismatched_refcounts, 0);
+    assert_eq!(check.orphan_chunks, 0);
 }

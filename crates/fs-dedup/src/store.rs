@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -31,8 +31,8 @@ const INODE_CACHE_PER_SHARD: usize = 65_536; // 1,048k total (~100 MiB, fits ent
 const IN_MEMORY_IMPORT_LIMIT: u64 = 16 * 1024 * 1024;
 const IMPORT_COMMIT_BATCH: usize = 2048;
 
-/// Cached inode metadata + pre-decoded chunk manifest held in RAM for sub-microsecond
-/// `get_info` and `read` dispatch without hitting SQLite.
+/// Cached inode metadata + pre-decoded chunk manifest + chunk start offsets held in RAM for
+/// sub-microsecond `get_info` and O(log N) `read` dispatch without hitting SQLite.
 #[derive(Clone, Debug)]
 pub struct CachedInode {
     pub inode_id: u64,
@@ -46,15 +46,32 @@ pub struct CachedInode {
     pub storage_mode: u8,
     /// Decoded chunk manifest (`None` when prefetched by `read_dir` without reading `manifest` BLOBs).
     pub entries: Option<Arc<[ManifestEntry]>>,
+    /// Prefix-sum byte start offsets for each entry in `entries` (enables O(log N) binary search).
+    pub chunk_offsets: Option<Arc<[u64]>>,
 }
 
 impl CachedInode {
+    pub fn build_offsets(entries: &[ManifestEntry]) -> Arc<[u64]> {
+        let mut offsets = Vec::with_capacity(entries.len());
+        let mut cur = 0u64;
+        for e in entries {
+            offsets.push(cur);
+            cur += u64::from(e.raw_len);
+        }
+        Arc::from(offsets.into_boxed_slice())
+    }
+
     pub fn from_row(row: &InodeRow) -> Result<Self> {
-        let entries: Arc<[ManifestEntry]> =
+        let (entries, chunk_offsets) =
             if row.storage_mode == STORAGE_CHUNKS && !row.manifest.is_empty() {
-                Arc::from(decode_manifest(&row.manifest)?.into_boxed_slice())
+                let decoded = decode_manifest(&row.manifest)?;
+                let offsets = Self::build_offsets(&decoded);
+                (Arc::from(decoded.into_boxed_slice()), offsets)
             } else {
-                Arc::from(Vec::new().into_boxed_slice())
+                (
+                    Arc::from(Vec::new().into_boxed_slice()),
+                    Arc::from(Vec::new().into_boxed_slice()),
+                )
             };
         Ok(Self {
             inode_id: row.inode_id,
@@ -67,6 +84,7 @@ impl CachedInode {
             changed_ns: row.changed_ns,
             storage_mode: row.storage_mode,
             entries: Some(entries),
+            chunk_offsets: Some(chunk_offsets),
         })
     }
 }
@@ -130,16 +148,32 @@ pub struct GcSummary {
     pub reclaimed_disk_bytes: u64,
 }
 
-/// Sharded in-memory set of already-stored 32-byte chunk hashes for lock-free fast-path dedup
-/// during parallel `import_dir`.
+/// Summary returned by `fsck`.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct FsckSummary {
+    pub files_scanned: u64,
+    pub chunk_refs_counted: u64,
+    pub total_chunks: u64,
+    pub missing_chunks: u64,
+    pub mismatched_refcounts: u64,
+    pub orphan_chunks: u64,
+    pub pack_accounting_fixed: u64,
+    pub fixed: bool,
+}
+
+/// Sharded in-memory set of **already committed** 32-byte chunk hashes for lock-free fast-path
+/// dedup during parallel `import_dir`.
+///
+/// Only the single-threaded committer inserts into `KnownChunks` AFTER a SQLite batch commits,
+/// guaranteeing workers never skip a chunk whose writer batch hasn't committed yet (or failed).
 struct KnownChunks {
-    shards: Vec<Mutex<HashSet<Hash32>>>,
+    shards: Vec<RwLock<HashSet<Hash32>>>,
 }
 
 impl KnownChunks {
     fn load(conn: &Connection) -> Result<Self> {
-        let mut shards: Vec<Mutex<HashSet<Hash32>>> = (0..KNOWN_SHARDS)
-            .map(|_| Mutex::new(HashSet::new()))
+        let mut shards: Vec<RwLock<HashSet<Hash32>>> = (0..KNOWN_SHARDS)
+            .map(|_| RwLock::new(HashSet::new()))
             .collect();
         let mut stmt = conn.prepare("SELECT hash FROM chunks")?;
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
@@ -154,15 +188,62 @@ impl KnownChunks {
         Ok(Self { shards })
     }
 
-    /// Returns `true` if `hash` was NOT yet known (caller should compress & store it).
     #[inline]
-    fn claim_if_new(&self, hash: Hash32) -> bool {
+    fn contains(&self, hash: &Hash32) -> bool {
         let idx = (hash[0] as usize) & (KNOWN_SHARDS - 1);
-        self.shards[idx].lock().unwrap().insert(hash)
+        self.shards[idx].read().unwrap().contains(hash)
+    }
+
+    fn insert_batch(&self, hashes: impl IntoIterator<Item = Hash32>) {
+        let mut by_shard: [Vec<Hash32>; KNOWN_SHARDS] = std::array::from_fn(|_| Vec::new());
+        for h in hashes {
+            by_shard[(h[0] as usize) & (KNOWN_SHARDS - 1)].push(h);
+        }
+        for (idx, list) in by_shard.into_iter().enumerate() {
+            if !list.is_empty() {
+                let mut guard = self.shards[idx].write().unwrap();
+                for h in list {
+                    guard.insert(h);
+                }
+            }
+        }
     }
 }
 
-type InodeCacheShard = RwLock<HashMap<(u64, u64), Arc<CachedInode>>>;
+type InodeCacheShard = RwLock<HashMap<(u64, u64), (Arc<CachedInode>, AtomicBool)>>;
+type ChunkLocCacheShard = RwLock<HashMap<Hash32, (ChunkLoc, AtomicBool)>>;
+
+/// CLOCK-style partial eviction: removes ~25% of unreferenced entries (giving referenced
+/// entries a second chance) instead of wiping the entire shard with `clear()`.
+fn clock_evict_quarter<K: Eq + std::hash::Hash + Copy, V>(
+    map: &mut HashMap<K, (V, AtomicBool)>,
+    limit: usize,
+) {
+    let target_remove = (limit / 4).max(1);
+    let mut to_remove: Vec<K> = Vec::with_capacity(target_remove);
+    // Pass 1: evict cold entries (`referenced == false`), clear ref bit on hot entries.
+    for (&k, (_, ref_bit)) in map.iter() {
+        if ref_bit.swap(false, Ordering::Relaxed) {
+            continue;
+        }
+        to_remove.push(k);
+        if to_remove.len() >= target_remove {
+            break;
+        }
+    }
+    // Pass 2 (if almost everything was hot): evict remaining needed count.
+    if to_remove.len() < target_remove {
+        for &k in map.keys() {
+            to_remove.push(k);
+            if to_remove.len() >= target_remove {
+                break;
+            }
+        }
+    }
+    for k in to_remove {
+        map.remove(&k);
+    }
+}
 
 /// Shared deduplicating store handle (metadata SQLite + external pack pool + local sparse overlay).
 pub struct DedupStore {
@@ -173,7 +254,7 @@ pub struct DedupStore {
     packs: PackStore,
     overlay: OverlayStore,
     inode_locks: Vec<RwLock<()>>,
-    chunk_loc_cache: Vec<Mutex<HashMap<Hash32, ChunkLoc>>>,
+    chunk_loc_cache: Vec<ChunkLocCacheShard>,
     inode_cache: Vec<InodeCacheShard>,
 }
 
@@ -245,7 +326,7 @@ impl DedupStore {
         let overlay = OverlayStore::new(root.join("overlay"));
         let inode_locks = (0..INODE_LOCK_STRIPES).map(|_| RwLock::new(())).collect();
         let chunk_loc_cache = (0..META_CACHE_SHARDS)
-            .map(|_| Mutex::new(HashMap::new()))
+            .map(|_| RwLock::new(HashMap::new()))
             .collect();
         let inode_cache = (0..META_CACHE_SHARDS)
             .map(|_| RwLock::new(HashMap::new()))
@@ -333,45 +414,45 @@ impl DedupStore {
         open_readonly_meta_connection(&self.meta_path)
     }
 
-    /// Looks up a chunk's pack location using the sharded RAM cache before falling back to SQLite.
+    /// Looks up a chunk's pack location using the sharded CLOCK RAM cache before falling back to SQLite.
     pub fn resolve_chunk_loc(&self, conn: &Connection, hash: &Hash32) -> Result<Option<ChunkLoc>> {
         let shard = (hash[0] as usize) & (META_CACHE_SHARDS - 1);
-        if let Some(&loc) = self.chunk_loc_cache[shard].lock().unwrap().get(hash) {
-            return Ok(Some(loc));
+        if let Some((loc, ref_bit)) = self.chunk_loc_cache[shard].read().unwrap().get(hash) {
+            ref_bit.store(true, Ordering::Relaxed);
+            return Ok(Some(*loc));
         }
         let loc = get_chunk_loc(conn, hash)?;
         if let Some(found) = loc {
-            let mut guard = self.chunk_loc_cache[shard].lock().unwrap();
+            let mut guard = self.chunk_loc_cache[shard].write().unwrap();
             if guard.len() >= CHUNK_LOC_CACHE_PER_SHARD {
-                guard.clear();
+                clock_evict_quarter(&mut guard, CHUNK_LOC_CACHE_PER_SHARD);
             }
-            guard.insert(*hash, found);
+            guard.insert(*hash, (found, AtomicBool::new(true)));
         }
         Ok(loc)
     }
 
-    /// Reads a cached inode snapshot if present.
+    /// Reads a cached inode snapshot if present (shared read lock + lock-free CLOCK ref bit).
     pub fn get_cached_inode(&self, ws_id: u64, inode_id: u64) -> Option<Arc<CachedInode>> {
         let shard = ((ws_id ^ inode_id) as usize) & (META_CACHE_SHARDS - 1);
-        self.inode_cache[shard]
-            .read()
-            .unwrap()
-            .get(&(ws_id, inode_id))
-            .cloned()
+        let guard = self.inode_cache[shard].read().unwrap();
+        let (inode, ref_bit) = guard.get(&(ws_id, inode_id))?;
+        ref_bit.store(true, Ordering::Relaxed);
+        Some(Arc::clone(inode))
     }
 
-    /// Stores an inode snapshot in the sharded RAM cache.
+    /// Stores an inode snapshot in the sharded CLOCK RAM cache.
     pub fn put_cached_inode(&self, ws_id: u64, inode: Arc<CachedInode>) {
         let shard = ((ws_id ^ inode.inode_id) as usize) & (META_CACHE_SHARDS - 1);
         let mut guard = self.inode_cache[shard].write().unwrap();
         if guard.len() >= INODE_CACHE_PER_SHARD {
-            guard.clear();
+            clock_evict_quarter(&mut guard, INODE_CACHE_PER_SHARD);
         }
-        guard.insert((ws_id, inode.inode_id), inode);
+        guard.insert((ws_id, inode.inode_id), (inode, AtomicBool::new(true)));
     }
 
     /// Batch-populates inode metadata prefetched by `read_dir`, preserving any already-decoded
-    /// chunk manifests in cache while acquiring each shard write lock at most once.
+    /// chunk manifests & offsets in cache while acquiring each shard write lock at most once.
     pub fn put_cached_inodes_preserve_manifest(&self, ws_id: u64, batch: Vec<CachedInode>) {
         if batch.is_empty() {
             return;
@@ -388,25 +469,29 @@ impl DedupStore {
             }
             let mut guard = self.inode_cache[shard_idx].write().unwrap();
             if guard.len().saturating_add(items.len()) >= INODE_CACHE_PER_SHARD {
-                guard.clear();
+                clock_evict_quarter(&mut guard, INODE_CACHE_PER_SHARD);
             }
             for mut item in items {
                 if item.entries.is_none() {
-                    if let Some(prev) = guard.get(&(ws_id, item.inode_id)) {
+                    if let Some((prev, _)) = guard.get(&(ws_id, item.inode_id)) {
                         if prev.storage_mode == item.storage_mode
                             && prev.size == item.size
                             && prev.written_ns == item.written_ns
                         {
                             item.entries = prev.entries.clone();
+                            item.chunk_offsets = prev.chunk_offsets.clone();
                         }
                     }
                 }
-                guard.insert((ws_id, item.inode_id), Arc::new(item));
+                guard.insert(
+                    (ws_id, item.inode_id),
+                    (Arc::new(item), AtomicBool::new(true)),
+                );
             }
         }
     }
 
-    /// Evicts one inode from the sharded RAM cache (called on writes, CoW, deletes, and dedup swaps).
+    /// Evicts one inode from the sharded RAM cache (called on deletes and dedup swaps).
     pub fn invalidate_inode(&self, ws_id: u64, inode_id: u64) {
         let shard = ((ws_id ^ inode_id) as usize) & (META_CACHE_SHARDS - 1);
         self.inode_cache[shard]
@@ -417,7 +502,7 @@ impl DedupStore {
 
     fn clear_chunk_loc_cache(&self) {
         for shard in &self.chunk_loc_cache {
-            shard.lock().unwrap().clear();
+            shard.write().unwrap().clear();
         }
     }
 
@@ -912,7 +997,7 @@ impl DedupStore {
             storage_mode: u8,
             pinned_overlay: bool,
             replacing_mode: Option<u8>,
-            manifest: Vec<u8>,
+            entries: Vec<ManifestEntry>,
             new_chunks: Vec<NewChunkBlob>,
         }
 
@@ -1028,7 +1113,7 @@ impl DedupStore {
                                     storage_mode: STORAGE_OVERLAY,
                                     pinned_overlay: true,
                                     replacing_mode: job.replacing_mode,
-                                    manifest: Vec::new(),
+                                    entries: Vec::new(),
                                     new_chunks: Vec::new(),
                                 });
                             }
@@ -1073,12 +1158,13 @@ impl DedupStore {
                         let mut file = File::open(&job.path)?;
                         let mut entries = Vec::new();
                         let mut new_chunks = Vec::new();
+                        let mut file_seen: HashSet<Hash32> = HashSet::new();
 
                         let mut handle_chunk = |chunk: &[u8]| -> Result<()> {
                             let hash = blake3_hash(chunk);
                             let raw_len = chunk.len() as u32;
                             entries.push(ManifestEntry { hash, raw_len });
-                            if known.claim_if_new(hash) {
+                            if !known.contains(&hash) && file_seen.insert(hash) {
                                 let (actual_codec, stored) = compress_chunk(codec, chunk)?;
                                 new_chunks.push(NewChunkBlob {
                                     hash,
@@ -1128,7 +1214,7 @@ impl DedupStore {
                                 storage_mode: STORAGE_CHUNKS,
                                 pinned_overlay: false,
                                 replacing_mode: job.replacing_mode,
-                                manifest: encode_manifest(&entries),
+                                entries,
                                 new_chunks,
                             });
                         }
@@ -1146,6 +1232,7 @@ impl DedupStore {
 
         // Spawn single sequential pack-writer & SQLite metadata committer thread.
         let store_c = Arc::clone(self);
+        let known_c = Arc::clone(&lazy_known);
         let f_c = Arc::clone(&files_done);
         let upd_c = Arc::clone(&updated_done);
         let l_c = Arc::clone(&logical_done);
@@ -1159,13 +1246,21 @@ impl DedupStore {
                 if batch.is_empty() {
                     return Ok(());
                 }
-                // 1. Sequentially append all new unique chunks to active `.pack` file(s).
+                let known_opt = known_c.lock().unwrap().clone();
+                // 1. Sequentially append truly new unique chunks to active `.pack` file(s).
+                //    Committer is the single authority deciding whether a chunk is new, eliminating
+                //    cross-batch refcount races and orphan claims on worker read errors.
                 let mut written_locs: HashMap<Hash32, ChunkLoc> = HashMap::new();
                 let mut pack_updates = Vec::new();
                 {
                     let mut pw = store_c.packs.writer();
                     for item in batch.iter() {
                         for chunk in &item.new_chunks {
+                            if written_locs.contains_key(&chunk.hash)
+                                || known_opt.as_ref().is_some_and(|k| k.contains(&chunk.hash))
+                            {
+                                continue;
+                            }
                             let loc = pw.append(
                                 &chunk.hash,
                                 chunk.codec,
@@ -1184,6 +1279,7 @@ impl DedupStore {
 
                 // 2. Batch-commit chunks, pack sizes, inodes, and dentries in one SQLite txn.
                 let mut overlays_to_remove: Vec<u64> = Vec::new();
+                let committed_hashes: Vec<Hash32> = written_locs.keys().copied().collect();
                 {
                     let mut conn = store_c.meta.lock().unwrap();
                     let tx = conn.transaction()?;
@@ -1206,11 +1302,11 @@ impl DedupStore {
                         }
                     }
 
-                    // Aggregate refcount additions across this entire batch.
+                    // Aggregate refcount additions directly from `item.entries` (no decode roundtrip).
                     let mut ref_adds: HashMap<Hash32, u64> = HashMap::new();
                     for item in batch.iter() {
-                        if item.storage_mode == STORAGE_CHUNKS && !item.manifest.is_empty() {
-                            for e in decode_manifest(&item.manifest)? {
+                        if item.storage_mode == STORAGE_CHUNKS {
+                            for e in &item.entries {
                                 *ref_adds.entry(e.hash).or_insert(0) += 1;
                             }
                         }
@@ -1235,6 +1331,11 @@ impl DedupStore {
                             } else {
                                 0
                             };
+                            let manifest_blob = if item.entries.is_empty() {
+                                Vec::new()
+                            } else {
+                                encode_manifest(&item.entries)
+                            };
                             ins_inode.execute(params![
                                 ws_id as i64,
                                 item.inode_id as i64,
@@ -1246,7 +1347,7 @@ impl DedupStore {
                                 item.written_ns,
                                 item.written_ns,
                                 i64::from(item.storage_mode),
-                                item.manifest.as_slice(),
+                                manifest_blob.as_slice(),
                                 dirty_since,
                                 i64::from(item.pinned_overlay),
                             ])?;
@@ -1269,6 +1370,12 @@ impl DedupStore {
                         }
                     }
                     tx.commit()?;
+                }
+                // Publish committed chunk hashes to `KnownChunks` only AFTER SQLite commit succeeds.
+                if !committed_hashes.is_empty() {
+                    if let Some(known) = known_opt {
+                        known.insert_batch(committed_hashes);
+                    }
                 }
                 for old_id in overlays_to_remove {
                     let _ = store_c.overlay.remove_file(ws_id, old_id);
@@ -1393,7 +1500,25 @@ impl DedupStore {
                     }
                 };
                 let child_path = entry.path();
-                let meta = match fs::symlink_metadata(&child_path) {
+                // On Windows, `entry.file_type()` and `entry.metadata()` reuse `WIN32_FIND_DATAW`
+                // from `FindNextFileW` with zero extra `CreateFileW` syscalls!
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(err) => {
+                        let n = errors_done.fetch_add(1, Ordering::Relaxed);
+                        if n < 50 {
+                            eprintln!(
+                                "  [import error] file_type {}: {err}",
+                                child_path.display()
+                            );
+                        }
+                        continue;
+                    }
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                let meta = match entry.metadata() {
                     Ok(m) => m,
                     Err(err) => {
                         let n = errors_done.fetch_add(1, Ordering::Relaxed);
@@ -1406,10 +1531,6 @@ impl DedupStore {
                         continue;
                     }
                 };
-                let ft = meta.file_type();
-                if ft.is_symlink() {
-                    continue;
-                }
                 let name_os = entry.file_name();
                 let Some(name_str) = name_os.to_str() else {
                     let n = errors_done.fetch_add(1, Ordering::Relaxed);
@@ -1725,18 +1846,25 @@ impl DedupStore {
             ..Default::default()
         };
 
+        // Open a dedicated read-only connection so path resolution and chunk existence checks
+        // never contend with `self.meta` write locks during background dedup.
+        let ro_conn = self.open_readonly_conn()?;
+
         // Reconstruct relative path for each candidate when `no_dedup` directory rules are configured.
+        // Uses `idx_dentries_child` index + `prepare_cached` (O(depth * log N) instead of full scan!).
         let resolve_rel_path = |ws_id: u64, mut node_id: u64| -> Option<String> {
-            let conn = self.meta.lock().unwrap();
+            let mut stmt = ro_conn
+                .prepare_cached(
+                    "SELECT parent_id, display_name FROM dentries WHERE ws_id = ?1 AND child_id = ?2 LIMIT 1",
+                )
+                .ok()?;
             let mut parts: Vec<String> = Vec::new();
             let mut depth = 0usize;
             while node_id != ROOT_INODE && depth < 512 {
-                let row: Option<(i64, Vec<u8>)> = conn
-                    .query_row(
-                        "SELECT parent_id, display_name FROM dentries WHERE ws_id = ?1 AND child_id = ?2 LIMIT 1",
-                        params![ws_id as i64, node_id as i64],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
+                let row: Option<(i64, Vec<u8>)> = stmt
+                    .query_row(params![ws_id as i64, node_id as i64], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
                     .optional()
                     .ok()
                     .flatten();
@@ -1774,21 +1902,17 @@ impl DedupStore {
                     summary.skipped_changed += 1;
                     continue;
                 };
-                // Chunk & hash outside the inode lock so foreground ops on other inodes never wait.
+                // Chunk & hash outside both inode and meta write locks so foreground ops never stall.
                 let mut chunk_hashes_seen: HashSet<Hash32> = HashSet::new();
                 let read_res = chunk_reader(&mut file, |chunk| {
                     let hash = blake3_hash(chunk);
                     let raw_len = chunk.len() as u32;
                     entries.push(ManifestEntry { hash, raw_len });
-                    if chunk_hashes_seen.insert(hash) {
-                        let exists_in_db = {
-                            let conn = self.meta.lock().unwrap();
-                            get_chunk_loc(&conn, &hash)?.is_some()
-                        };
-                        if !exists_in_db {
-                            let (c, stored) = compress_chunk(self.config.codec, chunk)?;
-                            new_blobs.push((hash, c, raw_len, stored));
-                        }
+                    if chunk_hashes_seen.insert(hash)
+                        && self.resolve_chunk_loc(&ro_conn, &hash)?.is_none()
+                    {
+                        let (c, stored) = compress_chunk(self.config.codec, chunk)?;
+                        new_blobs.push((hash, c, raw_len, stored));
                     }
                     Ok(())
                 });
@@ -2028,6 +2152,133 @@ impl DedupStore {
         {
             let conn = self.meta.lock().unwrap();
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+
+        Ok(summary)
+    }
+
+    /// Audits chunk reference counts and pack live/dead byte accounting across all workspaces.
+    /// When `fix == true`, repairs mismatched `chunks.refcount`, deletes orphan chunks (0 live refs),
+    /// and recomputes exact `packs.live_bytes` / `packs.dead_bytes`.
+    pub fn fsck(&self, fix: bool) -> Result<FsckSummary> {
+        let mut conn = self.meta.lock().unwrap();
+        let mut summary = FsckSummary {
+            fixed: fix,
+            ..FsckSummary::default()
+        };
+
+        // 1. Scan all chunk-backed file manifests to compute exact live refcounts.
+        let mut actual_refs: HashMap<Hash32, u64> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT manifest FROM inodes WHERE kind = ?1 AND storage_mode = ?2 AND length(manifest) > 0",
+            )?;
+            let rows = stmt.query_map(
+                params![i64::from(KIND_FILE), i64::from(STORAGE_CHUNKS)],
+                |r| r.get::<_, Vec<u8>>(0),
+            )?;
+            for row in rows {
+                let blob = row?;
+                summary.files_scanned += 1;
+                for entry in decode_manifest(&blob)? {
+                    *actual_refs.entry(entry.hash).or_insert(0) += 1;
+                    summary.chunk_refs_counted += 1;
+                }
+            }
+        }
+
+        // 2. Compare `chunks` table rows against `actual_refs` and recompute per-pack live bytes.
+        let mut ref_fixes: Vec<(Hash32, u64)> = Vec::new();
+        let mut orphans_to_delete: Vec<Hash32> = Vec::new();
+        let mut pack_live: HashMap<u64, u64> = HashMap::new();
+        let mut present_hashes: HashSet<Hash32> = HashSet::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT hash, pack_id, stored_len, refcount FROM chunks")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, i64>(3)? as u64,
+                ))
+            })?;
+            for row in rows {
+                let (h_bytes, pack_id, stored_len, db_refs) = row?;
+                if h_bytes.len() != 32 {
+                    continue;
+                }
+                let hash: Hash32 = h_bytes.try_into().unwrap();
+                summary.total_chunks += 1;
+                present_hashes.insert(hash);
+                let real_refs = actual_refs.get(&hash).copied().unwrap_or(0);
+                if real_refs == 0 {
+                    summary.orphan_chunks += 1;
+                    orphans_to_delete.push(hash);
+                } else {
+                    let rec_bytes = RECORD_HEADER_BYTES as u64 + stored_len;
+                    *pack_live.entry(pack_id).or_insert(0) += rec_bytes;
+                    if real_refs != db_refs {
+                        summary.mismatched_refcounts += 1;
+                        ref_fixes.push((hash, real_refs));
+                    }
+                }
+            }
+        }
+
+        for hash in actual_refs.keys() {
+            if !present_hashes.contains(hash) {
+                summary.missing_chunks += 1;
+            }
+        }
+
+        // 3. Compare `packs` live/dead accounting against recomputed `pack_live`.
+        let mut pack_fixes: Vec<(u64, u64, u64)> = Vec::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT pack_id, size_bytes, live_bytes, dead_bytes FROM packs")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, i64>(3)? as u64,
+                ))
+            })?;
+            for row in rows {
+                let (pack_id, size_bytes, db_live, db_dead) = row?;
+                let real_live = pack_live.get(&pack_id).copied().unwrap_or(0);
+                let data_bytes = size_bytes.saturating_sub(crate::pack::PACK_HEADER_BYTES);
+                let real_dead = data_bytes.saturating_sub(real_live);
+                if real_live != db_live || real_dead != db_dead {
+                    summary.pack_accounting_fixed += 1;
+                    pack_fixes.push((pack_id, real_live, real_dead));
+                }
+            }
+        }
+
+        if fix && (!ref_fixes.is_empty() || !orphans_to_delete.is_empty() || !pack_fixes.is_empty())
+        {
+            let tx = conn.transaction()?;
+            {
+                let mut upd =
+                    tx.prepare_cached("UPDATE chunks SET refcount = ?1 WHERE hash = ?2")?;
+                for (hash, refs) in &ref_fixes {
+                    upd.execute(params![*refs as i64, hash.as_slice()])?;
+                }
+                let mut del = tx.prepare_cached("DELETE FROM chunks WHERE hash = ?1")?;
+                for hash in &orphans_to_delete {
+                    del.execute(params![hash.as_slice()])?;
+                }
+                let mut upd_pack = tx.prepare_cached(
+                    "UPDATE packs SET live_bytes = ?1, dead_bytes = ?2 WHERE pack_id = ?3",
+                )?;
+                for &(pack_id, live, dead) in &pack_fixes {
+                    upd_pack.execute(params![live as i64, dead as i64, pack_id as i64])?;
+                }
+            }
+            tx.commit()?;
+            self.clear_chunk_loc_cache();
         }
 
         Ok(summary)

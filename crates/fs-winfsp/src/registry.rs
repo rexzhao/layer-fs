@@ -14,8 +14,8 @@
 //! A callback that arrives after the `delete` would otherwise read a freed key: that is the dangling-registry failure the
 //! ordering exists to make impossible, and the assertion is what makes it checkable.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use crate::adapter::Adapter;
 use crate::ops::WorkspaceOps;
@@ -52,7 +52,7 @@ pub fn miss_count() -> usize {
 /// `Arc` plus an explicit [`remove`](Registry::remove) rather than `Box::leak`: a leaked table can never be shown to be gone,
 /// and "we never remove" is precisely the shape that turns a lifetime rule into a leak.
 pub struct Registry<B: WorkspaceOps> {
-    mounts: Mutex<BTreeMap<usize, Arc<Adapter<B>>>>,
+    mounts: RwLock<HashMap<usize, Arc<Adapter<B>>>>,
 }
 
 impl<B: WorkspaceOps> Default for Registry<B> {
@@ -66,7 +66,7 @@ impl<B: WorkspaceOps> Registry<B> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            mounts: Mutex::new(BTreeMap::new()),
+            mounts: RwLock::new(HashMap::new()),
         }
     }
 
@@ -80,7 +80,7 @@ impl<B: WorkspaceOps> Registry<B> {
     /// against unknown state.
     pub fn insert(&self, file_system: usize, adapter: Arc<Adapter<B>>) -> Option<Arc<Adapter<B>>> {
         self.mounts
-            .lock()
+            .write()
             .expect("registry lock")
             .insert(file_system, adapter)
     }
@@ -95,7 +95,7 @@ impl<B: WorkspaceOps> Registry<B> {
     pub fn get(&self, file_system: usize) -> Option<Arc<Adapter<B>>> {
         let found = self
             .mounts
-            .lock()
+            .read()
             .expect("registry lock")
             .get(&file_system)
             .cloned();
@@ -112,7 +112,7 @@ impl<B: WorkspaceOps> Registry<B> {
     /// If the internal lock is poisoned.
     pub fn remove(&self, file_system: usize) -> bool {
         self.mounts
-            .lock()
+            .write()
             .expect("registry lock")
             .remove(&file_system)
             .is_some()
@@ -126,7 +126,7 @@ impl<B: WorkspaceOps> Registry<B> {
     #[must_use]
     pub fn contains(&self, file_system: usize) -> bool {
         self.mounts
-            .lock()
+            .read()
             .expect("registry lock")
             .contains_key(&file_system)
     }
@@ -138,7 +138,7 @@ impl<B: WorkspaceOps> Registry<B> {
     /// If the internal lock is poisoned.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.mounts.lock().expect("registry lock").len()
+        self.mounts.read().expect("registry lock").len()
     }
 
     /// Whether the registry holds no mounts.

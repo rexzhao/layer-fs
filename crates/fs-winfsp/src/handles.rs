@@ -78,17 +78,18 @@ pub enum CloseEffect {
 /// The table of open handles.
 #[derive(Debug, Default)]
 pub struct HandleTable {
-    handles: std::collections::BTreeMap<HandleId, Handle>,
+    handles: std::collections::HashMap<HandleId, Handle>,
+    /// O(1) reverse index `file_id -> HandleId` (one shared handle per open file).
+    by_file: std::collections::HashMap<u64, HandleId>,
     /// `FileId -> (parent, name)`: where each open entry currently lives.
     ///
     /// Keyed by **FileId**, not by handle: `remove_at` guards with an id, so the binding's lifetime has to follow the id.
-    /// Per-handle copies would disagree with each other after a rename, and the disagreement would surface as "the entry
-    /// cannot be deleted" (the guard refuses a stale name) rather than as an obvious error.
-    bindings: std::collections::BTreeMap<u64, (u64, Vec<u8>)>,
+    /// Cleaned up on the last close (or after `remove_at`) so long-lived mounts never leak entries.
+    bindings: std::collections::HashMap<u64, (u64, Vec<u8>)>,
     next: u64,
     /// `FileId`s that have been marked delete-pending. Kept per **id**, not per name: the entry may be renamed
     /// between `set_delete(true)` and the last close, and the deletion must follow the object.
-    pending: std::collections::BTreeSet<u64>,
+    pending: std::collections::HashSet<u64>,
 }
 
 /// The whole of criterion 3's third case, as one expression.
@@ -156,30 +157,20 @@ impl HandleTable {
             // The handles that were already open stay usable — that is the other half of the criterion.
             return Err(OpsError::DeletePending);
         }
-        let existing: Vec<(Mask, Mask)> = self
-            .handles
-            .values()
-            .filter(|handle| handle.file_id == file_id)
-            .map(|handle| (handle.desired, handle.share))
-            .collect();
-        if let Admission::Refuse(_) = admit(desired, share, &existing) {
-            return Err(OpsError::SharingViolation);
-        }
-        // **One entry, one handle, one count per open** (ruling 甲): a second open of the same `FileId` borrows the existing handle and bumps its reference
-        // count. A fresh handle per open is what leaked (`+8` directory handles per `status`); counting entries instead of opens is what R3 caught.
-        if let Some(existing_id) = self
-            .handles
-            .iter()
-            .find(|(_, handle)| handle.file_id == file_id)
-            .map(|(id, _)| *id)
-        {
-            let entry = self.handles.get_mut(&existing_id).expect("just found");
-            entry.refs += 1;
-            entry.active_refs += 1;
-            if delete_on_close {
-                self.pending.insert(file_id);
+        // O(1) lookup via `by_file` instead of O(N) full-table scans.
+        if let Some(&existing_id) = self.by_file.get(&file_id) {
+            if let Some(entry) = self.handles.get_mut(&existing_id) {
+                let existing = [(entry.desired, entry.share)];
+                if let Admission::Refuse(_) = admit(desired, share, &existing) {
+                    return Err(OpsError::SharingViolation);
+                }
+                entry.refs += 1;
+                entry.active_refs += 1;
+                if delete_on_close {
+                    self.pending.insert(file_id);
+                }
+                return Ok(existing_id);
             }
-            return Ok(existing_id);
         }
         let id = HandleId(self.next);
         self.next += 1;
@@ -195,6 +186,7 @@ impl HandleTable {
                 is_dir,
             },
         );
+        self.by_file.insert(file_id, id);
         if delete_on_close {
             // `DELETE_ON_CLOSE` *is* delete-pending from the moment of open: new opens must be refused immediately, not
             // only after the flag is observed at close time.
@@ -273,14 +265,16 @@ impl HandleTable {
         self.handles.is_empty()
     }
 
-    /// Every open handle of `file_id`, in creation order.
+    /// Every open handle of `file_id`, in O(1).
     #[must_use]
     pub fn handles_of(&self, file_id: u64) -> Vec<HandleId> {
-        self.handles
-            .iter()
-            .filter(|(_, handle)| handle.file_id == file_id)
-            .map(|(id, _)| *id)
-            .collect()
+        self.by_file.get(&file_id).copied().into_iter().collect()
+    }
+
+    /// O(1) check whether `file_id` currently has any open handle.
+    #[must_use]
+    pub fn has_open_handles(&self, file_id: u64) -> bool {
+        self.by_file.contains_key(&file_id)
     }
 
     /// Whether `file_id` is delete-pending (a new open must be refused).
@@ -307,21 +301,27 @@ impl HandleTable {
             }
         }
         let handle = self.handles.remove(&handle_id).ok_or(OpsError::NotFound)?;
-        let remaining = self.handles_of(handle.file_id).len();
+        if self.by_file.get(&handle.file_id) == Some(&handle_id) {
+            self.by_file.remove(&handle.file_id);
+        }
+        let remaining = usize::from(self.by_file.contains_key(&handle.file_id));
         let should_remove = close_removes(remaining, self.pending.contains(&handle.file_id));
         if should_remove {
-            // Leave `pending` set: the entry is still pending until the adapter's `remove_at` succeeds, and a second
-            // close of the same id cannot get here (the handle is already gone).
+            // Leave `pending` and `bindings` set until the adapter finishes `remove_at` and calls `removed()`.
             return Ok(CloseEffect::Remove(handle.file_id));
+        }
+        if remaining == 0 {
+            self.bindings.remove(&handle.file_id);
         }
         Ok(CloseEffect::Nothing)
     }
 
-    /// Clears the pending flag once the adapter has actually removed the entry.
+    /// Clears the pending flag and binding once the adapter has actually removed the entry.
     ///
     /// Separate from [`Self::close`] on purpose: "the last handle closed" and "the entry was removed" are two events,
     /// and a failure between them must not leave the adapter believing the entry is gone.
     pub fn removed(&mut self, file_id: u64) {
         self.pending.remove(&file_id);
+        self.bindings.remove(&file_id);
     }
 }

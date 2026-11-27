@@ -230,6 +230,9 @@ CREATE TABLE IF NOT EXISTS dentries (
     kind         INTEGER NOT NULL,
     PRIMARY KEY (ws_id, parent_id, folded_name)
 ) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_dentries_child
+    ON dentries(ws_id, child_id);
 "#;
 
 /// Opens and configures `meta.sqlite` with fast WAL settings tuned for metadata-only workloads.
@@ -258,12 +261,15 @@ pub fn open_readonly_meta_connection(path: &Path) -> Result<Connection> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    // 4 GiB OS mmap already caches hot SQLite pages in shared OS memory; keep per-conn
+    // private page cache at 16 MiB so 16 RO connections use ~256 MiB max instead of 2+ GiB.
     conn.execute_batch(
         "PRAGMA query_only = ON;\
-         PRAGMA cache_size = -131072;\
+         PRAGMA cache_size = -16384;\
          PRAGMA mmap_size = 4294967296;\
          PRAGMA temp_store = MEMORY;",
     )?;
+    conn.set_prepared_statement_cache_capacity(64);
     Ok(conn)
 }
 
@@ -278,12 +284,13 @@ pub fn next_pack_id(conn: &Connection) -> Result<u64> {
 
 /// Looks up one chunk's pack location by BLAKE3-256 hash.
 pub fn get_chunk_loc(conn: &Connection, hash: &Hash32) -> Result<Option<ChunkLoc>> {
-    let row: Option<(i64, i64, i64, i64, i64)> = conn
-        .query_row(
-            "SELECT pack_id, offset, raw_len, stored_len, codec FROM chunks WHERE hash = ?1",
-            params![hash.as_slice()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
+    let mut stmt = conn.prepare_cached(
+        "SELECT pack_id, offset, raw_len, stored_len, codec FROM chunks WHERE hash = ?1",
+    )?;
+    let row: Option<(i64, i64, i64, i64, i64)> = stmt
+        .query_row(params![hash.as_slice()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
         .optional()?;
     match row {
         Some((pack_id, offset, raw_len, stored_len, codec)) => Ok(Some(ChunkLoc {
@@ -348,6 +355,7 @@ pub fn upsert_pack_updates(
 }
 
 /// Inserts a newly written chunk (refcount = `add_refs`) or increments its refcount if it already exists.
+/// Returns `Error::Corrupt` if `loc` is `None` and the chunk row does not exist (never silently drops a ref).
 pub fn upsert_chunk_ref(
     tx: &rusqlite::Transaction<'_>,
     hash: &Hash32,
@@ -358,32 +366,37 @@ pub fn upsert_chunk_ref(
         return Ok(());
     }
     if let Some(loc) = loc {
-        let inserted = tx.execute(
+        let mut ins = tx.prepare_cached(
             "INSERT OR IGNORE INTO chunks (hash, pack_id, offset, raw_len, stored_len, codec, refcount)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                hash.as_slice(),
-                loc.pack_id as i64,
-                loc.offset as i64,
-                i64::from(loc.raw_len),
-                i64::from(loc.stored_len),
-                i64::from(loc.codec as u8),
-                add_refs as i64,
-            ],
         )?;
+        let inserted = ins.execute(params![
+            hash.as_slice(),
+            loc.pack_id as i64,
+            loc.offset as i64,
+            i64::from(loc.raw_len),
+            i64::from(loc.stored_len),
+            i64::from(loc.codec as u8),
+            add_refs as i64,
+        ])?;
         if inserted > 0 {
             let record_bytes = crate::pack::RECORD_HEADER_BYTES as i64 + i64::from(loc.stored_len);
-            tx.execute(
+            let mut add_live = tx.prepare_cached(
                 "UPDATE packs SET live_bytes = live_bytes + ?1 WHERE pack_id = ?2",
-                params![record_bytes, loc.pack_id as i64],
             )?;
+            add_live.execute(params![record_bytes, loc.pack_id as i64])?;
             return Ok(());
         }
     }
-    tx.execute(
-        "UPDATE chunks SET refcount = refcount + ?1 WHERE hash = ?2",
-        params![add_refs as i64, hash.as_slice()],
-    )?;
+    let mut upd =
+        tx.prepare_cached("UPDATE chunks SET refcount = refcount + ?1 WHERE hash = ?2")?;
+    let updated = upd.execute(params![add_refs as i64, hash.as_slice()])?;
+    if updated == 0 {
+        return Err(Error::Corrupt(format!(
+            "upsert_chunk_ref: missing chunk row for hash {:02x?}",
+            &hash[..4]
+        )));
+    }
     Ok(())
 }
 
@@ -430,27 +443,26 @@ pub fn find_workspace_id(conn: &Connection, name: &str) -> Result<u64> {
 
 /// Reads an inode row by `(ws_id, inode_id)`.
 pub fn load_inode(conn: &Connection, ws_id: u64, inode_id: u64) -> Result<Option<InodeRow>> {
-    conn.query_row(
+    let mut stmt = conn.prepare_cached(
         "SELECT inode_id, kind, size, attributes, created_ns, accessed_ns, written_ns, changed_ns, storage_mode, manifest, dirty_since_ns, pinned_overlay
          FROM inodes WHERE ws_id = ?1 AND inode_id = ?2",
-        params![ws_id as i64, inode_id as i64],
-        |r| {
-            Ok(InodeRow {
-                inode_id: r.get::<_, i64>(0)? as u64,
-                kind: r.get::<_, i64>(1)? as u8,
-                size: r.get::<_, i64>(2)? as u64,
-                attributes: r.get::<_, i64>(3)? as u32,
-                created_ns: r.get(4)?,
-                accessed_ns: r.get(5)?,
-                written_ns: r.get(6)?,
-                changed_ns: r.get(7)?,
-                storage_mode: r.get::<_, i64>(8)? as u8,
-                manifest: r.get(9)?,
-                dirty_since_ns: r.get(10)?,
-                pinned_overlay: r.get::<_, i64>(11)? != 0,
-            })
-        },
-    )
+    )?;
+    stmt.query_row(params![ws_id as i64, inode_id as i64], |r| {
+        Ok(InodeRow {
+            inode_id: r.get::<_, i64>(0)? as u64,
+            kind: r.get::<_, i64>(1)? as u8,
+            size: r.get::<_, i64>(2)? as u64,
+            attributes: r.get::<_, i64>(3)? as u32,
+            created_ns: r.get(4)?,
+            accessed_ns: r.get(5)?,
+            written_ns: r.get(6)?,
+            changed_ns: r.get(7)?,
+            storage_mode: r.get::<_, i64>(8)? as u8,
+            manifest: r.get(9)?,
+            dirty_since_ns: r.get(10)?,
+            pinned_overlay: r.get::<_, i64>(11)? != 0,
+        })
+    })
     .optional()
     .map_err(Error::from)
 }
