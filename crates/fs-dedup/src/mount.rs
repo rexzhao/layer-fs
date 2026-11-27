@@ -61,6 +61,48 @@ fn record_path(mount_point: &Path) -> PathBuf {
     mounts_dir().join(format!("{}.json", mount_key(mount_point)))
 }
 
+fn norm_path_key(p: &Path) -> String {
+    let canon = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+/// Returns `Some(mount_point)` if a live `dedupfs mount` process is currently serving `store_root`.
+/// Used by `fsck --fix` to refuse modifying metadata concurrently with a mounted filesystem.
+pub fn active_mount_for_store(store_root: &Path) -> Option<String> {
+    let target = norm_path_key(store_root);
+    let entries = fs::read_dir(mounts_dir()).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(rec) = serde_json::from_str::<MountRecord>(&raw) else {
+            continue;
+        };
+        if norm_path_key(Path::new(&rec.store)) != target {
+            continue;
+        }
+        #[cfg(windows)]
+        {
+            if win_pipe::send_command(&rec.pipe_name, "ping").is_ok() {
+                return Some(rec.mount_point);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            return Some(rec.mount_point);
+        }
+    }
+    None
+}
+
 fn volume_info(total_size: u64) -> VolumeInfo {
     let label_str = "dedupfs";
     let mut volume_label = [0u16; 32];
@@ -145,42 +187,60 @@ pub fn run_mount(
                 opts.dedup_idle_secs,
             );
 
-            // Spawn background periodic cold-file deduplication thread.
-            let dedup_handle = if opts.dedup_interval_secs > 0 {
+            // Spawn background maintenance thread:
+            // - Periodically flushes buffered dirty overlay metadata every 2s (caps crash-loss window).
+            // - Periodically runs cold-file deduplication when `dedup_interval_secs > 0`.
+            let maint_handle = {
                 let d_store = Arc::clone(&store);
                 let d_adapter = Arc::clone(&adapter);
                 let d_stop = Arc::clone(&stop_pair);
                 let d_ws = ws_name_owned.clone();
-                let interval = Duration::from_secs(opts.dedup_interval_secs);
+                let dedup_interval = if opts.dedup_interval_secs > 0 {
+                    Some(Duration::from_secs(opts.dedup_interval_secs))
+                } else {
+                    None
+                };
+                let flush_tick =
+                    dedup_interval.map_or(Duration::from_secs(2), |d| d.min(Duration::from_secs(2)));
                 let idle = opts.dedup_idle_secs;
-                Some(std::thread::spawn(move || {
+                std::thread::spawn(move || {
                     let (lock, cvar) = &*d_stop;
+                    let mut last_dedup = std::time::Instant::now();
                     loop {
                         let guard = lock.lock().unwrap();
-                        let (guard, _) = cvar.wait_timeout(guard, interval).unwrap();
+                        let (guard, _) = cvar.wait_timeout(guard, flush_tick).unwrap();
                         if *guard {
                             break;
                         }
                         drop(guard);
-                        // Persist any buffered foreground overlay size/mtime updates before dedup scan.
+
+                        // Persist any buffered foreground overlay size/mtime updates promptly.
                         let _ = d_adapter.backend().flush();
-                        if let Ok(sum) = d_store.dedup_workspace(Some(&d_ws), idle, |w, inode| {
-                            w == ws_id && d_adapter.has_open_handles(inode)
-                        }) {
-                            if sum.deduped_files > 0 {
-                                eprintln!(
-                                    "[dedup] `{}`: {} files -> {:.1} MiB reclaimed ({:.1} MiB new stored)",
-                                    d_ws,
-                                    sum.deduped_files,
-                                    sum.reclaimed_overlay_bytes as f64 / (1024.0 * 1024.0),
-                                    sum.stored_bytes as f64 / (1024.0 * 1024.0),
-                                );
+
+                        if let Some(interval) = dedup_interval {
+                            if last_dedup.elapsed() >= interval {
+                                last_dedup = std::time::Instant::now();
+                                if let Ok(sum) =
+                                    d_store.dedup_workspace(Some(&d_ws), idle, |w, inode| {
+                                        w == ws_id
+                                            && (d_adapter.has_open_handles(inode)
+                                                || d_adapter.backend().is_file_dirty(inode))
+                                    })
+                                {
+                                    if sum.deduped_files > 0 {
+                                        eprintln!(
+                                            "[dedup] `{}`: {} files -> {:.1} MiB reclaimed ({:.1} MiB new stored)",
+                                            d_ws,
+                                            sum.deduped_files,
+                                            sum.reclaimed_overlay_bytes as f64 / (1024.0 * 1024.0),
+                                            sum.stored_bytes as f64 / (1024.0 * 1024.0),
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
-                }))
-            } else {
-                None
+                })
             };
 
             // Start Windows named-pipe control server on a background thread.
@@ -217,9 +277,7 @@ pub fn run_mount(
             stop_flag.store(true, Ordering::SeqCst);
             let _ = adapter.backend().flush();
             let _ = fs::remove_file(&rec_path);
-            if let Some(h) = dedup_handle {
-                let _ = h.join();
-            }
+            let _ = maint_handle.join();
             #[cfg(windows)]
             {
                 // Wake blocked ConnectNamedPipe if needed and join cleanly.
@@ -351,15 +409,20 @@ mod win_pipe {
                     let (files, dirs) = adapter.open_handle_kinds();
                     format!("OK workspace={ws_name} open_files={files} open_dirs={dirs}\n")
                 }
-                "dedup" => match store.dedup_workspace(Some(ws_name), 0, |w, inode| {
-                    w == ws_id && adapter.has_open_handles(inode)
-                }) {
-                    Ok(s) => format!(
-                        "OK deduped_files={} reclaimed_bytes={}\n",
-                        s.deduped_files, s.reclaimed_overlay_bytes
-                    ),
-                    Err(e) => format!("ERR {e}\n"),
-                },
+                "dedup" => {
+                    let _ = adapter.backend().flush();
+                    match store.dedup_workspace(Some(ws_name), 0, |w, inode| {
+                        w == ws_id
+                            && (adapter.has_open_handles(inode)
+                                || adapter.backend().is_file_dirty(inode))
+                    }) {
+                        Ok(s) => format!(
+                            "OK deduped_files={} reclaimed_bytes={}\n",
+                            s.deduped_files, s.reclaimed_overlay_bytes
+                        ),
+                        Err(e) => format!("ERR {e}\n"),
+                    }
+                }
                 "umount" | "umount-force" => {
                     let force = cmd == "umount-force";
                     let (open_files, _) = adapter.open_handle_kinds();

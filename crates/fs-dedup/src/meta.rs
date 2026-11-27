@@ -250,6 +250,7 @@ pub fn open_meta_connection(path: &Path) -> Result<Connection> {
          PRAGMA foreign_keys = OFF;",
     )?;
     conn.execute_batch(SCHEMA_SQL)?;
+    conn.set_prepared_statement_cache_capacity(64);
     Ok(conn)
 }
 

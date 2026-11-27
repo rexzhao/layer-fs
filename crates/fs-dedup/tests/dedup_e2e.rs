@@ -839,3 +839,225 @@ fn batched_write_prefix_cow_read_into_and_dir_negative_cache() {
     assert_eq!(check.mismatched_refcounts, 0);
     assert_eq!(check.orphan_chunks, 0);
 }
+
+#[test]
+fn r2_1_concurrent_overwrite_and_write_has_no_abba_deadlock() {
+    let tmp = TempDir::new("r2_1_no_deadlock");
+    let store = DedupStore::init(tmp.0.join("store"), StoreConfig::default()).unwrap();
+    store.create_workspace("ws").unwrap();
+    let backend = std::sync::Arc::new(DedupWorkspaceBackend::open(store, "ws").unwrap());
+
+    let f = backend
+        .create_or_open(&OpsPath::new(b"/hot.bin"), Disposition::Create)
+        .unwrap();
+    backend.write(f.file_id, 0, &[0x42u8; 4096]).unwrap();
+
+    // Hammer concurrent Overwrite/Supersede (which used to lock write_conn -> inode) against
+    // concurrent write/set_size/flush_file (which lock inode -> write_conn).
+    std::thread::scope(|s| {
+        for tid in 0..4usize {
+            let b = backend.clone();
+            s.spawn(move || {
+                let path = OpsPath::new(b"/hot.bin");
+                for i in 0..100usize {
+                    let disp = if (tid + i) % 2 == 0 {
+                        Disposition::Overwrite
+                    } else {
+                        Disposition::Supersede
+                    };
+                    let out = b.create_or_open(&path, disp).unwrap();
+                    assert_eq!(out.file_id, f.file_id);
+                }
+            });
+        }
+        for tid in 0..4usize {
+            let b = backend.clone();
+            s.spawn(move || {
+                let payload = vec![(tid as u8) + 1; 2048];
+                for i in 0..100usize {
+                    b.write(f.file_id, (i as u64) * 16, &payload).unwrap();
+                    if i % 10 == 0 {
+                        b.set_size(f.file_id, 512).unwrap();
+                    }
+                    if i % 15 == 0 {
+                        b.flush_file(f.file_id).unwrap();
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn r2_2_concurrent_read_dir_and_create_remove_never_hides_or_resurrects_files() {
+    let tmp = TempDir::new("r2_2_neg_cache_race");
+    let store = DedupStore::init(tmp.0.join("store"), StoreConfig::default()).unwrap();
+    store.create_workspace("ws").unwrap();
+    let backend = std::sync::Arc::new(DedupWorkspaceBackend::open(store, "ws").unwrap());
+
+    let dir_id = backend.mkdir(&OpsPath::new(b"/race")).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::scope(|s| {
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let b = backend.clone();
+            let st = stop.clone();
+            readers.push(s.spawn(move || {
+                while !st.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = b.read_dir_with_info(dir_id).unwrap();
+                }
+            }));
+        }
+        let mut writers = Vec::new();
+        for tid in 0..2usize {
+            let b = backend.clone();
+            writers.push(s.spawn(move || {
+                for i in 0..80usize {
+                    let keep_name = format!("/race/live_{tid}_{i}.txt");
+                    let created = b
+                        .create_or_open(&OpsPath::new(keep_name.as_bytes()), Disposition::Create)
+                        .unwrap();
+                    b.write(created.file_id, 0, b"live").unwrap();
+
+                    let gone_name = format!("/race/gone_{tid}_{i}.txt");
+                    let gone = b
+                        .create_or_open(&OpsPath::new(gone_name.as_bytes()), Disposition::Create)
+                        .unwrap();
+                    b.remove_at(gone.binding.0, &gone.binding.1, gone.file_id)
+                        .unwrap();
+                }
+            }));
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+    });
+
+    // EVERY created `live_*` file must be visible via Open (not hidden by stale negative cache),
+    // and EVERY deleted `gone_*` file must return NotFound (not resurrected by stale snapshot).
+    for tid in 0..2usize {
+        for i in 0..80usize {
+            let keep_name = format!("/race/live_{tid}_{i}.txt");
+            assert!(
+                backend
+                    .create_or_open(&OpsPath::new(keep_name.as_bytes()), Disposition::Open)
+                    .is_ok(),
+                "created file {keep_name} must never be hidden by negative cache!"
+            );
+            let gone_name = format!("/race/gone_{tid}_{i}.txt");
+            assert!(
+                backend
+                    .create_or_open(&OpsPath::new(gone_name.as_bytes()), Disposition::Open)
+                    .is_err(),
+                "deleted file {gone_name} must never be resurrected by read_dir cache!"
+            );
+        }
+    }
+}
+
+#[test]
+fn r2_3_r2_4_r2_5_dirty_authority_dedup_guard_cleanup_flush_and_mount_reconcile() {
+    let tmp = TempDir::new("r2_3_4_5_dirty_authority");
+    let store = DedupStore::init(tmp.0.join("store"), StoreConfig::default()).unwrap();
+    store.create_workspace("ws").unwrap();
+    let backend = std::sync::Arc::new(DedupWorkspaceBackend::open(store.clone(), "ws").unwrap());
+
+    let f = backend
+        .create_or_open(&OpsPath::new(b"/grow.bin"), Disposition::Create)
+        .unwrap();
+    // Write 10 KiB (buffered in dirty_inodes, DB still has size=0).
+    let initial = vec![0xAAu8; 10_240];
+    backend.write(f.file_id, 0, &initial).unwrap();
+    assert!(backend.is_file_dirty(f.file_id));
+
+    // 1. R2-3: Even if inode_cache loses the entry, `get_info`, `read_into`, and slow-path
+    //    `write(offset=0, small)` MUST consult `dirty_inodes` and NEVER regress size!
+    store.invalidate_inode(backend.ws_id(), f.file_id);
+    assert_eq!(backend.get_info(f.file_id).unwrap().size, 10_240);
+
+    store.invalidate_inode(backend.ws_id(), f.file_id);
+    let mut rbuf = vec![0u8; 10_240];
+    assert_eq!(backend.read_into(f.file_id, 0, &mut rbuf).unwrap(), 10_240);
+    assert_eq!(rbuf, initial);
+
+    // Slow-path overwrite of first 16 bytes when cache is cold must preserve full 10_240 size!
+    store.invalidate_inode(backend.ws_id(), f.file_id);
+    backend.write(f.file_id, 0, b"0123456789ABCDEF").unwrap();
+    assert_eq!(backend.get_info(f.file_id).unwrap().size, 10_240);
+
+    // Concurrent appending writes + `read_dir_with_info` must never cause size regression.
+    let root_id = backend.open_dir(&OpsPath::new(b"/")).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::scope(|s| {
+        let b1 = backend.clone();
+        let st = stop.clone();
+        let reader = s.spawn(move || {
+            while !st.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = b1.read_dir_with_info(root_id).unwrap();
+            }
+        });
+        for i in 0..50u64 {
+            let off = 10_240 + i * 512;
+            backend.write(f.file_id, off, &[0xBBu8; 512]).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+    });
+    let expected_size = 10_240 + 50 * 512;
+    assert_eq!(backend.get_info(f.file_id).unwrap().size, expected_size);
+
+    // 2. R2-4: Same-size dirty overwrite after flush must be skipped by dedup when `is_busy`
+    //    checks `is_file_dirty`, and `on_cleanup` must persist it so subsequent dedup stores NEW data!
+    backend.flush().unwrap();
+    assert!(!backend.is_file_dirty(f.file_id));
+    backend.write(f.file_id, 0, b"NEW_HEADER_16B!!").unwrap();
+    assert!(backend.is_file_dirty(f.file_id));
+
+    let skipped = store
+        .dedup_workspace(Some("ws"), 0, |_, id| backend.is_file_dirty(id))
+        .unwrap();
+    assert_eq!(skipped.skipped_busy, 1);
+    assert_eq!(skipped.deduped_files, 0);
+
+    // Simulating WinFsp Cleanup flushes the dirty inode immediately.
+    backend.on_cleanup(f.file_id).unwrap();
+    assert!(!backend.is_file_dirty(f.file_id));
+
+    let deduped = store
+        .dedup_workspace(Some("ws"), 0, |_, id| backend.is_file_dirty(id))
+        .unwrap();
+    assert_eq!(deduped.deduped_files, 1);
+    assert_eq!(
+        backend.read(f.file_id, 0, 16).unwrap(),
+        b"NEW_HEADER_16B!!"
+    );
+
+    // 3. R2-9: `flush_file` succeeds even when overlay handle was evicted from the pool.
+    let f2 = backend
+        .create_or_open(&OpsPath::new(b"/sync_evicted.bin"), Disposition::Create)
+        .unwrap();
+    backend.write(f2.file_id, 0, b"durable-after-evict").unwrap();
+    store.overlay().evict_handle(backend.ws_id(), f2.file_id);
+    backend.flush_file(f2.file_id).unwrap();
+    assert!(!backend.is_file_dirty(f2.file_id));
+
+    // 4. R2-5: Mount-time overlay reconcile recovers file size if SQLite lagged behind NTFS after a crash.
+    {
+        let conn = store.open_conn().unwrap();
+        conn.execute(
+            "UPDATE inodes SET size = 0 WHERE ws_id = ?1 AND inode_id = ?2",
+            rusqlite::params![backend.ws_id() as i64, f2.file_id as i64],
+        )
+        .unwrap();
+    }
+    store.invalidate_inode(backend.ws_id(), f2.file_id);
+    let reopened = DedupWorkspaceBackend::open(store.clone(), "ws").unwrap();
+    assert_eq!(
+        reopened.get_info(f2.file_id).unwrap().size,
+        b"durable-after-evict".len() as u64
+    );
+}

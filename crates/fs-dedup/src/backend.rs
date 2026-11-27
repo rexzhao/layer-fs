@@ -29,7 +29,7 @@ use fs_winfsp::ops::{
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const MAX_RO_CONNS: usize = 16;
@@ -96,29 +96,54 @@ struct CachedDir {
     /// `true` when `read_dir` has loaded the complete directory listing into `entries`,
     /// enabling O(1) negative lookups without hitting SQLite.
     complete: bool,
+    /// Monotonic generation bumped on every mutation to this directory so concurrent `read_dir`
+    /// never overwrites newer mutations or sets `complete = true` from a stale snapshot.
+    generation: u64,
+    /// CLOCK reference bit so hot directories (`/`, `Assets/`) survive partial shard eviction.
+    referenced: AtomicBool,
 }
 
 #[derive(Default)]
 struct DentryShardMap {
     dirs: HashMap<u64, CachedDir>,
     total: usize,
+    /// Shard-wide mutation counter bumped on every create/mkdir/remove/rename in this shard so
+    /// `read_dir` detects concurrent mutations even for directories not yet in `dirs`.
+    mut_gen: u64,
 }
 
 impl DentryShardMap {
-    /// Evicts ~25% of cached entries by removing whole directories (preserving `complete`
-    /// invariants on all surviving directories) instead of clearing the entire shard.
+    /// Two-pass CLOCK eviction: removes ~25% of cold cached entries by whole directory
+    /// (giving recently accessed directories a second chance and preserving `complete` invariants).
     fn evict_quarter(&mut self, protect_dir: u64) {
         let target = (self.total / 4).max(1);
         let mut freed = 0usize;
         let mut to_remove = Vec::new();
+        // Pass 1: evict cold directories, clear ref bit on hot ones.
         for (&dir_id, dir) in &self.dirs {
             if dir_id == protect_dir {
+                continue;
+            }
+            if dir.referenced.swap(false, Ordering::Relaxed) {
                 continue;
             }
             to_remove.push(dir_id);
             freed += dir.entries.len().max(1);
             if freed >= target {
                 break;
+            }
+        }
+        // Pass 2: if everything was hot, evict remaining needed directories.
+        if freed < target {
+            for (&dir_id, dir) in &self.dirs {
+                if dir_id == protect_dir || to_remove.contains(&dir_id) {
+                    continue;
+                }
+                to_remove.push(dir_id);
+                freed += dir.entries.len().max(1);
+                if freed >= target {
+                    break;
+                }
             }
         }
         for dir_id in to_remove {
@@ -142,10 +167,12 @@ pub struct DedupWorkspaceBackend {
     write_conn: Mutex<Connection>,
     /// Concurrent read-only WAL SQLite connection pool (used for all read/stat/list/open paths).
     ro_pool: RoConnPool,
-    /// Sharded positive & negative `(parent_id -> {folded_name -> DentryVal, complete})` cache.
+    /// Sharded positive & negative `(parent_id -> {folded_name -> DentryVal, complete, generation})` cache.
     dentry_cache: Vec<DentryShard>,
-    /// Buffered dirty overlay `(size, written_ns)` updates flushed lazily on `flush` / `flush_file` / mutations.
+    /// Authoritative buffered overlay `(size, written_ns)` updates not yet persisted to SQLite.
     dirty_inodes: Mutex<HashMap<u64, (u64, i64)>>,
+    /// Lock-free count of entries in `dirty_inodes` so clean read paths avoid locking the mutex.
+    dirty_count: AtomicUsize,
     next_inode: AtomicU64,
 }
 
@@ -155,11 +182,55 @@ impl Drop for DedupWorkspaceBackend {
     }
 }
 
+/// Reconciles on-disk sparse overlay file sizes against SQLite on workspace open so that after
+/// a crash/power-loss, any buffered overlay writes whose `size` hadn't reached SQLite are
+/// automatically recovered instead of appearing truncated.
+fn reconcile_overlay_sizes(conn: &mut Connection, store: &DedupStore, ws_id: u64) -> crate::Result<()> {
+    let mut mismatched: Vec<(u64, u64)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT inode_id, size FROM inodes WHERE ws_id = ?1 AND kind = ?2 AND storage_mode = ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![ws_id as i64, i64::from(KIND_FILE), i64::from(STORAGE_OVERLAY)],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+        )?;
+        for row in rows {
+            let (inode_id, db_size) = row?;
+            if let Some(disk_len) = store.overlay().file_len_if_exists(ws_id, inode_id) {
+                if disk_len != db_size {
+                    mismatched.push((inode_id, disk_len));
+                }
+            }
+        }
+    }
+    if !mismatched.is_empty() {
+        let tx = conn.transaction()?;
+        {
+            let mut upd = tx.prepare_cached(
+                "UPDATE inodes SET size = ?1 WHERE ws_id = ?2 AND inode_id = ?3 AND storage_mode = ?4",
+            )?;
+            for (inode_id, disk_len) in mismatched {
+                upd.execute(params![
+                    disk_len as i64,
+                    ws_id as i64,
+                    inode_id as i64,
+                    i64::from(STORAGE_OVERLAY)
+                ])?;
+            }
+        }
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 impl DedupWorkspaceBackend {
-    /// Opens `ws_name` in `store` for live WinFsp serving.
+    /// Opens `ws_name` in `store` for live WinFsp serving, reconciling any un-flushed overlay
+    /// file sizes left over from a prior unclean shutdown.
     pub fn open(store: Arc<DedupStore>, ws_name: &str) -> crate::Result<Self> {
-        let conn = store.open_conn()?;
+        let mut conn = store.open_conn()?;
         let ws_id = find_workspace_id(&conn, ws_name)?;
+        reconcile_overlay_sizes(&mut conn, &store, ws_id)?;
         let next_inode: i64 = conn.query_row(
             "SELECT next_inode FROM workspaces WHERE ws_id = ?1",
             params![ws_id as i64],
@@ -177,6 +248,7 @@ impl DedupWorkspaceBackend {
             ro_pool,
             dentry_cache,
             dirty_inodes: Mutex::new(HashMap::new()),
+            dirty_count: AtomicUsize::new(0),
             next_inode: AtomicU64::new(next_inode.max((ROOT_INODE + 1) as i64) as u64),
         })
     }
@@ -208,13 +280,57 @@ impl DedupWorkspaceBackend {
         &self.dentry_cache[(parent_id as usize) & (DENTRY_SHARDS - 1)]
     }
 
-    fn cache_dentry(&self, parent_id: u64, folded: Vec<u8>, val: DentryVal) {
+    /// Inserts/updates a dentry caused by a namespace mutation (`create`, `mkdir`, `rename`)
+    /// and bumps both the shard and directory generation counters so any in-flight `read_dir`
+    /// cannot clobber this mutation or mark a stale snapshot `complete = true`.
+    fn cache_dentry_mutation(&self, parent_id: u64, folded: Vec<u8>, val: DentryVal) {
         let mut guard = self.dentry_shard(parent_id).write().unwrap();
         if guard.total >= MAX_DENTRY_PER_SHARD {
             guard.evict_quarter(parent_id);
         }
+        guard.mut_gen = guard.mut_gen.wrapping_add(1);
+        let new_gen = guard.mut_gen;
         let added = {
             let dir = guard.dirs.entry(parent_id).or_default();
+            dir.generation = new_gen;
+            dir.referenced.store(true, Ordering::Relaxed);
+            dir.entries.insert(folded.into_boxed_slice(), val).is_none()
+        };
+        if added {
+            guard.total += 1;
+        }
+    }
+
+    /// Inserts a dentry discovered by a read-only SQLite lookup, ONLY if no concurrent mutation
+    /// occurred in this directory/shard since the lookup started.
+    fn cache_dentry_if_unchanged(
+        &self,
+        parent_id: u64,
+        folded: Vec<u8>,
+        val: DentryVal,
+        start_dir_gen: Option<u64>,
+        start_shard_gen: u64,
+    ) {
+        let mut guard = self.dentry_shard(parent_id).write().unwrap();
+        let mutated = match start_dir_gen {
+            Some(g) => guard.dirs.get(&parent_id).map(|d| d.generation) != Some(g),
+            None => guard.mut_gen != start_shard_gen,
+        };
+        if mutated {
+            return;
+        }
+        if guard.total >= MAX_DENTRY_PER_SHARD {
+            guard.evict_quarter(parent_id);
+        }
+        let gen = start_dir_gen.unwrap_or(start_shard_gen);
+        let added = {
+            let dir = guard.dirs.entry(parent_id).or_insert_with(|| CachedDir {
+                entries: HashMap::new(),
+                complete: false,
+                generation: gen,
+                referenced: AtomicBool::new(true),
+            });
+            dir.referenced.store(true, Ordering::Relaxed);
             dir.entries.insert(folded.into_boxed_slice(), val).is_none()
         };
         if added {
@@ -224,10 +340,14 @@ impl DedupWorkspaceBackend {
 
     fn invalidate_dentry(&self, parent_id: u64, folded: &[u8]) {
         let mut guard = self.dentry_shard(parent_id).write().unwrap();
-        let removed = guard
-            .dirs
-            .get_mut(&parent_id)
-            .is_some_and(|dir| dir.entries.remove(folded).is_some());
+        guard.mut_gen = guard.mut_gen.wrapping_add(1);
+        let new_gen = guard.mut_gen;
+        let removed = if let Some(dir) = guard.dirs.get_mut(&parent_id) {
+            dir.generation = new_gen;
+            dir.entries.remove(folded).is_some()
+        } else {
+            false
+        };
         if removed {
             guard.total = guard.total.saturating_sub(1);
         }
@@ -241,20 +361,30 @@ impl DedupWorkspaceBackend {
         parent_id: u64,
         folded: &[u8],
     ) -> OpsResult<Option<DentryVal>> {
-        {
+        let (start_dir_gen, start_shard_gen) = {
             let guard = self.dentry_shard(parent_id).read().unwrap();
             if let Some(dir) = guard.dirs.get(&parent_id) {
+                dir.referenced.store(true, Ordering::Relaxed);
                 if let Some(hit) = dir.entries.get(folded) {
                     return Ok(Some(hit.clone()));
                 }
                 if dir.complete {
                     return Ok(None);
                 }
+                (Some(dir.generation), guard.mut_gen)
+            } else {
+                (None, guard.mut_gen)
             }
-        }
+        };
         let found = self.lookup_child_db(conn, parent_id, folded)?;
         if let Some(val) = &found {
-            self.cache_dentry(parent_id, folded.to_vec(), val.clone());
+            self.cache_dentry_if_unchanged(
+                parent_id,
+                folded.to_vec(),
+                val.clone(),
+                start_dir_gen,
+                start_shard_gen,
+            );
         }
         Ok(found)
     }
@@ -281,51 +411,137 @@ impl DedupWorkspaceBackend {
         .map_err(map_sql)
     }
 
+    #[inline]
+    fn set_dirty(&self, inode_id: u64, size: u64, ts: i64) -> usize {
+        let mut guard = self.dirty_inodes.lock().unwrap();
+        guard.insert(inode_id, (size, ts));
+        let len = guard.len();
+        self.dirty_count.store(len, Ordering::Release);
+        len
+    }
+
+    #[inline]
+    fn clear_dirty(&self, inode_id: u64) {
+        if self.dirty_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut guard = self.dirty_inodes.lock().unwrap();
+        if guard.remove(&inode_id).is_some() {
+            self.dirty_count.store(guard.len(), Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn get_dirty(&self, inode_id: u64) -> Option<(u64, i64)> {
+        if self.dirty_count.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.dirty_inodes.lock().unwrap().get(&inode_id).copied()
+    }
+
+    /// Returns `true` when `inode_id` has unflushed buffered write metadata in memory.
+    pub fn is_dirty(&self, inode_id: u64) -> bool {
+        self.get_dirty(inode_id).is_some()
+    }
+
     /// Flushes a single inode's buffered dirty `(size, written_ns)` to SQLite if pending.
+    /// Keeps the entry visible in `dirty_inodes` until AFTER SQLite commits so concurrent
+    /// readers never observe stale DB values during the flush window.
     fn flush_dirty_inode(&self, inode_id: u64) -> OpsResult<()> {
-        let pending = self.dirty_inodes.lock().unwrap().remove(&inode_id);
-        if let Some((size, ts)) = pending {
+        let Some((size, ts)) = self.get_dirty(inode_id) else {
+            return Ok(());
+        };
+        {
             let conn = self.write_conn.lock().unwrap();
             let mut stmt = conn
                 .prepare_cached(
                     "UPDATE inodes SET size = ?1, written_ns = ?2, changed_ns = ?2, dirty_since_ns = ?2
-                     WHERE ws_id = ?3 AND inode_id = ?4",
+                     WHERE ws_id = ?3 AND inode_id = ?4 AND storage_mode = ?5",
                 )
                 .map_err(map_sql)?;
-            stmt.execute(params![size as i64, ts, self.ws_id as i64, inode_id as i64])
-                .map_err(map_sql)?;
+            stmt.execute(params![
+                size as i64,
+                ts,
+                self.ws_id as i64,
+                inode_id as i64,
+                i64::from(STORAGE_OVERLAY),
+            ])
+            .map_err(map_sql)?;
+        }
+        let cleaned = {
+            let mut guard = self.dirty_inodes.lock().unwrap();
+            if guard.get(&inode_id) == Some(&(size, ts)) {
+                guard.remove(&inode_id);
+                self.dirty_count.store(guard.len(), Ordering::Release);
+                true
+            } else {
+                false
+            }
+        };
+        if cleaned {
+            self.store.clear_inode_dirty(self.ws_id, inode_id, size, ts);
         }
         Ok(())
     }
 
     /// Flushes all buffered dirty overlay metadata updates in one batched SQLite transaction.
+    /// Entries remain in `dirty_inodes` until AFTER commit; any inode written concurrently during
+    /// commit retains its newer dirty entry and stays marked dirty.
     fn flush_all_dirty(&self) -> OpsResult<()> {
-        let drained: Vec<(u64, (u64, i64))> = {
-            let mut guard = self.dirty_inodes.lock().unwrap();
+        if self.dirty_count.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        let snapshot: Vec<(u64, (u64, i64))> = {
+            let guard = self.dirty_inodes.lock().unwrap();
             if guard.is_empty() {
                 return Ok(());
             }
-            guard.drain().collect()
+            guard.iter().map(|(&id, &v)| (id, v)).collect()
         };
-        let mut conn = self.write_conn.lock().unwrap();
-        let tx = conn.transaction().map_err(map_sql)?;
         {
-            let mut stmt = tx
-                .prepare_cached(
-                    "UPDATE inodes SET size = ?1, written_ns = ?2, changed_ns = ?2, dirty_since_ns = ?2
-                     WHERE ws_id = ?3 AND inode_id = ?4",
-                )
-                .map_err(map_sql)?;
-            for (inode_id, (size, ts)) in drained {
-                stmt.execute(params![size as i64, ts, self.ws_id as i64, inode_id as i64])
+            let mut conn = self.write_conn.lock().unwrap();
+            let tx = conn.transaction().map_err(map_sql)?;
+            {
+                let mut stmt = tx
+                    .prepare_cached(
+                        "UPDATE inodes SET size = ?1, written_ns = ?2, changed_ns = ?2, dirty_since_ns = ?2
+                         WHERE ws_id = ?3 AND inode_id = ?4 AND storage_mode = ?5",
+                    )
                     .map_err(map_sql)?;
+                for &(inode_id, (size, ts)) in &snapshot {
+                    stmt.execute(params![
+                        size as i64,
+                        ts,
+                        self.ws_id as i64,
+                        inode_id as i64,
+                        i64::from(STORAGE_OVERLAY),
+                    ])
+                    .map_err(map_sql)?;
+                }
             }
+            tx.commit().map_err(map_sql)?;
         }
-        tx.commit().map_err(map_sql)?;
+        let mut cleaned = Vec::new();
+        {
+            let mut guard = self.dirty_inodes.lock().unwrap();
+            for &(inode_id, (size, ts)) in &snapshot {
+                if guard.get(&inode_id) == Some(&(size, ts)) {
+                    guard.remove(&inode_id);
+                    cleaned.push((inode_id, size, ts));
+                }
+            }
+            self.dirty_count.store(guard.len(), Ordering::Release);
+        }
+        for (inode_id, size, ts) in cleaned {
+            self.store.clear_inode_dirty(self.ws_id, inode_id, size, ts);
+        }
         Ok(())
     }
 
     fn dirty_snapshot(&self) -> Option<HashMap<u64, (u64, i64)>> {
+        if self.dirty_count.load(Ordering::Acquire) == 0 {
+            return None;
+        }
         let guard = self.dirty_inodes.lock().unwrap();
         if guard.is_empty() {
             None
@@ -334,7 +550,8 @@ impl DedupWorkspaceBackend {
         }
     }
 
-    /// Loads an inode via `DedupStore`'s sharded RAM cache, falling back to `conn`.
+    /// Loads an inode via `DedupStore`'s sharded RAM cache, falling back to `conn` and overlaying
+    /// any authoritative buffered `dirty_inodes` state.
     fn load_inode_cached(&self, conn: &Connection, inode_id: u64) -> OpsResult<Option<Arc<CachedInode>>> {
         if let Some(hit) = self.store.get_cached_inode(self.ws_id, inode_id) {
             return Ok(Some(hit));
@@ -342,9 +559,17 @@ impl DedupWorkspaceBackend {
         let Some(row) = load_inode(conn, self.ws_id, inode_id).map_err(map_err)? else {
             return Ok(None);
         };
-        let cached = Arc::new(CachedInode::from_row(&row).map_err(map_err)?);
-        self.store.put_cached_inode(self.ws_id, Arc::clone(&cached));
-        Ok(Some(cached))
+        let mut cached = CachedInode::from_row(&row).map_err(map_err)?;
+        if let Some((d_size, d_ts)) = self.get_dirty(inode_id) {
+            cached.size = d_size;
+            cached.written_ns = d_ts;
+            cached.changed_ns = d_ts;
+            cached.storage_mode = STORAGE_OVERLAY;
+            cached.dirty = true;
+        }
+        let arc = Arc::new(cached);
+        self.store.put_cached_inode(self.ws_id, Arc::clone(&arc));
+        Ok(Some(arc))
     }
 
     /// Splits a normalized WinFsp `Path` into `(parent_dir_id, leaf_display, leaf_folded)`.
@@ -484,7 +709,14 @@ impl DedupWorkspaceBackend {
             return Err(OpsError::NotADirectory);
         }
 
-        let dirty = self.dirty_snapshot();
+        // Record directory & shard mutation generations BEFORE running SQLite SELECT so any
+        // concurrent create/mkdir/remove/rename invalidates negative-cache promotion.
+        let (start_dir_gen, start_shard_gen) = {
+            let guard = self.dentry_shard(dir_id).read().unwrap();
+            let dg = guard.dirs.get(&dir_id).map(|d| d.generation);
+            (dg, guard.mut_gen)
+        };
+
         let mut stmt = conn
             .prepare_cached(
                 "SELECT d.folded_name, d.display_name, d.kind, d.child_id,
@@ -513,29 +745,39 @@ impl DedupWorkspaceBackend {
             })
             .map_err(map_sql)?;
 
-        let mut out = Vec::new();
-        let mut new_dentries = Vec::new();
-        let mut new_inodes = Vec::new();
+        let mut raw_rows = Vec::new();
         for row in rows {
-            let (
-                folded,
-                name,
-                kind_u8,
-                child_id,
-                mut size,
-                attributes,
-                created_ns,
-                accessed_ns,
-                mut written_ns,
-                mut changed_ns,
-                storage_mode,
-            ) = row.map_err(map_sql)?;
+            raw_rows.push(row.map_err(map_sql)?);
+        }
 
+        // Take dirty overlay snapshot AFTER SQLite query finishes so it is at least as fresh as DB.
+        let dirty = self.dirty_snapshot();
+
+        let mut out = Vec::with_capacity(raw_rows.len());
+        let mut new_dentries = Vec::with_capacity(raw_rows.len());
+        let mut new_inodes = Vec::with_capacity(raw_rows.len());
+        for (
+            folded,
+            name,
+            kind_u8,
+            child_id,
+            mut size,
+            attributes,
+            created_ns,
+            accessed_ns,
+            mut written_ns,
+            mut changed_ns,
+            mut storage_mode,
+        ) in raw_rows
+        {
+            let mut is_dirty = false;
             if let Some(ref dirty_map) = dirty {
                 if let Some(&(d_size, d_ts)) = dirty_map.get(&child_id) {
                     size = d_size;
                     written_ns = d_ts;
                     changed_ns = d_ts;
+                    storage_mode = STORAGE_OVERLAY;
+                    is_dirty = true;
                 }
             }
 
@@ -551,35 +793,47 @@ impl DedupWorkspaceBackend {
                 storage_mode,
                 entries: None,
                 chunk_offsets: None,
+                dirty: is_dirty,
             };
             let info = cached_to_node_info(&cached_inode);
             new_inodes.push(cached_inode);
             new_dentries.push((folded, (child_id, kind_u8, name.clone())));
             out.push((name, kind_u8, info));
         }
+        // Note: `put_cached_inodes_preserve_manifest` skips any `prev.dirty == true` entries,
+        // so writes racing after `dirty_snapshot()` can never be overwritten with stale sizes.
         self.store
             .put_cached_inodes_preserve_manifest(self.ws_id, new_inodes);
 
-        // Populate directory cache and mark `complete = true` for O(1) negative lookups!
+        // Populate directory cache and mark `complete = true` ONLY if no concurrent mutation
+        // occurred in this directory/shard while our SQLite snapshot was running!
         {
             let mut guard = self.dentry_shard(dir_id).write().unwrap();
-            if guard.total.saturating_add(new_dentries.len()) >= MAX_DENTRY_PER_SHARD {
-                guard.evict_quarter(dir_id);
+            let mutated = match start_dir_gen {
+                Some(g) => guard.dirs.get(&dir_id).map(|d| d.generation) != Some(g),
+                None => guard.mut_gen != start_shard_gen,
+            };
+            if !mutated {
+                if guard.total.saturating_add(new_dentries.len()) >= MAX_DENTRY_PER_SHARD {
+                    guard.evict_quarter(dir_id);
+                }
+                let prev_len = guard.dirs.get(&dir_id).map_or(0, |d| d.entries.len());
+                let mut map = HashMap::with_capacity(new_dentries.len());
+                for (folded, val) in new_dentries {
+                    map.insert(folded.into_boxed_slice(), val);
+                }
+                let new_len = map.len();
+                guard.dirs.insert(
+                    dir_id,
+                    CachedDir {
+                        entries: map,
+                        complete: true,
+                        generation: start_dir_gen.unwrap_or(start_shard_gen),
+                        referenced: AtomicBool::new(true),
+                    },
+                );
+                guard.total = guard.total.saturating_sub(prev_len) + new_len;
             }
-            let prev_len = guard.dirs.get(&dir_id).map_or(0, |d| d.entries.len());
-            let mut map = HashMap::with_capacity(new_dentries.len());
-            for (folded, val) in new_dentries {
-                map.insert(folded.into_boxed_slice(), val);
-            }
-            let new_len = map.len();
-            guard.dirs.insert(
-                dir_id,
-                CachedDir {
-                    entries: map,
-                    complete: true,
-                },
-            );
-            guard.total = guard.total.saturating_sub(prev_len) + new_len;
         }
         Ok(out)
     }
@@ -687,183 +941,216 @@ impl WorkspaceOps for DedupWorkspaceBackend {
             });
         }
 
-        // Mutating or potentially-creating dispositions serialize cleanly on `write_conn`.
-        let mut conn = self.write_conn.lock().unwrap();
-        let Some((parent_id, leaf_disp, leaf_fold)) = self.resolve_parent(&conn, path)? else {
-            return match decide(disposition, Exists::Directory) {
-                Outcome::Failed(fail) => Err(map_failure(fail)),
-                Outcome::Opened(_) => Err(OpsError::NotADirectory),
-            };
-        };
-        let existing = self.lookup_child_db(&conn, parent_id, &leaf_fold)?;
-        let exists = match &existing {
-            None => Exists::Absent,
-            Some((_, kind, _)) if *kind == KIND_DIR => Exists::Directory,
-            Some(_) => Exists::File,
-        };
-        let action = match decide(disposition, exists) {
-            Outcome::Opened(act) => act,
-            Outcome::Failed(fail) => return Err(map_failure(fail)),
-        };
-
-        match action {
-            Action::CreateNew => {
-                let ts = now_ns();
-                let pinned = std::str::from_utf8(&leaf_disp)
-                    .map(is_hot_db_name)
-                    .unwrap_or(false);
-                let tx = conn.transaction().map_err(map_sql)?;
-                let inode_id = self.alloc_inode(&tx)?;
-                tx.execute(
-                    "INSERT INTO inodes (ws_id, inode_id, kind, size, attributes, created_ns, accessed_ns, written_ns, changed_ns, storage_mode, manifest, dirty_since_ns, pinned_overlay)
-                     VALUES (?1, ?2, ?3, 0, 0, ?4, ?4, ?4, ?4, ?5, X'', ?4, ?6)",
-                    params![
-                        self.ws_id as i64,
-                        inode_id as i64,
-                        i64::from(KIND_FILE),
-                        ts,
-                        i64::from(STORAGE_OVERLAY),
-                        i64::from(pinned),
-                    ],
-                )
-                .map_err(map_sql)?;
-                tx.execute(
-                    "INSERT INTO dentries (ws_id, parent_id, folded_name, display_name, child_id, kind)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        self.ws_id as i64,
-                        parent_id as i64,
-                        leaf_fold.as_slice(),
-                        leaf_disp.as_slice(),
-                        inode_id as i64,
-                        i64::from(KIND_FILE),
-                    ],
-                )
-                .map_err(map_sql)?;
-                tx.commit().map_err(map_sql)?;
-                self.store
-                    .overlay()
-                    .create_empty(self.ws_id, inode_id)
-                    .map_err(map_err)?;
-
-                self.cache_dentry(parent_id, leaf_fold, (inode_id, KIND_FILE, leaf_disp.clone()));
-                self.store.put_cached_inode(
-                    self.ws_id,
-                    Arc::new(CachedInode {
-                        inode_id,
-                        kind: KIND_FILE,
-                        size: 0,
-                        attributes: 0,
-                        created_ns: ts,
-                        accessed_ns: ts,
-                        written_ns: ts,
-                        changed_ns: ts,
-                        storage_mode: STORAGE_OVERLAY,
-                        entries: Some(Arc::from(Vec::new().into_boxed_slice())),
-                        chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
-                    }),
-                );
-
-                Ok(OpenOutcome {
-                    file_id: inode_id,
-                    kind: Kind::File,
-                    action: Action::CreateNew,
-                    size: 0,
-                    times: Times {
-                        created: ts,
-                        accessed: ts,
-                        written: ts,
-                        changed: ts,
-                    },
-                    attributes: Attributes(report_attributes(false, 0)),
-                    binding: (parent_id, leaf_disp),
-                    replaced: None,
-                })
+        // For dispositions that may truncate an existing file, probe `child_id` via `ro_pool`
+        // BEFORE acquiring `write_conn` so we ALWAYS obey the global lock order:
+        // `store.lock_inode(ws_id, id)` -> `write_conn`.
+        let mut pre_lock_id: Option<u64> = if matches!(
+            disposition,
+            Disposition::Overwrite | Disposition::Supersede | Disposition::OverwriteIf
+        ) {
+            let ro_conn = self.ro_pool.get()?;
+            match self.resolve_parent(&ro_conn, path) {
+                Ok(Some((parent_id, _, leaf_fold))) => self
+                    .lookup_child_cached(&ro_conn, parent_id, &leaf_fold)?
+                    .and_then(|(cid, kind, _)| (kind == KIND_FILE).then_some(cid)),
+                _ => None,
             }
-            Action::Open => {
-                let (child_id, _, stored_name) = existing.unwrap();
-                let row = self
-                    .load_inode_cached(&conn, child_id)?
-                    .ok_or(OpsError::NotFound)?;
-                let info = cached_to_node_info(&row);
-                Ok(OpenOutcome {
-                    file_id: info.file_id,
-                    kind: info.kind,
-                    action: Action::Open,
-                    size: info.size,
-                    times: info.times,
-                    attributes: info.attributes,
-                    binding: (parent_id, stored_name),
-                    replaced: None,
-                })
-            }
-            Action::TruncateExisting => {
-                let (child_id, _, stored_name) = existing.unwrap();
-                let _lock = self.store.lock_inode(self.ws_id, child_id);
-                let row = load_inode(&conn, self.ws_id, child_id)
-                    .map_err(map_err)?
-                    .ok_or(OpsError::NotFound)?;
-                let ts = now_ns();
-                let tx = conn.transaction().map_err(map_sql)?;
-                if row.storage_mode == STORAGE_CHUNKS && !row.manifest.is_empty() {
-                    release_manifest_chunks(&tx, &row.manifest).map_err(map_err)?;
-                }
-                let new_attrs = if disposition == Disposition::Supersede {
-                    0u32
-                } else {
-                    row.attributes
+        } else {
+            None
+        };
+
+        loop {
+            let _inode_lock = pre_lock_id.map(|id| self.store.lock_inode(self.ws_id, id));
+            let mut conn = self.write_conn.lock().unwrap();
+            let Some((parent_id, leaf_disp, leaf_fold)) = self.resolve_parent(&conn, path)? else {
+                return match decide(disposition, Exists::Directory) {
+                    Outcome::Failed(fail) => Err(map_failure(fail)),
+                    Outcome::Opened(_) => Err(OpsError::NotADirectory),
                 };
-                tx.execute(
-                    "UPDATE inodes SET size = 0, attributes = ?1, written_ns = ?2, changed_ns = ?2,
-                                       storage_mode = ?3, manifest = X'', dirty_since_ns = ?2
-                     WHERE ws_id = ?4 AND inode_id = ?5",
-                    params![
-                        i64::from(new_attrs),
-                        ts,
-                        i64::from(STORAGE_OVERLAY),
-                        self.ws_id as i64,
-                        child_id as i64,
-                    ],
-                )
-                .map_err(map_sql)?;
-                tx.commit().map_err(map_sql)?;
-                self.store
-                    .overlay()
-                    .create_empty(self.ws_id, child_id)
-                    .map_err(map_err)?;
-                self.dirty_inodes.lock().unwrap().remove(&child_id);
-                self.store.put_cached_inode(
-                    self.ws_id,
-                    Arc::new(CachedInode {
-                        inode_id: child_id,
-                        kind: KIND_FILE,
-                        size: 0,
-                        attributes: new_attrs,
-                        created_ns: row.created_ns,
-                        accessed_ns: row.accessed_ns,
-                        written_ns: ts,
-                        changed_ns: ts,
-                        storage_mode: STORAGE_OVERLAY,
-                        entries: Some(Arc::from(Vec::new().into_boxed_slice())),
-                        chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
-                    }),
-                );
+            };
+            let existing = self.lookup_child_db(&conn, parent_id, &leaf_fold)?;
+            let exists = match &existing {
+                None => Exists::Absent,
+                Some((_, kind, _)) if *kind == KIND_DIR => Exists::Directory,
+                Some(_) => Exists::File,
+            };
+            let action = match decide(disposition, exists) {
+                Outcome::Opened(act) => act,
+                Outcome::Failed(fail) => return Err(map_failure(fail)),
+            };
 
-                Ok(OpenOutcome {
-                    file_id: child_id,
-                    kind: Kind::File,
-                    action: Action::TruncateExisting,
-                    size: 0,
-                    times: Times {
-                        created: row.created_ns,
-                        accessed: row.accessed_ns,
-                        written: ts,
-                        changed: ts,
-                    },
-                    attributes: Attributes(report_attributes(false, new_attrs)),
-                    binding: (parent_id, stored_name),
-                    replaced: None,
-                })
+            match action {
+                Action::CreateNew => {
+                    let ts = now_ns();
+                    let pinned = std::str::from_utf8(&leaf_disp)
+                        .map(is_hot_db_name)
+                        .unwrap_or(false);
+                    let tx = conn.transaction().map_err(map_sql)?;
+                    let inode_id = self.alloc_inode(&tx)?;
+                    tx.execute(
+                        "INSERT INTO inodes (ws_id, inode_id, kind, size, attributes, created_ns, accessed_ns, written_ns, changed_ns, storage_mode, manifest, dirty_since_ns, pinned_overlay)
+                         VALUES (?1, ?2, ?3, 0, 0, ?4, ?4, ?4, ?4, ?5, X'', ?4, ?6)",
+                        params![
+                            self.ws_id as i64,
+                            inode_id as i64,
+                            i64::from(KIND_FILE),
+                            ts,
+                            i64::from(STORAGE_OVERLAY),
+                            i64::from(pinned),
+                        ],
+                    )
+                    .map_err(map_sql)?;
+                    tx.execute(
+                        "INSERT INTO dentries (ws_id, parent_id, folded_name, display_name, child_id, kind)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            self.ws_id as i64,
+                            parent_id as i64,
+                            leaf_fold.as_slice(),
+                            leaf_disp.as_slice(),
+                            inode_id as i64,
+                            i64::from(KIND_FILE),
+                        ],
+                    )
+                    .map_err(map_sql)?;
+                    tx.commit().map_err(map_sql)?;
+                    self.store
+                        .overlay()
+                        .create_empty(self.ws_id, inode_id)
+                        .map_err(map_err)?;
+
+                    self.cache_dentry_mutation(
+                        parent_id,
+                        leaf_fold,
+                        (inode_id, KIND_FILE, leaf_disp.clone()),
+                    );
+                    self.store.put_cached_inode(
+                        self.ws_id,
+                        Arc::new(CachedInode {
+                            inode_id,
+                            kind: KIND_FILE,
+                            size: 0,
+                            attributes: 0,
+                            created_ns: ts,
+                            accessed_ns: ts,
+                            written_ns: ts,
+                            changed_ns: ts,
+                            storage_mode: STORAGE_OVERLAY,
+                            entries: Some(Arc::from(Vec::new().into_boxed_slice())),
+                            chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
+                            dirty: false,
+                        }),
+                    );
+
+                    return Ok(OpenOutcome {
+                        file_id: inode_id,
+                        kind: Kind::File,
+                        action: Action::CreateNew,
+                        size: 0,
+                        times: Times {
+                            created: ts,
+                            accessed: ts,
+                            written: ts,
+                            changed: ts,
+                        },
+                        attributes: Attributes(report_attributes(false, 0)),
+                        binding: (parent_id, leaf_disp),
+                        replaced: None,
+                    });
+                }
+                Action::Open => {
+                    let (child_id, _, stored_name) = existing.unwrap();
+                    let row = self
+                        .load_inode_cached(&conn, child_id)?
+                        .ok_or(OpsError::NotFound)?;
+                    let info = cached_to_node_info(&row);
+                    return Ok(OpenOutcome {
+                        file_id: info.file_id,
+                        kind: info.kind,
+                        action: Action::Open,
+                        size: info.size,
+                        times: info.times,
+                        attributes: info.attributes,
+                        binding: (parent_id, stored_name),
+                        replaced: None,
+                    });
+                }
+                Action::TruncateExisting => {
+                    let (child_id, _, stored_name) = existing.unwrap();
+                    // If `child_id` changed (or wasn't pre-locked), drop `write_conn` FIRST and
+                    // retry so `lock_inode(child_id)` is ALWAYS acquired before `write_conn`!
+                    if pre_lock_id != Some(child_id) {
+                        drop(conn);
+                        drop(_inode_lock);
+                        pre_lock_id = Some(child_id);
+                        continue;
+                    }
+                    let row = load_inode(&conn, self.ws_id, child_id)
+                        .map_err(map_err)?
+                        .ok_or(OpsError::NotFound)?;
+                    let ts = now_ns();
+                    let tx = conn.transaction().map_err(map_sql)?;
+                    if row.storage_mode == STORAGE_CHUNKS && !row.manifest.is_empty() {
+                        release_manifest_chunks(&tx, &row.manifest).map_err(map_err)?;
+                    }
+                    let new_attrs = if disposition == Disposition::Supersede {
+                        0u32
+                    } else {
+                        row.attributes
+                    };
+                    tx.execute(
+                        "UPDATE inodes SET size = 0, attributes = ?1, written_ns = ?2, changed_ns = ?2,
+                                           storage_mode = ?3, manifest = X'', dirty_since_ns = ?2
+                         WHERE ws_id = ?4 AND inode_id = ?5",
+                        params![
+                            i64::from(new_attrs),
+                            ts,
+                            i64::from(STORAGE_OVERLAY),
+                            self.ws_id as i64,
+                            child_id as i64,
+                        ],
+                    )
+                    .map_err(map_sql)?;
+                    tx.commit().map_err(map_sql)?;
+                    self.store
+                        .overlay()
+                        .create_empty(self.ws_id, child_id)
+                        .map_err(map_err)?;
+                    self.clear_dirty(child_id);
+                    self.store.put_cached_inode(
+                        self.ws_id,
+                        Arc::new(CachedInode {
+                            inode_id: child_id,
+                            kind: KIND_FILE,
+                            size: 0,
+                            attributes: new_attrs,
+                            created_ns: row.created_ns,
+                            accessed_ns: row.accessed_ns,
+                            written_ns: ts,
+                            changed_ns: ts,
+                            storage_mode: STORAGE_OVERLAY,
+                            entries: Some(Arc::from(Vec::new().into_boxed_slice())),
+                            chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
+                            dirty: false,
+                        }),
+                    );
+
+                    return Ok(OpenOutcome {
+                        file_id: child_id,
+                        kind: Kind::File,
+                        action: Action::TruncateExisting,
+                        size: 0,
+                        times: Times {
+                            created: row.created_ns,
+                            accessed: row.accessed_ns,
+                            written: ts,
+                            changed: ts,
+                        },
+                        attributes: Attributes(report_attributes(false, new_attrs)),
+                        binding: (parent_id, stored_name),
+                        replaced: None,
+                    });
+                }
             }
         }
     }
@@ -905,7 +1192,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         )
         .map_err(map_sql)?;
         tx.commit().map_err(map_sql)?;
-        self.cache_dentry(parent_id, leaf_fold, (inode_id, KIND_DIR, leaf_disp));
+        self.cache_dentry_mutation(parent_id, leaf_fold, (inode_id, KIND_DIR, leaf_disp));
         self.store.put_cached_inode(
             self.ws_id,
             Arc::new(CachedInode {
@@ -920,6 +1207,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                 storage_mode: STORAGE_CHUNKS,
                 entries: Some(Arc::from(Vec::new().into_boxed_slice())),
                 chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
+                dirty: false,
             }),
         );
         Ok(inode_id)
@@ -982,7 +1270,15 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                     let Some(row) = load_inode(conn, self.ws_id, file_id).map_err(map_err)? else {
                         return Err(OpsError::NotFound);
                     };
-                    let full = Arc::new(CachedInode::from_row(&row).map_err(map_err)?);
+                    let mut full_val = CachedInode::from_row(&row).map_err(map_err)?;
+                    if let Some((d_size, d_ts)) = self.get_dirty(file_id) {
+                        full_val.size = d_size;
+                        full_val.written_ns = d_ts;
+                        full_val.changed_ns = d_ts;
+                        full_val.storage_mode = STORAGE_OVERLAY;
+                        full_val.dirty = true;
+                    }
+                    let full = Arc::new(full_val);
                     self.store.put_cached_inode(self.ws_id, Arc::clone(&full));
                     full
                 }
@@ -1090,14 +1386,11 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                         storage_mode: STORAGE_OVERLAY,
                         entries: hit.entries.clone(),
                         chunk_offsets: hit.chunk_offsets.clone(),
+                        dirty: true,
                     }),
                 );
-                let need_flush = {
-                    let mut dirty = self.dirty_inodes.lock().unwrap();
-                    dirty.insert(file_id, (new_len, ts));
-                    dirty.len() >= DIRTY_FLUSH_THRESHOLD
-                };
-                if need_flush {
+                let dirty_len = self.set_dirty(file_id, new_len, ts);
+                if dirty_len >= DIRTY_FLUSH_THRESHOLD {
                     let _ = self.flush_all_dirty();
                 }
                 return Ok(bytes.len());
@@ -1115,6 +1408,12 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         if row.kind == KIND_DIR {
             return Err(OpsError::IsADirectory);
         }
+        if let Some((d_size, d_ts)) = self.get_dirty(file_id) {
+            row.size = d_size;
+            row.written_ns = d_ts;
+            row.changed_ns = d_ts;
+            row.storage_mode = STORAGE_OVERLAY;
+        }
         let was_chunks = row.storage_mode == STORAGE_CHUNKS;
         if was_chunks {
             self.materialize_overlay_unlocked(&row, None)?;
@@ -1128,26 +1427,47 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         let ts = now_ns();
         if was_chunks {
             self.commit_overlay_flip(&mut row, new_len, ts)?;
+            self.clear_dirty(file_id);
+            self.store.put_cached_inode(
+                self.ws_id,
+                Arc::new(CachedInode {
+                    inode_id: file_id,
+                    kind: KIND_FILE,
+                    size: new_len,
+                    attributes: row.attributes,
+                    created_ns: row.created_ns,
+                    accessed_ns: row.accessed_ns,
+                    written_ns: ts,
+                    changed_ns: ts,
+                    storage_mode: STORAGE_OVERLAY,
+                    entries: Some(Arc::from(Vec::new().into_boxed_slice())),
+                    chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
+                    dirty: false,
+                }),
+            );
         } else {
-            let mut dirty = self.dirty_inodes.lock().unwrap();
-            dirty.insert(file_id, (new_len, ts));
+            self.store.put_cached_inode(
+                self.ws_id,
+                Arc::new(CachedInode {
+                    inode_id: file_id,
+                    kind: KIND_FILE,
+                    size: new_len,
+                    attributes: row.attributes,
+                    created_ns: row.created_ns,
+                    accessed_ns: row.accessed_ns,
+                    written_ns: ts,
+                    changed_ns: ts,
+                    storage_mode: STORAGE_OVERLAY,
+                    entries: Some(Arc::from(Vec::new().into_boxed_slice())),
+                    chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
+                    dirty: true,
+                }),
+            );
+            let dirty_len = self.set_dirty(file_id, new_len, ts);
+            if dirty_len >= DIRTY_FLUSH_THRESHOLD {
+                let _ = self.flush_all_dirty();
+            }
         }
-        self.store.put_cached_inode(
-            self.ws_id,
-            Arc::new(CachedInode {
-                inode_id: file_id,
-                kind: KIND_FILE,
-                size: new_len,
-                attributes: row.attributes,
-                created_ns: row.created_ns,
-                accessed_ns: row.accessed_ns,
-                written_ns: ts,
-                changed_ns: ts,
-                storage_mode: STORAGE_OVERLAY,
-                entries: Some(Arc::from(Vec::new().into_boxed_slice())),
-                chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
-            }),
-        );
         Ok(bytes.len())
     }
 
@@ -1213,8 +1533,10 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                 storage_mode: STORAGE_OVERLAY,
                 entries: Some(Arc::from(Vec::new().into_boxed_slice())),
                 chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
+                dirty: false,
             }),
         );
+        self.clear_dirty(file_id);
         Ok(())
     }
 
@@ -1286,6 +1608,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         changed: Option<i64>,
         created: Option<i64>,
     ) -> OpsResult<()> {
+        let _lock = self.store.lock_inode(self.ws_id, file_id);
         self.flush_dirty_inode(file_id)?;
         let conn = self.write_conn.lock().unwrap();
         let mut stmt = conn
@@ -1326,6 +1649,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                     storage_mode: prev.storage_mode,
                     entries: prev.entries.clone(),
                     chunk_offsets: prev.chunk_offsets.clone(),
+                    dirty: false,
                 }),
             );
         }
@@ -1334,6 +1658,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
 
     fn set_attributes(&self, file_id: u64, attributes: Attributes) -> OpsResult<()> {
         validate_attributes(attributes.0).map_err(|_| OpsError::InvalidParameter)?;
+        let _lock = self.store.lock_inode(self.ws_id, file_id);
         self.flush_dirty_inode(file_id)?;
         let ts = now_ns();
         let conn = self.write_conn.lock().unwrap();
@@ -1368,6 +1693,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                     storage_mode: prev.storage_mode,
                     entries: prev.entries.clone(),
                     chunk_offsets: prev.chunk_offsets.clone(),
+                    dirty: false,
                 }),
             );
         }
@@ -1399,7 +1725,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                 ],
             )
             .map_err(map_sql)?;
-            self.cache_dentry(src_parent, src_fold, (src_id, src_kind, dst_disp.clone()));
+            self.cache_dentry_mutation(src_parent, src_fold, (src_id, src_kind, dst_disp.clone()));
             return Ok(RenameOutcome {
                 file_id: src_id,
                 binding: (dst_parent, dst_disp),
@@ -1498,9 +1824,10 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         tx.commit().map_err(map_sql)?;
 
         self.invalidate_dentry(src_parent, &src_fold);
-        self.cache_dentry(dst_parent, dst_fold, (src_id, src_kind, dst_disp.clone()));
+        self.cache_dentry_mutation(dst_parent, dst_fold, (src_id, src_kind, dst_disp.clone()));
         self.store.invalidate_inode(self.ws_id, src_id);
         if let Some(dst_id) = replaced_id {
+            self.clear_dirty(dst_id);
             self.store.invalidate_inode(self.ws_id, dst_id);
         }
         if let Some(old_id) = replaced_overlay_file {
@@ -1568,7 +1895,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         tx.commit().map_err(map_sql)?;
 
         self.invalidate_dentry(parent, &folded);
-        self.dirty_inodes.lock().unwrap().remove(&child_id);
+        self.clear_dirty(child_id);
         self.store.invalidate_inode(self.ws_id, child_id);
         if old_row.storage_mode == STORAGE_OVERLAY {
             let _ = self.store.overlay().remove_file(self.ws_id, child_id);
@@ -1581,8 +1908,21 @@ impl WorkspaceOps for DedupWorkspaceBackend {
     }
 
     fn flush_file(&self, file_id: u64) -> OpsResult<()> {
+        let _lock = self.store.lock_inode(self.ws_id, file_id);
         self.flush_dirty_inode(file_id)?;
         let _ = self.store.overlay().sync_data(self.ws_id, file_id);
+        Ok(())
+    }
+
+    fn is_file_dirty(&self, file_id: u64) -> bool {
+        self.is_dirty(file_id)
+    }
+
+    fn on_cleanup(&self, file_id: u64) -> OpsResult<()> {
+        if self.is_dirty(file_id) {
+            let _lock = self.store.lock_inode(self.ws_id, file_id);
+            self.flush_dirty_inode(file_id)?;
+        }
         Ok(())
     }
 }

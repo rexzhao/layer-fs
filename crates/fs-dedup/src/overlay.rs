@@ -27,7 +27,7 @@ fn apply_share_mode(opts: &mut OpenOptions) {
 fn apply_share_mode(_opts: &mut OpenOptions) {}
 
 struct OverlayHandlePool {
-    handles: HashMap<(u64, u64), Arc<File>>,
+    handles: HashMap<(u64, u64), (Arc<File>, bool)>,
     order: VecDeque<(u64, u64)>,
 }
 
@@ -39,23 +39,35 @@ impl OverlayHandlePool {
         }
     }
 
-    fn get(&self, key: (u64, u64)) -> Option<Arc<File>> {
-        self.handles.get(&key).cloned()
+    fn get(&mut self, key: (u64, u64)) -> Option<Arc<File>> {
+        let (file, ref_bit) = self.handles.get_mut(&key)?;
+        *ref_bit = true;
+        Some(Arc::clone(file))
     }
 
     fn insert(&mut self, key: (u64, u64), file: Arc<File>) {
         if let std::collections::hash_map::Entry::Occupied(mut e) = self.handles.entry(key) {
-            e.insert(file);
+            e.insert((file, true));
             return;
         }
+        // CLOCK second-chance eviction: hot handles get a second chance before eviction.
+        let mut scanned = 0usize;
+        let max_scan = self.order.len().saturating_mul(2).max(1);
         while self.handles.len() >= MAX_OPEN_OVERLAY_HANDLES {
-            if let Some(old) = self.order.pop_front() {
-                self.handles.remove(&old);
-            } else {
+            let Some(cand) = self.order.pop_front() else {
                 break;
+            };
+            scanned += 1;
+            if let Some((_, ref_bit)) = self.handles.get_mut(&cand) {
+                if *ref_bit && scanned <= max_scan {
+                    *ref_bit = false;
+                    self.order.push_back(cand);
+                    continue;
+                }
+                self.handles.remove(&cand);
             }
         }
-        self.handles.insert(key, file);
+        self.handles.insert(key, (file, true));
         self.order.push_back(key);
     }
 
@@ -118,20 +130,33 @@ impl OverlayStore {
     }
 
     /// Opens an existing overlay file for read/write (creating if absent).
+    /// Fast path tries opening directly in 1 syscall without `create_dir_all` / `exists`.
     pub fn open_rw(&self, ws_id: u64, inode_id: u64) -> Result<File> {
         let path = self.file_path(ws_id, inode_id);
+        let mut fast = OpenOptions::new();
+        fast.read(true).write(true);
+        apply_share_mode(&mut fast);
+        match fast.open(&path) {
+            Ok(file) => return Ok(file),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let existed = path.exists();
         let mut opts = OpenOptions::new();
         opts.create(true).truncate(false).read(true).write(true);
         apply_share_mode(&mut opts);
         let file = opts.open(&path)?;
-        if !existed {
-            let _ = layerfs_win32_host::set_sparse_file(&file);
-        }
+        let _ = layerfs_win32_host::set_sparse_file(&file);
         Ok(file)
+    }
+
+    /// Returns the on-disk byte length of `(ws_id, inode_id)`'s overlay file if it exists.
+    pub fn file_len_if_exists(&self, ws_id: u64, inode_id: u64) -> Option<u64> {
+        fs::metadata(self.file_path(ws_id, inode_id))
+            .ok()
+            .map(|m| m.len())
     }
 
     /// Opens an existing overlay file read-only.
@@ -311,9 +336,11 @@ impl OverlayStore {
         Ok(pos)
     }
 
-    /// Flushes OS buffers for an open overlay file to durable storage (`FlushFileBuffers` / `fdatasync`).
+    /// Flushes OS buffers for an overlay file to durable storage (`FlushFileBuffers` / `fdatasync`).
+    /// Re-opens the file if its handle was previously evicted from the pool so `FlushFileBuffers`
+    /// semantics are always honored.
     pub fn sync_data(&self, ws_id: u64, inode_id: u64) -> Result<()> {
-        if let Some(file) = self.pool.lock().unwrap().get((ws_id, inode_id)) {
+        if let Some(file) = self.get_cached_existing(ws_id, inode_id)? {
             file.sync_data()?;
         }
         Ok(())

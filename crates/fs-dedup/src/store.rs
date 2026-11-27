@@ -48,6 +48,9 @@ pub struct CachedInode {
     pub entries: Option<Arc<[ManifestEntry]>>,
     /// Prefix-sum byte start offsets for each entry in `entries` (enables O(log N) binary search).
     pub chunk_offsets: Option<Arc<[u64]>>,
+    /// `true` when this inode has buffered `(size, written_ns)` writes not yet committed to SQLite.
+    /// Dirty entries are never evicted by CLOCK and never overwritten by stale `read_dir` snapshots.
+    pub dirty: bool,
 }
 
 impl CachedInode {
@@ -85,6 +88,7 @@ impl CachedInode {
             storage_mode: row.storage_mode,
             entries: Some(entries),
             chunk_offsets: Some(chunk_offsets),
+            dirty: false,
         })
     }
 }
@@ -234,6 +238,42 @@ fn clock_evict_quarter<K: Eq + std::hash::Hash + Copy, V>(
     // Pass 2 (if almost everything was hot): evict remaining needed count.
     if to_remove.len() < target_remove {
         for &k in map.keys() {
+            to_remove.push(k);
+            if to_remove.len() >= target_remove {
+                break;
+            }
+        }
+    }
+    for k in to_remove {
+        map.remove(&k);
+    }
+}
+
+/// CLOCK-style partial eviction for `inode_cache`: removes ~25% of clean entries,
+/// never evicting `dirty == true` entries that carry authoritative unflushed metadata.
+fn clock_evict_quarter_inodes(
+    map: &mut HashMap<(u64, u64), (Arc<CachedInode>, AtomicBool)>,
+    limit: usize,
+) {
+    let target_remove = (limit / 4).max(1);
+    let mut to_remove: Vec<(u64, u64)> = Vec::with_capacity(target_remove);
+    for (&k, (inode, ref_bit)) in map.iter() {
+        if inode.dirty {
+            continue;
+        }
+        if ref_bit.swap(false, Ordering::Relaxed) {
+            continue;
+        }
+        to_remove.push(k);
+        if to_remove.len() >= target_remove {
+            break;
+        }
+    }
+    if to_remove.len() < target_remove {
+        for (&k, (inode, _)) in map.iter() {
+            if inode.dirty {
+                continue;
+            }
             to_remove.push(k);
             if to_remove.len() >= target_remove {
                 break;
@@ -446,13 +486,27 @@ impl DedupStore {
         let shard = ((ws_id ^ inode.inode_id) as usize) & (META_CACHE_SHARDS - 1);
         let mut guard = self.inode_cache[shard].write().unwrap();
         if guard.len() >= INODE_CACHE_PER_SHARD {
-            clock_evict_quarter(&mut guard, INODE_CACHE_PER_SHARD);
+            clock_evict_quarter_inodes(&mut guard, INODE_CACHE_PER_SHARD);
         }
         guard.insert((ws_id, inode.inode_id), (inode, AtomicBool::new(true)));
     }
 
+    /// Marks a cached inode clean (`dirty = false`) once its `(size, written_ns)` has been
+    /// committed to SQLite, leaving it dirty if a newer concurrent write updated it.
+    pub fn clear_inode_dirty(&self, ws_id: u64, inode_id: u64, flushed_size: u64, flushed_ts: i64) {
+        let shard = ((ws_id ^ inode_id) as usize) & (META_CACHE_SHARDS - 1);
+        let mut guard = self.inode_cache[shard].write().unwrap();
+        if let Some((prev, _)) = guard.get_mut(&(ws_id, inode_id)) {
+            if prev.dirty && prev.size == flushed_size && prev.written_ns == flushed_ts {
+                let mut clean = (**prev).clone();
+                clean.dirty = false;
+                *prev = Arc::new(clean);
+            }
+        }
+    }
+
     /// Batch-populates inode metadata prefetched by `read_dir`, preserving any already-decoded
-    /// chunk manifests & offsets in cache while acquiring each shard write lock at most once.
+    /// chunk manifests & offsets in cache and NEVER overwriting `dirty == true` entries.
     pub fn put_cached_inodes_preserve_manifest(&self, ws_id: u64, batch: Vec<CachedInode>) {
         if batch.is_empty() {
             return;
@@ -469,18 +523,21 @@ impl DedupStore {
             }
             let mut guard = self.inode_cache[shard_idx].write().unwrap();
             if guard.len().saturating_add(items.len()) >= INODE_CACHE_PER_SHARD {
-                clock_evict_quarter(&mut guard, INODE_CACHE_PER_SHARD);
+                clock_evict_quarter_inodes(&mut guard, INODE_CACHE_PER_SHARD);
             }
             for mut item in items {
-                if item.entries.is_none() {
-                    if let Some((prev, _)) = guard.get(&(ws_id, item.inode_id)) {
-                        if prev.storage_mode == item.storage_mode
-                            && prev.size == item.size
-                            && prev.written_ns == item.written_ns
-                        {
-                            item.entries = prev.entries.clone();
-                            item.chunk_offsets = prev.chunk_offsets.clone();
-                        }
+                if let Some((prev, _)) = guard.get(&(ws_id, item.inode_id)) {
+                    // Authoritative dirty write metadata must never be clobbered by a `read_dir` snapshot.
+                    if prev.dirty {
+                        continue;
+                    }
+                    if item.entries.is_none()
+                        && prev.storage_mode == item.storage_mode
+                        && prev.size == item.size
+                        && prev.written_ns == item.written_ns
+                    {
+                        item.entries = prev.entries.clone();
+                        item.chunk_offsets = prev.chunk_offsets.clone();
                     }
                 }
                 guard.insert(
@@ -2157,20 +2214,36 @@ impl DedupStore {
         Ok(summary)
     }
 
-    /// Audits chunk reference counts and pack live/dead byte accounting across all workspaces.
-    /// When `fix == true`, repairs mismatched `chunks.refcount`, deletes orphan chunks (0 live refs),
-    /// and recomputes exact `packs.live_bytes` / `packs.dead_bytes`.
+    /// Audits chunk reference counts and pack live/dead byte accounting across all workspaces
+    /// inside a single consistent SQLite transaction.
+    /// When `fix == true`, refuses to run if a live mount is active on this store, acquires an
+    /// `IMMEDIATE` write transaction across scan + repair so no concurrent writer can interleave,
+    /// repairs mismatched `chunks.refcount`, deletes orphan chunks (0 live refs), and recomputes
+    /// exact `packs.live_bytes` / `packs.dead_bytes`.
     pub fn fsck(&self, fix: bool) -> Result<FsckSummary> {
+        if fix {
+            if let Some(mp) = crate::mount::active_mount_for_store(&self.root) {
+                return Err(Error::Other(format!(
+                    "refusing `fsck --fix` while store is actively mounted at {mp}; unmount first"
+                )));
+            }
+        }
         let mut conn = self.meta.lock().unwrap();
+        let behavior = if fix {
+            rusqlite::TransactionBehavior::Immediate
+        } else {
+            rusqlite::TransactionBehavior::Deferred
+        };
+        let tx = conn.transaction_with_behavior(behavior)?;
         let mut summary = FsckSummary {
             fixed: fix,
             ..FsckSummary::default()
         };
 
-        // 1. Scan all chunk-backed file manifests to compute exact live refcounts.
+        // 1. Scan all chunk-backed file manifests within one consistent transaction snapshot.
         let mut actual_refs: HashMap<Hash32, u64> = HashMap::new();
         {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT manifest FROM inodes WHERE kind = ?1 AND storage_mode = ?2 AND length(manifest) > 0",
             )?;
             let rows = stmt.query_map(
@@ -2194,7 +2267,7 @@ impl DedupStore {
         let mut present_hashes: HashSet<Hash32> = HashSet::new();
         {
             let mut stmt =
-                conn.prepare("SELECT hash, pack_id, stored_len, refcount FROM chunks")?;
+                tx.prepare("SELECT hash, pack_id, stored_len, refcount FROM chunks")?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, Vec<u8>>(0)?,
@@ -2236,7 +2309,7 @@ impl DedupStore {
         let mut pack_fixes: Vec<(u64, u64, u64)> = Vec::new();
         {
             let mut stmt =
-                conn.prepare("SELECT pack_id, size_bytes, live_bytes, dead_bytes FROM packs")?;
+                tx.prepare("SELECT pack_id, size_bytes, live_bytes, dead_bytes FROM packs")?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)? as u64,
@@ -2257,9 +2330,9 @@ impl DedupStore {
             }
         }
 
-        if fix && (!ref_fixes.is_empty() || !orphans_to_delete.is_empty() || !pack_fixes.is_empty())
-        {
-            let tx = conn.transaction()?;
+        let mutated = fix
+            && (!ref_fixes.is_empty() || !orphans_to_delete.is_empty() || !pack_fixes.is_empty());
+        if mutated {
             {
                 let mut upd =
                     tx.prepare_cached("UPDATE chunks SET refcount = ?1 WHERE hash = ?2")?;
@@ -2279,6 +2352,8 @@ impl DedupStore {
             }
             tx.commit()?;
             self.clear_chunk_loc_cache();
+        } else {
+            tx.finish()?;
         }
 
         Ok(summary)

@@ -448,6 +448,22 @@ pub trait WorkspaceOps {
     fn is_dir_empty(&self, dir_id: u64) -> OpsResult<bool> {
         Ok(self.read_dir(dir_id)?.is_empty())
     }
+
+    /// Returns `true` when `file_id` has buffered metadata not yet committed to persistent storage.
+    /// Used by background deduplication to skip files with in-memory dirty metadata.
+    fn is_file_dirty(&self, _file_id: u64) -> bool {
+        false
+    }
+
+    /// Called on WinFsp `Cleanup` (non-delete) so backends with buffered write metadata can
+    /// persist per-file size/mtime promptly when user handles close.
+    ///
+    /// # Errors
+    ///
+    /// [`OpsError::Other`] when the backend reports a failure.
+    fn on_cleanup(&self, _file_id: u64) -> OpsResult<()> {
+        Ok(())
+    }
 }
 
 /// A boxed backend is a backend: the mount entry point does not know which concrete type it was given, and saying so once here
@@ -540,6 +556,14 @@ impl WorkspaceOps for Box<dyn WorkspaceOps + Send + Sync> {
 
     fn is_dir_empty(&self, dir_id: u64) -> OpsResult<bool> {
         (**self).is_dir_empty(dir_id)
+    }
+
+    fn is_file_dirty(&self, file_id: u64) -> bool {
+        (**self).is_file_dirty(file_id)
+    }
+
+    fn on_cleanup(&self, file_id: u64) -> OpsResult<()> {
+        (**self).on_cleanup(file_id)
     }
 }
 

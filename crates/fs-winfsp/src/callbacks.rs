@@ -1657,6 +1657,9 @@ pub unsafe fn cleanup_shell(
         0
     };
     adapter.cleanup(entry.handle);
+    if flags & FSP_CLEANUP_DELETE == 0 {
+        let _ = adapter.backend().on_cleanup(entry.file_id);
+    }
     status
 }
 
