@@ -548,6 +548,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let store_dir = discover_store(explicit_store.as_deref())?;
             let ws = pos.first().map(String::as_str);
+            // Never run offline `dedup` (which assumes 0 open handles) while a live mount is
+            // serving the same store; forward to the live mount's control pipe if matching!
+            if let Some((mp, mounted_ws, pipe)) =
+                fs_dedup::mount::active_mount_info_for_store(&store_dir)
+            {
+                if ws.is_none() || ws == Some(mounted_ws.as_str()) {
+                    let reply = fs_dedup::mount::trigger_live_dedup(&pipe)?;
+                    println!("forwarded dedup to active mount at {mp} ({mounted_ws}): {reply}");
+                    return Ok(());
+                }
+                return Err(format!(
+                    "refusing offline `dedup` while store is mounted at {mp} (workspace `{mounted_ws}`); unmount first"
+                )
+                .into());
+            }
             let store = DedupStore::open(&store_dir)?;
             let sum = store.dedup_workspace(ws, idle_secs, |_, _| false)?;
             println!(

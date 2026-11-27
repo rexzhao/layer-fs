@@ -10,6 +10,34 @@ use std::sync::OnceLock;
 /// 32-byte BLAKE3-256 chunk digest.
 pub type Hash32 = [u8; 32];
 
+/// Fast identity hasher for `Hash32` keys: BLAKE3 hashes are already uniformly distributed,
+/// so reading the first 8 bytes avoids SipHash overhead on every cache & dedup map lookup.
+#[derive(Default)]
+pub struct Hash32Hasher(u64);
+
+impl std::hash::Hasher for Hash32Hasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.len() >= 8 {
+            self.0 = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+        } else {
+            let mut acc = 0u64;
+            for &b in bytes {
+                acc = (acc << 8) | u64::from(b);
+            }
+            self.0 = acc;
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// `BuildHasher` for `HashMap<Hash32, V, Hash32BuildHasher>` and `HashSet<Hash32, Hash32BuildHasher>`.
+pub type Hash32BuildHasher = std::hash::BuildHasherDefault<Hash32Hasher>;
+
 /// FastCDC-256K parameters (validated on 484.5 GB Unity dataset).
 pub const MIN_CHUNK_BYTES: usize = 64 * 1024;
 pub const AVG_CHUNK_BYTES: usize = 256 * 1024;
@@ -261,8 +289,9 @@ pub fn compress_chunk(preferred: Codec, raw: &[u8]) -> Result<(Codec, Vec<u8>)> 
     }
 }
 
-/// Decompresses `stored` into exact `raw_len` bytes according to `codec`.
-pub fn decompress_chunk(codec: Codec, stored: &[u8], raw_len: usize) -> Result<Vec<u8>> {
+/// Decompresses `stored` directly into `dst` (which must have length `raw_len`).
+pub fn decompress_chunk_into(codec: Codec, stored: &[u8], dst: &mut [u8]) -> Result<()> {
+    let raw_len = dst.len();
     match codec {
         Codec::None => {
             if stored.len() != raw_len {
@@ -272,26 +301,25 @@ pub fn decompress_chunk(codec: Codec, stored: &[u8], raw_len: usize) -> Result<V
                     raw_len
                 )));
             }
-            Ok(stored.to_vec())
+            dst.copy_from_slice(stored);
+            Ok(())
         }
         Codec::Lz4 => {
-            let mut out = vec![0u8; raw_len];
-            let n = lz4_flex::block::decompress_into(stored, &mut out)
+            let n = lz4_flex::block::decompress_into(stored, dst)
                 .map_err(|e| Error::Corrupt(format!("lz4 decompress failed: {e}")))?;
             if n != raw_len {
                 return Err(Error::Corrupt(format!(
                     "lz4 decoded length {n} != expected {raw_len}"
                 )));
             }
-            Ok(out)
+            Ok(())
         }
         Codec::Zstd1 => ZSTD_CTX.with(|cell| {
             let ctx = cell.borrow_mut();
-            let mut out = vec![0u8; raw_len];
             let res = unsafe {
                 zstd_sys::ZSTD_decompressDCtx(
                     ctx.dctx,
-                    out.as_mut_ptr().cast::<c_void>(),
+                    dst.as_mut_ptr().cast::<c_void>(),
                     raw_len,
                     stored.as_ptr().cast::<c_void>(),
                     stored.len(),
@@ -302,9 +330,31 @@ pub fn decompress_chunk(codec: Codec, stored: &[u8], raw_len: usize) -> Result<V
                     "zstd decompress failed or length mismatch (expected {raw_len})"
                 )));
             }
-            Ok(out)
+            Ok(())
         }),
     }
+}
+
+/// Decompresses `stored` directly into a freshly allocated `Arc<[u8]>` in a single allocation
+/// (no intermediate `Vec<u8>` -> `Arc::from` full-chunk memcpy, MSRV 1.85 compatible, zero `unsafe`).
+pub fn decompress_chunk_arc(
+    codec: Codec,
+    stored: &[u8],
+    raw_len: usize,
+) -> Result<std::sync::Arc<[u8]>> {
+    // `repeat_n` implements `TrustedLen`, so `Arc<[u8]>::from_iter` allocates the `ArcInner<[u8]>`
+    // directly in a single allocation with refcount 1.
+    let mut arc: std::sync::Arc<[u8]> = std::iter::repeat_n(0u8, raw_len).collect();
+    let dst = std::sync::Arc::get_mut(&mut arc).expect("freshly allocated Arc is unique");
+    decompress_chunk_into(codec, stored, dst)?;
+    Ok(arc)
+}
+
+/// Decompresses `stored` into exact `raw_len` bytes according to `codec`.
+pub fn decompress_chunk(codec: Codec, stored: &[u8], raw_len: usize) -> Result<Vec<u8>> {
+    let mut out = vec![0u8; raw_len];
+    decompress_chunk_into(codec, stored, &mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]

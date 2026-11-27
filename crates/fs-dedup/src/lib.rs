@@ -10,6 +10,7 @@ pub mod meta;
 pub mod mount;
 pub mod overlay;
 pub mod pack;
+pub mod parallel_io;
 pub mod store;
 
 pub use backend::DedupWorkspaceBackend;

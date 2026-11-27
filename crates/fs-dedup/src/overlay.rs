@@ -1,33 +1,24 @@
 //! Per-workspace local NTFS sparse-file overlay storage.
 //!
-//! All foreground writes go directly to sharded local NTFS sparse files so Unity / Git / SVN
+//! All foreground writes go directly to sharded local NTFS files so Unity / Git / SVN
 //! write performance stays near native NTFS and hot databases (LMDB / SQLite) stay compatible.
 //!
-//! Open overlay handles are pooled in an LRU cache (opened with `FILE_SHARE_READ | WRITE | DELETE`
-//! on Windows) so high-frequency random I/O (such as Unity's LMDB `ArtifactDB` / `SourceAssetDB`
-//! page faults) executes a single positional `seek_read`/`seek_write` syscall without paying
-//! per-call `CreateFileW` / `CloseHandle` / AV minifilter overhead.
+//! Open overlay handles are pooled in a CLOCK-LRU cache using `ParallelFile` (`FILE_FLAG_OVERLAPPED`
+//! on Windows + `FILE_SHARE_READ | WRITE | DELETE`) so concurrent random I/O (such as Unity's LMDB
+//! `ArtifactDB` / `SourceAssetDB` page reads) executes genuinely in parallel inside the Windows
+//! kernel without per-call `CreateFileW` / `CloseHandle` or synchronous `FILE_OBJECT` serialization.
 
 use crate::error::Result;
+use crate::parallel_io::ParallelFile;
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const MAX_OPEN_OVERLAY_HANDLES: usize = 256;
 
-#[cfg(windows)]
-fn apply_share_mode(opts: &mut OpenOptions) {
-    use std::os::windows::fs::OpenOptionsExt;
-    // FILE_SHARE_READ (1) | FILE_SHARE_WRITE (2) | FILE_SHARE_DELETE (4)
-    opts.share_mode(0x07);
-}
-
-#[cfg(not(windows))]
-fn apply_share_mode(_opts: &mut OpenOptions) {}
-
 struct OverlayHandlePool {
-    handles: HashMap<(u64, u64), (Arc<File>, bool)>,
+    handles: HashMap<(u64, u64), (Arc<ParallelFile>, bool)>,
     order: VecDeque<(u64, u64)>,
 }
 
@@ -39,13 +30,13 @@ impl OverlayHandlePool {
         }
     }
 
-    fn get(&mut self, key: (u64, u64)) -> Option<Arc<File>> {
+    fn get(&mut self, key: (u64, u64)) -> Option<Arc<ParallelFile>> {
         let (file, ref_bit) = self.handles.get_mut(&key)?;
         *ref_bit = true;
         Some(Arc::clone(file))
     }
 
-    fn insert(&mut self, key: (u64, u64), file: Arc<File>) {
+    fn insert(&mut self, key: (u64, u64), file: Arc<ParallelFile>) {
         if let std::collections::hash_map::Entry::Occupied(mut e) = self.handles.entry(key) {
             e.insert((file, true));
             return;
@@ -102,6 +93,22 @@ impl OverlayStore {
         self.root.join(ws_id.to_string())
     }
 
+    /// Path of the clean-shutdown marker written on graceful backend drop and removed on open.
+    pub fn clean_marker_path(&self, ws_id: u64) -> PathBuf {
+        self.workspace_dir(ws_id).join(".clean")
+    }
+
+    /// Pre-creates all 256 hex shard subdirectories (`00`..`ff`) for `ws_id` so subsequent file
+    /// creations never pay per-file `create_dir_all` syscalls.
+    pub fn precreate_shards(&self, ws_id: u64) {
+        let ws_dir = self.workspace_dir(ws_id);
+        let _ = fs::create_dir_all(&ws_dir);
+        for shard in 0u8..=255 {
+            let dir = ws_dir.join(format!("{shard:02x}"));
+            let _ = fs::create_dir(&dir);
+        }
+    }
+
     pub fn file_path(&self, ws_id: u64, inode_id: u64) -> PathBuf {
         let shard = format!("{:02x}", (inode_id & 0xff) as u8);
         self.workspace_dir(ws_id)
@@ -114,29 +121,35 @@ impl OverlayStore {
         self.pool.lock().unwrap().evict((ws_id, inode_id));
     }
 
-    /// Creates or truncates a sparse overlay file for `(ws_id, inode_id)`.
-    pub fn create_empty(&self, ws_id: u64, inode_id: u64) -> Result<File> {
+    /// Creates or truncates an overlay file for `(ws_id, inode_id)` and caches its parallel RW
+    /// handle directly in the handle pool so the immediately following `write()` avoids a second
+    /// `CreateFileW` syscall.
+    pub fn create_empty(&self, ws_id: u64, inode_id: u64) -> Result<Arc<ParallelFile>> {
         self.evict_handle(ws_id, inode_id);
         let path = self.file_path(ws_id, inode_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut opts = OpenOptions::new();
-        opts.create(true).truncate(true).read(true).write(true);
-        apply_share_mode(&mut opts);
-        let file = opts.open(&path)?;
-        let _ = layerfs_win32_host::set_sparse_file(&file);
-        Ok(file)
+        let file = match ParallelFile::create_empty_rw(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                ParallelFile::create_empty_rw(&path)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let arc = Arc::new(file);
+        self.pool
+            .lock()
+            .unwrap()
+            .insert((ws_id, inode_id), Arc::clone(&arc));
+        Ok(arc)
     }
 
-    /// Opens an existing overlay file for read/write (creating if absent).
+    /// Opens an existing overlay file for parallel read/write (creating if absent).
     /// Fast path tries opening directly in 1 syscall without `create_dir_all` / `exists`.
-    pub fn open_rw(&self, ws_id: u64, inode_id: u64) -> Result<File> {
+    fn open_rw(&self, ws_id: u64, inode_id: u64) -> Result<ParallelFile> {
         let path = self.file_path(ws_id, inode_id);
-        let mut fast = OpenOptions::new();
-        fast.read(true).write(true);
-        apply_share_mode(&mut fast);
-        match fast.open(&path) {
+        match ParallelFile::open_existing_rw(&path) {
             Ok(file) => return Ok(file),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
@@ -144,12 +157,7 @@ impl OverlayStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut opts = OpenOptions::new();
-        opts.create(true).truncate(false).read(true).write(true);
-        apply_share_mode(&mut opts);
-        let file = opts.open(&path)?;
-        let _ = layerfs_win32_host::set_sparse_file(&file);
-        Ok(file)
+        Ok(ParallelFile::open_or_create_rw(&path)?)
     }
 
     /// Returns the on-disk byte length of `(ws_id, inode_id)`'s overlay file if it exists.
@@ -159,34 +167,20 @@ impl OverlayStore {
             .map(|m| m.len())
     }
 
-    /// Opens an existing overlay file read-only.
-    pub fn open_ro(&self, ws_id: u64, inode_id: u64) -> Result<File> {
-        let mut opts = OpenOptions::new();
-        opts.read(true);
-        apply_share_mode(&mut opts);
-        Ok(opts.open(self.file_path(ws_id, inode_id))?)
-    }
-
-    /// Gets a pooled RW handle for an existing overlay file (or `None` if absent).
-    fn get_cached_existing(&self, ws_id: u64, inode_id: u64) -> Result<Option<Arc<File>>> {
+    /// Gets a pooled parallel RW handle for an existing overlay file (or `None` if absent).
+    fn get_cached_existing(&self, ws_id: u64, inode_id: u64) -> Result<Option<Arc<ParallelFile>>> {
         let key = (ws_id, inode_id);
         if let Some(hit) = self.pool.lock().unwrap().get(key) {
             return Ok(Some(hit));
         }
         let path = self.file_path(ws_id, inode_id);
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true);
-        apply_share_mode(&mut opts);
-        let file = match opts.open(&path) {
+        let file = match ParallelFile::open_existing_rw(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(_) => {
                 // Fallback to read-only open if file has read-only OS attributes (do not
                 // place an RO-only handle into the shared RW pool).
-                let mut ro = OpenOptions::new();
-                ro.read(true);
-                apply_share_mode(&mut ro);
-                return match ro.open(&path) {
+                return match ParallelFile::open_read(&path) {
                     Ok(f) => Ok(Some(Arc::new(f))),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                     Err(e) => Err(e.into()),
@@ -198,8 +192,8 @@ impl OverlayStore {
         Ok(Some(arc))
     }
 
-    /// Gets a pooled RW handle for `(ws_id, inode_id)`, creating the sparse file if absent.
-    fn get_cached_rw(&self, ws_id: u64, inode_id: u64) -> Result<Arc<File>> {
+    /// Gets a pooled parallel RW handle for `(ws_id, inode_id)`, creating the file if absent.
+    fn get_cached_rw(&self, ws_id: u64, inode_id: u64) -> Result<Arc<ParallelFile>> {
         let key = (ws_id, inode_id);
         if let Some(hit) = self.pool.lock().unwrap().get(key) {
             return Ok(hit);
@@ -215,7 +209,7 @@ impl OverlayStore {
         self.read_at_known_len(ws_id, inode_id, None, offset, len)
     }
 
-    /// Positional read using a pooled file handle. When `known_len` is provided from
+    /// Positional read using a pooled parallel file handle. When `known_len` is provided from
     /// `CachedInode`, avoids even the per-call `metadata()` syscall.
     pub fn read_at_known_len(
         &self,
@@ -225,40 +219,12 @@ impl OverlayStore {
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>> {
-        #[cfg(windows)]
-        use std::os::windows::fs::FileExt;
-        #[cfg(unix)]
-        use std::os::unix::fs::FileExt;
-
         if len == 0 {
             return Ok(Vec::new());
         }
-        let Some(file) = self.get_cached_existing(ws_id, inode_id)? else {
-            return Ok(Vec::new());
-        };
-        let file_len = match known_len {
-            Some(l) => l,
-            None => file.metadata()?.len(),
-        };
-        if offset >= file_len {
-            return Ok(Vec::new());
-        }
-        let to_read = (file_len - offset).min(len as u64) as usize;
-        let mut buf = vec![0u8; to_read];
-        let mut done = 0usize;
-        while done < to_read {
-            #[cfg(windows)]
-            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
-            #[cfg(unix)]
-            let n = file.read_at(&mut buf[done..], offset + done as u64)?;
-            if n == 0 {
-                break;
-            }
-            done += n;
-        }
-        if known_len.is_none() {
-            buf.truncate(done);
-        }
+        let mut buf = vec![0u8; len];
+        let n = self.read_into_known_len(ws_id, inode_id, known_len, offset, &mut buf)?;
+        buf.truncate(n);
         Ok(buf)
     }
 
@@ -271,11 +237,6 @@ impl OverlayStore {
         offset: u64,
         dst: &mut [u8],
     ) -> Result<usize> {
-        #[cfg(windows)]
-        use std::os::windows::fs::FileExt;
-        #[cfg(unix)]
-        use std::os::unix::fs::FileExt;
-
         if dst.is_empty() {
             return Ok(0);
         }
@@ -284,7 +245,7 @@ impl OverlayStore {
         };
         let file_len = match known_len {
             Some(l) => l,
-            None => file.metadata()?.len(),
+            None => file.len()?,
         };
         if offset >= file_len {
             return Ok(0);
@@ -292,10 +253,7 @@ impl OverlayStore {
         let to_read = (file_len - offset).min(dst.len() as u64) as usize;
         let mut done = 0usize;
         while done < to_read {
-            #[cfg(windows)]
-            let n = file.seek_read(&mut dst[done..to_read], offset + done as u64)?;
-            #[cfg(unix)]
-            let n = file.read_at(&mut dst[done..to_read], offset + done as u64)?;
+            let n = file.read_at(offset + done as u64, &mut dst[done..to_read])?;
             if n == 0 {
                 break;
             }
@@ -317,23 +275,9 @@ impl OverlayStore {
         offset: u64,
         data: &[u8],
     ) -> Result<u64> {
-        #[cfg(windows)]
-        use std::os::windows::fs::FileExt;
-        #[cfg(unix)]
-        use std::os::unix::fs::FileExt;
-
         let file = self.get_cached_rw(ws_id, inode_id)?;
-        let mut pos = offset;
-        let mut rem = data;
-        while !rem.is_empty() {
-            #[cfg(windows)]
-            let n = file.seek_write(rem, pos)?;
-            #[cfg(unix)]
-            let n = file.write_at(rem, pos)?;
-            pos += n as u64;
-            rem = &rem[n..];
-        }
-        Ok(pos)
+        file.write_all_at(offset, data)?;
+        Ok(offset.saturating_add(data.len() as u64))
     }
 
     /// Flushes OS buffers for an overlay file to durable storage (`FlushFileBuffers` / `fdatasync`).
@@ -356,12 +300,16 @@ impl OverlayStore {
     ) -> Result<u64> {
         let _ = self.write_at_fast(ws_id, inode_id, offset, data)?;
         let file = self.get_cached_rw(ws_id, inode_id)?;
-        Ok(file.metadata()?.len())
+        Ok(file.len()?)
     }
 
     /// Resizes an overlay file (truncating or sparse zero-extending).
+    /// Enables NTFS sparse attribute only when extending to non-zero length.
     pub fn set_len(&self, ws_id: u64, inode_id: u64, new_len: u64) -> Result<()> {
         let file = self.get_cached_rw(ws_id, inode_id)?;
+        if new_len > 0 {
+            file.set_sparse();
+        }
         file.set_len(new_len)?;
         Ok(())
     }

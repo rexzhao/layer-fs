@@ -1949,7 +1949,7 @@ pub unsafe fn write_shell(
         Err(err) => return crate::error::to_status_of(&err).code() as i32,
     };
     // `WriteToEndOfFile` is signalled by `Offset == u64::MAX`; the header says so explicitly.
-    let mut at = if write_to_end_of_file {
+    let at = if write_to_end_of_file {
         before.size
     } else {
         offset
@@ -1963,9 +1963,16 @@ pub unsafe fn write_shell(
     }
     // SAFETY: `buffer` is valid for `length >= len` bytes per the caller's contract.
     let bytes = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), len) };
-    let written = match adapter.backend().write(entry.file_id, at, bytes) {
-        Ok(written) => written.min(len),
-        Err(err) => return crate::error::to_status_of(&err).code() as i32,
+    let (at, written) = if write_to_end_of_file && !constrained_io {
+        match adapter.backend().write_append(entry.file_id, bytes) {
+            Ok((append_at, written)) => (append_at, written.min(len)),
+            Err(err) => return crate::error::to_status_of(&err).code() as i32,
+        }
+    } else {
+        match adapter.backend().write(entry.file_id, at, bytes) {
+            Ok(written) => (at, written.min(len)),
+            Err(err) => return crate::error::to_status_of(&err).code() as i32,
+        }
     };
     let after = match adapter.backend().get_info(entry.file_id) {
         Ok(info) => info,
@@ -1999,7 +2006,7 @@ pub unsafe fn write_shell(
             Err(_) => return NOT_IMPLEMENTED,
         }
     }
-    let _ = &mut at;
+    let _ = at;
     0
 }
 

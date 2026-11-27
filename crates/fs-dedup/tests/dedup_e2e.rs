@@ -1061,3 +1061,216 @@ fn r2_3_r2_4_r2_5_dirty_authority_dedup_guard_cleanup_flush_and_mount_reconcile(
         b"durable-after-evict".len() as u64
     );
 }
+
+#[test]
+fn r3_parallel_overlapped_pack_reads_and_single_flight_decompress() {
+    let tmp = TempDir::new("r3_parallel_overlapped");
+    let store_dir = tmp.0.join("store");
+    let src = tmp.0.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // 2 MiB pseudo-random multi-chunk file stored in packs.
+    let mut big = vec![0u8; 2 * 1024 * 1024];
+    let mut x: u64 = 0x517c_c1b7_2722_0a95;
+    for b in &mut big {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = (x & 0xff) as u8;
+    }
+    std::fs::write(src.join("blob.bin"), &big).unwrap();
+
+    let store = DedupStore::init(&store_dir, StoreConfig::default()).unwrap();
+    store.import_dir(&src, "ws", 4, None).unwrap();
+    drop(store);
+
+    // Reopen fresh store so chunk cache is 100% cold and triggers single-flight decompression +
+    // concurrent Windows FILE_FLAG_OVERLAPPED reads on the same .pack handle.
+    let cold_store = DedupStore::open(&store_dir).unwrap();
+    let backend = std::sync::Arc::new(DedupWorkspaceBackend::open(cold_store, "ws").unwrap());
+    let opened = backend
+        .create_or_open(&OpsPath::new(b"/blob.bin"), Disposition::Open)
+        .unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+    std::thread::scope(|s| {
+        for tid in 0..16usize {
+            let b = backend.clone();
+            let bar = barrier.clone();
+            let data = &big;
+            let fid = opened.file_id;
+            s.spawn(move || {
+                bar.wait();
+                // First wave: all 16 threads hammer the exact same cold chunks simultaneously (single-flight).
+                let mut same_buf = vec![0u8; 128 * 1024];
+                let n = b.read_into(fid, 0, &mut same_buf).unwrap();
+                assert_eq!(n, same_buf.len());
+                assert_eq!(&same_buf[..], &data[..same_buf.len()]);
+
+                // Second wave: parallel scattered overlapped reads across the full 2 MiB pack-backed file.
+                for iter in 0..40usize {
+                    let off = ((tid * 37 + iter * 73) % 450) * 4096;
+                    let len = 8192usize.min(data.len() - off);
+                    let mut buf = vec![0u8; len];
+                    let got = b.read_into(fid, off as u64, &mut buf).unwrap();
+                    assert_eq!(got, len);
+                    assert_eq!(&buf[..], &data[off..off + len]);
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn r3_atomic_concurrent_write_append_has_no_lost_records() {
+    let tmp = TempDir::new("r3_atomic_append");
+    let store_dir = tmp.0.join("store");
+    let src = tmp.0.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let seed = b"SEED_HEADER_16B!";
+    std::fs::write(src.join("packed.log"), seed).unwrap();
+
+    let store = DedupStore::init(&store_dir, StoreConfig::default()).unwrap();
+    store.import_dir(&src, "ws", 2, None).unwrap();
+    let backend = std::sync::Arc::new(DedupWorkspaceBackend::open(store, "ws").unwrap());
+
+    // Test both a fresh empty overlay file AND a pack-backed file (CoW on first append).
+    let fresh = backend
+        .create_or_open(&OpsPath::new(b"/fresh.log"), Disposition::Create)
+        .unwrap();
+    let packed = backend
+        .create_or_open(&OpsPath::new(b"/packed.log"), Disposition::Open)
+        .unwrap();
+
+    for (fid, prefix_len) in [(fresh.file_id, 0usize), (packed.file_id, seed.len())] {
+        let threads = 8usize;
+        let per_thread = 50usize;
+        let rec_len = 16usize;
+        let offsets = std::sync::Mutex::new(Vec::<u64>::new());
+
+        std::thread::scope(|s| {
+            for tid in 0..threads {
+                let b = backend.clone();
+                let offs = &offsets;
+                s.spawn(move || {
+                    for iter in 0..per_thread {
+                        let mut rec = [0u8; 16];
+                        rec[0] = tid as u8;
+                        rec[1] = iter as u8;
+                        for (k, slot) in rec[2..].iter_mut().enumerate() {
+                            *slot = ((tid * 17 + iter * 31 + k) & 0xff) as u8;
+                        }
+                        let (at, written) = b.write_append(fid, &rec).unwrap();
+                        assert_eq!(written, rec_len);
+                        offs.lock().unwrap().push(at);
+                    }
+                });
+            }
+        });
+
+        let expected_size = (prefix_len + threads * per_thread * rec_len) as u64;
+        assert_eq!(backend.get_info(fid).unwrap().size, expected_size);
+
+        // Every returned append offset must be unique and tightly packed at 16-byte stride.
+        let mut offs = offsets.into_inner().unwrap();
+        offs.sort_unstable();
+        for (idx, off) in offs.iter().enumerate() {
+            assert_eq!(*off, (prefix_len + idx * rec_len) as u64);
+        }
+
+        // Read back the entire file and verify every (tid, iter) record is intact and present once.
+        let all = backend.read(fid, 0, expected_size as usize).unwrap();
+        assert_eq!(all.len(), expected_size as usize);
+        if prefix_len > 0 {
+            assert_eq!(&all[..prefix_len], seed);
+        }
+        let mut seen = vec![vec![false; per_thread]; threads];
+        for chunk in all[prefix_len..].chunks_exact(rec_len) {
+            let tid = chunk[0] as usize;
+            let iter = chunk[1] as usize;
+            assert!(!seen[tid][iter], "duplicate record ({tid}, {iter})");
+            for (k, &byte) in chunk[2..].iter().enumerate() {
+                assert_eq!(byte, ((tid * 17 + iter * 31 + k) & 0xff) as u8);
+            }
+            seen[tid][iter] = true;
+        }
+        assert!(seen.into_iter().flatten().all(|v| v));
+    }
+}
+
+#[test]
+fn r3_clean_marker_cached_read_dir_noop_basic_info_and_wal_checkpoint() {
+    let tmp = TempDir::new("r3_clean_marker_and_caches");
+    let store_dir = tmp.0.join("store");
+    let store = DedupStore::init(&store_dir, StoreConfig::default()).unwrap();
+    store.create_workspace("ws").unwrap();
+
+    let ws_id = {
+        let backend = DedupWorkspaceBackend::open(store.clone(), "ws").unwrap();
+        let ws_id = backend.ws_id();
+        // Clean marker must NOT exist while workspace is mounted/open.
+        assert!(!store.overlay().clean_marker_path(ws_id).exists());
+
+        let dir_id = backend.mkdir(&OpsPath::new(b"/dir")).unwrap();
+        for i in 0..5 {
+            let p = format!("/dir/f{i}.txt");
+            let f = backend
+                .create_or_open(&OpsPath::new(p.as_bytes()), Disposition::Create)
+                .unwrap();
+            backend.write(f.file_id, 0, format!("payload-{i}").as_bytes()).unwrap();
+            backend.flush_file(f.file_id).unwrap();
+
+            // No-op set_times and set_attributes short-circuit should succeed and preserve metadata.
+            let info = backend.get_info(f.file_id).unwrap();
+            backend
+                .set_times(
+                    f.file_id,
+                    Some(info.times.accessed),
+                    Some(info.times.written),
+                    Some(info.times.changed),
+                    Some(info.times.created),
+                )
+                .unwrap();
+            backend
+                .set_attributes(f.file_id, fs_winfsp::Attributes(info.attributes.0 & 0x27))
+                .unwrap();
+            let after = backend.get_info(f.file_id).unwrap();
+            assert_eq!(after.times, info.times);
+            assert_eq!(after.attributes, info.attributes);
+        }
+
+        // First read_dir warms the dir cache; second hits the zero-SQLite cache path.
+        let first = backend.read_dir_with_info(dir_id).unwrap();
+        let second = backend.read_dir_with_info(dir_id).unwrap();
+        assert_eq!(first.len(), 5);
+        assert_eq!(first.len(), second.len());
+        for ((n1, i1), (n2, i2)) in first.iter().zip(second.iter()) {
+            assert_eq!(n1, n2);
+            assert_eq!(i1.size, i2.size);
+        }
+
+        // Explicit WAL checkpoint works cleanly.
+        backend.checkpoint_wal().unwrap();
+        ws_id
+    };
+
+    // Dropping the backend cleanly must write the `.clean` marker.
+    assert!(store.overlay().clean_marker_path(ws_id).exists());
+
+    // Reopening consumes/removes the `.clean` marker and skips reconcile cleanly.
+    let reopened = DedupWorkspaceBackend::open(store.clone(), "ws").unwrap();
+    assert!(!store.overlay().clean_marker_path(ws_id).exists());
+    let dir_id = reopened.open_dir(&OpsPath::new(b"/dir")).unwrap();
+    assert_eq!(reopened.read_dir_with_info(dir_id).unwrap().len(), 5);
+    drop(reopened);
+
+    // Durable dedup + gc path (Safety A: sync_data + synchronous=FULL) keeps fsck clean.
+    let dsum = store.dedup_workspace(Some("ws"), 0, |_, _| false).unwrap();
+    assert_eq!(dsum.deduped_files, 5);
+    let gsum = store.gc(50).unwrap();
+    assert_eq!(gsum.deleted_empty_packs, 0);
+    let check = store.fsck(false).unwrap();
+    assert_eq!(check.missing_chunks, 0);
+    assert_eq!(check.mismatched_refcounts, 0);
+    assert_eq!(check.orphan_chunks, 0);
+}

@@ -28,7 +28,6 @@ use fs_winfsp::ops::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -163,13 +162,15 @@ impl DentryShardMap {
 type DentryShard = RwLock<DentryShardMap>;
 
 const DIRTY_FLUSH_THRESHOLD: usize = 256;
+const INODE_ALLOC_BATCH: u64 = 256;
 
 /// WinFsp `WorkspaceOps` backend serving one workspace of a `DedupStore`.
 pub struct DedupWorkspaceBackend {
     store: Arc<DedupStore>,
     ws_id: u64,
     ws_name: String,
-    /// Writer SQLite connection (used ONLY for mutations).
+    /// Writer SQLite connection (used ONLY for mutations; auto-checkpoint disabled so foreground
+    /// threads never stall on WAL checkpoint fsyncs).
     write_conn: Mutex<Connection>,
     /// Concurrent read-only WAL SQLite connection pool (used for all read/stat/list/open paths).
     ro_pool: RoConnPool,
@@ -180,11 +181,17 @@ pub struct DedupWorkspaceBackend {
     /// Lock-free count of entries in `dirty_inodes` so clean read paths avoid locking the mutex.
     dirty_count: AtomicUsize,
     next_inode: AtomicU64,
+    /// High-water mark already persisted to `workspaces.next_inode` so `alloc_inode` batches
+    /// SQLite updates to 1 per `INODE_ALLOC_BATCH` creations.
+    reserved_inode_end: AtomicU64,
 }
 
 impl Drop for DedupWorkspaceBackend {
     fn drop(&mut self) {
-        let _ = self.flush_all_dirty();
+        if self.flush_all_dirty().is_ok() {
+            let marker = self.store.overlay().clean_marker_path(self.ws_id);
+            let _ = std::fs::write(marker, b"clean");
+        }
     }
 }
 
@@ -232,16 +239,31 @@ fn reconcile_overlay_sizes(conn: &mut Connection, store: &DedupStore, ws_id: u64
 
 impl DedupWorkspaceBackend {
     /// Opens `ws_name` in `store` for live WinFsp serving, reconciling any un-flushed overlay
-    /// file sizes left over from a prior unclean shutdown.
+    /// file sizes left over from a prior unclean shutdown and pre-creating the 256 overlay shards.
     pub fn open(store: Arc<DedupStore>, ws_name: &str) -> crate::Result<Self> {
         let mut conn = store.open_conn()?;
+        // Disable foreground WAL auto-checkpoint so dispatcher threads never stall on a
+        // multi-hundred-millisecond checkpoint fsync; the background maintenance thread runs
+        // `checkpoint_wal()` periodically instead.
+        let _ = conn.execute_batch("PRAGMA wal_autocheckpoint = 0;");
         let ws_id = find_workspace_id(&conn, ws_name)?;
-        reconcile_overlay_sizes(&mut conn, &store, ws_id)?;
+
+        // Check clean-shutdown marker: skip per-overlay stat sweep when previous session exited cleanly.
+        let marker = store.overlay().clean_marker_path(ws_id);
+        let was_clean = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        if !was_clean {
+            reconcile_overlay_sizes(&mut conn, &store, ws_id)?;
+        }
+        // Pre-create all 256 hex shard directories once so file creations avoid per-file `create_dir_all`.
+        store.overlay().precreate_shards(ws_id);
+
         let next_inode: i64 = conn.query_row(
             "SELECT next_inode FROM workspaces WHERE ws_id = ?1",
             params![ws_id as i64],
             |r| r.get(0),
         )?;
+        let start_inode = next_inode.max((ROOT_INODE + 1) as i64) as u64;
         let ro_pool = RoConnPool::new(Arc::clone(&store));
         let dentry_cache = (0..DENTRY_SHARDS)
             .map(|_| RwLock::new(DentryShardMap::default()))
@@ -255,7 +277,8 @@ impl DedupWorkspaceBackend {
             dentry_cache,
             dirty_inodes: Mutex::new(HashMap::new()),
             dirty_count: AtomicUsize::new(0),
-            next_inode: AtomicU64::new(next_inode.max((ROOT_INODE + 1) as i64) as u64),
+            next_inode: AtomicU64::new(start_inode),
+            reserved_inode_end: AtomicU64::new(start_inode),
         })
     }
 
@@ -271,13 +294,21 @@ impl DedupWorkspaceBackend {
         &self.store
     }
 
+    /// Allocates an inode ID, batch-reserving `INODE_ALLOC_BATCH` IDs in SQLite so normal
+    /// file/dir creations only execute `UPDATE workspaces` once per 256 allocations.
     fn alloc_inode(&self, tx: &rusqlite::Transaction<'_>) -> OpsResult<u64> {
         let id = self.next_inode.fetch_add(1, Ordering::Relaxed);
-        tx.execute(
-            "UPDATE workspaces SET next_inode = MAX(next_inode, ?1) WHERE ws_id = ?2",
-            params![(id + 1) as i64, self.ws_id as i64],
-        )
-        .map_err(map_sql)?;
+        if id >= self.reserved_inode_end.load(Ordering::Relaxed) {
+            let new_end = id.saturating_add(INODE_ALLOC_BATCH);
+            let mut stmt = tx
+                .prepare_cached(
+                    "UPDATE workspaces SET next_inode = MAX(next_inode, ?1) WHERE ws_id = ?2",
+                )
+                .map_err(map_sql)?;
+            stmt.execute(params![new_end as i64, self.ws_id as i64])
+                .map_err(map_sql)?;
+            self.reserved_inode_end.store(new_end, Ordering::Relaxed);
+        }
         Ok(id)
     }
 
@@ -610,14 +641,14 @@ impl DedupWorkspaceBackend {
     }
 
     /// Materializes a `STORAGE_CHUNKS` file (or its first `max_bytes` prefix on truncating `set_size`)
-    /// into its local sparse overlay file WITHOUT holding `write_conn`!
+    /// into its local overlay file WITHOUT holding `write_conn`!
     /// Caller MUST hold `self.store.lock_inode(self.ws_id, inode.inode_id)` exclusively.
     fn materialize_overlay_unlocked(
         &self,
         inode: &InodeRow,
         max_bytes: Option<u64>,
     ) -> OpsResult<()> {
-        let mut file = self
+        let file = self
             .store
             .overlay()
             .create_empty(self.ws_id, inode.inode_id)
@@ -642,10 +673,9 @@ impl DedupWorkspaceBackend {
                     .read_chunk(&entry.hash, loc)
                     .map_err(map_err)?;
                 let take = ((limit - copied) as usize).min(raw.len());
-                file.write_all(&raw[..take]).map_err(map_io)?;
+                file.write_all_at(copied, &raw[..take]).map_err(map_io)?;
                 copied += take as u64;
             }
-            file.flush().map_err(map_io)?;
         }
         Ok(())
     }
@@ -711,6 +741,40 @@ impl DedupWorkspaceBackend {
     }
 
     fn read_dir_inner(&self, dir_id: u64) -> OpsResult<Vec<(Vec<u8>, u8, NodeInfo)>> {
+        // Fast zero-SQLite path: if `dir_id` is already marked `complete = true` in `dentry_cache`
+        // AND every child hits `inode_cache`, serve the entire directory listing directly from RAM
+        // without touching SQLite or acquiring any write locks!
+        {
+            let guard = self.dentry_shard(dir_id).read().unwrap();
+            if let Some(dir) = guard.dirs.get(&dir_id) {
+                if dir.complete {
+                    dir.referenced.store(true, Ordering::Relaxed);
+                    let mut keyed = Vec::with_capacity(dir.entries.len());
+                    let mut all_hit = true;
+                    for (folded, (child_id, kind_u8, display_name)) in &dir.entries {
+                        if let Some(cached) = self.store.get_cached_inode(self.ws_id, *child_id) {
+                            keyed.push((
+                                folded.as_ref(),
+                                display_name.clone(),
+                                *kind_u8,
+                                cached_to_node_info(&cached),
+                            ));
+                        } else {
+                            all_hit = false;
+                            break;
+                        }
+                    }
+                    if all_hit {
+                        keyed.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                        return Ok(keyed
+                            .into_iter()
+                            .map(|(_, name, kind, info)| (name, kind, info))
+                            .collect());
+                    }
+                }
+            }
+        }
+
         let conn = self.ro_pool.get()?;
         let dir_row = self
             .load_inode_cached(&conn, dir_id)?
@@ -846,6 +910,125 @@ impl DedupWorkspaceBackend {
             }
         }
         Ok(out)
+    }
+    /// Shared write implementation supporting both positional writes (`Some(offset)`) and
+    /// atomic append writes (`None` -> appends at authoritative EOF under `lock_inode`).
+    fn write_inner(&self, file_id: u64, offset_opt: Option<u64>, bytes: &[u8]) -> OpsResult<(u64, usize)> {
+        let _lock = self.store.lock_inode(self.ws_id, file_id);
+
+        // Fast path: already-cached `STORAGE_OVERLAY` file -> ZERO `write_conn` lock,
+        // ZERO SQLite query/txn, ZERO `file.metadata()` syscall!
+        if let Some(hit) = self.store.get_cached_inode(self.ws_id, file_id) {
+            if hit.kind == KIND_DIR {
+                return Err(OpsError::IsADirectory);
+            }
+            if hit.storage_mode == STORAGE_OVERLAY {
+                let offset = offset_opt.unwrap_or(hit.size);
+                let end_pos = self
+                    .store
+                    .overlay()
+                    .write_at_fast(self.ws_id, file_id, offset, bytes)
+                    .map_err(map_err)?;
+                let new_len = hit.size.max(end_pos);
+                let ts = now_ns();
+                self.store.put_cached_inode(
+                    self.ws_id,
+                    Arc::new(CachedInode {
+                        inode_id: file_id,
+                        kind: KIND_FILE,
+                        size: new_len,
+                        attributes: hit.attributes,
+                        created_ns: hit.created_ns,
+                        accessed_ns: hit.accessed_ns,
+                        written_ns: ts,
+                        changed_ns: ts,
+                        storage_mode: STORAGE_OVERLAY,
+                        entries: hit.entries.clone(),
+                        chunk_offsets: hit.chunk_offsets.clone(),
+                        dirty: true,
+                    }),
+                );
+                let dirty_len = self.set_dirty(file_id, new_len, ts);
+                if dirty_len >= DIRTY_FLUSH_THRESHOLD {
+                    let _ = self.flush_all_dirty();
+                }
+                return Ok((offset, bytes.len()));
+            }
+        }
+
+        // Slow path: cold cache or `STORAGE_CHUNKS` -> load via RO pool and materialize CoW
+        // WITHOUT holding `write_conn`!
+        let mut row = {
+            let ro_conn = self.ro_pool.get()?;
+            load_inode(&ro_conn, self.ws_id, file_id)
+                .map_err(map_err)?
+                .ok_or(OpsError::NotFound)?
+        };
+        if row.kind == KIND_DIR {
+            return Err(OpsError::IsADirectory);
+        }
+        if let Some((d_size, d_ts)) = self.get_dirty(file_id) {
+            row.size = d_size;
+            row.written_ns = d_ts;
+            row.changed_ns = d_ts;
+            row.storage_mode = STORAGE_OVERLAY;
+        }
+        let was_chunks = row.storage_mode == STORAGE_CHUNKS;
+        if was_chunks {
+            self.materialize_overlay_unlocked(&row, None)?;
+        }
+        let offset = offset_opt.unwrap_or(row.size);
+        let end_pos = self
+            .store
+            .overlay()
+            .write_at_fast(self.ws_id, file_id, offset, bytes)
+            .map_err(map_err)?;
+        let new_len = row.size.max(end_pos);
+        let ts = now_ns();
+        if was_chunks {
+            self.commit_overlay_flip(&mut row, new_len, ts)?;
+            self.clear_dirty(file_id);
+            self.store.put_cached_inode(
+                self.ws_id,
+                Arc::new(CachedInode {
+                    inode_id: file_id,
+                    kind: KIND_FILE,
+                    size: new_len,
+                    attributes: row.attributes,
+                    created_ns: row.created_ns,
+                    accessed_ns: row.accessed_ns,
+                    written_ns: ts,
+                    changed_ns: ts,
+                    storage_mode: STORAGE_OVERLAY,
+                    entries: Some(Arc::from(Vec::new().into_boxed_slice())),
+                    chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
+                    dirty: false,
+                }),
+            );
+        } else {
+            self.store.put_cached_inode(
+                self.ws_id,
+                Arc::new(CachedInode {
+                    inode_id: file_id,
+                    kind: KIND_FILE,
+                    size: new_len,
+                    attributes: row.attributes,
+                    created_ns: row.created_ns,
+                    accessed_ns: row.accessed_ns,
+                    written_ns: ts,
+                    changed_ns: ts,
+                    storage_mode: STORAGE_OVERLAY,
+                    entries: Some(Arc::from(Vec::new().into_boxed_slice())),
+                    chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
+                    dirty: true,
+                }),
+            );
+            let dirty_len = self.set_dirty(file_id, new_len, ts);
+            if dirty_len >= DIRTY_FLUSH_THRESHOLD {
+                let _ = self.flush_all_dirty();
+            }
+        }
+        Ok((offset, bytes.len()))
     }
 }
 
@@ -1369,119 +1552,12 @@ impl WorkspaceOps for DedupWorkspaceBackend {
     }
 
     fn write(&self, file_id: u64, offset: u64, bytes: &[u8]) -> OpsResult<usize> {
-        let _lock = self.store.lock_inode(self.ws_id, file_id);
+        let (_, written) = self.write_inner(file_id, Some(offset), bytes)?;
+        Ok(written)
+    }
 
-        // Fast path: already-cached `STORAGE_OVERLAY` file -> ZERO `write_conn` lock,
-        // ZERO SQLite query/txn, ZERO `file.metadata()` syscall!
-        if let Some(hit) = self.store.get_cached_inode(self.ws_id, file_id) {
-            if hit.kind == KIND_DIR {
-                return Err(OpsError::IsADirectory);
-            }
-            if hit.storage_mode == STORAGE_OVERLAY {
-                let end_pos = self
-                    .store
-                    .overlay()
-                    .write_at_fast(self.ws_id, file_id, offset, bytes)
-                    .map_err(map_err)?;
-                let new_len = hit.size.max(end_pos);
-                let ts = now_ns();
-                self.store.put_cached_inode(
-                    self.ws_id,
-                    Arc::new(CachedInode {
-                        inode_id: file_id,
-                        kind: KIND_FILE,
-                        size: new_len,
-                        attributes: hit.attributes,
-                        created_ns: hit.created_ns,
-                        accessed_ns: hit.accessed_ns,
-                        written_ns: ts,
-                        changed_ns: ts,
-                        storage_mode: STORAGE_OVERLAY,
-                        entries: hit.entries.clone(),
-                        chunk_offsets: hit.chunk_offsets.clone(),
-                        dirty: true,
-                    }),
-                );
-                let dirty_len = self.set_dirty(file_id, new_len, ts);
-                if dirty_len >= DIRTY_FLUSH_THRESHOLD {
-                    let _ = self.flush_all_dirty();
-                }
-                return Ok(bytes.len());
-            }
-        }
-
-        // Slow path: cold cache or `STORAGE_CHUNKS` -> load via RO pool and materialize CoW
-        // WITHOUT holding `write_conn`!
-        let mut row = {
-            let ro_conn = self.ro_pool.get()?;
-            load_inode(&ro_conn, self.ws_id, file_id)
-                .map_err(map_err)?
-                .ok_or(OpsError::NotFound)?
-        };
-        if row.kind == KIND_DIR {
-            return Err(OpsError::IsADirectory);
-        }
-        if let Some((d_size, d_ts)) = self.get_dirty(file_id) {
-            row.size = d_size;
-            row.written_ns = d_ts;
-            row.changed_ns = d_ts;
-            row.storage_mode = STORAGE_OVERLAY;
-        }
-        let was_chunks = row.storage_mode == STORAGE_CHUNKS;
-        if was_chunks {
-            self.materialize_overlay_unlocked(&row, None)?;
-        }
-        let end_pos = self
-            .store
-            .overlay()
-            .write_at_fast(self.ws_id, file_id, offset, bytes)
-            .map_err(map_err)?;
-        let new_len = row.size.max(end_pos);
-        let ts = now_ns();
-        if was_chunks {
-            self.commit_overlay_flip(&mut row, new_len, ts)?;
-            self.clear_dirty(file_id);
-            self.store.put_cached_inode(
-                self.ws_id,
-                Arc::new(CachedInode {
-                    inode_id: file_id,
-                    kind: KIND_FILE,
-                    size: new_len,
-                    attributes: row.attributes,
-                    created_ns: row.created_ns,
-                    accessed_ns: row.accessed_ns,
-                    written_ns: ts,
-                    changed_ns: ts,
-                    storage_mode: STORAGE_OVERLAY,
-                    entries: Some(Arc::from(Vec::new().into_boxed_slice())),
-                    chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
-                    dirty: false,
-                }),
-            );
-        } else {
-            self.store.put_cached_inode(
-                self.ws_id,
-                Arc::new(CachedInode {
-                    inode_id: file_id,
-                    kind: KIND_FILE,
-                    size: new_len,
-                    attributes: row.attributes,
-                    created_ns: row.created_ns,
-                    accessed_ns: row.accessed_ns,
-                    written_ns: ts,
-                    changed_ns: ts,
-                    storage_mode: STORAGE_OVERLAY,
-                    entries: Some(Arc::from(Vec::new().into_boxed_slice())),
-                    chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
-                    dirty: true,
-                }),
-            );
-            let dirty_len = self.set_dirty(file_id, new_len, ts);
-            if dirty_len >= DIRTY_FLUSH_THRESHOLD {
-                let _ = self.flush_all_dirty();
-            }
-        }
-        Ok(bytes.len())
+    fn write_append(&self, file_id: u64, bytes: &[u8]) -> OpsResult<(u64, usize)> {
+        self.write_inner(file_id, None, bytes)
     }
 
     fn set_size(&self, file_id: u64, len: u64) -> OpsResult<()> {
@@ -1622,6 +1698,16 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         created: Option<i64>,
     ) -> OpsResult<()> {
         let _lock = self.store.lock_inode(self.ws_id, file_id);
+        if let Some(prev) = self.store.get_cached_inode(self.ws_id, file_id) {
+            if !prev.dirty
+                && created.is_none_or(|t| t == prev.created_ns)
+                && accessed.is_none_or(|t| t == prev.accessed_ns)
+                && written.is_none_or(|t| t == prev.written_ns)
+                && changed.is_none_or(|t| t == prev.changed_ns)
+            {
+                return Ok(());
+            }
+        }
         self.flush_dirty_inode(file_id)?;
         let conn = self.write_conn.lock().unwrap();
         let mut stmt = conn
@@ -1672,6 +1758,11 @@ impl WorkspaceOps for DedupWorkspaceBackend {
     fn set_attributes(&self, file_id: u64, attributes: Attributes) -> OpsResult<()> {
         validate_attributes(attributes.0).map_err(|_| OpsError::InvalidParameter)?;
         let _lock = self.store.lock_inode(self.ws_id, file_id);
+        if let Some(prev) = self.store.get_cached_inode(self.ws_id, file_id) {
+            if !prev.dirty && prev.attributes == attributes.0 {
+                return Ok(());
+            }
+        }
         self.flush_dirty_inode(file_id)?;
         let ts = now_ns();
         let conn = self.write_conn.lock().unwrap();
@@ -1941,6 +2032,12 @@ impl WorkspaceOps for DedupWorkspaceBackend {
             let _lock = self.store.lock_inode(self.ws_id, file_id);
             self.flush_dirty_inode(file_id)?;
         }
+        Ok(())
+    }
+
+    fn checkpoint_wal(&self) -> OpsResult<()> {
+        let conn = self.write_conn.lock().unwrap();
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
         Ok(())
     }
 }

@@ -110,6 +110,69 @@ pub fn path_matches(rel_path: &str, raw_pattern: &str) -> bool {
     false
 }
 
+/// Precompiled filter set (patterns normalized & split once) for fast per-file matching
+/// during multi-million-file `import` and `dedup` scans.
+#[derive(Clone, Debug, Default)]
+pub struct CompiledFilter {
+    patterns: Vec<Vec<String>>,
+}
+
+impl CompiledFilter {
+    pub fn compile(raw_patterns: &[String]) -> Self {
+        let mut patterns = Vec::with_capacity(raw_patterns.len());
+        for raw in raw_patterns {
+            let norm = normalize_pattern(raw);
+            let segs: Vec<String> = norm
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if !segs.is_empty() {
+                patterns.push(segs);
+            }
+        }
+        Self { patterns }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    pub fn matches(&self, rel_path: &str) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let path = normalize_pattern(rel_path);
+        if path.is_empty() {
+            return false;
+        }
+        let path_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if path_segs.is_empty() {
+            return false;
+        }
+        for pat_segs in &self.patterns {
+            if pat_segs.len() > path_segs.len() {
+                continue;
+            }
+            let max_start = path_segs.len() - pat_segs.len();
+            for start in 0..=max_start {
+                let mut all_ok = true;
+                for (offset, pseg) in pat_segs.iter().enumerate() {
+                    if !glob_match_segment(pseg, path_segs[start + offset]) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+                if all_ok {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 /// Returns `true` if `rel_path` matches any pattern in `patterns`.
 pub fn matches_any(rel_path: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|p| path_matches(rel_path, p))

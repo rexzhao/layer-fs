@@ -70,9 +70,9 @@ fn norm_path_key(p: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-/// Returns `Some(mount_point)` if a live `dedupfs mount` process is currently serving `store_root`.
-/// Used by `fsck --fix` to refuse modifying metadata concurrently with a mounted filesystem.
-pub fn active_mount_for_store(store_root: &Path) -> Option<String> {
+/// Returns `Some((mount_point, workspace, pipe_name))` if a live `dedupfs mount` process is
+/// currently serving `store_root`.
+pub fn active_mount_info_for_store(store_root: &Path) -> Option<(String, String, String)> {
     let target = norm_path_key(store_root);
     let entries = fs::read_dir(mounts_dir()).ok()?;
     for entry in entries.flatten() {
@@ -92,15 +92,39 @@ pub fn active_mount_for_store(store_root: &Path) -> Option<String> {
         #[cfg(windows)]
         {
             if win_pipe::send_command(&rec.pipe_name, "ping").is_ok() {
-                return Some(rec.mount_point);
+                return Some((rec.mount_point, rec.workspace, rec.pipe_name));
             }
         }
         #[cfg(not(windows))]
         {
-            return Some(rec.mount_point);
+            return Some((rec.mount_point, rec.workspace, rec.pipe_name));
         }
     }
     None
+}
+
+/// Returns `Some(mount_point)` if a live `dedupfs mount` process is currently serving `store_root`.
+/// Used by `fsck --fix` and `gc` to refuse modifying packs/metadata concurrently with a mount.
+pub fn active_mount_for_store(store_root: &Path) -> Option<String> {
+    active_mount_info_for_store(store_root).map(|(mp, _, _)| mp)
+}
+
+/// Triggers a safe online `dedup` sweep through a running mount's control pipe so active handles
+/// and dirty overlay metadata are respected.
+pub fn trigger_live_dedup(pipe_name: &str) -> Result<String> {
+    #[cfg(windows)]
+    {
+        let reply = win_pipe::send_command(pipe_name, "dedup")?;
+        if let Some(err_msg) = reply.strip_prefix("ERR ") {
+            return Err(Error::Other(err_msg.trim().to_owned()));
+        }
+        Ok(reply.trim().to_owned())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pipe_name;
+        Err(Error::Other("mount control pipe is Windows-only".into()))
+    }
 }
 
 fn volume_info(total_size: u64) -> VolumeInfo {
@@ -206,6 +230,8 @@ pub fn run_mount(
                 std::thread::spawn(move || {
                     let (lock, cvar) = &*d_stop;
                     let mut last_dedup = std::time::Instant::now();
+                    let mut last_checkpoint = std::time::Instant::now();
+                    let checkpoint_interval = Duration::from_secs(30);
                     loop {
                         let guard = lock.lock().unwrap();
                         let (guard, _) = cvar.wait_timeout(guard, flush_tick).unwrap();
@@ -216,6 +242,13 @@ pub fn run_mount(
 
                         // Persist any buffered foreground overlay size/mtime updates promptly.
                         let _ = d_adapter.backend().flush();
+
+                        // Run non-blocking PASSIVE WAL checkpoint off the foreground dispatcher
+                        // threads so write commits never stall on auto-checkpoint fsyncs.
+                        if last_checkpoint.elapsed() >= checkpoint_interval {
+                            last_checkpoint = std::time::Instant::now();
+                            let _ = d_adapter.backend().checkpoint_wal();
+                        }
 
                         if let Some(interval) = dedup_interval {
                             if last_dedup.elapsed() >= interval {

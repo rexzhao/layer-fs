@@ -464,6 +464,28 @@ pub trait WorkspaceOps {
     fn on_cleanup(&self, _file_id: u64) -> OpsResult<()> {
         Ok(())
     }
+
+    /// Atomically appends `bytes` to the current end of `file_id`, returning `(write_offset, written_len)`.
+    /// Defaults to `get_info` + `write`; backends with per-inode locks override this so concurrent
+    /// `WriteToEndOfFile` appends never overwrite each other.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::write`].
+    fn write_append(&self, file_id: u64, bytes: &[u8]) -> OpsResult<(u64, usize)> {
+        let at = self.get_info(file_id)?.size;
+        let written = self.write(file_id, at, bytes)?;
+        Ok((at, written))
+    }
+
+    /// Runs a non-blocking background metadata WAL checkpoint when supported.
+    ///
+    /// # Errors
+    ///
+    /// [`OpsError::Other`] when the backend reports a failure.
+    fn checkpoint_wal(&self) -> OpsResult<()> {
+        Ok(())
+    }
 }
 
 /// A boxed backend is a backend: the mount entry point does not know which concrete type it was given, and saying so once here
@@ -564,6 +586,14 @@ impl WorkspaceOps for Box<dyn WorkspaceOps + Send + Sync> {
 
     fn on_cleanup(&self, file_id: u64) -> OpsResult<()> {
         (**self).on_cleanup(file_id)
+    }
+
+    fn write_append(&self, file_id: u64, bytes: &[u8]) -> OpsResult<(u64, usize)> {
+        (**self).write_append(file_id, bytes)
+    }
+
+    fn checkpoint_wal(&self) -> OpsResult<()> {
+        (**self).checkpoint_wal()
     }
 }
 

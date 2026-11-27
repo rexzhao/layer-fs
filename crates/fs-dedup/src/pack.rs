@@ -1,13 +1,14 @@
 //! Immutable append-only external `.pack` files with O(1) positional reads and a
 //! sharded in-memory LRU decoded chunk cache.
 
-use crate::chunker::{decompress_chunk, Codec, Hash32};
+use crate::chunker::{decompress_chunk_arc, Codec, Hash32, Hash32BuildHasher};
 use crate::error::{Error, Result};
+use crate::parallel_io::ParallelFile;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 pub const PACK_MAGIC: &[u8; 8] = b"DDFSPCK1";
 pub const PACK_HEADER_BYTES: u64 = 16;
@@ -175,10 +176,21 @@ impl PackWriter {
         Ok(())
     }
 
-    /// Flushes and seals the active pack.
+    /// Flushes and durably syncs (`sync_data`) the active pack to storage so newly written
+    /// chunks survive power loss before any old copy (overlay file or compacted pack) is deleted.
+    pub fn sync_data(&mut self) -> Result<()> {
+        if let Some(active) = &mut self.active {
+            active.writer.flush()?;
+            active.writer.get_ref().sync_data()?;
+        }
+        Ok(())
+    }
+
+    /// Flushes, syncs to disk, and seals the active pack.
     pub fn seal_active(&mut self) -> Result<()> {
         if let Some(mut active) = self.active.take() {
             active.writer.flush()?;
+            active.writer.get_ref().sync_data()?;
             self.pending_packs.insert(active.pack_id, (active.offset, true));
         }
         Ok(())
@@ -240,8 +252,12 @@ impl PackWriter {
     }
 }
 
+type SingleFlightOutcome = std::result::Result<Arc<[u8]>, String>;
+type SingleFlightSlot = Arc<(Mutex<Option<SingleFlightOutcome>>, Condvar)>;
+
 struct CacheShard {
-    map: HashMap<Hash32, (Arc<[u8]>, bool)>,
+    map: HashMap<Hash32, (Arc<[u8]>, bool), Hash32BuildHasher>,
+    in_flight: HashMap<Hash32, SingleFlightSlot, Hash32BuildHasher>,
     order: VecDeque<Hash32>,
     bytes: usize,
     limit: usize,
@@ -250,7 +266,8 @@ struct CacheShard {
 impl CacheShard {
     fn new(limit: usize) -> Self {
         Self {
-            map: HashMap::new(),
+            map: HashMap::with_hasher(Hash32BuildHasher::default()),
+            in_flight: HashMap::with_hasher(Hash32BuildHasher::default()),
             order: VecDeque::new(),
             bytes: 0,
             limit,
@@ -297,7 +314,7 @@ impl CacheShard {
 }
 
 struct ReaderPool {
-    handles: HashMap<u64, Arc<File>>,
+    handles: HashMap<u64, Arc<ParallelFile>>,
     order: VecDeque<u64>,
 }
 
@@ -309,11 +326,11 @@ impl ReaderPool {
         }
     }
 
-    fn get_cached(&self, pack_id: u64) -> Option<Arc<File>> {
+    fn get_cached(&self, pack_id: u64) -> Option<Arc<ParallelFile>> {
         self.handles.get(&pack_id).cloned()
     }
 
-    fn insert_opened(&mut self, pack_id: u64, file: Arc<File>) -> Arc<File> {
+    fn insert_opened(&mut self, pack_id: u64, file: Arc<ParallelFile>) -> Arc<ParallelFile> {
         if let Some(existing) = self.handles.get(&pack_id) {
             return Arc::clone(existing);
         }
@@ -335,7 +352,8 @@ impl ReaderPool {
     }
 }
 
-/// Thread-safe pack store supporting concurrent cached chunk reads and serialized pack appends.
+/// Thread-safe pack store supporting genuinely parallel `FILE_FLAG_OVERLAPPED` chunk reads,
+/// single-flight decompression, zero-copy `Arc<[u8]>` cache insertion, and serialized appends.
 pub struct PackStore {
     packs_dir: PathBuf,
     writer: Mutex<PackWriter>,
@@ -363,12 +381,13 @@ impl PackStore {
         }
     }
 
-    fn open_reader(&self, pack_id: u64) -> Result<Arc<File>> {
+    fn open_reader(&self, pack_id: u64) -> Result<Arc<ParallelFile>> {
         if let Some(f) = self.readers.read().unwrap().get_cached(pack_id) {
             return Ok(f);
         }
-        // Open pack file OUTSIDE the pool write lock so concurrent threads never serialize on `CreateFileW`.
-        let opened = Arc::new(File::open(pack_path(&self.packs_dir, pack_id))?);
+        // Open overlapped pack handle OUTSIDE the pool write lock so concurrent threads never
+        // serialize on `CreateFileW` or on synchronous Windows `FILE_OBJECT` I/O locks!
+        let opened = Arc::new(ParallelFile::open_read(&pack_path(&self.packs_dir, pack_id))?);
         Ok(self.readers.write().unwrap().insert_opened(pack_id, opened))
     }
 
@@ -380,20 +399,61 @@ impl PackStore {
         self.writer.lock().unwrap()
     }
 
-    /// Reads raw uncompressed bytes of `hash` at `loc`, using the sharded LRU cache.
-    ///
-    /// Verifies record magic, codec, lengths, embedded 32-byte header hash, and Zstd/LZ4
-    /// decompressor framing without recomputing a full BLAKE3-256 pass on every hot read.
+    /// Reads raw uncompressed bytes of `hash` at `loc`, using the sharded CLOCK-LRU cache,
+    /// `FILE_FLAG_OVERLAPPED` parallel kernel I/O, single-flight decompression coalescing, and
+    /// single-allocation decompression directly into `Arc<[u8]>`.
     pub fn read_chunk(&self, hash: &Hash32, loc: ChunkLoc) -> Result<Arc<[u8]>> {
         let shard_idx = (hash[0] as usize) & (CACHE_SHARDS - 1);
-        if let Some(hit) = self.cache[shard_idx].lock().unwrap().get(hash) {
-            return Ok(hit);
-        }
+        let leader_slot = {
+            let mut shard = self.cache[shard_idx].lock().unwrap();
+            if let Some(hit) = shard.get(hash) {
+                return Ok(hit);
+            }
+            if let Some(existing) = shard.in_flight.get(hash) {
+                let wait_slot = Arc::clone(existing);
+                drop(shard);
+                let (lock, cvar) = &*wait_slot;
+                let mut res = lock.lock().unwrap();
+                while res.is_none() {
+                    res = cvar.wait(res).unwrap();
+                }
+                return match res.as_ref().unwrap() {
+                    Ok(arc) => Ok(Arc::clone(arc)),
+                    Err(msg) => Err(Error::Other(msg.clone())),
+                };
+            }
+            let slot: SingleFlightSlot = Arc::new((Mutex::new(None), Condvar::new()));
+            shard.in_flight.insert(*hash, Arc::clone(&slot));
+            slot
+        };
 
+        // Leader executes parallel overlapped read + direct-to-Arc decompression, then publishes
+        // the result (or error) and wakes any waiting threads even on early `?` failure.
+        let outcome = self.read_chunk_uncached(hash, loc);
+        let pub_outcome: SingleFlightOutcome = match &outcome {
+            Ok(arc) => Ok(Arc::clone(arc)),
+            Err(err) => Err(err.to_string()),
+        };
+        {
+            let mut shard = self.cache[shard_idx].lock().unwrap();
+            if let Ok(arc) = &outcome {
+                shard.insert(*hash, Arc::clone(arc));
+            }
+            shard.in_flight.remove(hash);
+        }
+        {
+            let (lock, cvar) = &*leader_slot;
+            *lock.lock().unwrap() = Some(pub_outcome);
+            cvar.notify_all();
+        }
+        outcome
+    }
+
+    fn read_chunk_uncached(&self, hash: &Hash32, loc: ChunkLoc) -> Result<Arc<[u8]>> {
         let file = self.open_reader(loc.pack_id)?;
         let total_len = RECORD_HEADER_BYTES + loc.stored_len as usize;
         let mut record = vec![0u8; total_len];
-        read_exact_at(&file, loc.offset, &mut record)?;
+        file.read_exact_at(loc.offset, &mut record)?;
 
         let magic = u32::from_le_bytes(record[0..4].try_into().unwrap());
         if magic != RECORD_MAGIC {
@@ -412,20 +472,7 @@ impl PackStore {
             )));
         }
 
-        let raw = decompress_chunk(codec, &record[RECORD_HEADER_BYTES..], raw_len as usize)?;
-        if raw.len() != raw_len as usize {
-            return Err(Error::Corrupt(format!(
-                "decompressed chunk length mismatch in pack {} at offset {}",
-                loc.pack_id, loc.offset
-            )));
-        }
-
-        let arc: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
-        self.cache[shard_idx]
-            .lock()
-            .unwrap()
-            .insert(*hash, Arc::clone(&arc));
-        Ok(arc)
+        decompress_chunk_arc(codec, &record[RECORD_HEADER_BYTES..], raw_len as usize)
     }
 
     /// Reads raw on-disk stored bytes (still compressed) for pack GC compaction without re-compressing.
@@ -433,7 +480,7 @@ impl PackStore {
         let file = self.open_reader(loc.pack_id)?;
         let total_len = RECORD_HEADER_BYTES + loc.stored_len as usize;
         let mut record = vec![0u8; total_len];
-        read_exact_at(&file, loc.offset, &mut record)?;
+        file.read_exact_at(loc.offset, &mut record)?;
         let magic = u32::from_le_bytes(record[0..4].try_into().unwrap());
         if magic != RECORD_MAGIC || &record[16..48] != hash {
             return Err(Error::Corrupt(format!(
