@@ -23,7 +23,7 @@ pub struct MountOptions {
     pub dedup_interval_secs: u64,
     /// Minimum idle time in seconds before a closed overlay file is eligible for background dedup.
     pub dedup_idle_secs: u64,
-    /// WinFsp kernel `FileInfoTimeout` in milliseconds (`1000` default for fast `git status` / IDE stat sweeps).
+    /// WinFsp kernel `FileInfoTimeout` in milliseconds (`5000` default for fast Unity / `git status` / IDE stat sweeps).
     pub info_timeout_ms: u32,
 }
 

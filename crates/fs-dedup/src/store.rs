@@ -20,14 +20,14 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const INODE_LOCK_STRIPES: usize = 1024;
 const KNOWN_SHARDS: usize = 64;
 const META_CACHE_SHARDS: usize = 16;
 const CHUNK_LOC_CACHE_PER_SHARD: usize = 32_768; // 524k total (~32 MiB)
-const INODE_CACHE_PER_SHARD: usize = 16_384; // 262k total (~40 MiB)
+const INODE_CACHE_PER_SHARD: usize = 65_536; // 1,048k total (~100 MiB, fits entire Unity Assets/)
 const IN_MEMORY_IMPORT_LIMIT: u64 = 16 * 1024 * 1024;
 const IMPORT_COMMIT_BATCH: usize = 2048;
 
@@ -162,7 +162,7 @@ impl KnownChunks {
     }
 }
 
-type InodeCacheShard = Mutex<HashMap<(u64, u64), Arc<CachedInode>>>;
+type InodeCacheShard = RwLock<HashMap<(u64, u64), Arc<CachedInode>>>;
 
 /// Shared deduplicating store handle (metadata SQLite + external pack pool + local sparse overlay).
 pub struct DedupStore {
@@ -172,7 +172,7 @@ pub struct DedupStore {
     meta: Mutex<Connection>,
     packs: PackStore,
     overlay: OverlayStore,
-    inode_locks: Vec<Mutex<()>>,
+    inode_locks: Vec<RwLock<()>>,
     chunk_loc_cache: Vec<Mutex<HashMap<Hash32, ChunkLoc>>>,
     inode_cache: Vec<InodeCacheShard>,
 }
@@ -243,12 +243,12 @@ impl DedupStore {
             }
         }
         let overlay = OverlayStore::new(root.join("overlay"));
-        let inode_locks = (0..INODE_LOCK_STRIPES).map(|_| Mutex::new(())).collect();
+        let inode_locks = (0..INODE_LOCK_STRIPES).map(|_| RwLock::new(())).collect();
         let chunk_loc_cache = (0..META_CACHE_SHARDS)
             .map(|_| Mutex::new(HashMap::new()))
             .collect();
         let inode_cache = (0..META_CACHE_SHARDS)
-            .map(|_| Mutex::new(HashMap::new()))
+            .map(|_| RwLock::new(HashMap::new()))
             .collect();
         Ok(Arc::new(Self {
             root,
@@ -308,11 +308,19 @@ impl DedupStore {
         &self.overlay
     }
 
-    /// Acquires the per-inode stripe lock shared between live WinFsp ops and background dedup.
-    pub fn lock_inode(&self, ws_id: u64, inode_id: u64) -> std::sync::MutexGuard<'_, ()> {
+    /// Acquires an exclusive per-inode stripe lock (mutations, CoW, background dedup).
+    pub fn lock_inode(&self, ws_id: u64, inode_id: u64) -> std::sync::RwLockWriteGuard<'_, ()> {
         let idx = ((ws_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ inode_id) as usize)
             & (INODE_LOCK_STRIPES - 1);
-        self.inode_locks[idx].lock().unwrap()
+        self.inode_locks[idx].write().unwrap()
+    }
+
+    /// Acquires a shared per-inode stripe lock allowing concurrent reads of the same hot file
+    /// (e.g. parallel WinFsp page-fault reads on Unity's `ArtifactDB` / `SourceAssetDB`).
+    pub fn lock_inode_read(&self, ws_id: u64, inode_id: u64) -> std::sync::RwLockReadGuard<'_, ()> {
+        let idx = ((ws_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ inode_id) as usize)
+            & (INODE_LOCK_STRIPES - 1);
+        self.inode_locks[idx].read().unwrap()
     }
 
     /// Opens an additional WAL SQLite connection for concurrent workspace reads/writes.
@@ -346,7 +354,7 @@ impl DedupStore {
     pub fn get_cached_inode(&self, ws_id: u64, inode_id: u64) -> Option<Arc<CachedInode>> {
         let shard = ((ws_id ^ inode_id) as usize) & (META_CACHE_SHARDS - 1);
         self.inode_cache[shard]
-            .lock()
+            .read()
             .unwrap()
             .get(&(ws_id, inode_id))
             .cloned()
@@ -355,18 +363,54 @@ impl DedupStore {
     /// Stores an inode snapshot in the sharded RAM cache.
     pub fn put_cached_inode(&self, ws_id: u64, inode: Arc<CachedInode>) {
         let shard = ((ws_id ^ inode.inode_id) as usize) & (META_CACHE_SHARDS - 1);
-        let mut guard = self.inode_cache[shard].lock().unwrap();
+        let mut guard = self.inode_cache[shard].write().unwrap();
         if guard.len() >= INODE_CACHE_PER_SHARD {
             guard.clear();
         }
         guard.insert((ws_id, inode.inode_id), inode);
     }
 
+    /// Batch-populates inode metadata prefetched by `read_dir`, preserving any already-decoded
+    /// chunk manifests in cache while acquiring each shard write lock at most once.
+    pub fn put_cached_inodes_preserve_manifest(&self, ws_id: u64, batch: Vec<CachedInode>) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut by_shard: [Vec<CachedInode>; META_CACHE_SHARDS] =
+            std::array::from_fn(|_| Vec::new());
+        for item in batch {
+            let shard = ((ws_id ^ item.inode_id) as usize) & (META_CACHE_SHARDS - 1);
+            by_shard[shard].push(item);
+        }
+        for (shard_idx, items) in by_shard.into_iter().enumerate() {
+            if items.is_empty() {
+                continue;
+            }
+            let mut guard = self.inode_cache[shard_idx].write().unwrap();
+            if guard.len().saturating_add(items.len()) >= INODE_CACHE_PER_SHARD {
+                guard.clear();
+            }
+            for mut item in items {
+                if item.entries.is_none() {
+                    if let Some(prev) = guard.get(&(ws_id, item.inode_id)) {
+                        if prev.storage_mode == item.storage_mode
+                            && prev.size == item.size
+                            && prev.written_ns == item.written_ns
+                        {
+                            item.entries = prev.entries.clone();
+                        }
+                    }
+                }
+                guard.insert((ws_id, item.inode_id), Arc::new(item));
+            }
+        }
+    }
+
     /// Evicts one inode from the sharded RAM cache (called on writes, CoW, deletes, and dedup swaps).
     pub fn invalidate_inode(&self, ws_id: u64, inode_id: u64) {
         let shard = ((ws_id ^ inode_id) as usize) & (META_CACHE_SHARDS - 1);
         self.inode_cache[shard]
-            .lock()
+            .write()
             .unwrap()
             .remove(&(ws_id, inode_id));
     }

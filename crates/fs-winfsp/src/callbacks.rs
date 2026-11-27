@@ -454,16 +454,23 @@ fn write_is_safe(ptr: *const c_void, len: usize) -> bool {
     at >= start && at.saturating_add(len) <= end
 }
 
-/// Writes a `FileInfo` **only after asking the OS whether the pointer can take it**.
-///
-/// Returns `false` when the pointer is not writable for the whole structure; the caller refuses the call and counts it, so a bad output
-/// pointer becomes a named refusal instead of a heap that is discovered to be broken much later.
+fn verify_ptrs_enabled() -> bool {
+    static VERIFY_PTRS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFY_PTRS
+        .get_or_init(|| std::env::var_os("LAYERFS_VERIFY_PTRS").is_some_and(|v| v != "0"))
+}
+
+/// Writes a `FileInfo` to `out`, optionally running `VirtualQuery` when `LAYERFS_VERIFY_PTRS=1`.
 ///
 /// # Safety
 ///
-/// `out` is treated as opaque: it is validated before any write, and never dereferenced otherwise.
+/// `out` is non-null and writable for `size_of::<FileInfo>()` bytes per the WinFsp callback contract.
 unsafe fn write_file_info(out: *mut FileInfo, record: FileInfo) -> bool {
-    if !write_is_safe(out.cast::<c_void>(), std::mem::size_of::<FileInfo>()) {
+    if out.is_null() {
+        return false;
+    }
+    if verify_ptrs_enabled() && !write_is_safe(out.cast::<c_void>(), std::mem::size_of::<FileInfo>())
+    {
         BAD_OUTPUT_POINTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
             "file info: refusing to write {} bytes to {out:p} — not a writable region the OS knows about",
@@ -471,7 +478,7 @@ unsafe fn write_file_info(out: *mut FileInfo, record: FileInfo) -> bool {
         );
         return false;
     }
-    // SAFETY: the pointer was just checked to be writable for exactly this many bytes.
+    // SAFETY: checked non-null (and writable if diagnostic verification is enabled).
     unsafe { std::ptr::write(out, record) };
     true
 }
@@ -1063,6 +1070,7 @@ unsafe fn open_like(
     // attempted. Checking it here (rather than only after the file door answers) is what makes the refusal independent of what the backend does with
     // a directory name — and it is the check whose absence let a file replace a directory in the real trace.
     if expects_file
+        && disposition != fs_semantics::disposition::Disposition::Open
         && adapter
             .backend()
             .open_dir(&crate::ops::Path::new(path.as_bytes()))
@@ -1081,7 +1089,7 @@ unsafe fn open_like(
             Ok(file_id) => adapter
                 .backend()
                 .get_info(file_id)
-                .map(|_| {
+                .map(|node| {
                     let found = adapter
                         .backend()
                         .dir_binding(&crate::ops::Path::new(path.as_bytes()));
@@ -1096,7 +1104,7 @@ unsafe fn open_like(
                             );
                         }
                     }
-                    (file_id, found)
+                    (file_id, found, Some(node))
                 })
                 .map_err(|err| crate::error::to_status_of(&err).code() as i32),
             Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
@@ -1117,7 +1125,7 @@ unsafe fn open_like(
                         );
                     }
                 }
-                Ok((file_id, found))
+                Ok((file_id, found, None))
             }
             // Windows opens a directory with `FILE_OPEN_IF`, which means "open it, or make it": the make half is `mkdir`, and doing it here is
             // what keeps the 2x2 from needing a fifth verb.
@@ -1132,7 +1140,7 @@ unsafe fn open_like(
                         let found = adapter
                             .backend()
                             .dir_binding(&crate::ops::Path::new(path.as_bytes()));
-                        Ok((file_id, found))
+                        Ok((file_id, found, None))
                     }
                     Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
                 }
@@ -1143,16 +1151,25 @@ unsafe fn open_like(
             .backend()
             .create_or_open(&crate::ops::Path::new(path.as_bytes()), disposition)
         {
-            // The backend's own answer carries where the name lives — that is the binding `remove_at` will guard with.
+            // The backend's own answer carries both the binding and the full `NodeInfo` metadata!
             Ok(outcome) => Ok((
                 outcome.file_id,
                 Some(crate::ops::DirOutcome {
                     id: outcome.file_id,
                     binding: outcome.binding,
                 }),
+                Some(NodeInfo {
+                    file_id: outcome.file_id,
+                    kind: outcome.kind,
+                    size: outcome.size,
+                    times: outcome.times,
+                    attributes: outcome.attributes,
+                }),
             )),
             // **A directory opened without `FILE_DIRECTORY_FILE`.** Windows does open directories with a plain `FILE_OPEN`,
-            // and the file door refuses it with `NotADirectory` — so the directory door gets the second attempt.
+            // and the file door refuses it with `NotADirectory` — so if caller demanded a non-directory file, refuse immediately
+            // with `OURS_IS_A_DIRECTORY`; otherwise try the directory door.
+            Err(crate::ops::OpsError::NotADirectory) if expects_file => Err(OURS_IS_A_DIRECTORY),
             Err(crate::ops::OpsError::NotADirectory) => {
                 match adapter
                     .backend()
@@ -1170,7 +1187,7 @@ unsafe fn open_like(
                                 );
                             }
                         }
-                        Ok((file_id, found))
+                        Ok((file_id, found, None))
                     }
                     Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
                 }
@@ -1178,20 +1195,23 @@ unsafe fn open_like(
             Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
         },
     };
-    let (file_id, binding) = match outcome {
-        Ok(pair) => pair,
+    let (file_id, binding, known_node) = match outcome {
+        Ok(triple) => triple,
         Err(status) => {
             OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return status;
         }
     };
-    // Read current metadata once, verify the requested kind matches, and build the FileInfo record.
-    let node = match adapter.backend().get_info(file_id) {
-        Ok(node) => node,
-        Err(err) => {
-            OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return crate::error::to_status_of(&err).code() as i32;
-        }
+    // Reuse `NodeInfo` from `create_or_open` when available, avoiding a second `get_info` call.
+    let node = match known_node {
+        Some(node) => node,
+        None => match adapter.backend().get_info(file_id) {
+            Ok(node) => node,
+            Err(err) => {
+                OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return crate::error::to_status_of(&err).code() as i32;
+            }
+        },
     };
     let is_directory = node.kind == crate::ops::Kind::Directory;
     if wants_directory && !is_directory {
@@ -2056,22 +2076,30 @@ pub unsafe fn get_security_by_name_shell(
     // **A directory answers `NotADirectory` to the file door**, and reporting that as "name not found" is how a *parent segment* came to look
     // missing: Windows then mapped the whole operation to `ERROR_PATH_NOT_FOUND` (`os error 3`), and every child under a perfectly good directory
     // failed. So the directory door gets the second attempt here too — the same fallback `open_like` uses, for the same reason.
-    let resolved = match adapter.backend().create_or_open(
+    let node = match adapter.backend().create_or_open(
         &crate::ops::Path::new(path.as_bytes()),
         fs_semantics::disposition::Disposition::Open,
     ) {
-        Ok(outcome) => Some(outcome.file_id),
-        Err(crate::ops::OpsError::NotADirectory) => adapter
-            .backend()
-            .open_dir(&crate::ops::Path::new(path.as_bytes()))
-            .ok(),
-        Err(_) => None,
-    };
-    let Some(file_id) = resolved else {
-        return OURS_OBJECT_NAME_NOT_FOUND;
-    };
-    let Ok(node) = adapter.backend().get_info(file_id) else {
-        return OURS_OBJECT_NAME_NOT_FOUND;
+        Ok(outcome) => NodeInfo {
+            file_id: outcome.file_id,
+            kind: outcome.kind,
+            size: outcome.size,
+            times: outcome.times,
+            attributes: outcome.attributes,
+        },
+        Err(crate::ops::OpsError::NotADirectory) => {
+            let Ok(file_id) = adapter
+                .backend()
+                .open_dir(&crate::ops::Path::new(path.as_bytes()))
+            else {
+                return OURS_OBJECT_NAME_NOT_FOUND;
+            };
+            let Ok(node) = adapter.backend().get_info(file_id) else {
+                return OURS_OBJECT_NAME_NOT_FOUND;
+            };
+            node
+        }
+        Err(_) => return OURS_OBJECT_NAME_NOT_FOUND,
     };
     // SAFETY: the caller's contract covers all three out-pointers.
     unsafe { write_security_answer(attributes_out, descriptor_out, descriptor_size_out, &node) }

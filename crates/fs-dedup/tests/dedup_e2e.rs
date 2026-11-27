@@ -652,3 +652,51 @@ fn read_dir_prefetches_metadata_without_manifest_and_read_lazy_loads_bytes() {
     let got_b = backend.read(b_id, 0, payload_b.len()).unwrap();
     assert_eq!(got_b, payload_b);
 }
+
+#[test]
+fn overlay_pooled_handles_support_concurrent_reads_and_clean_eviction_on_delete() {
+    let tmp = TempDir::new("overlay_pool");
+    let store = DedupStore::init(tmp.0.join("store"), StoreConfig::default()).unwrap();
+    store.create_workspace("ws").unwrap();
+    let backend = std::sync::Arc::new(DedupWorkspaceBackend::open(store.clone(), "ws").unwrap());
+
+    // Create a hot overlay DB file (like Unity's ArtifactDB) and write 256 KiB of patterned bytes.
+    let opened = backend
+        .create_or_open(&OpsPath::new(b"/ArtifactDB"), Disposition::Create)
+        .unwrap();
+    let mut payload = vec![0u8; 256 * 1024];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = ((i.wrapping_mul(31) ^ (i >> 8)) & 0xff) as u8;
+    }
+    backend.write(opened.file_id, 0, &payload).unwrap();
+
+    // 8 threads perform 200 concurrent random reads each against the pooled handle.
+    std::thread::scope(|s| {
+        for tid in 0..8usize {
+            let b = backend.clone();
+            let p = &payload;
+            let fid = opened.file_id;
+            s.spawn(move || {
+                for iter in 0..200usize {
+                    let off = ((tid * 13 + iter * 97) % 60) * 4096;
+                    let got = b.read(fid, off as u64, 4096).unwrap();
+                    assert_eq!(&got[..], &p[off..off + 4096]);
+                }
+            });
+        }
+    });
+
+    // Truncating and deleting the pooled overlay file must succeed cleanly without Windows sharing errors.
+    backend.set_size(opened.file_id, 4096).unwrap();
+    assert_eq!(backend.get_info(opened.file_id).unwrap().size, 4096);
+    backend
+        .remove_at(opened.binding.0, &opened.binding.1, opened.file_id)
+        .unwrap();
+    assert!(
+        !store
+            .overlay()
+            .file_path(backend.ws_id(), opened.file_id)
+            .exists(),
+        "overlay file must be deleted cleanly after pool eviction"
+    );
+}
