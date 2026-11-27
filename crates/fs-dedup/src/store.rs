@@ -7,9 +7,9 @@ use crate::filter;
 use crate::meta::{
     create_empty_workspace, decode_manifest, encode_manifest, find_workspace_id, get_chunk_loc,
     is_hot_db_name, load_inode, next_pack_id, now_ns, open_meta_connection,
-    release_manifest_chunks, upsert_chunk_ref, upsert_pack_updates, InodeRow, ManifestEntry,
-    StoreConfig, StoreStats, WorkspaceInfo, KIND_DIR, KIND_FILE, ROOT_INODE, STORAGE_CHUNKS,
-    STORAGE_OVERLAY,
+    open_readonly_meta_connection, release_manifest_chunks, upsert_chunk_ref, upsert_pack_updates,
+    InodeRow, ManifestEntry, StoreConfig, StoreStats, WorkspaceInfo, KIND_DIR, KIND_FILE,
+    ROOT_INODE, STORAGE_CHUNKS, STORAGE_OVERLAY,
 };
 use crate::overlay::OverlayStore;
 use crate::pack::{ChunkLoc, PackStore, DEFAULT_CACHE_BYTES, RECORD_HEADER_BYTES};
@@ -25,8 +25,50 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const INODE_LOCK_STRIPES: usize = 1024;
 const KNOWN_SHARDS: usize = 64;
+const META_CACHE_SHARDS: usize = 16;
+const CHUNK_LOC_CACHE_PER_SHARD: usize = 32_768; // 524k total (~32 MiB)
+const INODE_CACHE_PER_SHARD: usize = 16_384; // 262k total (~40 MiB)
 const IN_MEMORY_IMPORT_LIMIT: u64 = 16 * 1024 * 1024;
 const IMPORT_COMMIT_BATCH: usize = 2048;
+
+/// Cached inode metadata + pre-decoded chunk manifest held in RAM for sub-microsecond
+/// `get_info` and `read` dispatch without hitting SQLite.
+#[derive(Clone, Debug)]
+pub struct CachedInode {
+    pub inode_id: u64,
+    pub kind: u8,
+    pub size: u64,
+    pub attributes: u32,
+    pub created_ns: i64,
+    pub accessed_ns: i64,
+    pub written_ns: i64,
+    pub changed_ns: i64,
+    pub storage_mode: u8,
+    pub entries: Arc<[ManifestEntry]>,
+}
+
+impl CachedInode {
+    pub fn from_row(row: &InodeRow) -> Result<Self> {
+        let entries: Arc<[ManifestEntry]> =
+            if row.storage_mode == STORAGE_CHUNKS && !row.manifest.is_empty() {
+                Arc::from(decode_manifest(&row.manifest)?.into_boxed_slice())
+            } else {
+                Arc::from(Vec::new().into_boxed_slice())
+            };
+        Ok(Self {
+            inode_id: row.inode_id,
+            kind: row.kind,
+            size: row.size,
+            attributes: row.attributes,
+            created_ns: row.created_ns,
+            accessed_ns: row.accessed_ns,
+            written_ns: row.written_ns,
+            changed_ns: row.changed_ns,
+            storage_mode: row.storage_mode,
+            entries,
+        })
+    }
+}
 
 /// Live progress snapshot reported during `import_dir` / `import_dir_update`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -119,6 +161,8 @@ impl KnownChunks {
     }
 }
 
+type InodeCacheShard = Mutex<HashMap<(u64, u64), Arc<CachedInode>>>;
+
 /// Shared deduplicating store handle (metadata SQLite + external pack pool + local sparse overlay).
 pub struct DedupStore {
     root: PathBuf,
@@ -128,6 +172,8 @@ pub struct DedupStore {
     packs: PackStore,
     overlay: OverlayStore,
     inode_locks: Vec<Mutex<()>>,
+    chunk_loc_cache: Vec<Mutex<HashMap<Hash32, ChunkLoc>>>,
+    inode_cache: Vec<InodeCacheShard>,
 }
 
 impl DedupStore {
@@ -197,6 +243,12 @@ impl DedupStore {
         }
         let overlay = OverlayStore::new(root.join("overlay"));
         let inode_locks = (0..INODE_LOCK_STRIPES).map(|_| Mutex::new(())).collect();
+        let chunk_loc_cache = (0..META_CACHE_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
+        let inode_cache = (0..META_CACHE_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
         Ok(Arc::new(Self {
             root,
             config,
@@ -205,6 +257,8 @@ impl DedupStore {
             packs,
             overlay,
             inode_locks,
+            chunk_loc_cache,
+            inode_cache,
         }))
     }
 
@@ -263,6 +317,63 @@ impl DedupStore {
     /// Opens an additional WAL SQLite connection for concurrent workspace reads/writes.
     pub fn open_conn(&self) -> Result<Connection> {
         open_meta_connection(&self.meta_path)
+    }
+
+    /// Opens a fast read-only WAL SQLite connection (`PRAGMA query_only = ON`, 4 GiB mmap).
+    pub fn open_readonly_conn(&self) -> Result<Connection> {
+        open_readonly_meta_connection(&self.meta_path)
+    }
+
+    /// Looks up a chunk's pack location using the sharded RAM cache before falling back to SQLite.
+    pub fn resolve_chunk_loc(&self, conn: &Connection, hash: &Hash32) -> Result<Option<ChunkLoc>> {
+        let shard = (hash[0] as usize) & (META_CACHE_SHARDS - 1);
+        if let Some(&loc) = self.chunk_loc_cache[shard].lock().unwrap().get(hash) {
+            return Ok(Some(loc));
+        }
+        let loc = get_chunk_loc(conn, hash)?;
+        if let Some(found) = loc {
+            let mut guard = self.chunk_loc_cache[shard].lock().unwrap();
+            if guard.len() >= CHUNK_LOC_CACHE_PER_SHARD {
+                guard.clear();
+            }
+            guard.insert(*hash, found);
+        }
+        Ok(loc)
+    }
+
+    /// Reads a cached inode snapshot if present.
+    pub fn get_cached_inode(&self, ws_id: u64, inode_id: u64) -> Option<Arc<CachedInode>> {
+        let shard = ((ws_id ^ inode_id) as usize) & (META_CACHE_SHARDS - 1);
+        self.inode_cache[shard]
+            .lock()
+            .unwrap()
+            .get(&(ws_id, inode_id))
+            .cloned()
+    }
+
+    /// Stores an inode snapshot in the sharded RAM cache.
+    pub fn put_cached_inode(&self, ws_id: u64, inode: Arc<CachedInode>) {
+        let shard = ((ws_id ^ inode.inode_id) as usize) & (META_CACHE_SHARDS - 1);
+        let mut guard = self.inode_cache[shard].lock().unwrap();
+        if guard.len() >= INODE_CACHE_PER_SHARD {
+            guard.clear();
+        }
+        guard.insert((ws_id, inode.inode_id), inode);
+    }
+
+    /// Evicts one inode from the sharded RAM cache (called on writes, CoW, deletes, and dedup swaps).
+    pub fn invalidate_inode(&self, ws_id: u64, inode_id: u64) {
+        let shard = ((ws_id ^ inode_id) as usize) & (META_CACHE_SHARDS - 1);
+        self.inode_cache[shard]
+            .lock()
+            .unwrap()
+            .remove(&(ws_id, inode_id));
+    }
+
+    fn clear_chunk_loc_cache(&self) {
+        for shard in &self.chunk_loc_cache {
+            shard.lock().unwrap().clear();
+        }
     }
 
     /// Creates a brand-new empty workspace.
@@ -1715,8 +1826,9 @@ impl DedupStore {
                 tx.commit()?;
             }
 
-            // Delete loose overlay file to immediately free host disk space!
+            // Delete loose overlay file to immediately free host disk space, and evict cached inode!
             let _ = self.overlay.remove_file(ws_id, inode_id);
+            self.invalidate_inode(ws_id, inode_id);
 
             summary.deduped_files += 1;
             summary.raw_bytes += actual_len;
@@ -1861,6 +1973,7 @@ impl DedupStore {
             }
 
             self.packs.delete_pack_file(pack_id)?;
+            self.clear_chunk_loc_cache();
             summary.compacted_packs += 1;
             summary.moved_chunks += moved.len() as u64;
             summary.reclaimed_disk_bytes += dead_bytes;

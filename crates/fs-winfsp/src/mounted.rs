@@ -959,9 +959,12 @@ mod platform {
 
             let mount_path = wide(mount_point.as_os_str());
             let mount_status = set_mount_point(file_system, mount_path.as_ptr());
-            // Explicit thread count: memfs passes 0, but if 0 means "no threads" the dispatcher would exist and serve
-            // nothing — which is indistinguishable from a dangling table from the outside. 2 is enough to tell the difference.
-            let start_status = start(file_system, 2);
+            // Explicit multi-thread dispatcher count (4..=16 based on CPU cores) so concurrent
+            // VS Code / Unity / Explorer I/O does not queue behind 2 threads.
+            let dispatcher_threads = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(4, 16) as u32)
+                .unwrap_or(8);
+            let start_status = start(file_system, dispatcher_threads);
 
             // Observe **while mounted**: this is the only window in which the OS can see the file system.
             let looked_like_a_mount = mount_status == 0

@@ -240,12 +240,30 @@ pub fn open_meta_connection(path: &Path) -> Result<Connection> {
         "PRAGMA journal_mode = WAL;\
          PRAGMA synchronous = NORMAL;\
          PRAGMA page_size = 4096;\
-         PRAGMA cache_size = -131072;\
+         PRAGMA cache_size = -262144;\
+         PRAGMA mmap_size = 4294967296;\
          PRAGMA wal_autocheckpoint = 16384;\
          PRAGMA temp_store = MEMORY;\
          PRAGMA foreign_keys = OFF;",
     )?;
     conn.execute_batch(SCHEMA_SQL)?;
+    Ok(conn)
+}
+
+/// Opens a fast read-only WAL connection for concurrent metadata queries (`read`, `get_info`,
+/// `read_dir`, `open_dir`) without contending with other readers or writer locks.
+pub fn open_readonly_meta_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    conn.execute_batch(
+        "PRAGMA query_only = ON;\
+         PRAGMA cache_size = -131072;\
+         PRAGMA mmap_size = 4294967296;\
+         PRAGMA temp_store = MEMORY;",
+    )?;
     Ok(conn)
 }
 
