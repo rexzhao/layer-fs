@@ -108,7 +108,7 @@ fn list_entries(adapter: &crate::DynAdapter, dir_id: u64) -> Vec<ListEntry> {
     let Ok(items) = adapter.backend().read_dir(dir_id) else {
         return Vec::new();
     };
-    let mut entries: Vec<ListEntry> = items
+    let mut children: Vec<ListEntry> = items
         .into_iter()
         .filter_map(|item| {
             let info = adapter.backend().get_info(item.file_id).ok()?;
@@ -120,8 +120,21 @@ fn list_entries(adapter: &crate::DynAdapter, dir_id: u64) -> Vec<ListEntry> {
             ))
         })
         .collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    entries
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Windows NTFS / WinFsp contract: every non-root directory must report `.` and `..`
+    // before its children. Without them, `FindFirstFileW("empty_dir\\*")` (used by Git
+    // for Windows `mingw_opendir`) receives zero entries -> `ERROR_FILE_NOT_FOUND` (ENOENT).
+    if dir_id != crate::ROOT {
+        if let Ok(self_info) = adapter.backend().get_info(dir_id) {
+            let mut entries = Vec::with_capacity(children.len() + 2);
+            entries.push((vec![u16::from(b'.')], self_info.clone()));
+            entries.push((vec![u16::from(b'.'), u16::from(b'.')], self_info));
+            entries.extend(children);
+            return entries;
+        }
+    }
+    children
 }
 
 /// The `ReadDirectory` body with the entries handed in — the resume, the framing and the count are all here.
@@ -138,8 +151,8 @@ pub unsafe fn read_directory_from(
     bytes_transferred: *mut u32,
 ) -> i32 {
     // A non-null marker means the caller wants to resume after that name; we index by position, so translate it.
-    // If the marker entry was deleted mid-enumeration, advance to the first entry strictly greater than it
-    // (or `entries.len()` if none) instead of restarting at 0, which would loop forever.
+    // If the marker entry was deleted mid-enumeration, advance to the first real child strictly greater than it
+    // (skipping synthesized leading `.` and `..` so names like `!foo` < `.` never loop back to `.`).
     let start = if marker.is_null() {
         0usize
     } else {
@@ -152,10 +165,17 @@ pub unsafe fn read_directory_from(
             .position(|(candidate, _)| candidate.as_slice() == name)
             .map(|index| index + 1)
             .unwrap_or_else(|| {
-                entries
+                let first_real = entries
+                    .iter()
+                    .take_while(|(c, _)| {
+                        c.as_slice() == [u16::from(b'.')]
+                            || c.as_slice() == [u16::from(b'.'), u16::from(b'.')]
+                    })
+                    .count();
+                entries[first_real..]
                     .iter()
                     .position(|(candidate, _)| candidate.as_slice() > name)
-                    .unwrap_or(entries.len())
+                    .map_or(entries.len(), |offset| first_real + offset)
             })
     };
 

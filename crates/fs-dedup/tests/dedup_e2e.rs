@@ -258,6 +258,7 @@ fn live_winfsp_mount_io_background_dedup_and_umount() {
     let src_dir = tmp.0.join("src");
     let mount_point = tmp.0.join("mnt");
     std::fs::create_dir_all(src_dir.join("Assets")).unwrap();
+    std::fs::create_dir_all(src_dir.join(".claude").join(".session-state")).unwrap();
     std::fs::write(src_dir.join("Assets").join("hello.txt"), b"hello unity dedupfs").unwrap();
 
     let store = DedupStore::init(&store_dir, StoreConfig::default()).unwrap();
@@ -307,6 +308,29 @@ fn live_winfsp_mount_io_background_dedup_and_umount() {
         std::fs::read(&hello_path).expect("read imported file through WinFsp"),
         b"hello unity dedupfs"
     );
+
+    // Verify empty subdirectory emits `.` and `..` so `git status` / `FindFirstFileW("*")`
+    // never fails with ENOENT ("could not open directory ...: No such file or directory")!
+    let empty_dir = mount_point.join(".claude").join(".session-state");
+    assert_eq!(std::fs::read_dir(&empty_dir).unwrap().count(), 0);
+    let git_init = Command::new("git")
+        .current_dir(&mount_point)
+        .args(["init", "-q"])
+        .output();
+    if let Ok(out) = git_init {
+        if out.status.success() {
+            let st = Command::new("git")
+                .current_dir(&mount_point)
+                .args(["status"])
+                .output()
+                .expect("run git status");
+            let stderr = String::from_utf8_lossy(&st.stderr);
+            assert!(
+                !stderr.contains("could not open directory"),
+                "git status must not fail on empty subdirectories, got stderr: {stderr}"
+            );
+        }
+    }
 
     // Write a new file through Windows filesystem APIs (lands in sparse overlay).
     let created_path = mount_point.join("Assets").join("new_asset.txt");
