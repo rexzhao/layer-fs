@@ -115,11 +115,12 @@ struct DentryShardMap {
 impl DentryShardMap {
     /// Two-pass CLOCK eviction: removes ~25% of cold cached entries by whole directory
     /// (giving recently accessed directories a second chance and preserving `complete` invariants).
+    /// Runs in linear O(D) time (removes Pass-1 victims before scanning Pass-2).
     fn evict_quarter(&mut self, protect_dir: u64) {
         let target = (self.total / 4).max(1);
         let mut freed = 0usize;
         let mut to_remove = Vec::new();
-        // Pass 1: evict cold directories, clear ref bit on hot ones.
+        // Pass 1: collect cold directories, clearing ref bit on hot ones.
         for (&dir_id, dir) in &self.dirs {
             if dir_id == protect_dir {
                 continue;
@@ -133,10 +134,15 @@ impl DentryShardMap {
                 break;
             }
         }
-        // Pass 2: if everything was hot, evict remaining needed directories.
+        for dir_id in to_remove.drain(..) {
+            if let Some(removed) = self.dirs.remove(&dir_id) {
+                self.total = self.total.saturating_sub(removed.entries.len());
+            }
+        }
+        // Pass 2: if everything was hot, evict remaining needed directories from surviving keys (O(D)).
         if freed < target {
             for (&dir_id, dir) in &self.dirs {
-                if dir_id == protect_dir || to_remove.contains(&dir_id) {
+                if dir_id == protect_dir {
                     continue;
                 }
                 to_remove.push(dir_id);
@@ -145,10 +151,10 @@ impl DentryShardMap {
                     break;
                 }
             }
-        }
-        for dir_id in to_remove {
-            if let Some(removed) = self.dirs.remove(&dir_id) {
-                self.total = self.total.saturating_sub(removed.entries.len());
+            for dir_id in to_remove {
+                if let Some(removed) = self.dirs.remove(&dir_id) {
+                    self.total = self.total.saturating_sub(removed.entries.len());
+                }
             }
         }
     }
@@ -646,23 +652,27 @@ impl DedupWorkspaceBackend {
 
     /// Commits the `STORAGE_CHUNKS -> STORAGE_OVERLAY` metadata flip inside a brief `write_conn` txn.
     fn commit_overlay_flip(&self, inode: &mut InodeRow, new_size: u64, ts: i64) -> OpsResult<()> {
-        let mut conn = self.write_conn.lock().unwrap();
-        let tx = conn.transaction().map_err(map_sql)?;
-        release_manifest_chunks(&tx, &inode.manifest).map_err(map_err)?;
-        tx.execute(
-            "UPDATE inodes SET size = ?1, written_ns = ?2, changed_ns = ?2,
-                               storage_mode = ?3, manifest = X'', dirty_since_ns = ?2
-             WHERE ws_id = ?4 AND inode_id = ?5",
-            params![
-                new_size as i64,
-                ts,
-                i64::from(STORAGE_OVERLAY),
-                self.ws_id as i64,
-                inode.inode_id as i64
-            ],
-        )
-        .map_err(map_sql)?;
-        tx.commit().map_err(map_sql)?;
+        let deleted_chunks = {
+            let mut conn = self.write_conn.lock().unwrap();
+            let tx = conn.transaction().map_err(map_sql)?;
+            let deleted = release_manifest_chunks(&tx, &inode.manifest).map_err(map_err)?;
+            tx.execute(
+                "UPDATE inodes SET size = ?1, written_ns = ?2, changed_ns = ?2,
+                                   storage_mode = ?3, manifest = X'', dirty_since_ns = ?2
+                 WHERE ws_id = ?4 AND inode_id = ?5",
+                params![
+                    new_size as i64,
+                    ts,
+                    i64::from(STORAGE_OVERLAY),
+                    self.ws_id as i64,
+                    inode.inode_id as i64
+                ],
+            )
+            .map_err(map_sql)?;
+            tx.commit().map_err(map_sql)?;
+            deleted
+        };
+        self.store.invalidate_chunk_locs(&deleted_chunks);
         inode.size = new_size;
         inode.storage_mode = STORAGE_OVERLAY;
         inode.manifest.clear();
@@ -1090,9 +1100,11 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                         .ok_or(OpsError::NotFound)?;
                     let ts = now_ns();
                     let tx = conn.transaction().map_err(map_sql)?;
-                    if row.storage_mode == STORAGE_CHUNKS && !row.manifest.is_empty() {
-                        release_manifest_chunks(&tx, &row.manifest).map_err(map_err)?;
-                    }
+                    let deleted_chunks = if row.storage_mode == STORAGE_CHUNKS && !row.manifest.is_empty() {
+                        release_manifest_chunks(&tx, &row.manifest).map_err(map_err)?
+                    } else {
+                        Vec::new()
+                    };
                     let new_attrs = if disposition == Disposition::Supersede {
                         0u32
                     } else {
@@ -1112,6 +1124,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                     )
                     .map_err(map_sql)?;
                     tx.commit().map_err(map_sql)?;
+                    self.store.invalidate_chunk_locs(&deleted_chunks);
                     self.store
                         .overlay()
                         .create_empty(self.ws_id, child_id)
@@ -1773,10 +1786,11 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         }
 
         let tx = conn.transaction().map_err(map_sql)?;
+        let mut deleted_chunks = Vec::new();
         if let Some(dst_id) = replaced_id {
             if let Some(old_row) = load_inode(&tx, self.ws_id, dst_id).map_err(map_err)? {
                 if old_row.storage_mode == STORAGE_CHUNKS && !old_row.manifest.is_empty() {
-                    release_manifest_chunks(&tx, &old_row.manifest).map_err(map_err)?;
+                    deleted_chunks = release_manifest_chunks(&tx, &old_row.manifest).map_err(map_err)?;
                 } else if old_row.storage_mode == STORAGE_OVERLAY {
                     replaced_overlay_file = Some(dst_id);
                 }
@@ -1822,6 +1836,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
             .map_err(map_sql)?;
         }
         tx.commit().map_err(map_sql)?;
+        self.store.invalidate_chunk_locs(&deleted_chunks);
 
         self.invalidate_dentry(src_parent, &src_fold);
         self.cache_dentry_mutation(dst_parent, dst_fold, (src_id, src_kind, dst_disp.clone()));
@@ -1879,9 +1894,11 @@ impl WorkspaceOps for DedupWorkspaceBackend {
             .ok_or(OpsError::NotFound)?;
 
         let tx = conn.transaction().map_err(map_sql)?;
-        if old_row.storage_mode == STORAGE_CHUNKS && !old_row.manifest.is_empty() {
-            release_manifest_chunks(&tx, &old_row.manifest).map_err(map_err)?;
-        }
+        let deleted_chunks = if old_row.storage_mode == STORAGE_CHUNKS && !old_row.manifest.is_empty() {
+            release_manifest_chunks(&tx, &old_row.manifest).map_err(map_err)?
+        } else {
+            Vec::new()
+        };
         tx.execute(
             "DELETE FROM dentries WHERE ws_id = ?1 AND parent_id = ?2 AND folded_name = ?3",
             params![self.ws_id as i64, parent as i64, folded.as_slice()],
@@ -1893,6 +1910,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         )
         .map_err(map_sql)?;
         tx.commit().map_err(map_sql)?;
+        self.store.invalidate_chunk_locs(&deleted_chunks);
 
         self.invalidate_dentry(parent, &folded);
         self.clear_dirty(child_id);

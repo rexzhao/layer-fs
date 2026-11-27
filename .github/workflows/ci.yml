@@ -23,19 +23,20 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Clippy (Windows adapter, bridge, CLI, Win32 host)
+      - name: Clippy (Windows adapter, bridge, dedup, CLI, Win32 host)
         run: >
           cargo clippy --no-deps
           -p fs-semantics
           -p fs-windows
           -p fs-winfsp
           -p fs-layerfs
+          -p fs-dedup
           -p fs-cli
           -p layerfs-win32-host
           --all-targets
           -- -D warnings
 
-      - name: Test Windows adapter, bridge, and CLI
+      - name: Test Windows adapter, bridge, dedup, and CLI
         run: >
           cargo test
           -p fs-semantics
@@ -44,6 +45,12 @@ jobs:
           -p fs-layerfs
           -p fs-cli
           -- --test-threads=1
+
+      - name: Test fs-dedup (non-mount unit, e2e, and regression tests)
+        run: >
+          cargo test
+          -p fs-dedup
+          -- --skip live_winfsp_mount --test-threads=1
 
       - name: Test upstream Windows-adapted core crates
         run: >
@@ -54,5 +61,5 @@ jobs:
           -p layerfs-workspace
           -p layerfs-project
 
-      - name: Build release binary
-        run: cargo build --release -p fs-cli
+      - name: Build release binaries
+        run: cargo build --release -p fs-cli -p fs-dedup

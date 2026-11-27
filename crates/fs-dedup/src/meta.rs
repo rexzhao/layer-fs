@@ -305,36 +305,57 @@ pub fn get_chunk_loc(conn: &Connection, hash: &Hash32) -> Result<Option<ChunkLoc
     }
 }
 
-/// Decrements chunk refcounts for every chunk in `manifest_blob`; chunks whose refcount hits 0
-/// are removed from `chunks` and accounted as `dead_bytes` in `packs`.
-pub fn release_manifest_chunks(tx: &rusqlite::Transaction<'_>, manifest_blob: &[u8]) -> Result<()> {
-    if manifest_blob.is_empty() {
-        return Ok(());
+/// Decrements a chunk's refcount by `dec_refs`; if refcount reaches `<= 0`, deletes the row
+/// from `chunks`, updates `packs.live_bytes` / `dead_bytes`, and returns `Ok(true)`.
+pub fn decrement_chunk_refs(
+    tx: &rusqlite::Transaction<'_>,
+    hash: &Hash32,
+    dec_refs: u64,
+) -> Result<bool> {
+    if dec_refs == 0 {
+        return Ok(false);
     }
-    let entries = decode_manifest(manifest_blob)?;
     let mut dec_stmt = tx.prepare_cached(
-        "UPDATE chunks SET refcount = refcount - 1 WHERE hash = ?1 RETURNING refcount, pack_id, stored_len",
+        "UPDATE chunks SET refcount = refcount - ?1 WHERE hash = ?2 RETURNING refcount, pack_id, stored_len",
     )?;
-    let mut del_stmt = tx.prepare_cached("DELETE FROM chunks WHERE hash = ?1")?;
-    let mut pack_dead_stmt = tx.prepare_cached(
-        "UPDATE packs SET live_bytes = MAX(0, live_bytes - ?1), dead_bytes = dead_bytes + ?1 WHERE pack_id = ?2",
-    )?;
-
-    for entry in entries {
-        let info: Option<(i64, i64, i64)> = dec_stmt
-            .query_row(params![entry.hash.as_slice()], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
-            .optional()?;
-        if let Some((refcount, pack_id, stored_len)) = info {
-            if refcount <= 0 {
-                del_stmt.execute(params![entry.hash.as_slice()])?;
-                let record_bytes = crate::pack::RECORD_HEADER_BYTES as i64 + stored_len;
-                pack_dead_stmt.execute(params![record_bytes, pack_id])?;
-            }
+    let info: Option<(i64, i64, i64)> = dec_stmt
+        .query_row(params![dec_refs as i64, hash.as_slice()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?;
+    if let Some((refcount, pack_id, stored_len)) = info {
+        if refcount <= 0 {
+            let mut del_stmt = tx.prepare_cached("DELETE FROM chunks WHERE hash = ?1")?;
+            del_stmt.execute(params![hash.as_slice()])?;
+            let record_bytes = crate::pack::RECORD_HEADER_BYTES as i64 + stored_len;
+            let mut pack_dead_stmt = tx.prepare_cached(
+                "UPDATE packs SET live_bytes = MAX(0, live_bytes - ?1), dead_bytes = dead_bytes + ?1 WHERE pack_id = ?2",
+            )?;
+            pack_dead_stmt.execute(params![record_bytes, pack_id])?;
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
+}
+
+/// Decrements chunk refcounts for every chunk in `manifest_blob`; chunks whose refcount hits 0
+/// are removed from `chunks` and accounted as `dead_bytes` in `packs`.
+/// Returns the list of chunk hashes deleted from `chunks` so callers can evict `chunk_loc_cache`.
+pub fn release_manifest_chunks(
+    tx: &rusqlite::Transaction<'_>,
+    manifest_blob: &[u8],
+) -> Result<Vec<Hash32>> {
+    if manifest_blob.is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries = decode_manifest(manifest_blob)?;
+    let mut deleted = Vec::new();
+    for entry in entries {
+        if decrement_chunk_refs(tx, &entry.hash, 1)? {
+            deleted.push(entry.hash);
+        }
+    }
+    Ok(deleted)
 }
 
 /// Persists pack header/size/sealed updates into `packs`.

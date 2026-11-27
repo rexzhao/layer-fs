@@ -5,22 +5,22 @@ use crate::chunker::{blake3_hash, chunk_bytes, chunk_reader, compress_chunk, Cod
 use crate::error::{Error, Result};
 use crate::filter;
 use crate::meta::{
-    create_empty_workspace, decode_manifest, encode_manifest, find_workspace_id, get_chunk_loc,
-    is_hot_db_name, load_inode, next_pack_id, now_ns, open_meta_connection,
-    open_readonly_meta_connection, release_manifest_chunks, upsert_chunk_ref, upsert_pack_updates,
-    InodeRow, ManifestEntry, StoreConfig, StoreStats, WorkspaceInfo, KIND_DIR, KIND_FILE,
-    ROOT_INODE, STORAGE_CHUNKS, STORAGE_OVERLAY,
+    create_empty_workspace, decode_manifest, decrement_chunk_refs, encode_manifest,
+    find_workspace_id, get_chunk_loc, is_hot_db_name, load_inode, next_pack_id, now_ns,
+    open_meta_connection, open_readonly_meta_connection, release_manifest_chunks,
+    upsert_chunk_ref, upsert_pack_updates, InodeRow, ManifestEntry, StoreConfig, StoreStats,
+    WorkspaceInfo, KIND_DIR, KIND_FILE, ROOT_INODE, STORAGE_CHUNKS, STORAGE_OVERLAY,
 };
 use crate::overlay::OverlayStore;
 use crate::pack::{ChunkLoc, PackStore, DEFAULT_CACHE_BYTES, RECORD_HEADER_BYTES};
 use fs_semantics::name::fold_bytes;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const INODE_LOCK_STRIPES: usize = 1024;
@@ -28,8 +28,11 @@ const KNOWN_SHARDS: usize = 64;
 const META_CACHE_SHARDS: usize = 16;
 const CHUNK_LOC_CACHE_PER_SHARD: usize = 32_768; // 524k total (~32 MiB)
 const INODE_CACHE_PER_SHARD: usize = 65_536; // 1,048k total (~100 MiB, fits entire Unity Assets/)
-const IN_MEMORY_IMPORT_LIMIT: u64 = 16 * 1024 * 1024;
+const IN_MEMORY_IMPORT_LIMIT: u64 = 256 * 1024;
 const IMPORT_COMMIT_BATCH: usize = 2048;
+const IMPORT_COMMIT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const IMPORT_INFLIGHT_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+const DEDUP_MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Cached inode metadata + pre-decoded chunk manifest + chunk start offsets held in RAM for
 /// sub-microsecond `get_info` and O(log N) `read` dispatch without hitting SQLite.
@@ -285,6 +288,54 @@ fn clock_evict_quarter_inodes(
     }
 }
 
+/// Byte-level backpressure semaphore bounding total in-flight chunk payload memory between
+/// parallel import workers and the sequential pack committer.
+struct ByteBudget {
+    max: usize,
+    used: Mutex<usize>,
+    cvar: Condvar,
+}
+
+impl ByteBudget {
+    fn new(max: usize) -> Self {
+        Self {
+            max: max.max(1),
+            used: Mutex::new(0),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, bytes: usize) {
+        let mut used = self.used.lock().unwrap();
+        // Allow progress when `used == 0` even if a single chunk exceeds `max`.
+        while *used > 0 && used.saturating_add(bytes) > self.max {
+            used = self.cvar.wait(used).unwrap();
+        }
+        *used = used.saturating_add(bytes);
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut used = self.used.lock().unwrap();
+        *used = used.saturating_sub(bytes);
+        self.cvar.notify_all();
+    }
+}
+
+/// Exclusive cross-process & intra-process guard serializing pack allocation, appends, GC, and
+/// `fsck --fix` across independent `DedupStore` handles on the same store directory.
+struct PackWriteGuard<'a> {
+    store: &'a DedupStore,
+    _lock_file: File,
+}
+
+impl Drop for PackWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Flush and close any open active pack handle BEFORE releasing the OS file lock so
+        // the next serialized writer can safely sync from SQLite and resume/roll packs.
+        let _ = self.store.packs.writer().close_active();
+    }
+}
+
 /// Shared deduplicating store handle (metadata SQLite + external pack pool + local sparse overlay).
 pub struct DedupStore {
     root: PathBuf,
@@ -350,19 +401,6 @@ impl DedupStore {
             next_id,
             cache_bytes,
         );
-        // Resume the latest unsealed pack if it has room so small incremental dedups don't create tiny packs.
-        if let Some((pid, sz)) = conn
-            .query_row(
-                "SELECT pack_id, size_bytes FROM packs WHERE sealed = 0 ORDER BY pack_id DESC LIMIT 1",
-                [],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-            )
-            .optional()?
-        {
-            if sz < config.pack_target_bytes {
-                packs.writer().resume_pack(pid, sz)?;
-            }
-        }
         let overlay = OverlayStore::new(root.join("overlay"));
         let inode_locks = (0..INODE_LOCK_STRIPES).map(|_| RwLock::new(())).collect();
         let chunk_loc_cache = (0..META_CACHE_SHARDS)
@@ -557,6 +595,74 @@ impl DedupStore {
             .remove(&(ws_id, inode_id));
     }
 
+    /// Acquires the exclusive `<store>/pack.lock` file and synchronizes `PackWriter`'s
+    /// `next_pack_id` and active unsealed pack directly from `meta.sqlite`.
+    /// Prevents independent `DedupStore` handles / processes from colliding on pack IDs.
+    fn acquire_pack_write_lock(&self) -> Result<PackWriteGuard<'_>> {
+        let lock_path = self.root.join("pack.lock");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let lock_file = loop {
+            let mut opts = OpenOptions::new();
+            opts.create(true).read(true).write(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // Exclusive OS file lock (`share_mode(0)`) enforced both cross-process and intra-process.
+                opts.share_mode(0);
+            }
+            match opts.open(&lock_path) {
+                Ok(f) => break f,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => {
+                    return Err(Error::Other(format!(
+                        "another writer holds store pack lock ({}): {e}",
+                        lock_path.display()
+                    )));
+                }
+            }
+        };
+
+        let (db_next, unsealed) = {
+            let conn = self.meta.lock().unwrap();
+            let next_id = next_pack_id(&conn)?;
+            let unsealed: Option<(u64, u64)> = conn
+                .query_row(
+                    "SELECT pack_id, size_bytes FROM packs WHERE sealed = 0 ORDER BY pack_id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+                )
+                .optional()?;
+            (next_id, unsealed)
+        };
+        self.packs.writer().sync_from_db(db_next, unsealed)?;
+        Ok(PackWriteGuard {
+            store: self,
+            _lock_file: lock_file,
+        })
+    }
+
+    /// Evicts deleted chunk hashes from `chunk_loc_cache` so removed chunks are never served as stale hits.
+    pub fn invalidate_chunk_locs(&self, hashes: &[Hash32]) {
+        if hashes.is_empty() {
+            return;
+        }
+        let mut by_shard: [Vec<Hash32>; META_CACHE_SHARDS] = std::array::from_fn(|_| Vec::new());
+        for &h in hashes {
+            let shard = (h[0] as usize) & (META_CACHE_SHARDS - 1);
+            by_shard[shard].push(h);
+        }
+        for (shard_idx, list) in by_shard.into_iter().enumerate() {
+            if !list.is_empty() {
+                let mut guard = self.chunk_loc_cache[shard_idx].write().unwrap();
+                for h in list {
+                    guard.remove(&h);
+                }
+            }
+        }
+    }
+
     fn clear_chunk_loc_cache(&self) {
         for shard in &self.chunk_loc_cache {
             shard.write().unwrap().clear();
@@ -690,8 +796,9 @@ impl DedupStore {
                 }
             }
         }
+        let mut deleted_chunks = Vec::new();
         for m in manifests {
-            release_manifest_chunks(&tx, &m)?;
+            deleted_chunks.extend(release_manifest_chunks(&tx, &m)?);
         }
         tx.execute("DELETE FROM dentries WHERE ws_id = ?1", params![ws_id as i64])?;
         tx.execute("DELETE FROM inodes WHERE ws_id = ?1", params![ws_id as i64])?;
@@ -701,6 +808,7 @@ impl DedupStore {
         )?;
         tx.commit()?;
         drop(conn);
+        self.invalidate_chunk_locs(&deleted_chunks);
         self.overlay.remove_workspace(ws_id)?;
         Ok(())
     }
@@ -944,6 +1052,7 @@ impl DedupStore {
         Ok(canon_src)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn delete_subtree(
         tx: &rusqlite::Transaction<'_>,
         ws_id: u64,
@@ -952,6 +1061,7 @@ impl DedupStore {
         root_child_id: u64,
         root_kind: u8,
         overlay_to_delete: &mut Vec<u64>,
+        deferred_manifests: &mut Vec<Vec<u8>>,
     ) -> Result<u64> {
         let mut removed = 0u64;
         // Remove the entry binding in parent first.
@@ -985,7 +1095,7 @@ impl DedupStore {
             if let Some(row) = load_inode(tx, ws_id, node_id)? {
                 if row.kind == KIND_FILE {
                     if row.storage_mode == STORAGE_CHUNKS && !row.manifest.is_empty() {
-                        release_manifest_chunks(tx, &row.manifest)?;
+                        deferred_manifests.push(row.manifest);
                     } else if row.storage_mode == STORAGE_OVERLAY {
                         overlay_to_delete.push(node_id);
                     }
@@ -1010,6 +1120,8 @@ impl DedupStore {
         threads: usize,
         progress_cb: Option<Box<dyn Fn(ImportProgress) + Send + Sync>>,
     ) -> Result<ImportSummary> {
+        let _pack_guard = self.acquire_pack_write_lock()?;
+
         struct ExistingChild {
             display_name: Vec<u8>,
             inode_id: u64,
@@ -1055,7 +1167,11 @@ impl DedupStore {
             pinned_overlay: bool,
             replacing_mode: Option<u8>,
             entries: Vec<ManifestEntry>,
-            new_chunks: Vec<NewChunkBlob>,
+        }
+
+        enum ImportMsg {
+            Chunk(NewChunkBlob),
+            File(PreparedFile),
         }
 
         // Lazy-load `KnownChunks` on first file that actually needs chunking so a 0-change
@@ -1082,11 +1198,12 @@ impl DedupStore {
         let next_inode = Arc::new(AtomicU64::new(initial_next_inode));
 
         // Channel: walker -> workers
-        let (job_tx, job_rx) = mpsc::sync_channel::<ImportFileJob>(4096);
+        let (job_tx, job_rx) = mpsc::sync_channel::<ImportFileJob>(256);
         let job_rx = Arc::new(Mutex::new(job_rx));
 
-        // Channel: workers -> committer
-        let (prep_tx, prep_rx) = mpsc::sync_channel::<PreparedFile>(1024);
+        // Streaming chunk/file channel: workers -> committer, strictly byte-bounded by `budget`.
+        let (prep_tx, prep_rx) = mpsc::sync_channel::<ImportMsg>(256);
+        let budget = Arc::new(ByteBudget::new(IMPORT_INFLIGHT_BYTE_BUDGET));
 
         // Progress reporter thread (optional).
         let stop_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1135,8 +1252,9 @@ impl DedupStore {
             let lazy_known = Arc::clone(&lazy_known);
             let store = Arc::clone(self);
             let errs = Arc::clone(&errors_done);
+            let budget_w = Arc::clone(&budget);
             workers.push(std::thread::spawn(move || {
-                let mut file_buf = Vec::with_capacity(1024 * 1024);
+                let mut file_buf = Vec::new();
                 let mut cached_known: Option<Arc<KnownChunks>> = None;
                 loop {
                     let job = { rx.lock().unwrap().recv() };
@@ -1158,7 +1276,7 @@ impl DedupStore {
                         })();
                         match copy_res {
                             Ok(actual_len) => {
-                                let _ = tx.send(PreparedFile {
+                                let _ = tx.send(ImportMsg::File(PreparedFile {
                                     parent_id: job.parent_id,
                                     inode_id: job.inode_id,
                                     display_name: job.display_name,
@@ -1171,8 +1289,7 @@ impl DedupStore {
                                     pinned_overlay: true,
                                     replacing_mode: job.replacing_mode,
                                     entries: Vec::new(),
-                                    new_chunks: Vec::new(),
-                                });
+                                }));
                             }
                             Err(err) => {
                                 let n = errs.fetch_add(1, Ordering::Relaxed);
@@ -1211,24 +1328,33 @@ impl DedupStore {
                         }
                     };
 
-                    let prep_res = (|| -> Result<(u64, Vec<ManifestEntry>, Vec<NewChunkBlob>)> {
+                    let prep_res = (|| -> Result<(u64, Vec<ManifestEntry>)> {
                         let mut file = File::open(&job.path)?;
                         let mut entries = Vec::new();
-                        let mut new_chunks = Vec::new();
                         let mut file_seen: HashSet<Hash32> = HashSet::new();
 
+                        // Stream each newly compressed chunk immediately to the committer under
+                        // `ByteBudget` backpressure so peak RAM stays O(1) even for multi-GiB files!
                         let mut handle_chunk = |chunk: &[u8]| -> Result<()> {
                             let hash = blake3_hash(chunk);
                             let raw_len = chunk.len() as u32;
                             entries.push(ManifestEntry { hash, raw_len });
                             if !known.contains(&hash) && file_seen.insert(hash) {
                                 let (actual_codec, stored) = compress_chunk(codec, chunk)?;
-                                new_chunks.push(NewChunkBlob {
-                                    hash,
-                                    codec: actual_codec,
-                                    raw_len,
-                                    stored,
-                                });
+                                let charge = stored.len().max(1);
+                                budget_w.acquire(charge);
+                                if tx
+                                    .send(ImportMsg::Chunk(NewChunkBlob {
+                                        hash,
+                                        codec: actual_codec,
+                                        raw_len,
+                                        stored,
+                                    }))
+                                    .is_err()
+                                {
+                                    budget_w.release(charge);
+                                    return Err(Error::Other("import committer disconnected".into()));
+                                }
                             }
                             Ok(())
                         };
@@ -1250,16 +1376,19 @@ impl DedupStore {
                                     return Err(e);
                                 }
                             }
+                            if file_buf.capacity() > IN_MEMORY_IMPORT_LIMIT as usize {
+                                file_buf.shrink_to(IN_MEMORY_IMPORT_LIMIT as usize);
+                            }
                             len
                         } else {
                             chunk_reader(&mut file, handle_chunk)?
                         };
-                        Ok((actual_len, entries, new_chunks))
+                        Ok((actual_len, entries))
                     })();
 
                     match prep_res {
-                        Ok((actual_len, entries, new_chunks)) => {
-                            let _ = tx.send(PreparedFile {
+                        Ok((actual_len, entries)) => {
+                            let _ = tx.send(ImportMsg::File(PreparedFile {
                                 parent_id: job.parent_id,
                                 inode_id: job.inode_id,
                                 display_name: job.display_name,
@@ -1272,8 +1401,7 @@ impl DedupStore {
                                 pinned_overlay: false,
                                 replacing_mode: job.replacing_mode,
                                 entries,
-                                new_chunks,
-                            });
+                            }));
                         }
                         Err(err) => {
                             let n = errs.fetch_add(1, Ordering::Relaxed);
@@ -1290,6 +1418,7 @@ impl DedupStore {
         // Spawn single sequential pack-writer & SQLite metadata committer thread.
         let store_c = Arc::clone(self);
         let known_c = Arc::clone(&lazy_known);
+        let budget_c = Arc::clone(&budget);
         let f_c = Arc::clone(&files_done);
         let upd_c = Arc::clone(&updated_done);
         let l_c = Arc::clone(&logical_done);
@@ -1298,57 +1427,44 @@ impl DedupStore {
         let s_c = Arc::clone(&stored_done);
         let p_c = Arc::clone(&pinned_done);
         let committer = std::thread::spawn(move || -> Result<()> {
-            let mut batch: Vec<PreparedFile> = Vec::with_capacity(IMPORT_COMMIT_BATCH);
-            let flush_batch = |batch: &mut Vec<PreparedFile>| -> Result<()> {
+            let mut batch: Vec<PreparedFile> = Vec::with_capacity(256);
+            let mut pending_written_locs: HashMap<Hash32, ChunkLoc> = HashMap::new();
+            let mut deferred_releases: HashMap<Hash32, u64> = HashMap::new();
+            let mut batch_pack_bytes: u64 = 0;
+
+            let flush_batch = |batch: &mut Vec<PreparedFile>,
+                               pending_written_locs: &mut HashMap<Hash32, ChunkLoc>,
+                               deferred_releases: &mut HashMap<Hash32, u64>,
+                               batch_pack_bytes: &mut u64|
+             -> Result<()> {
                 if batch.is_empty() {
                     return Ok(());
                 }
                 let known_opt = known_c.lock().unwrap().clone();
-                // 1. Sequentially append truly new unique chunks to active `.pack` file(s).
-                //    Committer is the single authority deciding whether a chunk is new, eliminating
-                //    cross-batch refcount races and orphan claims on worker read errors.
-                let mut written_locs: HashMap<Hash32, ChunkLoc> = HashMap::new();
-                let mut pack_updates = Vec::new();
-                {
+                let pack_updates = {
                     let mut pw = store_c.packs.writer();
-                    for item in batch.iter() {
-                        for chunk in &item.new_chunks {
-                            if written_locs.contains_key(&chunk.hash)
-                                || known_opt.as_ref().is_some_and(|k| k.contains(&chunk.hash))
-                            {
-                                continue;
-                            }
-                            let loc = pw.append(
-                                &chunk.hash,
-                                chunk.codec,
-                                chunk.raw_len,
-                                &chunk.stored,
-                            )?;
-                            written_locs.insert(chunk.hash, loc);
-                            uc_c.fetch_add(1, Ordering::Relaxed);
-                            u_c.fetch_add(u64::from(chunk.raw_len), Ordering::Relaxed);
-                            s_c.fetch_add(chunk.stored.len() as u64, Ordering::Relaxed);
-                        }
-                    }
                     pw.flush()?;
-                    pack_updates.extend(pw.take_pack_updates());
-                }
+                    pw.take_pack_updates()
+                };
 
-                // 2. Batch-commit chunks, pack sizes, inodes, and dentries in one SQLite txn.
+                // Batch-commit chunks, pack sizes, inodes, and dentries in one SQLite txn.
                 let mut overlays_to_remove: Vec<u64> = Vec::new();
-                let committed_hashes: Vec<Hash32> = written_locs.keys().copied().collect();
+                let mut committed_hashes: Vec<Hash32> = Vec::new();
                 {
                     let mut conn = store_c.meta.lock().unwrap();
                     let tx = conn.transaction()?;
                     upsert_pack_updates(&tx, &pack_updates)?;
 
-                    // Release old chunk refs for any modified files being updated in place.
+                    // Collect old chunk refs from modified files being replaced in place.
+                    let mut old_refs: HashMap<Hash32, u64> = HashMap::new();
                     for item in batch.iter() {
                         if let Some(old_mode) = item.replacing_mode {
                             if old_mode == STORAGE_CHUNKS {
                                 if let Some(old_row) = load_inode(&tx, ws_id, item.inode_id)? {
                                     if !old_row.manifest.is_empty() {
-                                        release_manifest_chunks(&tx, &old_row.manifest)?;
+                                        for e in decode_manifest(&old_row.manifest)? {
+                                            *old_refs.entry(e.hash).or_insert(0) += 1;
+                                        }
                                     }
                                 }
                             } else if old_mode == STORAGE_OVERLAY
@@ -1359,18 +1475,47 @@ impl DedupStore {
                         }
                     }
 
-                    // Aggregate refcount additions directly from `item.entries` (no decode roundtrip).
-                    let mut ref_adds: HashMap<Hash32, u64> = HashMap::new();
+                    // Aggregate new refcount additions directly from `item.entries`.
+                    let mut new_refs: HashMap<Hash32, u64> = HashMap::new();
                     for item in batch.iter() {
                         if item.storage_mode == STORAGE_CHUNKS {
                             for e in &item.entries {
-                                *ref_adds.entry(e.hash).or_insert(0) += 1;
+                                *new_refs.entry(e.hash).or_insert(0) += 1;
                             }
                         }
                     }
-                    for (hash, add) in ref_adds {
-                        let loc = written_locs.remove(&hash);
-                        upsert_chunk_ref(&tx, &hash, loc, add)?;
+
+                    // Compute NET refcount deltas: reused chunks cancel out before touching SQLite,
+                    // and net decrements are deferred until all workers finish so no chunk in
+                    // `KnownChunks` is ever deleted mid-import!
+                    for (hash, mut add) in new_refs {
+                        if let Some(old_cnt) = old_refs.get_mut(&hash) {
+                            let cancel = add.min(*old_cnt);
+                            add -= cancel;
+                            *old_cnt -= cancel;
+                        }
+                        if add > 0 {
+                            if let Some(def_cnt) = deferred_releases.get_mut(&hash) {
+                                let cancel = add.min(*def_cnt);
+                                add -= cancel;
+                                *def_cnt -= cancel;
+                                if *def_cnt == 0 {
+                                    deferred_releases.remove(&hash);
+                                }
+                            }
+                        }
+                        if add > 0 {
+                            let loc = pending_written_locs.remove(&hash);
+                            if loc.is_some() {
+                                committed_hashes.push(hash);
+                            }
+                            upsert_chunk_ref(&tx, &hash, loc, add)?;
+                        }
+                    }
+                    for (hash, dec) in old_refs {
+                        if dec > 0 {
+                            *deferred_releases.entry(hash).or_insert(0) += dec;
+                        }
                     }
 
                     {
@@ -1438,20 +1583,76 @@ impl DedupStore {
                     let _ = store_c.overlay.remove_file(ws_id, old_id);
                 }
                 batch.clear();
+                *batch_pack_bytes = 0;
                 Ok(())
             };
 
-            while let Ok(item) = prep_rx.recv() {
-                batch.push(item);
-                if batch.len() >= IMPORT_COMMIT_BATCH {
-                    flush_batch(&mut batch)?;
+            while let Ok(msg) = prep_rx.recv() {
+                match msg {
+                    ImportMsg::Chunk(chunk) => {
+                        let charge = chunk.stored.len().max(1);
+                        let known_opt = known_c.lock().unwrap().clone();
+                        let already_present = pending_written_locs.contains_key(&chunk.hash)
+                            || known_opt.as_ref().is_some_and(|k| k.contains(&chunk.hash));
+                        if !already_present {
+                            let loc = store_c.packs.writer().append(
+                                &chunk.hash,
+                                chunk.codec,
+                                chunk.raw_len,
+                                &chunk.stored,
+                            )?;
+                            pending_written_locs.insert(chunk.hash, loc);
+                            uc_c.fetch_add(1, Ordering::Relaxed);
+                            u_c.fetch_add(u64::from(chunk.raw_len), Ordering::Relaxed);
+                            s_c.fetch_add(chunk.stored.len() as u64, Ordering::Relaxed);
+                            batch_pack_bytes =
+                                batch_pack_bytes.saturating_add(chunk.stored.len() as u64);
+                        }
+                        drop(chunk);
+                        budget_c.release(charge);
+                    }
+                    ImportMsg::File(item) => {
+                        batch.push(item);
+                        if batch.len() >= IMPORT_COMMIT_BATCH
+                            || batch_pack_bytes >= IMPORT_COMMIT_MAX_BYTES
+                        {
+                            flush_batch(
+                                &mut batch,
+                                &mut pending_written_locs,
+                                &mut deferred_releases,
+                                &mut batch_pack_bytes,
+                            )?;
+                        }
+                    }
                 }
             }
-            flush_batch(&mut batch)?;
+            flush_batch(
+                &mut batch,
+                &mut pending_written_locs,
+                &mut deferred_releases,
+                &mut batch_pack_bytes,
+            )?;
+
+            // All workers have exited: safely apply any remaining deferred refcount decrements.
+            if !deferred_releases.is_empty() {
+                let mut deleted_hashes = Vec::new();
+                {
+                    let mut conn = store_c.meta.lock().unwrap();
+                    let tx = conn.transaction()?;
+                    for (hash, dec) in deferred_releases {
+                        if decrement_chunk_refs(&tx, &hash, dec)? {
+                            deleted_hashes.push(hash);
+                        }
+                    }
+                    tx.commit()?;
+                }
+                store_c.invalidate_chunk_locs(&deleted_hashes);
+            }
             Ok(())
         });
 
         type PendingDir = (u64, u64, Vec<u8>, Vec<u8>, i64, i64);
+        let mut deferred_deleted_manifests: Vec<Vec<u8>> = Vec::new();
         // Walk source directory tree, batch-inserting directories and feeding file jobs to workers.
         let mut dir_stack: Vec<(PathBuf, u64, String)> =
             vec![(canon_src.to_path_buf(), ROOT_INODE, String::new())];
@@ -1654,6 +1855,7 @@ impl DedupStore {
                                 p.inode_id,
                                 p.kind,
                                 &mut ov,
+                                &mut deferred_deleted_manifests,
                             )?;
                             removed_done.fetch_add(n, Ordering::Relaxed);
                             tx.commit()?;
@@ -1721,6 +1923,7 @@ impl DedupStore {
                                     p.inode_id,
                                     p.kind,
                                     &mut ov,
+                                    &mut deferred_deleted_manifests,
                                 )?;
                                 removed_done.fetch_add(n, Ordering::Relaxed);
                                 tx.commit()?;
@@ -1770,6 +1973,7 @@ impl DedupStore {
                             child.inode_id,
                             child.kind,
                             &mut ov,
+                            &mut deferred_deleted_manifests,
                         )?;
                         removed_done.fetch_add(n, Ordering::Relaxed);
                     }
@@ -1790,6 +1994,21 @@ impl DedupStore {
         committer
             .join()
             .map_err(|_| Error::Other("import committer panicked".into()))??;
+
+        // Release chunk refs for any entries deleted during `--update` AFTER all workers and
+        // committer batches have committed (safe across file moves/renames!).
+        if !deferred_deleted_manifests.is_empty() {
+            let mut deleted_chunks = Vec::new();
+            {
+                let mut conn = self.meta.lock().unwrap();
+                let tx = conn.transaction()?;
+                for m in &deferred_deleted_manifests {
+                    deleted_chunks.extend(release_manifest_chunks(&tx, m)?);
+                }
+                tx.commit()?;
+            }
+            self.invalidate_chunk_locs(&deleted_chunks);
+        }
 
         // Update workspace's `next_inode` counter to the final allocated value.
         let final_next = next_inode.load(Ordering::Relaxed);
@@ -1902,6 +2121,11 @@ impl DedupStore {
             scanned: candidates.len() as u64,
             ..Default::default()
         };
+        if candidates.is_empty() {
+            return Ok(summary);
+        }
+
+        let _pack_guard = self.acquire_pack_write_lock()?;
 
         // Open a dedicated read-only connection so path resolution and chunk existence checks
         // never contend with `self.meta` write locks during background dedup.
@@ -1949,7 +2173,13 @@ impl DedupStore {
             }
             let loose_path = self.overlay.file_path(ws_id, inode_id);
             let mut entries = Vec::new();
+            let mut entry_first_span: HashMap<Hash32, (u64, u32)> = HashMap::new();
             let mut new_blobs: Vec<(Hash32, Codec, u32, Vec<u8>)> = Vec::new();
+            let mut new_blobs_bytes: usize = 0;
+            let mut written_locs: HashMap<Hash32, ChunkLoc> = HashMap::new();
+            let mut pack_updates: Vec<(u64, u64, bool)> = Vec::new();
+            let mut added_unique = 0u64;
+            let mut added_stored = 0u64;
             let actual_len: u64;
 
             if expected_size == 0 || !loose_path.exists() {
@@ -1960,16 +2190,35 @@ impl DedupStore {
                     continue;
                 };
                 // Chunk & hash outside both inode and meta write locks so foreground ops never stall.
+                // Check authoritative SQLite `get_chunk_loc` (NEVER `chunk_loc_cache`) and spill
+                // buffered compressed chunks to `PackWriter` at `DEDUP_MAX_BUFFER_BYTES` (4 MiB)
+                // so deduping multi-GiB files stays strictly memory-bounded.
                 let mut chunk_hashes_seen: HashSet<Hash32> = HashSet::new();
+                let mut file_cursor = 0u64;
                 let read_res = chunk_reader(&mut file, |chunk| {
                     let hash = blake3_hash(chunk);
                     let raw_len = chunk.len() as u32;
                     entries.push(ManifestEntry { hash, raw_len });
-                    if chunk_hashes_seen.insert(hash)
-                        && self.resolve_chunk_loc(&ro_conn, &hash)?.is_none()
-                    {
+                    entry_first_span
+                        .entry(hash)
+                        .or_insert((file_cursor, raw_len));
+                    file_cursor += u64::from(raw_len);
+                    if chunk_hashes_seen.insert(hash) && get_chunk_loc(&ro_conn, &hash)?.is_none() {
                         let (c, stored) = compress_chunk(self.config.codec, chunk)?;
+                        new_blobs_bytes = new_blobs_bytes.saturating_add(stored.len());
                         new_blobs.push((hash, c, raw_len, stored));
+                        if new_blobs_bytes >= DEDUP_MAX_BUFFER_BYTES {
+                            let mut pw = self.packs.writer();
+                            for (h, codec, rlen, bytes) in new_blobs.drain(..) {
+                                let loc = pw.append(&h, codec, rlen, &bytes)?;
+                                written_locs.insert(h, loc);
+                                added_unique += u64::from(rlen);
+                                added_stored += bytes.len() as u64;
+                            }
+                            pw.flush()?;
+                            pack_updates.extend(pw.take_pack_updates());
+                            new_blobs_bytes = 0;
+                        }
                     }
                     Ok(())
                 });
@@ -2008,17 +2257,13 @@ impl DedupStore {
                 continue;
             }
 
-            // Append any truly new unique chunks to pack store.
-            let mut written_locs: HashMap<Hash32, ChunkLoc> = HashMap::new();
-            let mut pack_updates = Vec::new();
-            let mut added_unique = 0u64;
-            let mut added_stored = 0u64;
+            // Append any remaining buffered new unique chunks to pack store.
             if !new_blobs.is_empty() {
                 let mut pw = self.packs.writer();
-                for (hash, codec, raw_len, stored) in &new_blobs {
-                    let loc = pw.append(hash, *codec, *raw_len, stored)?;
-                    written_locs.insert(*hash, loc);
-                    added_unique += u64::from(*raw_len);
+                for (hash, codec, raw_len, stored) in new_blobs.drain(..) {
+                    let loc = pw.append(&hash, codec, raw_len, &stored)?;
+                    written_locs.insert(hash, loc);
+                    added_unique += u64::from(raw_len);
                     added_stored += stored.len() as u64;
                 }
                 pw.flush()?;
@@ -2026,15 +2271,44 @@ impl DedupStore {
             }
 
             // Commit chunk refcounts + flip inode from Overlay -> Chunks atomically.
+            // Re-verify inside the write transaction that any skipped chunk still exists in
+            // SQLite `chunks`; if another thread concurrently deleted its last ref, re-read its
+            // slice from the still-locked overlay file and write it to pack before inserting!
             let manifest_blob = encode_manifest(&entries);
             {
                 let mut conn = self.meta.lock().unwrap();
                 let tx = conn.transaction()?;
-                upsert_pack_updates(&tx, &pack_updates)?;
                 let mut ref_adds: HashMap<Hash32, u64> = HashMap::new();
                 for e in &entries {
                     *ref_adds.entry(e.hash).or_insert(0) += 1;
                 }
+
+                // Check for any chunk concurrently deleted between phase 1 and commit tx.
+                let mut missing_hashes: Vec<Hash32> = Vec::new();
+                for hash in ref_adds.keys() {
+                    if !written_locs.contains_key(hash) && get_chunk_loc(&tx, hash)?.is_none() {
+                        missing_hashes.push(*hash);
+                    }
+                }
+                if !missing_hashes.is_empty() {
+                    let mut ov_file = File::open(&loose_path)?;
+                    let mut pw = self.packs.writer();
+                    for hash in missing_hashes {
+                        let (off, rlen) = entry_first_span[&hash];
+                        let mut raw = vec![0u8; rlen as usize];
+                        crate::pack::read_exact_at(&ov_file, off, &mut raw)?;
+                        let (codec, stored) = compress_chunk(self.config.codec, &raw)?;
+                        let loc = pw.append(&hash, codec, rlen, &stored)?;
+                        written_locs.insert(hash, loc);
+                        added_unique += u64::from(rlen);
+                        added_stored += stored.len() as u64;
+                    }
+                    pw.flush()?;
+                    pack_updates.extend(pw.take_pack_updates());
+                    let _ = &mut ov_file;
+                }
+
+                upsert_pack_updates(&tx, &pack_updates)?;
                 for (hash, add) in ref_adds {
                     let loc = written_locs.remove(&hash);
                     upsert_chunk_ref(&tx, &hash, loc, add)?;
@@ -2071,6 +2345,7 @@ impl DedupStore {
     /// - Sealed packs whose `dead_bytes / size_bytes >= dead_threshold_pct%` are compacted into
     ///   new pack(s) without re-compressing, then the old pack file is deleted.
     pub fn gc(&self, dead_threshold_pct: u8) -> Result<GcSummary> {
+        let _pack_guard = self.acquire_pack_write_lock()?;
         // Seal any active writer pack first so pack boundaries stay clean.
         {
             let mut pw = self.packs.writer();
@@ -2221,13 +2496,16 @@ impl DedupStore {
     /// repairs mismatched `chunks.refcount`, deletes orphan chunks (0 live refs), and recomputes
     /// exact `packs.live_bytes` / `packs.dead_bytes`.
     pub fn fsck(&self, fix: bool) -> Result<FsckSummary> {
-        if fix {
+        let _pack_guard = if fix {
             if let Some(mp) = crate::mount::active_mount_for_store(&self.root) {
                 return Err(Error::Other(format!(
                     "refusing `fsck --fix` while store is actively mounted at {mp}; unmount first"
                 )));
             }
-        }
+            Some(self.acquire_pack_write_lock()?)
+        } else {
+            None
+        };
         let mut conn = self.meta.lock().unwrap();
         let behavior = if fix {
             rusqlite::TransactionBehavior::Immediate

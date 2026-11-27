@@ -43,21 +43,29 @@ const SERIAL_POOL_BATCH: u64 = 256;
 /// Folded child name -> `(exact_stored_name, child_serial)`.
 type DirTable = HashMap<Vec<u8>, (Vec<u8>, u64)>;
 
-/// Mutable coordinator state protected by a mutex inside `WinFspBackend`.
+/// Concurrent-reader directory lookup cache protected by `RwLock`.
+/// `mut_gen` increments on every namespace mutation so a concurrent lock-free directory
+/// scan never publishes a stale snapshot into `dirs`.
 #[derive(Default)]
-struct BackendState {
-    /// Pre-reserved inode serial range `[next, end)` from the store's allocator.
-    serial_pool: (u64, u64),
-    /// Per-directory case-folded lookup table:
-    /// `dir_serial -> { fold_bytes(stored_name) -> (stored_name, child_serial) }`.
-    dir_cache: HashMap<u64, DirTable>,
+struct DirCache {
+    dirs: HashMap<u64, Arc<DirTable>>,
+    mut_gen: u64,
 }
 
 /// WinFsp `WorkspaceOps` backend backed by an upstream LayerFS `BoundWorkspace`.
+///
+/// Read operations (`read`, `read_into`, `get_info`, `open_dir`, `dir_binding`,
+/// `create_or_open(Open)`, `read_dir`, `read_dir_with_info`, `is_dir_empty`) run in parallel
+/// across all WinFsp dispatcher threads without holding any global mutex during I/O.
 pub struct WinFspBackend {
     workspace: Arc<BoundWorkspace>,
     gate: Arc<RwLock<()>>,
-    state: Arc<Mutex<BackendState>>,
+    /// Pre-reserved inode serial range `[next, end)` from the store's allocator.
+    serial_pool: Arc<Mutex<(u64, u64)>>,
+    /// Concurrent-read case-folded directory lookup cache.
+    dir_cache: Arc<RwLock<DirCache>>,
+    /// Serializes mutating operations so namespace & overlay updates stay consistent.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for WinFspBackend {
@@ -73,7 +81,9 @@ impl Clone for WinFspBackend {
         Self {
             workspace: Arc::clone(&self.workspace),
             gate: Arc::clone(&self.gate),
-            state: Arc::clone(&self.state),
+            serial_pool: Arc::clone(&self.serial_pool),
+            dir_cache: Arc::clone(&self.dir_cache),
+            write_lock: Arc::clone(&self.write_lock),
         }
     }
 }
@@ -85,32 +95,31 @@ impl WinFspBackend {
         Self {
             workspace,
             gate,
-            state: Arc::new(Mutex::new(BackendState::default())),
+            serial_pool: Arc::new(Mutex::new((0, 0))),
+            dir_cache: Arc::new(RwLock::new(DirCache::default())),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
     /// Drops cached directory tables (called after `commit` or base-root switch).
     pub fn invalidate_cache(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let mut cache = self
             .dir_cache
-            .clear();
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.mut_gen = cache.mut_gen.wrapping_add(1);
+        cache.dirs.clear();
     }
 
-    /// Runs a closure with a fresh `StoreOperation` + acquired `SourceView`,
-    /// releasing the base source before returning.
-    fn with_view<T>(
+    /// Runs a **concurrent read-only** closure with a fresh `StoreOperation` + acquired `SourceView`
+    /// WITHOUT acquiring `write_lock`, so multiple WinFsp dispatcher threads run I/O in parallel.
+    fn with_read_view<T>(
         &self,
-        body: impl FnOnce(&StoreOperation, &SourceView, &mut BackendState) -> OpsResult<T>,
+        body: impl FnOnce(&StoreOperation, &SourceView) -> OpsResult<T>,
     ) -> OpsResult<T> {
         let _read_gate = self
             .gate
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut state = self
-            .state
-            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let op = self.workspace.operation().map_err(map_workspace_err)?;
         let source = op
@@ -121,9 +130,9 @@ impl WinFspBackend {
             .workspace()
             .view_for_source(source)
             .map_err(map_workspace_err);
-        let result = match view {
+        match view {
             Ok(view) => {
-                let res = body(&op, &view, &mut state);
+                let res = body(&op, &view);
                 let _ = op
                     .overlay()
                     .release_base_source(self.workspace.route(), view.source());
@@ -135,8 +144,243 @@ impl WinFspBackend {
                     .release_base_source(self.workspace.route(), source);
                 Err(err)
             }
+        }
+    }
+
+    /// Runs a **mutating** closure serialized by `write_lock` under `gate.read()`.
+    fn with_write_view<T>(
+        &self,
+        body: impl FnOnce(&StoreOperation, &SourceView) -> OpsResult<T>,
+    ) -> OpsResult<T> {
+        let _read_gate = self
+            .gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let op = self.workspace.operation().map_err(map_workspace_err)?;
+        let source = op
+            .overlay()
+            .acquire_diagnostic_source(self.workspace.route())
+            .map_err(|e| OpsError::Other(e.to_string()))?;
+        let view = op
+            .workspace()
+            .view_for_source(source)
+            .map_err(map_workspace_err);
+        match view {
+            Ok(view) => {
+                let res = body(&op, &view);
+                let _ = op
+                    .overlay()
+                    .release_base_source(self.workspace.route(), view.source());
+                res
+            }
+            Err(err) => {
+                let _ = op
+                    .overlay()
+                    .release_base_source(self.workspace.route(), source);
+                Err(err)
+            }
+        }
+    }
+
+    fn next_serial(&self, op: &StoreOperation) -> OpsResult<u64> {
+        let mut pool = self
+            .serial_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pool.0 == pool.1 {
+            let (start, count) = op
+                .ports()
+                .reserve_pooled(SERIAL_POOL_BATCH)
+                .map_err(map_workspace_err)?;
+            *pool = (start, start.saturating_add(count));
+        }
+        let serial = pool.0;
+        pool.0 += 1;
+        Ok(serial)
+    }
+
+    fn apply_op(
+        &self,
+        op: &StoreOperation,
+        view: &SourceView,
+        operation: Operation,
+        now: Time,
+    ) -> OpsResult<Option<ViewStat>> {
+        let fresh = if operation.creates() {
+            Some(self.next_serial(op)?)
+        } else {
+            None
         };
-        result
+        let mut plan = op
+            .workspace()
+            .prepare_mutation(view, operation, now, fresh)
+            .map_err(|e| map_workspace_err(e.error))?;
+        loop {
+            let job = plan
+                .job()
+                .ok_or_else(|| OpsError::Other("mutation plan missing job".to_owned()))?;
+            let result = OverlayJobs::namespace(op.overlay(), job);
+            match plan.accept(result).map_err(map_workspace_err)? {
+                Some(Outcome::Applied { publication, stat }) => {
+                    op.overlay()
+                        .reply_attempted(publication)
+                        .map_err(|e| OpsError::Other(e.to_string()))?;
+                    return Ok(stat);
+                }
+                Some(Outcome::Unchanged { stat }) => return Ok(stat),
+                None => plan.supply(view).map_err(map_workspace_err)?,
+            }
+        }
+    }
+
+    /// Returns a snapshot of `dir_serial`'s folded lookup table without holding any lock during I/O.
+    fn get_dir_table(
+        &self,
+        op: &StoreOperation,
+        view: &SourceView,
+        dir_serial: u64,
+    ) -> OpsResult<Arc<DirTable>> {
+        let start_gen = {
+            let cache = self
+                .dir_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(hit) = cache.dirs.get(&dir_serial) {
+                return Ok(Arc::clone(hit));
+            }
+            cache.mut_gen
+        };
+        // Lock-free directory scan on cache miss.
+        let stat = view.stat(op.overlay(), dir_serial).map_err(map_workspace_err)?;
+        if stat.kind != InodeKind::Directory {
+            return Err(OpsError::NotADirectory);
+        }
+        let mut map = DirTable::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = view
+                .list(op.overlay(), dir_serial, after.as_deref())
+                .map_err(map_workspace_err)?;
+            for (name, serial) in page.entries {
+                map.insert(fold_bytes(&name), (name, serial));
+            }
+            match page.continuation {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        let arc = Arc::new(map);
+        {
+            let mut cache = self
+                .dir_cache
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.mut_gen == start_gen {
+                cache.dirs.entry(dir_serial).or_insert_with(|| Arc::clone(&arc));
+            }
+        }
+        Ok(arc)
+    }
+
+    fn dir_cache_insert(&self, dir_serial: u64, folded: Vec<u8>, stored: Vec<u8>, child: u64) {
+        let mut cache = self
+            .dir_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.mut_gen = cache.mut_gen.wrapping_add(1);
+        if let Some(arc) = cache.dirs.get_mut(&dir_serial) {
+            Arc::make_mut(arc).insert(folded, (stored, child));
+        }
+    }
+
+    fn dir_cache_remove_entry(&self, dir_serial: u64, folded: &[u8]) {
+        let mut cache = self
+            .dir_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.mut_gen = cache.mut_gen.wrapping_add(1);
+        if let Some(arc) = cache.dirs.get_mut(&dir_serial) {
+            Arc::make_mut(arc).remove(folded);
+        }
+    }
+
+    fn dir_cache_insert_empty_dir(&self, dir_serial: u64) {
+        let mut cache = self
+            .dir_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.mut_gen = cache.mut_gen.wrapping_add(1);
+        cache.dirs.insert(dir_serial, Arc::new(HashMap::new()));
+    }
+
+    fn dir_cache_remove_dir(&self, dir_serial: u64) {
+        let mut cache = self
+            .dir_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.mut_gen = cache.mut_gen.wrapping_add(1);
+        cache.dirs.remove(&dir_serial);
+    }
+
+    /// Resolves a directory path (all components) using case-folded lookup,
+    /// returning `(dir_serial, canonical_path_names_from_root)`.
+    fn resolve_dir_chain(
+        &self,
+        op: &StoreOperation,
+        view: &SourceView,
+        components: &[Vec<u8>],
+    ) -> OpsResult<(u64, Vec<PathName>)> {
+        let mut current = view.root_serial();
+        let mut chain = Vec::with_capacity(components.len());
+        for comp in components {
+            let folded = fold_bytes(comp);
+            let found = self
+                .get_dir_table(op, view, current)?
+                .get(&folded)
+                .cloned();
+            let Some((stored, child)) = found else {
+                return Err(OpsError::NotFound);
+            };
+            let stat = view.stat(op.overlay(), child).map_err(map_workspace_err)?;
+            if stat.kind != InodeKind::Directory {
+                return Err(OpsError::NotADirectory);
+            }
+            chain.push(to_path_name(&stored)?);
+            current = child;
+        }
+        Ok((current, chain))
+    }
+
+    /// Resolves an arbitrary path (file or directory), returning
+    /// `(parent_serial, stored_name_opt, target_serial, target_stat)`.
+    fn resolve_entry(
+        &self,
+        op: &StoreOperation,
+        view: &SourceView,
+        path: &Path<'_>,
+    ) -> OpsResult<(u64, Option<Vec<u8>>, u64, ViewStat)> {
+        let segments = parse_segments(path)?;
+        if segments.is_empty() {
+            let root = view.root_serial();
+            let stat = view.stat(op.overlay(), root).map_err(map_workspace_err)?;
+            return Ok((root, None, root, stat));
+        }
+        let (parent, _) = self.resolve_dir_chain(op, view, &segments[..segments.len() - 1])?;
+        let leaf = &segments[segments.len() - 1];
+        let folded = fold_bytes(leaf);
+        let found = self
+            .get_dir_table(op, view, parent)?
+            .get(&folded)
+            .cloned();
+        let Some((stored, serial)) = found else {
+            return Err(OpsError::NotFound);
+        };
+        let stat = view.stat(op.overlay(), serial).map_err(map_workspace_err)?;
+        Ok((parent, Some(stored), serial, stat))
     }
 }
 
@@ -279,142 +523,75 @@ fn to_path_name(bytes: &[u8]) -> OpsResult<PathName> {
     PathName::from_bytes(bytes).map_err(|_| OpsError::InvalidParameter)
 }
 
-fn next_serial(op: &StoreOperation, state: &mut BackendState) -> OpsResult<u64> {
-    if state.serial_pool.0 == state.serial_pool.1 {
-        let (start, count) = op
-            .ports()
-            .reserve_pooled(SERIAL_POOL_BATCH)
-            .map_err(map_workspace_err)?;
-        state.serial_pool = (start, start.saturating_add(count));
-    }
-    let serial = state.serial_pool.0;
-    state.serial_pool.0 += 1;
-    Ok(serial)
-}
-
-fn apply_op(
-    op: &StoreOperation,
-    view: &SourceView,
-    state: &mut BackendState,
-    operation: Operation,
-    now: Time,
-) -> OpsResult<Option<ViewStat>> {
-    let fresh = if operation.creates() {
-        Some(next_serial(op, state)?)
-    } else {
-        None
-    };
-    let mut plan = op
-        .workspace()
-        .prepare_mutation(view, operation, now, fresh)
-        .map_err(|e| map_workspace_err(e.error))?;
-    loop {
-        let job = plan
-            .job()
-            .ok_or_else(|| OpsError::Other("mutation plan missing job".to_owned()))?;
-        let result = OverlayJobs::namespace(op.overlay(), job);
-        match plan.accept(result).map_err(map_workspace_err)? {
-            Some(Outcome::Applied { publication, stat }) => {
-                op.overlay()
-                    .reply_attempted(publication)
-                    .map_err(|e| OpsError::Other(e.to_string()))?;
-                return Ok(stat);
-            }
-            Some(Outcome::Unchanged { stat }) => return Ok(stat),
-            None => plan.supply(view).map_err(map_workspace_err)?,
-        }
-    }
-}
-
-/// Ensures `dir_serial`'s folded lookup map is loaded in `state.dir_cache`.
-fn ensure_dir_cached<'a>(
-    op: &StoreOperation,
-    view: &SourceView,
-    state: &'a mut BackendState,
-    dir_serial: u64,
-) -> OpsResult<&'a mut DirTable> {
-    if let std::collections::hash_map::Entry::Vacant(entry) = state.dir_cache.entry(dir_serial) {
-        let stat = view.stat(op.overlay(), dir_serial).map_err(map_workspace_err)?;
-        if stat.kind != InodeKind::Directory {
-            return Err(OpsError::NotADirectory);
-        }
-        let mut map = DirTable::new();
-        let mut after: Option<Vec<u8>> = None;
-        loop {
-            let page = view
-                .list(op.overlay(), dir_serial, after.as_deref())
-                .map_err(map_workspace_err)?;
-            for (name, serial) in page.entries {
-                map.insert(fold_bytes(&name), (name, serial));
-            }
-            match page.continuation {
-                Some(next) => after = Some(next),
-                None => break,
-            }
-        }
-        entry.insert(map);
-    }
-    Ok(state.dir_cache.get_mut(&dir_serial).expect("just inserted"))
-}
-
-/// Resolves a directory path (all components) using case-folded lookup,
-/// returning `(dir_serial, canonical_path_names_from_root)`.
-fn resolve_dir_chain(
-    op: &StoreOperation,
-    view: &SourceView,
-    state: &mut BackendState,
-    components: &[Vec<u8>],
-) -> OpsResult<(u64, Vec<PathName>)> {
-    let mut current = view.root_serial();
-    let mut chain = Vec::with_capacity(components.len());
-    for comp in components {
-        let folded = fold_bytes(comp);
-        let found = ensure_dir_cached(op, view, state, current)?
-            .get(&folded)
-            .cloned();
-        let Some((stored, child)) = found else {
-            return Err(OpsError::NotFound);
-        };
-        let stat = view.stat(op.overlay(), child).map_err(map_workspace_err)?;
-        if stat.kind != InodeKind::Directory {
-            return Err(OpsError::NotADirectory);
-        }
-        chain.push(to_path_name(&stored)?);
-        current = child;
-    }
-    Ok((current, chain))
-}
-
-/// Resolves an arbitrary path (file or directory), returning
-/// `(parent_serial, stored_name_opt, target_serial, target_stat)`.
-fn resolve_entry(
-    op: &StoreOperation,
-    view: &SourceView,
-    state: &mut BackendState,
-    path: &Path<'_>,
-) -> OpsResult<(u64, Option<Vec<u8>>, u64, ViewStat)> {
-    let segments = parse_segments(path)?;
-    if segments.is_empty() {
-        let root = view.root_serial();
-        let stat = view.stat(op.overlay(), root).map_err(map_workspace_err)?;
-        return Ok((root, None, root, stat));
-    }
-    let (parent, _) = resolve_dir_chain(op, view, state, &segments[..segments.len() - 1])?;
-    let leaf = &segments[segments.len() - 1];
-    let folded = fold_bytes(leaf);
-    let found = ensure_dir_cached(op, view, state, parent)?
-        .get(&folded)
-        .cloned();
-    let Some((stored, serial)) = found else {
-        return Err(OpsError::NotFound);
-    };
-    let stat = view.stat(op.overlay(), serial).map_err(map_workspace_err)?;
-    Ok((parent, Some(stored), serial, stat))
-}
-
 impl WorkspaceOps for WinFspBackend {
     fn create_or_open(&self, path: &Path<'_>, disposition: Disposition) -> OpsResult<OpenOutcome> {
-        self.with_view(|op, view, state| {
+        // Fast concurrent read-only path for `Disposition::Open` (no `write_lock` held!).
+        if disposition == Disposition::Open {
+            return self.with_read_view(|op, view| {
+                let segments = parse_segments(path)?;
+                if segments.is_empty() {
+                    let root = view.root_serial();
+                    let stat = view.stat(op.overlay(), root).map_err(map_workspace_err)?;
+                    return match decide(disposition, Exists::Directory) {
+                        DispOutcome::Opened(action) => {
+                            let info = node_info_of(view, &stat);
+                            Ok(OpenOutcome {
+                                file_id: info.file_id,
+                                kind: info.kind,
+                                action,
+                                size: info.size,
+                                times: info.times,
+                                attributes: info.attributes,
+                                binding: (root, Vec::new()),
+                                replaced: None,
+                            })
+                        }
+                        DispOutcome::Failed(f) => Err(map_failure(f)),
+                    };
+                }
+                let (parent, _) =
+                    self.resolve_dir_chain(op, view, &segments[..segments.len() - 1])?;
+                let leaf = &segments[segments.len() - 1];
+                let folded = fold_bytes(leaf);
+                let Some((stored, serial)) = self
+                    .get_dir_table(op, view, parent)?
+                    .get(&folded)
+                    .cloned()
+                else {
+                    return Err(OpsError::NotFound);
+                };
+                let stat = match view.stat(op.overlay(), serial) {
+                    Ok(stat) => stat,
+                    Err(WorkspaceError::Content(ContentError::PathNotFound)) => {
+                        self.dir_cache_remove_entry(parent, &folded);
+                        return Err(OpsError::NotFound);
+                    }
+                    Err(e) => return Err(map_workspace_err(e)),
+                };
+                let exists = if stat.kind == InodeKind::Directory {
+                    Exists::Directory
+                } else {
+                    Exists::File
+                };
+                let action = match decide(disposition, exists) {
+                    DispOutcome::Opened(action) => action,
+                    DispOutcome::Failed(failure) => return Err(map_failure(failure)),
+                };
+                let info = node_info_of(view, &stat);
+                Ok(OpenOutcome {
+                    file_id: info.file_id,
+                    kind: info.kind,
+                    action,
+                    size: info.size,
+                    times: info.times,
+                    attributes: info.attributes,
+                    binding: (from_serial(view, parent), stored),
+                    replaced: None,
+                })
+            });
+        }
+
+        self.with_write_view(|op, view| {
             let segments = parse_segments(path)?;
             if segments.is_empty() {
                 let root = view.root_serial();
@@ -437,10 +614,11 @@ impl WorkspaceOps for WinFspBackend {
                 };
             }
 
-            let (parent, _) = resolve_dir_chain(op, view, state, &segments[..segments.len() - 1])?;
+            let (parent, _) = self.resolve_dir_chain(op, view, &segments[..segments.len() - 1])?;
             let leaf = &segments[segments.len() - 1];
             let folded = fold_bytes(leaf);
-            let existing = ensure_dir_cached(op, view, state, parent)?
+            let existing = self
+                .get_dir_table(op, view, parent)?
                 .get(&folded)
                 .cloned();
             let (exists, existing_stat) = match &existing {
@@ -455,10 +633,7 @@ impl WorkspaceOps for WinFspBackend {
                         (ex, Some(stat))
                     }
                     Err(WorkspaceError::Content(ContentError::PathNotFound)) => {
-                        // Stale cache entry: drop it and treat as absent.
-                        if let Some(map) = state.dir_cache.get_mut(&parent) {
-                            map.remove(&folded);
-                        }
+                        self.dir_cache_remove_entry(parent, &folded);
                         (Exists::Absent, None)
                     }
                     Err(e) => return Err(map_workspace_err(e)),
@@ -479,21 +654,19 @@ impl WorkspaceOps for WinFspBackend {
                 }
                 Action::CreateNew => {
                     let name = to_path_name(leaf)?;
-                    let stat = apply_op(
-                        op,
-                        view,
-                        state,
-                        Operation::Create {
-                            parent,
-                            name,
-                            mode: DEFAULT_FILE_MODE,
-                        },
-                        now,
-                    )?
-                    .ok_or_else(|| OpsError::Other("Create returned no stat".to_owned()))?;
-                    if let Some(map) = state.dir_cache.get_mut(&parent) {
-                        map.insert(folded, (leaf.clone(), stat.serial));
-                    }
+                    let stat = self
+                        .apply_op(
+                            op,
+                            view,
+                            Operation::Create {
+                                parent,
+                                name,
+                                mode: DEFAULT_FILE_MODE,
+                            },
+                            now,
+                        )?
+                        .ok_or_else(|| OpsError::Other("Create returned no stat".to_owned()))?;
+                    self.dir_cache_insert(parent, folded, leaf.clone(), stat.serial);
                     (stat, leaf.clone())
                 }
                 Action::TruncateExisting => {
@@ -503,19 +676,19 @@ impl WorkspaceOps for WinFspBackend {
                     } else {
                         None
                     };
-                    let stat = apply_op(
-                        op,
-                        view,
-                        state,
-                        Operation::SetAttributes {
-                            serial,
-                            mode,
-                            mtime: Some(now),
-                            size: Some(0),
-                        },
-                        now,
-                    )?
-                    .ok_or_else(|| OpsError::Other("Truncate returned no stat".to_owned()))?;
+                    let stat = self
+                        .apply_op(
+                            op,
+                            view,
+                            Operation::SetAttributes {
+                                serial,
+                                mode,
+                                mtime: Some(now),
+                                size: Some(0),
+                            },
+                            now,
+                        )?
+                        .ok_or_else(|| OpsError::Other("Truncate returned no stat".to_owned()))?;
                     (stat, stored)
                 }
             };
@@ -535,42 +708,39 @@ impl WorkspaceOps for WinFspBackend {
     }
 
     fn mkdir(&self, path: &Path<'_>) -> OpsResult<u64> {
-        self.with_view(|op, view, state| {
+        self.with_write_view(|op, view| {
             let segments = parse_segments(path)?;
             if segments.is_empty() {
                 return Err(OpsError::NameCollision);
             }
-            let (parent, _) = resolve_dir_chain(op, view, state, &segments[..segments.len() - 1])?;
+            let (parent, _) = self.resolve_dir_chain(op, view, &segments[..segments.len() - 1])?;
             let leaf = &segments[segments.len() - 1];
             let folded = fold_bytes(leaf);
-            if ensure_dir_cached(op, view, state, parent)?.contains_key(&folded) {
+            if self.get_dir_table(op, view, parent)?.contains_key(&folded) {
                 return Err(OpsError::NameCollision);
             }
             let name = to_path_name(leaf)?;
-            let stat = apply_op(
-                op,
-                view,
-                state,
-                Operation::Mkdir {
-                    parent,
-                    name,
-                    mode: DEFAULT_DIR_MODE,
-                },
-                now_time(),
-            )?
-            .ok_or_else(|| OpsError::Other("Mkdir returned no stat".to_owned()))?;
-            if let Some(map) = state.dir_cache.get_mut(&parent) {
-                map.insert(folded, (leaf.clone(), stat.serial));
-            }
-            // Newly created directory starts empty in cache.
-            state.dir_cache.insert(stat.serial, HashMap::new());
+            let stat = self
+                .apply_op(
+                    op,
+                    view,
+                    Operation::Mkdir {
+                        parent,
+                        name,
+                        mode: DEFAULT_DIR_MODE,
+                    },
+                    now_time(),
+                )?
+                .ok_or_else(|| OpsError::Other("Mkdir returned no stat".to_owned()))?;
+            self.dir_cache_insert(parent, folded, leaf.clone(), stat.serial);
+            self.dir_cache_insert_empty_dir(stat.serial);
             Ok(from_serial(view, stat.serial))
         })
     }
 
     fn open_dir(&self, path: &Path<'_>) -> OpsResult<u64> {
-        self.with_view(|op, view, state| {
-            let (_, _, serial, stat) = resolve_entry(op, view, state, path)?;
+        self.with_read_view(|op, view| {
+            let (_, _, serial, stat) = self.resolve_entry(op, view, path)?;
             if stat.kind != InodeKind::Directory {
                 return Err(OpsError::NotADirectory);
             }
@@ -579,8 +749,8 @@ impl WorkspaceOps for WinFspBackend {
     }
 
     fn dir_binding(&self, path: &Path<'_>) -> Option<DirOutcome> {
-        self.with_view(|op, view, state| {
-            let (parent, stored, serial, _) = resolve_entry(op, view, state, path)?;
+        self.with_read_view(|op, view| {
+            let (parent, stored, serial, _) = self.resolve_entry(op, view, path)?;
             let name = stored.unwrap_or_default();
             Ok(DirOutcome {
                 id: from_serial(view, serial),
@@ -594,46 +764,58 @@ impl WorkspaceOps for WinFspBackend {
         if len == 0 {
             return Ok(Vec::new());
         }
-        self.with_view(|op, view, _state| {
+        let mut out = vec![0u8; len];
+        let _ = self.read_into(file_id, offset, &mut out)?;
+        // WorkspaceOps::read contract: short reads at EOF are zero-padded to `len`.
+        Ok(out)
+    }
+
+    fn read_into(&self, file_id: u64, offset: u64, dst: &mut [u8]) -> OpsResult<usize> {
+        if dst.is_empty() {
+            return Ok(0);
+        }
+        self.with_read_view(|op, view| {
             let serial = to_serial(view, file_id);
-            let mut out = Vec::with_capacity(len.min(READ_WINDOW));
+            let mut scratch = Vec::with_capacity(dst.len().min(READ_WINDOW));
             let mut pos = offset;
-            let mut remaining = len;
-            while remaining > 0 {
+            let mut written = 0usize;
+            while written < dst.len() {
+                let remaining = dst.len() - written;
                 let want = remaining.min(READ_WINDOW) as u32;
-                let before = out.len();
-                match view.read(op.overlay(), serial, pos, want, &mut out) {
+                scratch.clear();
+                match view.read(op.overlay(), serial, pos, want, &mut scratch) {
                     Ok(_) => {}
                     Err(WorkspaceError::Refused(Refusal::Invalid))
-                        if out.is_empty()
+                        if written == 0
                             && view
                                 .stat(op.overlay(), serial)
                                 .is_ok_and(|s| s.kind == InodeKind::Symlink) =>
                     {
-                        // Expose POSIX symlinks safely as immutable target-text files on Windows
-                        // (matches git core.symlinks=false and avoids requiring Developer Mode/Admin).
-                        let target = view.readlink(op.overlay(), serial).map_err(map_workspace_err)?;
+                        let target = view
+                            .readlink(op.overlay(), serial)
+                            .map_err(map_workspace_err)?;
                         let raw = target.as_bytes();
                         let start = usize::try_from(offset).unwrap_or(raw.len()).min(raw.len());
-                        let end = start.saturating_add(len).min(raw.len());
-                        out.extend_from_slice(&raw[start..end]);
+                        let end = start.saturating_add(dst.len()).min(raw.len());
+                        let n = end - start;
+                        dst[..n].copy_from_slice(&raw[start..end]);
+                        written = n;
                         break;
                     }
                     Err(err) => return Err(map_workspace_err(err)),
                 }
-                let got = out.len() - before;
+                let got = scratch.len().min(remaining);
                 if got == 0 {
                     break;
                 }
+                dst[written..written + got].copy_from_slice(&scratch[..got]);
+                written += got;
                 pos = pos.saturating_add(got as u64);
-                remaining -= got;
                 if got < want as usize {
                     break;
                 }
             }
-            // WorkspaceOps::read contract: short reads at EOF are zero-padded to `len`.
-            out.resize(len, 0);
-            Ok(out)
+            Ok(written)
         })
     }
 
@@ -641,17 +823,16 @@ impl WorkspaceOps for WinFspBackend {
         if bytes.is_empty() {
             return Ok(0);
         }
-        self.with_view(|op, view, state| {
+        self.with_write_view(|op, view| {
             let serial = to_serial(view, file_id);
             let now = now_time();
             let mut written = 0usize;
             while written < bytes.len() {
                 let end = (written + WRITE_WINDOW).min(bytes.len());
                 let chunk = &bytes[written..end];
-                apply_op(
+                self.apply_op(
                     op,
                     view,
-                    state,
                     Operation::Write {
                         serial,
                         position: Position::At(offset.saturating_add(written as u64)),
@@ -666,12 +847,11 @@ impl WorkspaceOps for WinFspBackend {
     }
 
     fn set_size(&self, file_id: u64, len: u64) -> OpsResult<()> {
-        self.with_view(|op, view, state| {
+        self.with_write_view(|op, view| {
             let serial = to_serial(view, file_id);
-            apply_op(
+            self.apply_op(
                 op,
                 view,
-                state,
                 Operation::SetAttributes {
                     serial,
                     mode: None,
@@ -685,29 +865,41 @@ impl WorkspaceOps for WinFspBackend {
     }
 
     fn read_dir(&self, dir_id: u64) -> OpsResult<Vec<DirEntry>> {
-        self.with_view(|op, view, state| {
+        let items = self.read_dir_with_info(dir_id)?;
+        Ok(items
+            .into_iter()
+            .map(|(name, info)| DirEntry {
+                name,
+                kind: info.kind,
+                file_id: info.file_id,
+            })
+            .collect())
+    }
+
+    fn read_dir_with_info(&self, dir_id: u64) -> OpsResult<Vec<(Vec<u8>, NodeInfo)>> {
+        self.with_read_view(|op, view| {
             let dir_serial = to_serial(view, dir_id);
-            let entries: Vec<(Vec<u8>, u64)> = ensure_dir_cached(op, view, state, dir_serial)?
-                .values()
-                .cloned()
-                .collect();
-            let mut out = Vec::with_capacity(entries.len());
-            for (name, serial) in entries {
-                if let Ok(stat) = view.stat(op.overlay(), serial) {
-                    out.push(DirEntry {
-                        name,
-                        kind: kind_of(stat.kind),
-                        file_id: from_serial(view, serial),
-                    });
+            let table = self.get_dir_table(op, view, dir_serial)?;
+            let mut out = Vec::with_capacity(table.len());
+            for (name, serial) in table.values() {
+                if let Ok(stat) = view.stat(op.overlay(), *serial) {
+                    out.push((name.clone(), node_info_of(view, &stat)));
                 }
             }
-            out.sort_by(|a, b| a.name.cmp(&b.name));
+            out.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(out)
         })
     }
 
+    fn is_dir_empty(&self, dir_id: u64) -> OpsResult<bool> {
+        self.with_read_view(|op, view| {
+            let dir_serial = to_serial(view, dir_id);
+            Ok(self.get_dir_table(op, view, dir_serial)?.is_empty())
+        })
+    }
+
     fn get_info(&self, file_id: u64) -> OpsResult<NodeInfo> {
-        self.with_view(|op, view, _state| {
+        self.with_read_view(|op, view| {
             let serial = to_serial(view, file_id);
             let stat = view.stat(op.overlay(), serial).map_err(map_workspace_err)?;
             Ok(node_info_of(view, &stat))
@@ -726,12 +918,11 @@ impl WorkspaceOps for WinFspBackend {
         let Some(mtime) = mtime else {
             return Ok(());
         };
-        self.with_view(|op, view, state| {
+        self.with_write_view(|op, view| {
             let serial = to_serial(view, file_id);
-            apply_op(
+            self.apply_op(
                 op,
                 view,
-                state,
                 Operation::SetAttributes {
                     serial,
                     mode: None,
@@ -747,7 +938,7 @@ impl WorkspaceOps for WinFspBackend {
     fn set_attributes(&self, file_id: u64, attributes: Attributes) -> OpsResult<()> {
         fs_semantics::attributes::validate(attributes.0)
             .map_err(|_| OpsError::InvalidParameter)?;
-        self.with_view(|op, view, state| {
+        self.with_write_view(|op, view| {
             let serial = to_serial(view, file_id);
             let stat = view.stat(op.overlay(), serial).map_err(map_workspace_err)?;
             if matches!(stat.kind, InodeKind::Directory | InodeKind::Symlink) {
@@ -762,10 +953,9 @@ impl WorkspaceOps for WinFspBackend {
             if new_mode == current {
                 return Ok(());
             }
-            apply_op(
+            self.apply_op(
                 op,
                 view,
-                state,
                 Operation::SetAttributes {
                     serial,
                     mode: Some(new_mode),
@@ -779,30 +969,32 @@ impl WorkspaceOps for WinFspBackend {
     }
 
     fn rename(&self, from: &Path<'_>, to: &Path<'_>, replace: bool) -> OpsResult<RenameOutcome> {
-        self.with_view(|op, view, state| {
+        self.with_write_view(|op, view| {
             let from_segs = parse_segments(from)?;
             let to_segs = parse_segments(to)?;
             if from_segs.is_empty() || to_segs.is_empty() {
                 return Err(OpsError::InvalidParameter);
             }
             let (src_parent, _) =
-                resolve_dir_chain(op, view, state, &from_segs[..from_segs.len() - 1])?;
+                self.resolve_dir_chain(op, view, &from_segs[..from_segs.len() - 1])?;
             let (dst_parent, dst_chain) =
-                resolve_dir_chain(op, view, state, &to_segs[..to_segs.len() - 1])?;
+                self.resolve_dir_chain(op, view, &to_segs[..to_segs.len() - 1])?;
 
             let from_leaf = &from_segs[from_segs.len() - 1];
             let to_leaf = &to_segs[to_segs.len() - 1];
             let from_folded = fold_bytes(from_leaf);
             let to_folded = fold_bytes(to_leaf);
 
-            let Some((stored_from, source_serial)) = ensure_dir_cached(op, view, state, src_parent)?
+            let Some((stored_from, source_serial)) = self
+                .get_dir_table(op, view, src_parent)?
                 .get(&from_folded)
                 .cloned()
             else {
                 return Err(OpsError::NotFound);
             };
 
-            let existing_dst = ensure_dir_cached(op, view, state, dst_parent)?
+            let existing_dst = self
+                .get_dir_table(op, view, dst_parent)?
                 .get(&to_folded)
                 .cloned();
 
@@ -815,12 +1007,9 @@ impl WorkspaceOps for WinFspBackend {
                         replaced: None,
                     });
                 }
-                // Case-only rename in same directory: upstream is case-sensitive so
-                // rename directly from `stored_from` to `to_leaf`!
-                apply_op(
+                self.apply_op(
                     op,
                     view,
-                    state,
                     Operation::Rename {
                         parent: src_parent,
                         name: to_path_name(&stored_from)?,
@@ -831,9 +1020,7 @@ impl WorkspaceOps for WinFspBackend {
                     },
                     now_time(),
                 )?;
-                if let Some(map) = state.dir_cache.get_mut(&dst_parent) {
-                    map.insert(to_folded, (to_leaf.clone(), source_serial));
-                }
+                self.dir_cache_insert(dst_parent, to_folded, to_leaf.clone(), source_serial);
                 return Ok(RenameOutcome {
                     file_id: source_serial,
                     binding: (dst_parent, to_leaf.clone()),
@@ -846,8 +1033,6 @@ impl WorkspaceOps for WinFspBackend {
                 if !replace {
                     return Err(OpsError::NameCollision);
                 }
-                // If the existing target has a different case spelling than `to_leaf`,
-                // unlink/rmdir the differently-cased target first so no ghost entry remains.
                 if stored_dst != *to_leaf {
                     let dst_stat = view
                         .stat(op.overlay(), dst_serial)
@@ -863,9 +1048,9 @@ impl WorkspaceOps for WinFspBackend {
                             name: to_path_name(&stored_dst)?,
                         }
                     };
-                    apply_op(op, view, state, remove_op, now_time())?;
+                    self.apply_op(op, view, remove_op, now_time())?;
                     if dst_stat.kind == InodeKind::Directory {
-                        state.dir_cache.remove(&dst_serial);
+                        self.dir_cache_remove_dir(dst_serial);
                     }
                 }
                 replaced_serial = Some(dst_serial);
@@ -876,10 +1061,9 @@ impl WorkspaceOps for WinFspBackend {
             } else {
                 None
             };
-            apply_op(
+            self.apply_op(
                 op,
                 view,
-                state,
                 Operation::Rename {
                     parent: src_parent,
                     name: to_path_name(&stored_from)?,
@@ -891,14 +1075,10 @@ impl WorkspaceOps for WinFspBackend {
                 now_time(),
             )?;
 
-            if let Some(map) = state.dir_cache.get_mut(&src_parent) {
-                map.remove(&from_folded);
-            }
-            if let Some(map) = state.dir_cache.get_mut(&dst_parent) {
-                map.insert(to_folded, (to_leaf.clone(), source_serial));
-            }
+            self.dir_cache_remove_entry(src_parent, &from_folded);
+            self.dir_cache_insert(dst_parent, to_folded, to_leaf.clone(), source_serial);
             if let Some(old_id) = replaced_serial {
-                state.dir_cache.remove(&old_id);
+                self.dir_cache_remove_dir(old_id);
             }
 
             Ok(RenameOutcome {
@@ -910,15 +1090,15 @@ impl WorkspaceOps for WinFspBackend {
     }
 
     fn remove_at(&self, parent: u64, name: &[u8], expected_id: u64) -> OpsResult<()> {
-        self.with_view(|op, view, state| {
+        self.with_write_view(|op, view| {
             let parent_serial = to_serial(view, parent);
             let expected_serial = to_serial(view, expected_id);
             let folded = fold_bytes(name);
-            let Some((stored, serial)) = ensure_dir_cached(op, view, state, parent_serial)?
+            let Some((stored, serial)) = self
+                .get_dir_table(op, view, parent_serial)?
                 .get(&folded)
                 .cloned()
             else {
-                // Idempotent when `expected_serial` is already retired; `NotFound` when it is still live elsewhere.
                 return match view.stat(op.overlay(), expected_serial) {
                     Ok(stat) if stat.namespace_refs == 0 => Ok(()),
                     Err(
@@ -947,19 +1127,16 @@ impl WorkspaceOps for WinFspBackend {
                     name: to_path_name(&stored)?,
                 }
             };
-            apply_op(op, view, state, remove_op, now_time())?;
-            if let Some(map) = state.dir_cache.get_mut(&parent_serial) {
-                map.remove(&folded);
-            }
+            self.apply_op(op, view, remove_op, now_time())?;
+            self.dir_cache_remove_entry(parent_serial, &folded);
             if stat.kind == InodeKind::Directory {
-                state.dir_cache.remove(&serial);
+                self.dir_cache_remove_dir(serial);
             }
             Ok(())
         })
     }
 
     fn flush(&self) -> OpsResult<()> {
-        // Each upstream overlay mutation job is already committed to the overlay SQLite file.
         Ok(())
     }
 }

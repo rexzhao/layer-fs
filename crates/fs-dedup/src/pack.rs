@@ -88,14 +88,22 @@ impl PackWriter {
     fn ensure_open(&mut self) -> Result<&mut ActiveWriter> {
         if self.active.is_none() {
             fs::create_dir_all(&self.packs_dir)?;
-            let pack_id = self.next_pack_id;
-            self.next_pack_id += 1;
-            let path = pack_path(&self.packs_dir, pack_id);
-            let mut file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&path)?;
+            // Never truncate an existing pack file: allocate a fresh `pack_id` using `create_new`
+            // (O_EXCL / CREATE_NEW) so committed packs can never be overwritten.
+            let (pack_id, mut file) = loop {
+                let candidate = self.next_pack_id;
+                self.next_pack_id += 1;
+                let path = pack_path(&self.packs_dir, candidate);
+                match OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&path)
+                {
+                    Ok(f) => break (candidate, f),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            };
             let mut hdr = [0u8; 16];
             hdr[..8].copy_from_slice(PACK_MAGIC);
             hdr[8..16].copy_from_slice(&pack_id.to_le_bytes());
@@ -103,7 +111,7 @@ impl PackWriter {
             self.pending_packs.insert(pack_id, (PACK_HEADER_BYTES, false));
             self.active = Some(ActiveWriter {
                 pack_id,
-                writer: BufWriter::with_capacity(1024 * 1024, file),
+                writer: BufWriter::with_capacity(256 * 1024, file),
                 offset: PACK_HEADER_BYTES,
             });
         }
@@ -184,6 +192,33 @@ impl PackWriter {
             .collect()
     }
 
+    /// Flushes and closes the active pack handle without marking it sealed, so another
+    /// serialized writer can safely resume or allocate the next pack after `pack.lock` releases.
+    pub fn close_active(&mut self) -> Result<()> {
+        if let Some(mut active) = self.active.take() {
+            active.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Synchronizes `next_pack_id` and optionally resumes the latest committed unsealed pack
+    /// from SQLite while holding the exclusive cross-process store pack lock.
+    pub fn sync_from_db(
+        &mut self,
+        db_next_pack_id: u64,
+        unsealed: Option<(u64, u64)>,
+    ) -> Result<()> {
+        self.close_active()?;
+        self.pending_packs.clear();
+        self.next_pack_id = db_next_pack_id.max(1);
+        if let Some((pid, sz)) = unsealed {
+            if sz < self.pack_target_bytes {
+                self.resume_pack(pid, sz)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Resumes writing into an existing unsealed pack if one exists (optional optimization).
     pub fn resume_pack(&mut self, pack_id: u64, size_bytes: u64) -> Result<()> {
         let path = pack_path(&self.packs_dir, pack_id);
@@ -195,7 +230,7 @@ impl PackWriter {
         file.seek(SeekFrom::End(0))?;
         self.active = Some(ActiveWriter {
             pack_id,
-            writer: BufWriter::with_capacity(1024 * 1024, file),
+            writer: BufWriter::with_capacity(256 * 1024, file),
             offset: size_bytes,
         });
         if self.next_pack_id <= pack_id {
