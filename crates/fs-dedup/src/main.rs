@@ -1,23 +1,55 @@
 //! `dedupfs` CLI — Unity-focused multi-workspace deduplicating WinFsp filesystem.
+//!
+//! Store discovery order (for all commands other than `init`):
+//!   1. Explicit `--store <dir>` / `--store=<dir>` flag (anywhere on the command line)
+//!   2. Current directory or nearest ancestor containing `store.json` + `meta.sqlite`
+//!   3. `DEDUPFS_STORE` environment variable
 
 use fs_dedup::{
     request_umount, run_mount, Codec, DedupStore, ImportProgress, MountOptions, StoreConfig,
     DEFAULT_CACHE_BYTES, DEFAULT_PACK_TARGET_BYTES,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+fn is_store_dir(path: &Path) -> bool {
+    path.join("store.json").is_file() && path.join("meta.sqlite").is_file()
+}
+
+fn discover_store(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(p) = explicit {
+        return Ok(p.to_path_buf());
+    }
+    if let Ok(mut cur) = std::env::current_dir() {
+        loop {
+            if is_store_dir(&cur) {
+                return Ok(cur);
+            }
+            if !cur.pop() {
+                break;
+            }
+        }
+    }
+    if let Some(env) = std::env::var_os("DEDUPFS_STORE") {
+        if !env.is_empty() {
+            return Ok(PathBuf::from(env));
+        }
+    }
+    Err("no dedup store found; run from inside a store directory, pass `--store <dir>`, or set DEDUPFS_STORE".to_owned())
+}
 
 fn parse_size(raw: &str) -> Result<u64, String> {
     let s = raw.trim().to_ascii_uppercase();
-    let (num_str, mult): (&str, u64) = if let Some(v) = s.strip_suffix("GIB").or_else(|| s.strip_suffix('G')) {
-        (v, 1024 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("MIB").or_else(|| s.strip_suffix('M')) {
-        (v, 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("KIB").or_else(|| s.strip_suffix('K')) {
-        (v, 1024)
-    } else {
-        (s.as_str(), 1)
-    };
+    let (num_str, mult): (&str, u64) =
+        if let Some(v) = s.strip_suffix("GIB").or_else(|| s.strip_suffix('G')) {
+            (v, 1024 * 1024 * 1024)
+        } else if let Some(v) = s.strip_suffix("MIB").or_else(|| s.strip_suffix('M')) {
+            (v, 1024 * 1024)
+        } else if let Some(v) = s.strip_suffix("KIB").or_else(|| s.strip_suffix('K')) {
+            (v, 1024)
+        } else {
+            (s.as_str(), 1)
+        };
     let n: u64 = num_str
         .trim()
         .parse()
@@ -45,23 +77,47 @@ fn fmt_bytes(b: u64) -> String {
 fn print_help() {
     println!(
         "dedupfs — streamlined multi-workspace deduplicating WinFsp filesystem\n\n\
+         STORE DISCOVERY (all commands except `init`):\n  \
+           1. `--store <dir>` (anywhere on the command line)\n  \
+           2. Current directory or nearest ancestor store\n  \
+           3. `DEDUPFS_STORE` environment variable\n\n\
          COMMANDS:\n  \
-           dedupfs init <store> [--codec zstd1|lz4|none] [--pack-size 128M]\n  \
-           dedupfs import <store> <source_dir> [--name <ws>] [--threads N]\n  \
-           dedupfs create <store> <ws>\n  \
-           dedupfs clone <store> <src_ws> <new_ws>\n  \
-           dedupfs rm <store> <ws>\n  \
-           dedupfs list <store>\n  \
-           dedupfs stats <store>\n  \
-           dedupfs dedup <store> [ws] [--idle 0]\n  \
-           dedupfs gc <store> [--threshold 30]\n  \
-           dedupfs mount <store> <ws> <mount_point> [--cache 256M] [--dedup-interval 60] [--dedup-idle 30]\n  \
+           dedupfs init [dir] [--codec zstd1|lz4|none] [--pack-size 128M]\n  \
+           dedupfs import <source_dir> [--name <ws>] [--update] [--threads N]\n  \
+           dedupfs create <ws>\n  \
+           dedupfs clone <src_ws> <new_ws>\n  \
+           dedupfs rm <ws>\n  \
+           dedupfs list\n  \
+           dedupfs stats\n  \
+           dedupfs dedup [ws] [--idle 0]\n  \
+           dedupfs gc [--threshold 30]\n  \
+           dedupfs mount <ws> <mount_point> [--cache 256M] [--dedup-interval 60] [--dedup-idle 30]\n  \
            dedupfs umount <mount_point> [--force]"
     );
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // Extract global `--store <dir>` / `--store=<dir>` anywhere on the command line.
+    let mut explicit_store: Option<PathBuf> = None;
+    let mut args: Vec<String> = Vec::with_capacity(raw_args.len());
+    let mut k = 0;
+    while k < raw_args.len() {
+        if raw_args[k] == "--store" {
+            let val = raw_args
+                .get(k + 1)
+                .ok_or("--store requires a directory path")?;
+            explicit_store = Some(PathBuf::from(val));
+            k += 2;
+        } else if let Some(val) = raw_args[k].strip_prefix("--store=") {
+            explicit_store = Some(PathBuf::from(val));
+            k += 1;
+        } else {
+            args.push(raw_args[k].clone());
+            k += 1;
+        }
+    }
+
     if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
         print_help();
         return Ok(());
@@ -69,11 +125,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match args[0].as_str() {
         "init" => {
-            let store_dir = args
-                .get(1)
-                .ok_or("usage: dedupfs init <store> [--codec zstd1|lz4|none] [--pack-size 128M]")?;
             let mut cfg = StoreConfig::default();
-            let mut i = 2;
+            let mut pos: Vec<String> = Vec::new();
+            let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
                     "--codec" => {
@@ -86,10 +140,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         cfg.pack_target_bytes = parse_size(raw)?;
                         i += 2;
                     }
-                    other => return Err(format!("unknown option {other:?}").into()),
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown option {other:?}").into());
+                    }
+                    other => {
+                        pos.push(other.to_owned());
+                        i += 1;
+                    }
                 }
             }
-            let store = DedupStore::init(store_dir, cfg)?;
+            if pos.len() > 1 {
+                return Err(
+                    "usage: dedupfs init [dir] [--codec zstd1|lz4|none] [--pack-size 128M]".into(),
+                );
+            }
+            let store_dir = pos
+                .first()
+                .map(PathBuf::from)
+                .or(explicit_store)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let store = DedupStore::init(&store_dir, cfg)?;
             println!(
                 "initialized dedup store at {} (codec={}, pack_size={})",
                 store.root().display(),
@@ -98,87 +168,138 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "create" => {
-            let store_dir = args.get(1).ok_or("usage: dedupfs create <store> <ws>")?;
-            let ws_name = args.get(2).ok_or("usage: dedupfs create <store> <ws>")?;
-            let store = DedupStore::open(store_dir)?;
+            if args.len() != 2 {
+                return Err("usage: dedupfs [--store <dir>] create <ws>".into());
+            }
+            let store_dir = discover_store(explicit_store.as_deref())?;
+            let ws_name = args[1].as_str();
+            let store = DedupStore::open(&store_dir)?;
             let ws_id = store.create_workspace(ws_name)?;
             println!("created workspace `{ws_name}` (id={ws_id})");
         }
         "import" => {
-            let store_dir = args
-                .get(1)
-                .ok_or("usage: dedupfs import <store> <source_dir> [--name <ws>] [--threads N]")?;
-            let source_dir = args
-                .get(2)
-                .ok_or("usage: dedupfs import <store> <source_dir> [--name <ws>] [--threads N]")?;
             let mut ws_name: Option<String> = None;
+            let mut update = false;
             let mut threads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(8);
-            let mut i = 3;
+            let mut pos: Vec<String> = Vec::new();
+            let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
                     "--name" => {
                         ws_name = Some(args.get(i + 1).ok_or("--name requires a value")?.clone());
                         i += 2;
                     }
+                    "--update" | "-u" => {
+                        update = true;
+                        i += 1;
+                    }
                     "--threads" => {
                         let raw = args.get(i + 1).ok_or("--threads requires a value")?;
                         threads = raw.parse::<usize>()?.max(1);
                         i += 2;
                     }
-                    other => return Err(format!("unknown option {other:?}").into()),
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown option {other:?}").into());
+                    }
+                    other => {
+                        pos.push(other.to_owned());
+                        i += 1;
+                    }
                 }
             }
-            let src_path = PathBuf::from(source_dir);
+            if pos.len() != 1 {
+                return Err(
+                    "usage: dedupfs [--store <dir>] import <source_dir> [--name <ws>] [--update] [--threads N]"
+                        .into(),
+                );
+            }
+            let store_dir = discover_store(explicit_store.as_deref())?;
+            let src_path = PathBuf::from(&pos[0]);
             let ws = ws_name.unwrap_or_else(|| {
                 src_path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "default".to_owned())
             });
-            let store = DedupStore::open(store_dir)?;
+            let store = DedupStore::open(&store_dir)?;
             let start = Instant::now();
             let cb = Box::new(move |p: ImportProgress| {
                 let secs = start.elapsed().as_secs_f64().max(0.001);
                 let mb_s = p.logical_bytes as f64 / (1024.0 * 1024.0) / secs;
-                eprintln!(
-                    "  [{:>5.0}s] {:>9} files, {} logical -> {} new unique ({} stored), {:.0} MB/s",
-                    secs,
-                    p.files,
-                    fmt_bytes(p.logical_bytes),
-                    fmt_bytes(p.new_unique_bytes),
-                    fmt_bytes(p.stored_bytes),
-                    mb_s,
-                );
+                if update {
+                    eprintln!(
+                        "  [{:>5.0}s] {:>9} files (unchanged={}, updated={}, removed={}), {} logical -> {} new unique ({} stored), {:.0} MB/s",
+                        secs,
+                        p.files,
+                        p.unchanged_files,
+                        p.updated_files,
+                        p.removed_entries,
+                        fmt_bytes(p.logical_bytes),
+                        fmt_bytes(p.new_unique_bytes),
+                        fmt_bytes(p.stored_bytes),
+                        mb_s,
+                    );
+                } else {
+                    eprintln!(
+                        "  [{:>5.0}s] {:>9} files, {} logical -> {} new unique ({} stored), {:.0} MB/s",
+                        secs,
+                        p.files,
+                        fmt_bytes(p.logical_bytes),
+                        fmt_bytes(p.new_unique_bytes),
+                        fmt_bytes(p.stored_bytes),
+                        mb_s,
+                    );
+                }
             });
-            let sum = store.import_dir(&src_path, &ws, threads, Some(cb))?;
-            println!(
-                "imported `{}` (ws_id={}): {} files, {} dirs, {} logical -> {} new unique ({} stored, {} hot-DB pinned, {} errors) in {:.1}s ({:.0} MB/s)",
-                sum.workspace,
-                sum.ws_id,
-                sum.files,
-                sum.dirs,
-                fmt_bytes(sum.logical_bytes),
-                fmt_bytes(sum.new_unique_bytes),
-                fmt_bytes(sum.stored_bytes),
-                sum.overlay_pinned_files,
-                sum.errors,
-                sum.elapsed_secs,
-                sum.logical_bytes as f64 / (1024.0 * 1024.0) / sum.elapsed_secs.max(0.001),
-            );
+            let sum = if update {
+                store.import_dir_update(&src_path, &ws, threads, Some(cb))?
+            } else {
+                store.import_dir(&src_path, &ws, threads, Some(cb))?
+            };
+            if update {
+                println!(
+                    "updated `{}` (ws_id={}): {} files (unchanged={}, updated={}, added={}, removed={}), {} dirs, {} logical -> {} new unique ({} stored, {} hot-DB pinned, {} errors) in {:.1}s",
+                    sum.workspace,
+                    sum.ws_id,
+                    sum.files,
+                    sum.unchanged_files,
+                    sum.updated_files,
+                    sum.files.saturating_sub(sum.unchanged_files + sum.updated_files),
+                    sum.removed_entries,
+                    sum.dirs,
+                    fmt_bytes(sum.logical_bytes),
+                    fmt_bytes(sum.new_unique_bytes),
+                    fmt_bytes(sum.stored_bytes),
+                    sum.overlay_pinned_files,
+                    sum.errors,
+                    sum.elapsed_secs,
+                );
+            } else {
+                println!(
+                    "imported `{}` (ws_id={}): {} files, {} dirs, {} logical -> {} new unique ({} stored, {} hot-DB pinned, {} errors) in {:.1}s ({:.0} MB/s)",
+                    sum.workspace,
+                    sum.ws_id,
+                    sum.files,
+                    sum.dirs,
+                    fmt_bytes(sum.logical_bytes),
+                    fmt_bytes(sum.new_unique_bytes),
+                    fmt_bytes(sum.stored_bytes),
+                    sum.overlay_pinned_files,
+                    sum.errors,
+                    sum.elapsed_secs,
+                    sum.logical_bytes as f64 / (1024.0 * 1024.0) / sum.elapsed_secs.max(0.001),
+                );
+            }
         }
         "clone" => {
-            let store_dir = args
-                .get(1)
-                .ok_or("usage: dedupfs clone <store> <src_ws> <new_ws>")?;
-            let src_ws = args
-                .get(2)
-                .ok_or("usage: dedupfs clone <store> <src_ws> <new_ws>")?;
-            let new_ws = args
-                .get(3)
-                .ok_or("usage: dedupfs clone <store> <src_ws> <new_ws>")?;
-            let store = DedupStore::open(store_dir)?;
+            if args.len() != 3 {
+                return Err("usage: dedupfs [--store <dir>] clone <src_ws> <new_ws>".into());
+            }
+            let store_dir = discover_store(explicit_store.as_deref())?;
+            let (src_ws, new_ws) = (args[1].as_str(), args[2].as_str());
+            let store = DedupStore::open(&store_dir)?;
             let t0 = Instant::now();
             let ws_id = store.clone_workspace(src_ws, new_ws)?;
             println!(
@@ -187,15 +308,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "rm" => {
-            let store_dir = args.get(1).ok_or("usage: dedupfs rm <store> <ws>")?;
-            let ws = args.get(2).ok_or("usage: dedupfs rm <store> <ws>")?;
-            let store = DedupStore::open(store_dir)?;
+            if args.len() != 2 {
+                return Err("usage: dedupfs [--store <dir>] rm <ws>".into());
+            }
+            let store_dir = discover_store(explicit_store.as_deref())?;
+            let ws = args[1].as_str();
+            let store = DedupStore::open(&store_dir)?;
             store.remove_workspace(ws)?;
             println!("removed workspace `{ws}` (run `dedupfs gc` to reclaim dead pack space)");
         }
         "list" => {
-            let store_dir = args.get(1).ok_or("usage: dedupfs list <store>")?;
-            let store = DedupStore::open(store_dir)?;
+            if args.len() != 1 {
+                return Err("usage: dedupfs [--store <dir>] list".into());
+            }
+            let store_dir = discover_store(explicit_store.as_deref())?;
+            let store = DedupStore::open(&store_dir)?;
             let list = store.list_workspaces()?;
             println!(
                 "{:<4} {:<24} {:>10} {:>8} {:>12} {:>12}",
@@ -214,8 +341,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "stats" => {
-            let store_dir = args.get(1).ok_or("usage: dedupfs stats <store>")?;
-            let store = DedupStore::open(store_dir)?;
+            if args.len() != 1 {
+                return Err("usage: dedupfs [--store <dir>] stats".into());
+            }
+            let store_dir = discover_store(explicit_store.as_deref())?;
+            let store = DedupStore::open(&store_dir)?;
             let s = store.stats()?;
             let physical = s.pack_disk_bytes + s.overlay_bytes + s.meta_db_bytes;
             let saved_pct = if s.total_logical_bytes == 0 {
@@ -260,12 +390,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "dedup" => {
-            let store_dir = args
-                .get(1)
-                .ok_or("usage: dedupfs dedup <store> [ws] [--idle 0]")?;
-            let mut ws: Option<String> = None;
             let mut idle_secs = 0u64;
-            let mut i = 2;
+            let mut pos: Vec<String> = Vec::new();
+            let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
                     "--idle" => {
@@ -276,13 +403,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         return Err(format!("unknown option {other:?}").into());
                     }
                     other => {
-                        ws = Some(other.to_owned());
+                        pos.push(other.to_owned());
                         i += 1;
                     }
                 }
             }
-            let store = DedupStore::open(store_dir)?;
-            let sum = store.dedup_workspace(ws.as_deref(), idle_secs, |_, _| false)?;
+            if pos.len() > 1 {
+                return Err("usage: dedupfs [--store <dir>] dedup [ws] [--idle 0]".into());
+            }
+            let store_dir = discover_store(explicit_store.as_deref())?;
+            let ws = pos.first().map(String::as_str);
+            let store = DedupStore::open(&store_dir)?;
+            let sum = store.dedup_workspace(ws, idle_secs, |_, _| false)?;
             println!(
                 "deduped {} / {} overlay files: {} raw -> {} new stored, reclaimed {} from overlay",
                 sum.deduped_files,
@@ -293,11 +425,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "gc" => {
-            let store_dir = args
-                .get(1)
-                .ok_or("usage: dedupfs gc <store> [--threshold 30]")?;
             let mut threshold = 30u8;
-            let mut i = 2;
+            let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
                     "--threshold" => {
@@ -307,10 +436,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .parse()?;
                         i += 2;
                     }
-                    other => return Err(format!("unknown option {other:?}").into()),
+                    other => {
+                        return Err(format!(
+                            "unexpected argument {other:?}; usage: dedupfs [--store <dir>] gc [--threshold 30]"
+                        )
+                        .into());
+                    }
                 }
             }
-            let store = DedupStore::open(store_dir)?;
+            let store_dir = discover_store(explicit_store.as_deref())?;
+            let store = DedupStore::open(&store_dir)?;
             let sum = store.gc(threshold)?;
             println!(
                 "gc complete: deleted {} empty pack(s), compacted {} pack(s) ({} chunks moved), reclaimed {}",
@@ -321,17 +456,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "mount" => {
-            let store_dir = args.get(1).ok_or(
-                "usage: dedupfs mount <store> <ws> <mount_point> [--cache 256M] [--dedup-interval 60] [--dedup-idle 30]",
-            )?;
-            let ws = args.get(2).ok_or("missing workspace name")?;
-            let mount_point = args.get(3).ok_or("missing mount point")?;
             let mut opts = MountOptions {
                 cache_bytes: DEFAULT_CACHE_BYTES,
                 dedup_interval_secs: 60,
                 dedup_idle_secs: 30,
             };
-            let mut i = 4;
+            let mut pos: Vec<String> = Vec::new();
+            let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
                     "--cache" => {
@@ -349,16 +480,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             args.get(i + 1).ok_or("--dedup-idle requires seconds")?.parse()?;
                         i += 2;
                     }
-                    other => return Err(format!("unknown option {other:?}").into()),
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown option {other:?}").into());
+                    }
+                    other => {
+                        pos.push(other.to_owned());
+                        i += 1;
+                    }
                 }
             }
+            if pos.len() != 2 {
+                return Err(
+                    "usage: dedupfs [--store <dir>] mount <ws> <mount_point> [--cache 256M] [--dedup-interval 60] [--dedup-idle 30]"
+                        .into(),
+                );
+            }
+            let store_dir = discover_store(explicit_store.as_deref())?;
+            let (ws, mount_point) = (pos[0].as_str(), PathBuf::from(&pos[1]));
             let _ = DEFAULT_PACK_TARGET_BYTES;
-            run_mount(
-                &PathBuf::from(store_dir),
-                ws,
-                &PathBuf::from(mount_point),
-                opts,
-            )?;
+            run_mount(&store_dir, ws, &mount_point, opts)?;
         }
         "umount" => {
             let mount_point = args

@@ -277,8 +277,9 @@ fn live_winfsp_mount_io_background_dedup_and_umount() {
     let mut child_guard = ChildGuard(Some(
         Command::new(bin)
             .args([
-                "mount",
+                "--store",
                 store_dir.to_str().unwrap(),
+                "mount",
                 "main_ws",
                 mount_point.to_str().unwrap(),
                 "--cache",
@@ -356,4 +357,140 @@ fn live_winfsp_mount_io_background_dedup_and_umount() {
         "background dedup should have moved new_asset.txt out of overlay into packs"
     );
     assert!(stats.unique_chunks >= 2);
+}
+
+#[test]
+fn import_update_skips_unchanged_updates_modified_adds_new_and_deletes_removed() {
+    let tmp = TempDir::new("import_update");
+    let src = tmp.0.join("src");
+    std::fs::create_dir_all(src.join("keep_dir")).unwrap();
+    std::fs::create_dir_all(src.join("drop_dir")).unwrap();
+    std::fs::write(src.join("keep_dir").join("same.txt"), b"unchanged content").unwrap();
+    std::fs::write(src.join("keep_dir").join("edit.txt"), b"version 1").unwrap();
+    std::fs::write(src.join("drop_dir").join("gone.txt"), b"will be deleted").unwrap();
+    std::fs::write(src.join("Library_ArtifactDB.db"), b"hot-db-v1").unwrap();
+
+    let store = DedupStore::init(tmp.0.join("store"), StoreConfig::default()).unwrap();
+
+    // First `--update` on a non-existent workspace creates it cleanly.
+    let first = store.import_dir_update(&src, "proj", 2, None).unwrap();
+    assert_eq!(first.files, 4);
+    assert_eq!(first.unchanged_files, 0);
+
+    // Second `--update` with zero changes skips all 4 files with zero new unique bytes!
+    let noop = store.import_dir_update(&src, "proj", 2, None).unwrap();
+    assert_eq!(noop.files, 4);
+    assert_eq!(noop.unchanged_files, 4);
+    assert_eq!(noop.updated_files, 0);
+    assert_eq!(noop.removed_entries, 0);
+    assert_eq!(noop.new_unique_bytes, 0);
+
+    // Mutate host source: modify `edit.txt` & hot DB, add `new_dir/added.txt`, delete `drop_dir/`.
+    std::fs::write(src.join("keep_dir").join("edit.txt"), b"version 2 - longer payload!").unwrap();
+    std::fs::write(src.join("Library_ArtifactDB.db"), b"hot-db-v2-updated").unwrap();
+    std::fs::create_dir_all(src.join("new_dir")).unwrap();
+    std::fs::write(src.join("new_dir").join("added.txt"), b"brand new file").unwrap();
+    std::fs::remove_dir_all(src.join("drop_dir")).unwrap();
+
+    let upd = store.import_dir_update(&src, "proj", 2, None).unwrap();
+    assert_eq!(upd.unchanged_files, 1, "only same.txt should be unchanged");
+    assert_eq!(upd.updated_files, 2, "edit.txt + Library_ArtifactDB.db updated");
+    assert_eq!(upd.files, 4, "same + edit + hot-db + added");
+    assert_eq!(upd.removed_entries, 2, "drop_dir + drop_dir/gone.txt removed");
+
+    // Verify exact contents in workspace after update.
+    let backend = DedupWorkspaceBackend::open(store.clone(), "proj").unwrap();
+    let f_same = backend
+        .create_or_open(&OpsPath::new(b"/keep_dir/same.txt"), Disposition::Open)
+        .unwrap();
+    assert_eq!(
+        backend.read(f_same.file_id, 0, f_same.size as usize).unwrap(),
+        b"unchanged content"
+    );
+    let f_edit = backend
+        .create_or_open(&OpsPath::new(b"/keep_dir/edit.txt"), Disposition::Open)
+        .unwrap();
+    assert_eq!(
+        backend.read(f_edit.file_id, 0, f_edit.size as usize).unwrap(),
+        b"version 2 - longer payload!"
+    );
+    let f_db = backend
+        .create_or_open(&OpsPath::new(b"/Library_ArtifactDB.db"), Disposition::Open)
+        .unwrap();
+    assert_eq!(
+        backend.read(f_db.file_id, 0, f_db.size as usize).unwrap(),
+        b"hot-db-v2-updated"
+    );
+    let f_add = backend
+        .create_or_open(&OpsPath::new(b"/new_dir/added.txt"), Disposition::Open)
+        .unwrap();
+    assert_eq!(
+        backend.read(f_add.file_id, 0, f_add.size as usize).unwrap(),
+        b"brand new file"
+    );
+    assert!(
+        backend
+            .create_or_open(&OpsPath::new(b"/drop_dir/gone.txt"), Disposition::Open)
+            .is_err(),
+        "deleted file must no longer exist in workspace"
+    );
+}
+
+#[test]
+fn cli_auto_discovers_store_from_cwd_and_env() {
+    use std::process::Command;
+
+    let tmp = TempDir::new("cli_discover");
+    let store_dir = tmp.0.join("my_store");
+    let src_dir = tmp.0.join("src");
+    let other_dir = tmp.0.join("elsewhere");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&other_dir).unwrap();
+    std::fs::write(src_dir.join("a.txt"), b"hello auto discovery").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_dedupfs");
+    let run_in = |cwd: &std::path::Path, args: &[&str], env_store: Option<&std::path::Path>| {
+        let mut cmd = Command::new(bin);
+        cmd.current_dir(cwd).args(args).env_remove("DEDUPFS_STORE");
+        if let Some(s) = env_store {
+            cmd.env("DEDUPFS_STORE", s);
+        }
+        let out = cmd.output().expect("run dedupfs");
+        assert!(
+            out.status.success(),
+            "dedupfs {:?} failed: stdout={} stderr={}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Inside store dir: omit `<store>` everywhere!
+    run_in(&store_dir, &["init"], None);
+    let out = run_in(
+        &store_dir,
+        &["import", src_dir.to_str().unwrap(), "--name", "ws1", "--update"],
+        None,
+    );
+    assert!(out.contains("updated `ws1`"));
+    let list_out = run_in(&store_dir, &["list"], None);
+    assert!(list_out.contains("ws1"));
+    run_in(&store_dir, &["clone", "ws1", "ws2"], None);
+    let stats_out = run_in(&store_dir, &["stats"], None);
+    assert!(stats_out.contains("workspaces     : 2"));
+    run_in(&store_dir, &["dedup"], None);
+    run_in(&store_dir, &["gc"], None);
+    run_in(&store_dir, &["rm", "ws2"], None);
+
+    // Outside store dir: discovered via DEDUPFS_STORE and explicit `--store`!
+    let env_stats = run_in(&other_dir, &["stats"], Some(&store_dir));
+    assert!(env_stats.contains("workspaces     : 1"));
+    let flag_stats = run_in(
+        &other_dir,
+        &["--store", store_dir.to_str().unwrap(), "stats"],
+        None,
+    );
+    assert!(flag_stats.contains("workspaces     : 1"));
 }

@@ -27,10 +27,13 @@ const KNOWN_SHARDS: usize = 64;
 const IN_MEMORY_IMPORT_LIMIT: u64 = 16 * 1024 * 1024;
 const IMPORT_COMMIT_BATCH: usize = 2048;
 
-/// Live progress snapshot reported during `import_dir`.
+/// Live progress snapshot reported during `import_dir` / `import_dir_update`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImportProgress {
     pub files: u64,
+    pub unchanged_files: u64,
+    pub updated_files: u64,
+    pub removed_entries: u64,
     pub dirs: u64,
     pub logical_bytes: u64,
     pub new_unique_bytes: u64,
@@ -39,12 +42,15 @@ pub struct ImportProgress {
     pub errors: u64,
 }
 
-/// Summary returned by `import_dir`.
+/// Summary returned by `import_dir` / `import_dir_update`.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ImportSummary {
     pub workspace: String,
     pub ws_id: u64,
     pub files: u64,
+    pub unchanged_files: u64,
+    pub updated_files: u64,
+    pub removed_entries: u64,
     pub dirs: u64,
     pub logical_bytes: u64,
     pub new_unique_chunks: u64,
@@ -503,75 +509,165 @@ impl DedupStore {
         progress_cb: Option<Box<dyn Fn(ImportProgress) + Send + Sync>>,
     ) -> Result<ImportSummary> {
         let start = Instant::now();
-        let canon_src = fs::canonicalize(source.as_ref()).map_err(|e| {
-            Error::InvalidInput(format!(
-                "cannot access source {}: {e}",
-                source.as_ref().display()
-            ))
-        })?;
-        if !canon_src.is_dir() {
-            return Err(Error::InvalidInput(format!(
-                "source is not a directory: {}",
-                source.as_ref().display()
-            )));
-        }
-
-        // Reject importing a source that contains this store directory.
-        if self.root.starts_with(&canon_src) {
-            return Err(Error::InvalidInput(format!(
-                "store {} cannot lie inside source {}",
-                self.root.display(),
-                source.as_ref().display()
-            )));
-        }
-
+        let canon_src = self.validate_import_source(source.as_ref())?;
         let ws_id = self.create_workspace(ws_name)?;
-        let known = {
-            let conn = self.meta.lock().unwrap();
-            Arc::new(KnownChunks::load(&conn)?)
-        };
-
-        let result = self.import_dir_inner(ws_id, &canon_src, known, threads.max(1), progress_cb);
+        let result = self.import_dir_inner(
+            ws_id,
+            ROOT_INODE + 1,
+            false,
+            &canon_src,
+            threads.max(1),
+            progress_cb,
+        );
         match result {
-            Ok((
-                files,
-                dirs,
-                logical_bytes,
-                new_unique_chunks,
-                new_unique_bytes,
-                stored_bytes,
-                overlay_pinned_files,
-                errors,
-            )) => Ok(ImportSummary {
-                workspace: ws_name.to_owned(),
-                ws_id,
-                files,
-                dirs,
-                logical_bytes,
-                new_unique_chunks,
-                new_unique_bytes,
-                stored_bytes,
-                overlay_pinned_files,
-                errors,
-                elapsed_secs: start.elapsed().as_secs_f64(),
-            }),
+            Ok(mut summary) => {
+                summary.workspace = ws_name.to_owned();
+                summary.ws_id = ws_id;
+                summary.elapsed_secs = start.elapsed().as_secs_f64();
+                Ok(summary)
+            }
             Err(err) => {
-                // Clean up partial workspace on import failure.
+                // Clean up partial workspace on fresh import failure.
                 let _ = self.remove_workspace(ws_name);
                 Err(err)
             }
         }
     }
 
-    #[allow(clippy::type_complexity)]
+    /// Incrementally updates an existing workspace from `source` (or creates it if absent).
+    ///
+    /// Files whose `(size, mtime, attributes)` match the workspace's recorded metadata are
+    /// skipped without opening or hashing; added/modified files are chunked and deduplicated
+    /// in parallel; files/directories removed from `source` are removed from the workspace and
+    /// their chunk refcounts are decremented.
+    pub fn import_dir_update(
+        self: &Arc<Self>,
+        source: impl AsRef<Path>,
+        ws_name: &str,
+        threads: usize,
+        progress_cb: Option<Box<dyn Fn(ImportProgress) + Send + Sync>>,
+    ) -> Result<ImportSummary> {
+        let existing = {
+            let conn = self.meta.lock().unwrap();
+            conn.query_row(
+                "SELECT ws_id, next_inode FROM workspaces WHERE name = ?1",
+                params![ws_name],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?
+        };
+        let Some((ws_id, initial_next_inode)) = existing else {
+            return self.import_dir(source, ws_name, threads, progress_cb);
+        };
+        let start = Instant::now();
+        let canon_src = self.validate_import_source(source.as_ref())?;
+        let mut summary = self.import_dir_inner(
+            ws_id,
+            initial_next_inode.max(ROOT_INODE + 1),
+            true,
+            &canon_src,
+            threads.max(1),
+            progress_cb,
+        )?;
+        summary.workspace = ws_name.to_owned();
+        summary.ws_id = ws_id;
+        summary.elapsed_secs = start.elapsed().as_secs_f64();
+        Ok(summary)
+    }
+
+    fn validate_import_source(&self, source: &Path) -> Result<PathBuf> {
+        let canon_src = fs::canonicalize(source)
+            .map_err(|e| Error::InvalidInput(format!("cannot access source {}: {e}", source.display())))?;
+        if !canon_src.is_dir() {
+            return Err(Error::InvalidInput(format!(
+                "source is not a directory: {}",
+                source.display()
+            )));
+        }
+        if self.root.starts_with(&canon_src) {
+            return Err(Error::InvalidInput(format!(
+                "store {} cannot lie inside source {}",
+                self.root.display(),
+                source.display()
+            )));
+        }
+        Ok(canon_src)
+    }
+
+    fn delete_subtree(
+        tx: &rusqlite::Transaction<'_>,
+        ws_id: u64,
+        parent_id: u64,
+        folded_name: &[u8],
+        root_child_id: u64,
+        root_kind: u8,
+        overlay_to_delete: &mut Vec<u64>,
+    ) -> Result<u64> {
+        let mut removed = 0u64;
+        // Remove the entry binding in parent first.
+        tx.execute(
+            "DELETE FROM dentries WHERE ws_id = ?1 AND parent_id = ?2 AND folded_name = ?3",
+            params![ws_id as i64, parent_id as i64, folded_name],
+        )?;
+
+        let mut stack: Vec<(u64, u8)> = vec![(root_child_id, root_kind)];
+        while let Some((node_id, kind)) = stack.pop() {
+            removed += 1;
+            if kind == KIND_DIR {
+                let mut children = Vec::new();
+                {
+                    let mut stmt = tx.prepare_cached(
+                        "SELECT child_id, kind FROM dentries WHERE ws_id = ?1 AND parent_id = ?2",
+                    )?;
+                    let rows = stmt.query_map(params![ws_id as i64, node_id as i64], |r| {
+                        Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u8))
+                    })?;
+                    for r in rows {
+                        children.push(r?);
+                    }
+                }
+                tx.execute(
+                    "DELETE FROM dentries WHERE ws_id = ?1 AND parent_id = ?2",
+                    params![ws_id as i64, node_id as i64],
+                )?;
+                stack.extend(children);
+            }
+            if let Some(row) = load_inode(tx, ws_id, node_id)? {
+                if row.kind == KIND_FILE {
+                    if row.storage_mode == STORAGE_CHUNKS && !row.manifest.is_empty() {
+                        release_manifest_chunks(tx, &row.manifest)?;
+                    } else if row.storage_mode == STORAGE_OVERLAY {
+                        overlay_to_delete.push(node_id);
+                    }
+                }
+            }
+            tx.execute(
+                "DELETE FROM inodes WHERE ws_id = ?1 AND inode_id = ?2",
+                params![ws_id as i64, node_id as i64],
+            )?;
+        }
+        Ok(removed)
+    }
+
     fn import_dir_inner(
         self: &Arc<Self>,
         ws_id: u64,
+        initial_next_inode: u64,
+        is_update: bool,
         canon_src: &Path,
-        known: Arc<KnownChunks>,
         threads: usize,
         progress_cb: Option<Box<dyn Fn(ImportProgress) + Send + Sync>>,
-    ) -> Result<(u64, u64, u64, u64, u64, u64, u64, u64)> {
+    ) -> Result<ImportSummary> {
+        struct ExistingChild {
+            display_name: Vec<u8>,
+            inode_id: u64,
+            kind: u8,
+            size: u64,
+            written_ns: i64,
+            attributes: u32,
+            storage_mode: u8,
+        }
+
         struct ImportFileJob {
             parent_id: u64,
             inode_id: u64,
@@ -583,6 +679,8 @@ impl DedupStore {
             created_ns: i64,
             written_ns: i64,
             pinned_overlay: bool,
+            /// `Some(old_storage_mode)` when replacing an existing file inode in place.
+            replacing_mode: Option<u8>,
         }
 
         struct NewChunkBlob {
@@ -603,11 +701,23 @@ impl DedupStore {
             written_ns: i64,
             storage_mode: u8,
             pinned_overlay: bool,
+            replacing_mode: Option<u8>,
             manifest: Vec<u8>,
             new_chunks: Vec<NewChunkBlob>,
         }
 
+        // Lazy-load `KnownChunks` on first file that actually needs chunking so a 0-change
+        // `import --update` finishes without even scanning the `chunks` table!
+        let lazy_known: Arc<Mutex<Option<Arc<KnownChunks>>>> = Arc::new(Mutex::new(None));
+        if !is_update {
+            let conn = self.meta.lock().unwrap();
+            *lazy_known.lock().unwrap() = Some(Arc::new(KnownChunks::load(&conn)?));
+        }
+
         let files_done = Arc::new(AtomicU64::new(0));
+        let unchanged_done = Arc::new(AtomicU64::new(0));
+        let updated_done = Arc::new(AtomicU64::new(0));
+        let removed_done = Arc::new(AtomicU64::new(0));
         let dirs_done = Arc::new(AtomicU64::new(1)); // root dir
         let logical_done = Arc::new(AtomicU64::new(0));
         let unique_done = Arc::new(AtomicU64::new(0));
@@ -616,7 +726,7 @@ impl DedupStore {
         let pinned_done = Arc::new(AtomicU64::new(0));
         let errors_done = Arc::new(AtomicU64::new(0));
 
-        let next_inode = Arc::new(AtomicU64::new(ROOT_INODE + 1));
+        let next_inode = Arc::new(AtomicU64::new(initial_next_inode));
 
         // Channel: walker -> workers
         let (job_tx, job_rx) = mpsc::sync_channel::<ImportFileJob>(4096);
@@ -630,6 +740,9 @@ impl DedupStore {
         let progress_handle = progress_cb.map(|cb| {
             let stop = Arc::clone(&stop_progress);
             let f = Arc::clone(&files_done);
+            let unc = Arc::clone(&unchanged_done);
+            let upd = Arc::clone(&updated_done);
+            let rem = Arc::clone(&removed_done);
             let d = Arc::clone(&dirs_done);
             let l = Arc::clone(&logical_done);
             let u = Arc::clone(&unique_done);
@@ -644,6 +757,9 @@ impl DedupStore {
                     }
                     cb(ImportProgress {
                         files: f.load(Ordering::Relaxed),
+                        unchanged_files: unc.load(Ordering::Relaxed),
+                        updated_files: upd.load(Ordering::Relaxed),
+                        removed_entries: rem.load(Ordering::Relaxed),
                         dirs: d.load(Ordering::Relaxed),
                         logical_bytes: l.load(Ordering::Relaxed),
                         new_unique_bytes: u.load(Ordering::Relaxed),
@@ -661,11 +777,12 @@ impl DedupStore {
         for _ in 0..threads {
             let rx = Arc::clone(&job_rx);
             let tx = prep_tx.clone();
-            let known = Arc::clone(&known);
+            let lazy_known = Arc::clone(&lazy_known);
             let store = Arc::clone(self);
             let errs = Arc::clone(&errors_done);
             workers.push(std::thread::spawn(move || {
                 let mut file_buf = Vec::with_capacity(1024 * 1024);
+                let mut cached_known: Option<Arc<KnownChunks>> = None;
                 loop {
                     let job = { rx.lock().unwrap().recv() };
                     let Ok(job) = job else {
@@ -697,16 +814,47 @@ impl DedupStore {
                                     written_ns: job.written_ns,
                                     storage_mode: STORAGE_OVERLAY,
                                     pinned_overlay: true,
+                                    replacing_mode: job.replacing_mode,
                                     manifest: Vec::new(),
                                     new_chunks: Vec::new(),
                                 });
                             }
-                            Err(_) => {
-                                errs.fetch_add(1, Ordering::Relaxed);
+                            Err(err) => {
+                                let n = errs.fetch_add(1, Ordering::Relaxed);
+                                if n < 50 {
+                                    eprintln!(
+                                        "  [import error] copy pinned {}: {err}",
+                                        job.path.display()
+                                    );
+                                }
                             }
                         }
                         continue;
                     }
+
+                    // Ensure `KnownChunks` is loaded on first chunked file.
+                    let known = match &cached_known {
+                        Some(k) => Arc::clone(k),
+                        None => {
+                            let mut guard = lazy_known.lock().unwrap();
+                            if guard.is_none() {
+                                let conn = store.meta.lock().unwrap();
+                                match KnownChunks::load(&conn) {
+                                    Ok(loaded) => *guard = Some(Arc::new(loaded)),
+                                    Err(err) => {
+                                        let n = errs.fetch_add(1, Ordering::Relaxed);
+                                        if n < 50 {
+                                            eprintln!("  [import error] load chunk index: {err}");
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            let k = Arc::clone(guard.as_ref().unwrap());
+                            cached_known = Some(Arc::clone(&k));
+                            k
+                        }
+                    };
 
                     let prep_res = (|| -> Result<(u64, Vec<ManifestEntry>, Vec<NewChunkBlob>)> {
                         let mut file = File::open(&job.path)?;
@@ -766,12 +914,16 @@ impl DedupStore {
                                 written_ns: job.written_ns,
                                 storage_mode: STORAGE_CHUNKS,
                                 pinned_overlay: false,
+                                replacing_mode: job.replacing_mode,
                                 manifest: encode_manifest(&entries),
                                 new_chunks,
                             });
                         }
-                        Err(_) => {
-                            errs.fetch_add(1, Ordering::Relaxed);
+                        Err(err) => {
+                            let n = errs.fetch_add(1, Ordering::Relaxed);
+                            if n < 50 {
+                                eprintln!("  [import error] read {}: {err}", job.path.display());
+                            }
                         }
                     }
                 }
@@ -782,6 +934,7 @@ impl DedupStore {
         // Spawn single sequential pack-writer & SQLite metadata committer thread.
         let store_c = Arc::clone(self);
         let f_c = Arc::clone(&files_done);
+        let upd_c = Arc::clone(&updated_done);
         let l_c = Arc::clone(&logical_done);
         let u_c = Arc::clone(&unique_done);
         let uc_c = Arc::clone(&unique_chunks_done);
@@ -817,71 +970,96 @@ impl DedupStore {
                 }
 
                 // 2. Batch-commit chunks, pack sizes, inodes, and dentries in one SQLite txn.
-                let mut conn = store_c.meta.lock().unwrap();
-                let tx = conn.transaction()?;
-                upsert_pack_updates(&tx, &pack_updates)?;
-
-                // Aggregate refcount additions across this entire batch so duplicate chunks
-                // within the batch execute a single SQL statement per unique hash.
-                let mut ref_adds: HashMap<Hash32, u64> = HashMap::new();
-                for item in batch.iter() {
-                    if item.storage_mode == STORAGE_CHUNKS && !item.manifest.is_empty() {
-                        for e in decode_manifest(&item.manifest)? {
-                            *ref_adds.entry(e.hash).or_insert(0) += 1;
-                        }
-                    }
-                }
-                for (hash, add) in ref_adds {
-                    let loc = written_locs.remove(&hash);
-                    upsert_chunk_ref(&tx, &hash, loc, add)?;
-                }
-
+                let mut overlays_to_remove: Vec<u64> = Vec::new();
                 {
-                    let mut ins_inode = tx.prepare_cached(
-                        "INSERT INTO inodes (ws_id, inode_id, kind, size, attributes, created_ns, accessed_ns, written_ns, changed_ns, storage_mode, manifest, dirty_since_ns, pinned_overlay)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    )?;
-                    let mut ins_dentry = tx.prepare_cached(
-                        "INSERT OR REPLACE INTO dentries (ws_id, parent_id, folded_name, display_name, child_id, kind)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    )?;
+                    let mut conn = store_c.meta.lock().unwrap();
+                    let tx = conn.transaction()?;
+                    upsert_pack_updates(&tx, &pack_updates)?;
+
+                    // Release old chunk refs for any modified files being updated in place.
                     for item in batch.iter() {
-                        let dirty_since = if item.storage_mode == STORAGE_OVERLAY {
-                            item.written_ns
-                        } else {
-                            0
-                        };
-                        ins_inode.execute(params![
-                            ws_id as i64,
-                            item.inode_id as i64,
-                            i64::from(KIND_FILE),
-                            item.size as i64,
-                            i64::from(item.attributes),
-                            item.created_ns,
-                            item.written_ns,
-                            item.written_ns,
-                            item.written_ns,
-                            i64::from(item.storage_mode),
-                            item.manifest.as_slice(),
-                            dirty_since,
-                            i64::from(item.pinned_overlay),
-                        ])?;
-                        ins_dentry.execute(params![
-                            ws_id as i64,
-                            item.parent_id as i64,
-                            item.folded_name.as_slice(),
-                            item.display_name.as_slice(),
-                            item.inode_id as i64,
-                            i64::from(KIND_FILE),
-                        ])?;
-                        f_c.fetch_add(1, Ordering::Relaxed);
-                        l_c.fetch_add(item.size, Ordering::Relaxed);
-                        if item.pinned_overlay {
-                            p_c.fetch_add(1, Ordering::Relaxed);
+                        if let Some(old_mode) = item.replacing_mode {
+                            if old_mode == STORAGE_CHUNKS {
+                                if let Some(old_row) = load_inode(&tx, ws_id, item.inode_id)? {
+                                    if !old_row.manifest.is_empty() {
+                                        release_manifest_chunks(&tx, &old_row.manifest)?;
+                                    }
+                                }
+                            } else if old_mode == STORAGE_OVERLAY
+                                && item.storage_mode == STORAGE_CHUNKS
+                            {
+                                overlays_to_remove.push(item.inode_id);
+                            }
                         }
                     }
+
+                    // Aggregate refcount additions across this entire batch.
+                    let mut ref_adds: HashMap<Hash32, u64> = HashMap::new();
+                    for item in batch.iter() {
+                        if item.storage_mode == STORAGE_CHUNKS && !item.manifest.is_empty() {
+                            for e in decode_manifest(&item.manifest)? {
+                                *ref_adds.entry(e.hash).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                    for (hash, add) in ref_adds {
+                        let loc = written_locs.remove(&hash);
+                        upsert_chunk_ref(&tx, &hash, loc, add)?;
+                    }
+
+                    {
+                        let mut ins_inode = tx.prepare_cached(
+                            "INSERT OR REPLACE INTO inodes (ws_id, inode_id, kind, size, attributes, created_ns, accessed_ns, written_ns, changed_ns, storage_mode, manifest, dirty_since_ns, pinned_overlay)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        )?;
+                        let mut ins_dentry = tx.prepare_cached(
+                            "INSERT OR REPLACE INTO dentries (ws_id, parent_id, folded_name, display_name, child_id, kind)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        )?;
+                        for item in batch.iter() {
+                            let dirty_since = if item.storage_mode == STORAGE_OVERLAY {
+                                item.written_ns
+                            } else {
+                                0
+                            };
+                            ins_inode.execute(params![
+                                ws_id as i64,
+                                item.inode_id as i64,
+                                i64::from(KIND_FILE),
+                                item.size as i64,
+                                i64::from(item.attributes),
+                                item.created_ns,
+                                item.written_ns,
+                                item.written_ns,
+                                item.written_ns,
+                                i64::from(item.storage_mode),
+                                item.manifest.as_slice(),
+                                dirty_since,
+                                i64::from(item.pinned_overlay),
+                            ])?;
+                            ins_dentry.execute(params![
+                                ws_id as i64,
+                                item.parent_id as i64,
+                                item.folded_name.as_slice(),
+                                item.display_name.as_slice(),
+                                item.inode_id as i64,
+                                i64::from(KIND_FILE),
+                            ])?;
+                            f_c.fetch_add(1, Ordering::Relaxed);
+                            if item.replacing_mode.is_some() {
+                                upd_c.fetch_add(1, Ordering::Relaxed);
+                            }
+                            l_c.fetch_add(item.size, Ordering::Relaxed);
+                            if item.pinned_overlay {
+                                p_c.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    tx.commit()?;
                 }
-                tx.commit()?;
+                for old_id in overlays_to_remove {
+                    let _ = store_c.overlay.remove_file(ws_id, old_id);
+                }
                 batch.clear();
                 Ok(())
             };
@@ -896,11 +1074,12 @@ impl DedupStore {
             Ok(())
         });
 
+        type PendingDir = (u64, u64, Vec<u8>, Vec<u8>, i64, i64);
         // Walk source directory tree, batch-inserting directories and feeding file jobs to workers.
         let mut dir_stack: Vec<(PathBuf, u64)> = vec![(canon_src.to_path_buf(), ROOT_INODE)];
-        let mut pending_dirs: Vec<(u64, u64, Vec<u8>, Vec<u8>, i64, i64)> = Vec::with_capacity(1024);
+        let mut pending_dirs: Vec<PendingDir> = Vec::with_capacity(1024);
 
-        let flush_dirs = |pending: &mut Vec<(u64, u64, Vec<u8>, Vec<u8>, i64, i64)>| -> Result<()> {
+        let flush_dirs = |pending: &mut Vec<PendingDir>| -> Result<()> {
             if pending.is_empty() {
                 return Ok(());
             }
@@ -940,22 +1119,78 @@ impl DedupStore {
         };
 
         while let Some((dir_path, parent_id)) = dir_stack.pop() {
+            // In `--update` mode, load existing children of this directory once so unchanged files
+            // are skipped with zero file opens and deleted entries are detected cleanly.
+            let mut existing_children: HashMap<Vec<u8>, ExistingChild> = if is_update {
+                flush_dirs(&mut pending_dirs)?;
+                let conn = self.meta.lock().unwrap();
+                let mut stmt = conn.prepare_cached(
+                    "SELECT d.folded_name, d.display_name, d.child_id, d.kind, i.size, i.written_ns, i.attributes, i.storage_mode
+                     FROM dentries d
+                     JOIN inodes i ON i.ws_id = d.ws_id AND i.inode_id = d.child_id
+                     WHERE d.ws_id = ?1 AND d.parent_id = ?2",
+                )?;
+                let rows = stmt.query_map(params![ws_id as i64, parent_id as i64], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        ExistingChild {
+                            display_name: r.get(1)?,
+                            inode_id: r.get::<_, i64>(2)? as u64,
+                            kind: r.get::<_, i64>(3)? as u8,
+                            size: r.get::<_, i64>(4)? as u64,
+                            written_ns: r.get(5)?,
+                            attributes: r.get::<_, i64>(6)? as u32,
+                            storage_mode: r.get::<_, i64>(7)? as u8,
+                        },
+                    ))
+                })?;
+                let mut map = HashMap::new();
+                for r in rows {
+                    let (k, v) = r?;
+                    map.insert(k, v);
+                }
+                map
+            } else {
+                HashMap::new()
+            };
+
             let entries = match fs::read_dir(&dir_path) {
                 Ok(rd) => rd,
-                Err(_) => {
-                    errors_done.fetch_add(1, Ordering::Relaxed);
+                Err(err) => {
+                    let n = errors_done.fetch_add(1, Ordering::Relaxed);
+                    if n < 50 {
+                        eprintln!("  [import error] read_dir {}: {err}", dir_path.display());
+                    }
                     continue;
                 }
             };
             for entry in entries {
-                let Ok(entry) = entry else {
-                    errors_done.fetch_add(1, Ordering::Relaxed);
-                    continue;
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(err) => {
+                        let n = errors_done.fetch_add(1, Ordering::Relaxed);
+                        if n < 50 {
+                            eprintln!(
+                                "  [import error] read_dir entry in {}: {err}",
+                                dir_path.display()
+                            );
+                        }
+                        continue;
+                    }
                 };
                 let child_path = entry.path();
-                let Ok(meta) = fs::symlink_metadata(&child_path) else {
-                    errors_done.fetch_add(1, Ordering::Relaxed);
-                    continue;
+                let meta = match fs::symlink_metadata(&child_path) {
+                    Ok(m) => m,
+                    Err(err) => {
+                        let n = errors_done.fetch_add(1, Ordering::Relaxed);
+                        if n < 50 {
+                            eprintln!(
+                                "  [import error] metadata {}: {err}",
+                                child_path.display()
+                            );
+                        }
+                        continue;
+                    }
                 };
                 let ft = meta.file_type();
                 if ft.is_symlink() {
@@ -963,7 +1198,13 @@ impl DedupStore {
                 }
                 let name_os = entry.file_name();
                 let Some(name_str) = name_os.to_str() else {
-                    errors_done.fetch_add(1, Ordering::Relaxed);
+                    let n = errors_done.fetch_add(1, Ordering::Relaxed);
+                    if n < 50 {
+                        eprintln!(
+                            "  [import error] non-UTF-8 filename: {}",
+                            child_path.display()
+                        );
+                    }
                     continue;
                 };
                 let display_name = name_str.as_bytes().to_vec();
@@ -979,9 +1220,49 @@ impl DedupStore {
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map_or_else(now_ns, |d| d.as_nanos().min(i64::MAX as u128) as i64);
 
-                let inode_id = next_inode.fetch_add(1, Ordering::Relaxed);
+                let prev = if is_update {
+                    existing_children.remove(&folded_name)
+                } else {
+                    None
+                };
+
                 if ft.is_dir() {
                     dirs_done.fetch_add(1, Ordering::Relaxed);
+                    if let Some(p) = prev {
+                        if p.kind == KIND_DIR {
+                            if p.display_name != display_name {
+                                let conn = self.meta.lock().unwrap();
+                                conn.execute(
+                                    "UPDATE dentries SET display_name = ?1 WHERE ws_id = ?2 AND parent_id = ?3 AND folded_name = ?4",
+                                    params![display_name.as_slice(), ws_id as i64, parent_id as i64, folded_name.as_slice()],
+                                )?;
+                            }
+                            dir_stack.push((child_path, p.inode_id));
+                            continue;
+                        }
+                        // Previously a file, now a directory: remove the old file first.
+                        let mut ov = Vec::new();
+                        {
+                            let mut conn = self.meta.lock().unwrap();
+                            let tx = conn.transaction()?;
+                            let n = Self::delete_subtree(
+                                &tx,
+                                ws_id,
+                                parent_id,
+                                &folded_name,
+                                p.inode_id,
+                                p.kind,
+                                &mut ov,
+                            )?;
+                            removed_done.fetch_add(n, Ordering::Relaxed);
+                            tx.commit()?;
+                        }
+                        for id in ov {
+                            let _ = self.overlay.remove_file(ws_id, id);
+                        }
+                    }
+
+                    let inode_id = next_inode.fetch_add(1, Ordering::Relaxed);
                     pending_dirs.push((
                         parent_id,
                         inode_id,
@@ -1001,6 +1282,55 @@ impl DedupStore {
                         0u32
                     };
                     let pinned = is_hot_db_name(name_str);
+                    let mut replacing_mode = None;
+                    let inode_id = if let Some(p) = prev {
+                        if p.kind == KIND_FILE {
+                            if p.size == meta.len()
+                                && p.written_ns == written_ns
+                                && p.attributes == attrs
+                            {
+                                // Unchanged file: skip open/read/hash completely!
+                                if p.display_name != display_name {
+                                    let conn = self.meta.lock().unwrap();
+                                    conn.execute(
+                                        "UPDATE dentries SET display_name = ?1 WHERE ws_id = ?2 AND parent_id = ?3 AND folded_name = ?4",
+                                        params![display_name.as_slice(), ws_id as i64, parent_id as i64, folded_name.as_slice()],
+                                    )?;
+                                }
+                                files_done.fetch_add(1, Ordering::Relaxed);
+                                unchanged_done.fetch_add(1, Ordering::Relaxed);
+                                logical_done.fetch_add(p.size, Ordering::Relaxed);
+                                continue;
+                            }
+                            replacing_mode = Some(p.storage_mode);
+                            p.inode_id
+                        } else {
+                            // Previously a directory, now a file: recursively remove old dir.
+                            let mut ov = Vec::new();
+                            {
+                                let mut conn = self.meta.lock().unwrap();
+                                let tx = conn.transaction()?;
+                                let n = Self::delete_subtree(
+                                    &tx,
+                                    ws_id,
+                                    parent_id,
+                                    &folded_name,
+                                    p.inode_id,
+                                    p.kind,
+                                    &mut ov,
+                                )?;
+                                removed_done.fetch_add(n, Ordering::Relaxed);
+                                tx.commit()?;
+                            }
+                            for id in ov {
+                                let _ = self.overlay.remove_file(ws_id, id);
+                            }
+                            next_inode.fetch_add(1, Ordering::Relaxed)
+                        }
+                    } else {
+                        next_inode.fetch_add(1, Ordering::Relaxed)
+                    };
+
                     if job_tx
                         .send(ImportFileJob {
                             parent_id,
@@ -1013,11 +1343,37 @@ impl DedupStore {
                             created_ns,
                             written_ns,
                             pinned_overlay: pinned,
+                            replacing_mode,
                         })
                         .is_err()
                     {
                         break;
                     }
+                }
+            }
+
+            // In `--update` mode, remove any children that no longer exist on the host.
+            if is_update && !existing_children.is_empty() {
+                let mut ov = Vec::new();
+                {
+                    let mut conn = self.meta.lock().unwrap();
+                    let tx = conn.transaction()?;
+                    for (folded, child) in existing_children {
+                        let n = Self::delete_subtree(
+                            &tx,
+                            ws_id,
+                            parent_id,
+                            &folded,
+                            child.inode_id,
+                            child.kind,
+                            &mut ov,
+                        )?;
+                        removed_done.fetch_add(n, Ordering::Relaxed);
+                    }
+                    tx.commit()?;
+                }
+                for id in ov {
+                    let _ = self.overlay.remove_file(ws_id, id);
                 }
             }
         }
@@ -1037,7 +1393,7 @@ impl DedupStore {
         {
             let conn = self.meta.lock().unwrap();
             conn.execute(
-                "UPDATE workspaces SET next_inode = ?1 WHERE ws_id = ?2",
+                "UPDATE workspaces SET next_inode = MAX(next_inode, ?1) WHERE ws_id = ?2",
                 params![final_next as i64, ws_id as i64],
             )?;
         }
@@ -1047,16 +1403,22 @@ impl DedupStore {
             let _ = h.join();
         }
 
-        Ok((
-            files_done.load(Ordering::Relaxed),
-            dirs_done.load(Ordering::Relaxed),
-            logical_done.load(Ordering::Relaxed),
-            unique_chunks_done.load(Ordering::Relaxed),
-            unique_done.load(Ordering::Relaxed),
-            stored_done.load(Ordering::Relaxed),
-            pinned_done.load(Ordering::Relaxed),
-            errors_done.load(Ordering::Relaxed),
-        ))
+        Ok(ImportSummary {
+            workspace: String::new(),
+            ws_id,
+            files: files_done.load(Ordering::Relaxed),
+            unchanged_files: unchanged_done.load(Ordering::Relaxed),
+            updated_files: updated_done.load(Ordering::Relaxed),
+            removed_entries: removed_done.load(Ordering::Relaxed),
+            dirs: dirs_done.load(Ordering::Relaxed),
+            logical_bytes: logical_done.load(Ordering::Relaxed),
+            new_unique_chunks: unique_chunks_done.load(Ordering::Relaxed),
+            new_unique_bytes: unique_done.load(Ordering::Relaxed),
+            stored_bytes: stored_done.load(Ordering::Relaxed),
+            overlay_pinned_files: pinned_done.load(Ordering::Relaxed),
+            errors: errors_done.load(Ordering::Relaxed),
+            elapsed_secs: 0.0,
+        })
     }
 
     /// Deduplicates idle, unpinned overlay files in `ws_name` (or all workspaces if `None`)
