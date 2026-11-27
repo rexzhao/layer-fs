@@ -1,0 +1,19 @@
+[package]
+name = "chunk-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Read-only offline chunking, deduplication, and compression benchmark tool for large directory trees"
+
+[[bin]]
+name = "chunk-bench"
+path = "src/main.rs"
+
+[dependencies]
+blake3.workspace = true
+layerfs-content = { path = "../../upstream/crates/layerfs-content" }
+lz4_flex = "0.11"
+serde.workspace = true
+serde_json.workspace = true
+zstd-sys = "2"
