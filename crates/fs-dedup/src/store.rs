@@ -1540,6 +1540,9 @@ impl DedupStore {
                 }
             }));
         }
+        // Release parent thread's receiver handle so that if all workers exit on cancellation,
+        // `job_rx` drops immediately and unblocks any walker waiting on a full `job_tx.send()`.
+        drop(job_rx);
         drop(prep_tx);
 
         // Spawn single sequential pack-writer & SQLite metadata committer thread.
@@ -1711,6 +1714,9 @@ impl DedupStore {
             };
 
             while let Ok(msg) = prep_rx.recv() {
+                if budget_c.is_cancelled() {
+                    break;
+                }
                 match msg {
                     ImportMsg::Chunk(chunk) => {
                         let known_opt = known_c.lock().unwrap().clone();
@@ -1746,6 +1752,9 @@ impl DedupStore {
                         }
                     }
                 }
+            }
+            if budget_c.is_cancelled() {
+                return Ok(());
             }
             flush_batch(
                 &mut batch,
@@ -1803,206 +1812,150 @@ impl DedupStore {
             Ok(())
         };
 
-        while let Some((dir_path, parent_id, rel_dir)) = dir_stack.pop() {
-            if budget.is_cancelled() {
-                break;
-            }
-            // In `--update` mode, load existing children of this directory once so unchanged files
-            // are skipped with zero file opens and deleted entries are detected cleanly.
-            let mut existing_children: HashMap<Vec<u8>, ExistingChild> = if is_update {
-                flush_dirs(&mut pending_dirs)?;
-                let conn = self.meta.lock().unwrap();
-                let mut stmt = conn.prepare_cached(
-                    "SELECT d.folded_name, d.display_name, d.child_id, d.kind, i.size, i.written_ns, i.attributes, i.storage_mode
-                     FROM dentries d
-                     JOIN inodes i ON i.ws_id = d.ws_id AND i.inode_id = d.child_id
-                     WHERE d.ws_id = ?1 AND d.parent_id = ?2",
-                )?;
-                let rows = stmt.query_map(params![ws_id as i64, parent_id as i64], |r| {
-                    Ok((
-                        r.get::<_, Vec<u8>>(0)?,
-                        ExistingChild {
-                            display_name: r.get(1)?,
-                            inode_id: r.get::<_, i64>(2)? as u64,
-                            kind: r.get::<_, i64>(3)? as u8,
-                            size: r.get::<_, i64>(4)? as u64,
-                            written_ns: r.get(5)?,
-                            attributes: r.get::<_, i64>(6)? as u32,
-                            storage_mode: r.get::<_, i64>(7)? as u8,
-                        },
-                    ))
-                })?;
-                let mut map = HashMap::new();
-                for r in rows {
-                    let (k, v) = r?;
-                    map.insert(k, v);
+        // Wrap the ENTIRE walker in a closure so EVERY early `?` error exit cancels the pipeline,
+        // closes channels, and joins all workers + committer + progress BEFORE releasing `pack.lock`!
+        let walk_res: Result<()> = (|| {
+            while let Some((dir_path, parent_id, rel_dir)) = dir_stack.pop() {
+                if budget.is_cancelled() {
+                    break;
                 }
-                map
-            } else {
-                HashMap::new()
-            };
-
-            let entries = match fs::read_dir(&dir_path) {
-                Ok(rd) => rd,
-                Err(err) => {
-                    let n = errors_done.fetch_add(1, Ordering::Relaxed);
-                    if n < 50 {
-                        eprintln!("  [import error] read_dir {}: {err}", dir_path.display());
+                // In `--update` mode, load existing children of this directory once so unchanged files
+                // are skipped with zero file opens and deleted entries are detected cleanly.
+                let mut existing_children: HashMap<Vec<u8>, ExistingChild> = if is_update {
+                    flush_dirs(&mut pending_dirs)?;
+                    let conn = self.meta.lock().unwrap();
+                    let mut stmt = conn.prepare_cached(
+                        "SELECT d.folded_name, d.display_name, d.child_id, d.kind, i.size, i.written_ns, i.attributes, i.storage_mode
+                         FROM dentries d
+                         JOIN inodes i ON i.ws_id = d.ws_id AND i.inode_id = d.child_id
+                         WHERE d.ws_id = ?1 AND d.parent_id = ?2",
+                    )?;
+                    let rows = stmt.query_map(params![ws_id as i64, parent_id as i64], |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            ExistingChild {
+                                display_name: r.get(1)?,
+                                inode_id: r.get::<_, i64>(2)? as u64,
+                                kind: r.get::<_, i64>(3)? as u8,
+                                size: r.get::<_, i64>(4)? as u64,
+                                written_ns: r.get(5)?,
+                                attributes: r.get::<_, i64>(6)? as u32,
+                                storage_mode: r.get::<_, i64>(7)? as u8,
+                            },
+                        ))
+                    })?;
+                    let mut map = HashMap::new();
+                    for r in rows {
+                        let (k, v) = r?;
+                        map.insert(k, v);
                     }
-                    continue;
-                }
-            };
-            for entry in entries {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(err) => {
-                        let n = errors_done.fetch_add(1, Ordering::Relaxed);
-                        if n < 50 {
-                            eprintln!(
-                                "  [import error] read_dir entry in {}: {err}",
-                                dir_path.display()
-                            );
-                        }
-                        continue;
-                    }
-                };
-                let child_path = entry.path();
-                // On Windows, `entry.file_type()` and `entry.metadata()` reuse `WIN32_FIND_DATAW`
-                // from `FindNextFileW` with zero extra `CreateFileW` syscalls!
-                let ft = match entry.file_type() {
-                    Ok(ft) => ft,
-                    Err(err) => {
-                        let n = errors_done.fetch_add(1, Ordering::Relaxed);
-                        if n < 50 {
-                            eprintln!(
-                                "  [import error] file_type {}: {err}",
-                                child_path.display()
-                            );
-                        }
-                        continue;
-                    }
-                };
-                if ft.is_symlink() {
-                    continue;
-                }
-                let meta = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(err) => {
-                        let n = errors_done.fetch_add(1, Ordering::Relaxed);
-                        if n < 50 {
-                            eprintln!(
-                                "  [import error] metadata {}: {err}",
-                                child_path.display()
-                            );
-                        }
-                        continue;
-                    }
-                };
-                let name_os = entry.file_name();
-                let Some(name_str) = name_os.to_str() else {
-                    let n = errors_done.fetch_add(1, Ordering::Relaxed);
-                    if n < 50 {
-                        eprintln!(
-                            "  [import error] non-UTF-8 filename: {}",
-                            child_path.display()
-                        );
-                    }
-                    continue;
-                };
-                let rel_path = if rel_dir.is_empty() {
-                    name_str.to_owned()
+                    map
                 } else {
-                    format!("{rel_dir}/{name_str}")
-                };
-                if !excludes.is_empty() && filter::matches_any(&rel_path, excludes) {
-                    excluded_done.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                let display_name = name_str.as_bytes().to_vec();
-                let folded_name = fold_bytes(&display_name);
-                let created_ns = meta
-                    .created()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map_or_else(now_ns, |d| d.as_nanos().min(i64::MAX as u128) as i64);
-                let written_ns = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map_or_else(now_ns, |d| d.as_nanos().min(i64::MAX as u128) as i64);
-
-                let prev = if is_update {
-                    existing_children.remove(&folded_name)
-                } else {
-                    None
+                    HashMap::new()
                 };
 
-                if ft.is_dir() {
-                    dirs_done.fetch_add(1, Ordering::Relaxed);
-                    if let Some(p) = prev {
-                        if p.kind == KIND_DIR {
-                            if p.display_name != display_name {
-                                let conn = self.meta.lock().unwrap();
-                                conn.execute(
-                                    "UPDATE dentries SET display_name = ?1 WHERE ws_id = ?2 AND parent_id = ?3 AND folded_name = ?4",
-                                    params![display_name.as_slice(), ws_id as i64, parent_id as i64, folded_name.as_slice()],
-                                )?;
+                let entries = match fs::read_dir(&dir_path) {
+                    Ok(rd) => rd,
+                    Err(err) => {
+                        let n = errors_done.fetch_add(1, Ordering::Relaxed);
+                        if n < 50 {
+                            eprintln!("  [import error] read_dir {}: {err}", dir_path.display());
+                        }
+                        continue;
+                    }
+                };
+                for entry in entries {
+                    if budget.is_cancelled() {
+                        break;
+                    }
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(err) => {
+                            let n = errors_done.fetch_add(1, Ordering::Relaxed);
+                            if n < 50 {
+                                eprintln!(
+                                    "  [import error] read_dir entry in {}: {err}",
+                                    dir_path.display()
+                                );
                             }
-                            dir_stack.push((child_path, p.inode_id, rel_path));
                             continue;
                         }
-                        // Previously a file, now a directory: remove the old file first.
-                        let mut ov = Vec::new();
-                        {
-                            let mut conn = self.meta.lock().unwrap();
-                            let tx = conn.transaction()?;
-                            let n = Self::delete_subtree(
-                                &tx,
-                                ws_id,
-                                parent_id,
-                                &folded_name,
-                                p.inode_id,
-                                p.kind,
-                                &mut ov,
-                            )?;
-                            removed_done.fetch_add(n, Ordering::Relaxed);
-                            tx.commit()?;
-                        }
-                        for id in ov {
-                            let _ = self.overlay.remove_file(ws_id, id);
-                        }
-                    }
-
-                    let inode_id = next_inode.fetch_add(1, Ordering::Relaxed);
-                    pending_dirs.push((
-                        parent_id,
-                        inode_id,
-                        display_name,
-                        folded_name,
-                        created_ns,
-                        written_ns,
-                    ));
-                    if pending_dirs.len() >= 1024 {
-                        flush_dirs(&mut pending_dirs)?;
-                    }
-                    dir_stack.push((child_path, inode_id, rel_path));
-                } else if ft.is_file() {
-                    let attrs = if meta.permissions().readonly() {
-                        0x01u32
-                    } else {
-                        0u32
                     };
-                    let pinned = is_hot_db_name(name_str)
-                        || (!self.config.no_dedup.is_empty()
-                            && filter::matches_any(&rel_path, &self.config.no_dedup));
-                    let mut replacing_mode = None;
-                    let inode_id = if let Some(p) = prev {
-                        if p.kind == KIND_FILE {
-                            if p.size == meta.len()
-                                && p.written_ns == written_ns
-                                && p.attributes == attrs
-                            {
-                                // Unchanged file: skip open/read/hash completely!
+                    let child_path = entry.path();
+                    // On Windows, `entry.file_type()` and `entry.metadata()` reuse `WIN32_FIND_DATAW`
+                    // from `FindNextFileW` with zero extra `CreateFileW` syscalls!
+                    let ft = match entry.file_type() {
+                        Ok(ft) => ft,
+                        Err(err) => {
+                            let n = errors_done.fetch_add(1, Ordering::Relaxed);
+                            if n < 50 {
+                                eprintln!(
+                                    "  [import error] file_type {}: {err}",
+                                    child_path.display()
+                                );
+                            }
+                            continue;
+                        }
+                    };
+                    if ft.is_symlink() {
+                        continue;
+                    }
+                    let meta = match entry.metadata() {
+                        Ok(m) => m,
+                        Err(err) => {
+                            let n = errors_done.fetch_add(1, Ordering::Relaxed);
+                            if n < 50 {
+                                eprintln!(
+                                    "  [import error] metadata {}: {err}",
+                                    child_path.display()
+                                );
+                            }
+                            continue;
+                        }
+                    };
+                    let name_os = entry.file_name();
+                    let Some(name_str) = name_os.to_str() else {
+                        let n = errors_done.fetch_add(1, Ordering::Relaxed);
+                        if n < 50 {
+                            eprintln!(
+                                "  [import error] non-UTF-8 filename: {}",
+                                child_path.display()
+                            );
+                        }
+                        continue;
+                    };
+                    let rel_path = if rel_dir.is_empty() {
+                        name_str.to_owned()
+                    } else {
+                        format!("{rel_dir}/{name_str}")
+                    };
+                    if !excludes.is_empty() && filter::matches_any(&rel_path, excludes) {
+                        excluded_done.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let display_name = name_str.as_bytes().to_vec();
+                    let folded_name = fold_bytes(&display_name);
+                    let created_ns = meta
+                        .created()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map_or_else(now_ns, |d| d.as_nanos().min(i64::MAX as u128) as i64);
+                    let written_ns = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map_or_else(now_ns, |d| d.as_nanos().min(i64::MAX as u128) as i64);
+
+                    let prev = if is_update {
+                        existing_children.remove(&folded_name)
+                    } else {
+                        None
+                    };
+
+                    if ft.is_dir() {
+                        dirs_done.fetch_add(1, Ordering::Relaxed);
+                        if let Some(p) = prev {
+                            if p.kind == KIND_DIR {
                                 if p.display_name != display_name {
                                     let conn = self.meta.lock().unwrap();
                                     conn.execute(
@@ -2010,15 +1963,10 @@ impl DedupStore {
                                         params![display_name.as_slice(), ws_id as i64, parent_id as i64, folded_name.as_slice()],
                                     )?;
                                 }
-                                files_done.fetch_add(1, Ordering::Relaxed);
-                                unchanged_done.fetch_add(1, Ordering::Relaxed);
-                                logical_done.fetch_add(p.size, Ordering::Relaxed);
+                                dir_stack.push((child_path, p.inode_id, rel_path));
                                 continue;
                             }
-                            replacing_mode = Some(p.storage_mode);
-                            p.inode_id
-                        } else {
-                            // Previously a directory, now a file: recursively remove old dir.
+                            // Previously a file, now a directory: remove the old file first.
                             let mut ov = Vec::new();
                             {
                                 let mut conn = self.meta.lock().unwrap();
@@ -2038,90 +1986,159 @@ impl DedupStore {
                             for id in ov {
                                 let _ = self.overlay.remove_file(ws_id, id);
                             }
-                            next_inode.fetch_add(1, Ordering::Relaxed)
                         }
-                    } else {
-                        next_inode.fetch_add(1, Ordering::Relaxed)
-                    };
 
-                    if budget.is_cancelled() {
-                        break;
-                    }
-                    if job_tx
-                        .send(ImportFileJob {
+                        let inode_id = next_inode.fetch_add(1, Ordering::Relaxed);
+                        pending_dirs.push((
                             parent_id,
                             inode_id,
                             display_name,
                             folded_name,
-                            path: child_path,
-                            size: meta.len(),
-                            attributes: attrs,
                             created_ns,
                             written_ns,
-                            pinned_overlay: pinned,
-                            replacing_mode,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
+                        ));
+                        if pending_dirs.len() >= 1024 {
+                            flush_dirs(&mut pending_dirs)?;
+                        }
+                        dir_stack.push((child_path, inode_id, rel_path));
+                    } else if ft.is_file() {
+                        let attrs = if meta.permissions().readonly() {
+                            0x01u32
+                        } else {
+                            0u32
+                        };
+                        let pinned = is_hot_db_name(name_str)
+                            || (!self.config.no_dedup.is_empty()
+                                && filter::matches_any(&rel_path, &self.config.no_dedup));
+                        let mut replacing_mode = None;
+                        let inode_id = if let Some(p) = prev {
+                            if p.kind == KIND_FILE {
+                                if p.size == meta.len()
+                                    && p.written_ns == written_ns
+                                    && p.attributes == attrs
+                                {
+                                    // Unchanged file: skip open/read/hash completely!
+                                    if p.display_name != display_name {
+                                        let conn = self.meta.lock().unwrap();
+                                        conn.execute(
+                                            "UPDATE dentries SET display_name = ?1 WHERE ws_id = ?2 AND parent_id = ?3 AND folded_name = ?4",
+                                            params![display_name.as_slice(), ws_id as i64, parent_id as i64, folded_name.as_slice()],
+                                        )?;
+                                    }
+                                    files_done.fetch_add(1, Ordering::Relaxed);
+                                    unchanged_done.fetch_add(1, Ordering::Relaxed);
+                                    logical_done.fetch_add(p.size, Ordering::Relaxed);
+                                    continue;
+                                }
+                                replacing_mode = Some(p.storage_mode);
+                                p.inode_id
+                            } else {
+                                // Previously a directory, now a file: recursively remove old dir.
+                                let mut ov = Vec::new();
+                                {
+                                    let mut conn = self.meta.lock().unwrap();
+                                    let tx = conn.transaction()?;
+                                    let n = Self::delete_subtree(
+                                        &tx,
+                                        ws_id,
+                                        parent_id,
+                                        &folded_name,
+                                        p.inode_id,
+                                        p.kind,
+                                        &mut ov,
+                                    )?;
+                                    removed_done.fetch_add(n, Ordering::Relaxed);
+                                    tx.commit()?;
+                                }
+                                for id in ov {
+                                    let _ = self.overlay.remove_file(ws_id, id);
+                                }
+                                next_inode.fetch_add(1, Ordering::Relaxed)
+                            }
+                        } else {
+                            next_inode.fetch_add(1, Ordering::Relaxed)
+                        };
 
-            // In `--update` mode, remove any children that no longer exist on the host.
-            if is_update && !budget.is_cancelled() && !existing_children.is_empty() {
-                let mut ov = Vec::new();
-                {
-                    let mut conn = self.meta.lock().unwrap();
-                    let tx = conn.transaction()?;
-                    for (folded, child) in existing_children {
-                        let n = Self::delete_subtree(
-                            &tx,
-                            ws_id,
-                            parent_id,
-                            &folded,
-                            child.inode_id,
-                            child.kind,
-                            &mut ov,
-                        )?;
-                        removed_done.fetch_add(n, Ordering::Relaxed);
+                        if budget.is_cancelled() {
+                            break;
+                        }
+                        if job_tx
+                            .send(ImportFileJob {
+                                parent_id,
+                                inode_id,
+                                display_name,
+                                folded_name,
+                                path: child_path,
+                                size: meta.len(),
+                                attributes: attrs,
+                                created_ns,
+                                written_ns,
+                                pinned_overlay: pinned,
+                                replacing_mode,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                    tx.commit()?;
                 }
-                for id in ov {
-                    let _ = self.overlay.remove_file(ws_id, id);
+
+                // In `--update` mode, remove any children that no longer exist on the host.
+                if is_update && !budget.is_cancelled() && !existing_children.is_empty() {
+                    let mut ov = Vec::new();
+                    {
+                        let mut conn = self.meta.lock().unwrap();
+                        let tx = conn.transaction()?;
+                        for (folded, child) in existing_children {
+                            let n = Self::delete_subtree(
+                                &tx,
+                                ws_id,
+                                parent_id,
+                                &folded,
+                                child.inode_id,
+                                child.kind,
+                                &mut ov,
+                            )?;
+                            removed_done.fetch_add(n, Ordering::Relaxed);
+                        }
+                        tx.commit()?;
+                    }
+                    for id in ov {
+                        let _ = self.overlay.remove_file(ws_id, id);
+                    }
                 }
             }
-        }
-        if !budget.is_cancelled() {
-            if let Err(err) = flush_dirs(&mut pending_dirs) {
-                budget.cancel();
-                drop(job_tx);
-                for w in workers {
-                    let _ = w.join();
-                }
-                let _ = committer.join();
-                stop_progress.store(true, Ordering::Relaxed);
-                if let Some(h) = progress_handle {
-                    let _ = h.join();
-                }
-                return Err(err);
+            if !budget.is_cancelled() {
+                flush_dirs(&mut pending_dirs)?;
             }
+            Ok(())
+        })();
+
+        // Unified shutdown: on walker error, cancel pipeline FIRST so workers & committer stop
+        // immediately without committing further batches, and ALWAYS join every background thread
+        // before returning or releasing `_pack_guard` (`pack.lock`)!
+        if walk_res.is_err() {
+            budget.cancel();
         }
         drop(job_tx);
 
+        let mut worker_panicked = false;
         for w in workers {
-            w.join()
-                .map_err(|_| Error::Other("import worker panicked".into()))?;
+            if w.join().is_err() {
+                worker_panicked = true;
+            }
         }
-        let commit_res = committer
-            .join()
-            .map_err(|_| Error::Other("import committer panicked".into()))?;
+        let commit_join = committer.join();
         stop_progress.store(true, Ordering::Relaxed);
         if let Some(h) = progress_handle {
             let _ = h.join();
         }
-        commit_res?;
+
+        walk_res?;
+        if worker_panicked {
+            return Err(Error::Other("import worker panicked".into()));
+        }
+        commit_join.map_err(|_| Error::Other("import committer panicked".into()))??;
 
         // Update workspace's `next_inode` counter to the final allocated value.
         let final_next = next_inode.load(Ordering::Relaxed);
