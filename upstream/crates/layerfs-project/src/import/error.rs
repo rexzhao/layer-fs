@@ -113,3 +113,11 @@ pub(crate) fn acquisition(error: AcquisitionError) -> ProjectError {
 pub(crate) fn malformed() -> ProjectError {
     ProjectError::Acquisition(AcquisitionError::Persistence(PersistenceError::Malformed))
 }
+/// Wraps a host I/O failure with the failing operation and path while preserving `ErrorKind`.
+#[cfg(any(unix, windows))]
+pub(crate) fn io_path(op: &str, path: &std::path::Path, error: io::Error) -> ProjectError {
+    ProjectError::Io(io::Error::new(
+        error.kind(),
+        format!("{op} {}: {error}", path.display()),
+    ))
+}

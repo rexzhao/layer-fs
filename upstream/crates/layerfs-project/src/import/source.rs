@@ -1,5 +1,5 @@
 //! Host source observations; symbolic links are stored without traversal.
-use crate::{backing::Stamp, host, ProjectError};
+use crate::{backing::Stamp, error::io_path, host, ProjectError};
 use layerfs_content::filesystem::symlink::SymlinkTarget;
 use std::{
     fs::{self, Metadata},
@@ -10,8 +10,9 @@ pub(super) fn read_link(path: &Path, scanned: &Metadata) -> Result<Vec<u8>, Proj
     // read_link never follows the target, including dangling, external or cyclic
     // links. A replaced/changed source is refused without a second read/retry.
     let before = Stamp::of_path(path, scanned)?;
-    let target = fs::read_link(path)?;
-    let after_meta = fs::symlink_metadata(path)?;
+    let target = fs::read_link(path).map_err(|error| io_path("read_link", path, error))?;
+    let after_meta =
+        fs::symlink_metadata(path).map_err(|error| io_path("symlink_metadata", path, error))?;
     let after = Stamp::of_path(path, &after_meta)?;
     if !after_meta.file_type().is_symlink() || after != before {
         return Err(ProjectError::InvalidInput);
@@ -36,9 +37,11 @@ pub(super) fn outside_source(
     placement: &Path,
 ) -> Result<(), ProjectError> {
     let (src_dev, src_ino) = host::dev_ino_of_path(source_path, source)?;
-    let mut ancestor = fs::canonicalize(placement)?;
+    let mut ancestor =
+        fs::canonicalize(placement).map_err(|error| io_path("canonicalize", placement, error))?;
     loop {
-        let metadata = fs::symlink_metadata(&ancestor)?;
+        let metadata = fs::symlink_metadata(&ancestor)
+            .map_err(|error| io_path("symlink_metadata", &ancestor, error))?;
         let (dev, ino) = host::dev_ino_of_path(&ancestor, &metadata)?;
         if dev == src_dev && ino == src_ino {
             return Err(ProjectError::BackingInsideSource);

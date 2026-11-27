@@ -5,8 +5,7 @@
 //! ordered batches, and each constructed root is recorded against its identity
 //! in bounded write windows. Neither queue grows with the acquired root.
 use crate::backing::{Backing, Stamp, WINDOW_ROWS};
-use crate::error::ProjectError as Failure;
-use crate::error::{content, storage};
+use crate::error::{content, io_path, storage, ProjectError as Failure};
 use crate::host;
 use crate::{
     batch::{BatchProducer, Event, ImportBatch, QUEUE_SLOTS},
@@ -181,7 +180,9 @@ fn check_aliases(backing: &Backing<'_>, progress: &mut ImportProgress) -> Result
             return Err(Failure::InvalidInput);
         };
         let path = host::join_name(directory, &entry.key.name)?;
-        if !stamp.matches_path(&path, &fs::symlink_metadata(&path)?) {
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|error| io_path("symlink_metadata", &path, error))?;
+        if !stamp.matches_path(&path, &meta) {
             return Err(Failure::InvalidInput);
         }
     }
@@ -198,8 +199,11 @@ fn construct_file(
     if Instant::now() >= deadline {
         return Err(Failure::Deadline);
     }
-    let mut file = File::open(&job.path)?;
-    if !job.stamp.matches_open_file(&file, &file.metadata()?) {
+    let mut file = File::open(&job.path).map_err(|error| io_path("open", &job.path, error))?;
+    let meta = file
+        .metadata()
+        .map_err(|error| io_path("metadata", &job.path, error))?;
+    if !job.stamp.matches_open_file(&file, &meta) {
         return Err(Failure::InvalidInput);
     }
     let (result, _) = Timing::disabled("history.import_file", |scope| {
@@ -212,9 +216,14 @@ fn construct_file(
         )
     });
     let built = result.map_err(content)?;
+    let after_open = file
+        .metadata()
+        .map_err(|error| io_path("metadata", &job.path, error))?;
+    let after_path = fs::symlink_metadata(&job.path)
+        .map_err(|error| io_path("symlink_metadata", &job.path, error))?;
     if built.logical_len != job.stamp.len
-        || !job.stamp.matches_open_file(&file, &file.metadata()?)
-        || !job.stamp.matches_path(&job.path, &fs::symlink_metadata(&job.path)?)
+        || !job.stamp.matches_open_file(&file, &after_open)
+        || !job.stamp.matches_path(&job.path, &after_path)
     {
         return Err(Failure::InvalidInput);
     }

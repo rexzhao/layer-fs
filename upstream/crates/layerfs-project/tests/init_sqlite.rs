@@ -182,3 +182,52 @@ fn a_store_inside_the_source_is_refused_before_an_operation_begins() {
 /// deferred by owner for Disposable-only development. Durable support and its
 /// retained historical receipts are unchanged.
 const DEVELOPMENT_PROFILES: [SqlitePersistenceProfile; 1] = [SqlitePersistenceProfile::Disposable];
+
+/// On Windows, host trees may contain literal files with DOS-reserved names
+/// (such as `nul`, commonly created by bash/agent redirects `> nul`) and paths
+/// longer than the legacy 260-char `MAX_PATH`. `Init` normalizes the validated
+/// source root to a verbatim `\\?\...` path so traversal, metadata, identity,
+/// and reads succeed without mapping `nul` to `\Device\Null`.
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_init_handles_reserved_device_names_and_long_paths() {
+    let fixture = Fixture::new(0);
+    let canonical_src = std::fs::canonicalize(&fixture.source).unwrap();
+    let verbatim_nul = canonical_src.join("nul");
+    let deep_dir = canonical_src
+        .join("a".repeat(80))
+        .join("b".repeat(80))
+        .join("c".repeat(80))
+        .join("d".repeat(60));
+    std::fs::create_dir_all(&deep_dir).unwrap();
+    let deep_file = deep_dir.join("deep.txt");
+    assert!(
+        deep_file.as_os_str().len() > 280,
+        "test path must exceed legacy MAX_PATH: {}",
+        deep_file.display()
+    );
+    std::fs::write(&verbatim_nul, b"literal-nul-content").unwrap();
+    std::fs::write(&deep_file, b"long-path-content").unwrap();
+
+    struct Cleanup(std::path::PathBuf, std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    let _cleanup = Cleanup(verbatim_nul.clone(), canonical_src.join("a".repeat(80)));
+
+    let handles = create(
+        &fixture.path.join("store.sqlite"),
+        SqliteAcquisitionSchema::Tables,
+    );
+    // `fixture.source` is intentionally a plain non-`\\?\` Windows path.
+    assert!(
+        !fixture.source.to_string_lossy().starts_with(r"\\?\"),
+        "source should start without verbatim prefix"
+    );
+    let initialized = attempt(&fixture, &handles).expect("init with nul + long path must succeed");
+    assert!(initialized.entries >= 6);
+    handles.seal().unwrap();
+}

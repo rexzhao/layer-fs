@@ -7,8 +7,7 @@
 //! fixed child buffer and one write window are resident; a directory wider than
 //! the child buffer is written unpositioned and ordered by the backing.
 use crate::backing::{placed_bytes, window_full, Backing, Bound, Pending, Stamp, WINDOW_ROWS};
-use crate::error::content;
-use crate::error::ProjectError as Failure;
+use crate::error::{content, io_path, ProjectError as Failure};
 use crate::host;
 
 use crate::namespace::ImportProgress;
@@ -34,7 +33,8 @@ pub(crate) struct Scanned {
 
 /// Refuses a source that is not itself one real directory.
 pub(crate) fn check_root(source: &Path) -> Result<Metadata, Failure> {
-    let metadata = fs::symlink_metadata(source)?;
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| io_path("symlink_metadata", source, error))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(Failure::InvalidInput);
     }
@@ -185,9 +185,9 @@ pub(crate) fn scan(
         let parent = directory.position;
         let path = host::bytes_to_path(directory.host_path)?;
         let (mut count, mut wide) = (0usize, false);
-        for child in fs::read_dir(&path)? {
+        for child in fs::read_dir(&path).map_err(|error| io_path("read_dir", &path, error))? {
             progress.tick()?;
-            let child = child?;
+            let child = child.map_err(|error| io_path("read_dir entry", &path, error))?;
             let child_name = host::os_str_to_bytes(&child.file_name())?;
             buffer.push(observe(&child.path(), &child_name)?);
             count += 1;
@@ -284,7 +284,8 @@ fn place_wide(
 /// Observes one child without following it; an unsupported kind is refused.
 fn observe(path: &Path, name: &[u8]) -> Result<Child, Failure> {
     PathName::from_bytes(name).map_err(content)?;
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| io_path("symlink_metadata", path, error))?;
     let (kind, target) = if metadata.file_type().is_symlink() {
         let target = super::source::read_link(path, &metadata)?;
         (InodeKind::Symlink, Some(target))

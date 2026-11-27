@@ -491,3 +491,71 @@ fn init_from_multiple_directories_branches_diff_merge_and_zero_side_effects() {
     );
     ws_m.close().unwrap();
 }
+
+#[cfg(windows)]
+#[test]
+fn init_from_imports_windows_reserved_device_names_and_long_paths() {
+    let dir = TempDir::new("reserved_and_long");
+    let src = dir.0.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let canonical_src = std::fs::canonicalize(&src).unwrap();
+    let verbatim_nul = canonical_src.join("nul");
+    let seg_a = "a".repeat(80);
+    let seg_b = "b".repeat(80);
+    let seg_c = "c".repeat(80);
+    let seg_d = "d".repeat(60);
+    let deep_dir = canonical_src
+        .join(&seg_a)
+        .join(&seg_b)
+        .join(&seg_c)
+        .join(&seg_d);
+    std::fs::create_dir_all(&deep_dir).unwrap();
+    let deep_file = deep_dir.join("payload.txt");
+    assert!(deep_file.as_os_str().len() > 280);
+    std::fs::write(&verbatim_nul, b"reserved-nul-payload").unwrap();
+    std::fs::write(&deep_file, b"deep-long-path-payload").unwrap();
+
+    struct Cleanup(std::path::PathBuf, std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    let _cleanup = Cleanup(verbatim_nul.clone(), canonical_src.join(&seg_a));
+
+    let store_dir = dir.0.join("store");
+    let (repo, summary) = Repo::init_from(
+        &store_dir,
+        &src,
+        PersistenceProfile::Disposable,
+        DEFAULT_VOLUME_SIZE_BYTES,
+    )
+    .expect("Repo::init_from must import literal nul + >260-char path");
+
+    let ws = repo.open_workspace(&summary.branches[0].branch).unwrap();
+    let nul_handle = ws
+        .backend()
+        .create_or_open(&Path::new(b"/nul"), Disposition::Open)
+        .unwrap();
+    assert_eq!(
+        ws.backend()
+            .read(nul_handle.file_id, 0, nul_handle.size as usize)
+            .unwrap(),
+        b"reserved-nul-payload"
+    );
+
+    let deep_vfs_path = format!("/{seg_a}/{seg_b}/{seg_c}/{seg_d}/payload.txt");
+    let deep_handle = ws
+        .backend()
+        .create_or_open(&Path::new(deep_vfs_path.as_bytes()), Disposition::Open)
+        .unwrap();
+    assert_eq!(
+        ws.backend()
+            .read(deep_handle.file_id, 0, deep_handle.size as usize)
+            .unwrap(),
+        b"deep-long-path-payload"
+    );
+    ws.close().unwrap();
+}

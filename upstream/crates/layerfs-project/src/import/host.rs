@@ -4,12 +4,30 @@
 //! Windows directory import via `layerfs-win32-host`.
 
 use crate::backing::Stamp;
+#[cfg(windows)]
+use crate::error::io_path;
 use crate::ProjectError;
 use std::{
     ffi::OsStr,
     fs::{File, Metadata},
     path::{Path, PathBuf},
 };
+
+/// Normalizes a validated source root directory for host traversal.
+///
+/// On Windows, `std::fs::canonicalize` returns a verbatim `\\?\...` path so
+/// descendant traversal, metadata queries, and file opens bypass Win32 DOS
+/// device name mangling (e.g. literal files named `nul`, `con`, `aux`) and the
+/// legacy 260-character `MAX_PATH` limit.
+#[cfg(windows)]
+pub(crate) fn canonical_source_root(source: &Path) -> Result<PathBuf, ProjectError> {
+    std::fs::canonicalize(source).map_err(|error| io_path("canonicalize", source, error))
+}
+
+#[cfg(unix)]
+pub(crate) fn canonical_source_root(source: &Path) -> Result<PathBuf, ProjectError> {
+    Ok(source.to_path_buf())
+}
 
 #[cfg(unix)]
 pub(crate) fn os_str_to_bytes(os: &OsStr) -> Result<Vec<u8>, ProjectError> {
@@ -66,7 +84,8 @@ pub(crate) fn dev_ino_of_path(
     path: &Path,
     _metadata: &Metadata,
 ) -> Result<(u64, u64), ProjectError> {
-    let id = layerfs_win32_host::path_identity(path)?;
+    let id = layerfs_win32_host::path_identity(path)
+        .map_err(|error| io_path("path_identity", path, error))?;
     Ok((id.device, id.inode))
 }
 
@@ -126,7 +145,8 @@ fn windows_portable_mode(metadata: &Metadata) -> u32 {
 
 #[cfg(windows)]
 pub(crate) fn stamp_of_path(path: &Path, metadata: &Metadata) -> Result<Stamp, ProjectError> {
-    let id = layerfs_win32_host::path_identity(path)?;
+    let id = layerfs_win32_host::path_identity(path)
+        .map_err(|error| io_path("path_identity", path, error))?;
     let (mtime, mtime_nsec) = system_time_parts(metadata.modified());
     let (ctime, ctime_nsec) = system_time_parts(metadata.created());
     Ok(Stamp {

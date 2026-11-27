@@ -100,13 +100,14 @@ pub fn init_observed(
     let mut progress = ImportProgress::observed(request.deadline, counters);
     progress.tick()?;
     let source = scan::check_root(request.source)?;
+    let source_root = host::canonical_source_root(request.source)?;
     if let Some(placement) = request.acquisition.placement() {
-        super::source::outside_source(request.source, &source, &placement)?;
+        super::source::outside_source(&source_root, &source, &placement)?;
     }
     let scope = scope_for_seed(request.scope_seed);
     let mut stack = [0; 16];
     stack.copy_from_slice(&request.stack.to_bytes()[1..]);
-    let (source_device, source_inode) = host::dev_ino_of_path(request.source, &source)?;
+    let (source_device, source_inode) = host::dev_ino_of_path(&source_root, &source)?;
     let begun = request.acquisition.begin(&Begin {
         source_device,
         source_inode,
@@ -117,7 +118,8 @@ pub fn init_observed(
     let acquired = acquire(
         store,
         catalog,
-        &request,
+        &source_root,
+        request.scope_seed,
         &source,
         &backing,
         &mut progress,
@@ -177,10 +179,12 @@ pub fn init_observed(
 /// Scans with attributes, constructs each file once, consumes serials and
 /// builds the tree. The returned tree save is unfinished.
 #[cfg(any(unix, windows))]
+#[allow(clippy::too_many_arguments)]
 fn acquire<'a>(
     store: &'a Storage,
     catalog: &dyn HistoryCatalog,
-    request: &InitRequest<'_>,
+    source_root: &Path,
+    scope_seed: [u8; 32],
     source: &std::fs::Metadata,
     backing: &Backing<'_>,
     progress: &mut ImportProgress,
@@ -192,7 +196,7 @@ fn acquire<'a>(
         let built = timer.child("history.import_scan").run(|_| {
             let mut sink = save.sink();
             let mut objects = FilesystemObjects::new(&provider, &mut sink);
-            scan::scan(request.source, source, backing, &mut objects, progress)
+            scan::scan(source_root, source, backing, &mut objects, progress)
         });
         let scanned = match save.take_failure() {
             Some(error) => Err(storage(error)),
@@ -213,7 +217,7 @@ fn acquire<'a>(
         .child("history.import_finish_save")
         .run(|_| save.finish().map_err(storage))?;
     progress.counters.step(InitStep::Tree);
-    let scope = scope_for_seed(request.scope_seed);
+    let scope = scope_for_seed(scope_seed);
     let reservation = timer.child("history.reserve_inodes").run(|_| {
         catalog
             .reserve_inodes(&ReserveRequest {
@@ -289,13 +293,14 @@ pub fn import_tree(
     let mut progress = ImportProgress::observed(request.deadline, counters);
     progress.tick()?;
     let source = scan::check_root(request.source)?;
+    let source_root = host::canonical_source_root(request.source)?;
     if let Some(placement) = request.acquisition.placement() {
-        super::source::outside_source(request.source, &source, &placement)?;
+        super::source::outside_source(&source_root, &source, &placement)?;
     }
     let scope = scope_for_seed(request.scope_seed);
     let mut stack = [0; 16];
     stack.copy_from_slice(&request.stack.to_bytes()[1..]);
-    let (source_device, source_inode) = host::dev_ino_of_path(request.source, &source)?;
+    let (source_device, source_inode) = host::dev_ino_of_path(&source_root, &source)?;
     let begun = request.acquisition.begin(&Begin {
         source_device,
         source_inode,
@@ -306,7 +311,7 @@ pub fn import_tree(
     let acquired = acquire_into_root(
         store,
         catalog,
-        request.source,
+        &source_root,
         request.scope_seed,
         request.root_serial,
         &source,
