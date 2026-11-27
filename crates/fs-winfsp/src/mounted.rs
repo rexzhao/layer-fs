@@ -137,9 +137,36 @@ pub fn mount_serving(
     capacity: Option<crate::callbacks::CapacitySource>,
     serve: impl FnOnce(&Mounted) -> Result<(), String>,
 ) -> Result<MountReport, LoadError> {
+    mount_serving_with_timeout(library, mount_point, backend, volume, capacity, 0, serve)
+}
+
+/// Same as [`mount_serving`], with an explicit WinFsp kernel `FileInfoTimeout` in milliseconds
+/// (`0` disables kernel metadata caching; `1000` matches standard WinFsp disk mounts and speeds
+/// up rapid `git status` / IDE stat sweeps).
+///
+/// # Errors
+///
+/// [`LoadError`] from the loader or a missing export.
+pub fn mount_serving_with_timeout(
+    library: &Path,
+    mount_point: &Path,
+    backend: crate::ops::DynOps,
+    volume: crate::abi::VolumeInfo,
+    capacity: Option<crate::callbacks::CapacitySource>,
+    file_info_timeout_ms: u32,
+    serve: impl FnOnce(&Mounted) -> Result<(), String>,
+) -> Result<MountReport, LoadError> {
     // **Fail before anything is created** when the DLL cannot be resolved: a version problem must not look like a mount problem.
     resolve_library(library)?;
-    platform::mount_serving(library, mount_point, backend, volume, capacity, serve)
+    platform::mount_serving(
+        library,
+        mount_point,
+        backend,
+        volume,
+        capacity,
+        file_info_timeout_ms,
+        serve,
+    )
 }
 
 #[cfg(windows)]
@@ -842,6 +869,7 @@ mod platform {
         backend: crate::ops::DynOps,
         volume: crate::abi::VolumeInfo,
         capacity: Option<crate::callbacks::CapacitySource>,
+        file_info_timeout_ms: u32,
         serve: impl FnOnce(&super::Mounted) -> Result<(), String>,
     ) -> Result<super::MountReport, LoadError> {
         let module_path = wide(library.as_os_str());
@@ -897,7 +925,7 @@ mod platform {
             params.set_max_component_length(255);
             params.set_name_flags();
             // No caching: the workspace is the only source of truth, and a cached FileInfo would hide another handle's write.
-            params.set_file_info_timeout(0);
+            params.set_file_info_timeout(file_info_timeout_ms);
             // **A directory mount has no name of its own**, unlike a drive letter, so the volume must carry one. Applied only for
             // that shape: a drive-letter volume should not advertise a UNC prefix it will never be reached by.
             // **No `Prefix` for a directory mount.** It is the UNC form (`\server\share`); a volume whose name looks like a

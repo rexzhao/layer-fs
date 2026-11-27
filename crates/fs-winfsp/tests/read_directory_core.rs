@@ -204,3 +204,210 @@ fn the_derived_attribute_bits_do_not_stop_a_listing() {
         "cell attributes: the bit the record carries for a directory is the one Win32 defines"
     );
 }
+
+#[test]
+fn binary_search_pagination_handles_dots_and_pre_dot_names() {
+    // Leading `.` and `..` followed by sorted real entries including names < '.' in UTF-16 (`!`, `#`, `-`).
+    let mut expected: Vec<String> = vec![
+        ".".to_owned(),
+        "..".to_owned(),
+        "!bang.txt".to_owned(),
+        "#hash.txt".to_owned(),
+        "-dash.txt".to_owned(),
+        ".hidden".to_owned(),
+    ];
+    for i in 0..120 {
+        expected.push(format!("file_{i:03}.txt"));
+    }
+    let all: Vec<ListEntry> = expected
+        .iter()
+        .map(|n| {
+            let kind = if n == "." || n == ".." {
+                Kind::Directory
+            } else {
+                Kind::File
+            };
+            (n.encode_utf16().collect(), info(kind))
+        })
+        .collect();
+
+    let mut collected = Vec::new();
+    let mut marker: Option<Vec<u16>> = None;
+    let mut pages = 0usize;
+    loop {
+        let (status, transferred, names) = page(&all, 512, marker.as_deref());
+        assert_eq!(status, 0);
+        if transferred == 0 || names.is_empty() {
+            break;
+        }
+        pages += 1;
+        assert!(pages < 200, "pagination must terminate without looping");
+        marker = Some(names.last().unwrap().encode_utf16().collect());
+        collected.extend(names);
+    }
+    assert!(pages > 10, "expected multi-page traversal, got {pages}");
+    assert_eq!(collected, expected);
+}
+
+#[test]
+fn read_directory_shell_caches_snapshot_across_pages() {
+    use fs_semantics::disposition::Disposition;
+    use fs_winfsp::ops::{
+        Attributes, DirEntry, DirOutcome, OpenOutcome, OpsResult, Path as OpsPath, RenameOutcome,
+        WorkspaceOps,
+    };
+    use std::sync::Arc;
+
+    struct SharedMock(Arc<fs_winfsp::MockBackend>);
+    impl WorkspaceOps for SharedMock {
+        fn create_or_open(&self, path: &OpsPath<'_>, d: Disposition) -> OpsResult<OpenOutcome> {
+            self.0.create_or_open(path, d)
+        }
+        fn mkdir(&self, path: &OpsPath<'_>) -> OpsResult<u64> {
+            self.0.mkdir(path)
+        }
+        fn open_dir(&self, path: &OpsPath<'_>) -> OpsResult<u64> {
+            self.0.open_dir(path)
+        }
+        fn dir_binding(&self, path: &OpsPath<'_>) -> Option<DirOutcome> {
+            self.0.dir_binding(path)
+        }
+        fn read(&self, file_id: u64, offset: u64, len: usize) -> OpsResult<Vec<u8>> {
+            self.0.read(file_id, offset, len)
+        }
+        fn write(&self, file_id: u64, offset: u64, bytes: &[u8]) -> OpsResult<usize> {
+            self.0.write(file_id, offset, bytes)
+        }
+        fn set_size(&self, file_id: u64, len: u64) -> OpsResult<()> {
+            self.0.set_size(file_id, len)
+        }
+        fn read_dir(&self, dir_id: u64) -> OpsResult<Vec<DirEntry>> {
+            self.0.read_dir(dir_id)
+        }
+        fn get_info(&self, file_id: u64) -> OpsResult<NodeInfo> {
+            self.0.get_info(file_id)
+        }
+        fn set_times(
+            &self,
+            file_id: u64,
+            a: Option<i64>,
+            w: Option<i64>,
+            c: Option<i64>,
+            cr: Option<i64>,
+        ) -> OpsResult<()> {
+            self.0.set_times(file_id, a, w, c, cr)
+        }
+        fn set_attributes(&self, file_id: u64, attr: Attributes) -> OpsResult<()> {
+            self.0.set_attributes(file_id, attr)
+        }
+        fn rename(&self, from: &OpsPath<'_>, to: &OpsPath<'_>, r: bool) -> OpsResult<RenameOutcome> {
+            self.0.rename(from, to, r)
+        }
+        fn remove_at(&self, parent: u64, name: &[u8], expected_id: u64) -> OpsResult<()> {
+            self.0.remove_at(parent, name, expected_id)
+        }
+        fn flush(&self) -> OpsResult<()> {
+            self.0.flush()
+        }
+    }
+
+    let mock = Arc::new(fs_winfsp::MockBackend::new());
+    let sub_id = mock.mkdir(&OpsPath::new(b"/sub")).unwrap();
+    for i in 0..40 {
+        let p = format!("/sub/item_{i:02}.txt");
+        mock.create_or_open(&OpsPath::new(p.as_bytes()), Disposition::Create)
+            .unwrap();
+    }
+
+    let dyn_ops: fs_winfsp::ops::DynOps = Box::new(SharedMock(mock.clone()));
+    let adapter = fs_winfsp::DynAdapter::new(dyn_ops);
+    let context = fs_winfsp::callbacks::register_context_for_test(
+        fs_winfsp::callbacks::EntryContext {
+            file_id: sub_id,
+            handle: fs_winfsp::handles::HandleId::from_raw(99),
+        },
+    );
+
+    let read_shell_page = |marker: Option<&[u16]>| -> (u32, Vec<String>) {
+        let capacity = 512usize;
+        let mut buffer = vec![0u8; capacity];
+        let mut transferred = u32::MAX;
+        let mut terminated = marker.map(|m| {
+            let mut u = m.to_vec();
+            u.push(0);
+            u
+        });
+        let marker_ptr = terminated
+            .as_mut()
+            .map_or(std::ptr::null(), |u| u.as_ptr());
+        let status = unsafe {
+            read_directory_shell(
+                Some(&adapter),
+                context,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                marker_ptr,
+                capacity as u32,
+                std::ptr::addr_of_mut!(transferred),
+            )
+        };
+        assert_eq!(status, 0);
+        let mut names = Vec::new();
+        let mut at = 0usize;
+        while at + 104 <= capacity {
+            let size = u16::from_ne_bytes([buffer[at], buffer[at + 1]]) as usize;
+            if size == 0 {
+                break;
+            }
+            let name_len = size - 104;
+            let name = String::from_utf16_lossy(
+                &buffer[at + 104..at + 104 + name_len]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                    .collect::<Vec<u16>>(),
+            );
+            names.push(name);
+            at += fs_winfsp::abi::dir_info::aligned(size);
+        }
+        (transferred, names)
+    };
+
+    let mut collected = Vec::new();
+    let mut marker: Option<Vec<u16>> = None;
+    let mut pages = 0usize;
+    loop {
+        let (transferred, names) = read_shell_page(marker.as_deref());
+        if transferred == 0 || names.is_empty() {
+            break;
+        }
+        pages += 1;
+        marker = Some(names.last().unwrap().encode_utf16().collect());
+        collected.extend(names);
+    }
+
+    assert!(pages > 5, "expected multiple pages, got {pages}");
+    assert_eq!(collected.len(), 42, "`.` + `..` + 40 files");
+    assert_eq!(collected[0], ".");
+    assert_eq!(collected[1], "..");
+
+    let read_dir_calls = mock
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, fs_winfsp::Call::ReadDir(id) if *id == sub_id))
+        .count();
+    assert_eq!(
+        read_dir_calls, 1,
+        "paginated ReadDirectory must call backend.read_dir exactly once per enumeration, not once per page"
+    );
+
+    // Restart scan (`marker = None`) refreshes the snapshot cleanly.
+    let (transferred, _) = read_shell_page(None);
+    assert!(transferred > 0);
+    let read_dir_calls_after_restart = mock
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, fs_winfsp::Call::ReadDir(id) if *id == sub_id))
+        .count();
+    assert_eq!(read_dir_calls_after_restart, 2);
+
+    fs_winfsp::callbacks::release_context_for_test(context);
+}

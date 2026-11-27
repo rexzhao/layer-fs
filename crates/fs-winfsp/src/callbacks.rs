@@ -88,13 +88,29 @@ pub unsafe fn read_directory_shell(
     let Some(entry) = entry_of(context) else {
         return NOT_IMPLEMENTED;
     };
-    let entry = &entry;
-    // The listing comes from **this mount's backend**, not from an injected hook: `DirEntry` now carries the entry's id, so its
-    // metadata is one `get_info` away (367 — the field exists exactly so this derivation stops being impossible).
-    let entries = match adapter {
-        Some(adapter) => list_entries(adapter, entry.file_id),
+    let context_id = context as usize as u64;
+    // Cache the sorted directory snapshot on the open directory handle (`Shared::dir_snapshot`):
+    // - On the first page (`marker.is_null()`), compute a fresh snapshot once and cache it.
+    // - On pages 2..N (`!marker.is_null()`), reuse the cached `Arc<Vec<ListEntry>>` in O(1)
+    //   instead of re-scanning and re-sorting the entire directory on every 16 KiB WinFsp page!
+    let entries: std::sync::Arc<Vec<ListEntry>> = match adapter {
+        Some(adapter) => {
+            if !marker.is_null() {
+                if let Some(cached) = cached_dir_snapshot(context_id) {
+                    cached
+                } else {
+                    let fresh = std::sync::Arc::new(list_entries(adapter, entry.file_id));
+                    store_dir_snapshot(context_id, std::sync::Arc::clone(&fresh));
+                    fresh
+                }
+            } else {
+                let fresh = std::sync::Arc::new(list_entries(adapter, entry.file_id));
+                store_dir_snapshot(context_id, std::sync::Arc::clone(&fresh));
+                fresh
+            }
+        }
         // No mount: an empty page. A miss must never fall back to another mount's listing (352).
-        None => Vec::new(),
+        None => std::sync::Arc::new(Vec::new()),
     };
     // SAFETY: the caller's contract covers every pointer handed through.
     unsafe { read_directory_from(&entries, buffer, marker, length, bytes_transferred) }
@@ -160,23 +176,26 @@ pub unsafe fn read_directory_from(
         let name_units = unsafe { crate::boundary::utf16_len(marker) };
         // SAFETY: same pointer, bounded by the terminator just measured.
         let name = unsafe { std::slice::from_raw_parts(marker, name_units) };
-        entries
+        let first_real = entries
+            .iter()
+            .take_while(|(c, _)| {
+                c.as_slice() == [u16::from(b'.')]
+                    || c.as_slice() == [u16::from(b'.'), u16::from(b'.')]
+            })
+            .count();
+        if let Some(dot_idx) = entries[..first_real]
             .iter()
             .position(|(candidate, _)| candidate.as_slice() == name)
-            .map(|index| index + 1)
-            .unwrap_or_else(|| {
-                let first_real = entries
-                    .iter()
-                    .take_while(|(c, _)| {
-                        c.as_slice() == [u16::from(b'.')]
-                            || c.as_slice() == [u16::from(b'.'), u16::from(b'.')]
-                    })
-                    .count();
-                entries[first_real..]
-                    .iter()
-                    .position(|(candidate, _)| candidate.as_slice() > name)
-                    .map_or(entries.len(), |offset| first_real + offset)
-            })
+        {
+            dot_idx + 1
+        } else {
+            // `entries[first_real..]` is sorted by UTF-16 code units: O(log N) resume!
+            let real = &entries[first_real..];
+            match real.binary_search_by(|(candidate, _)| candidate.as_slice().cmp(name)) {
+                Ok(idx) => first_real + idx + 1,
+                Err(ins) => first_real + ins,
+            }
+        }
     };
 
     // SAFETY: `buffer` is valid for `length` bytes per the caller's contract.
@@ -622,6 +641,30 @@ pub unsafe fn get_file_info_shell(
 struct Shared {
     entry: EntryContext,
     refs: usize,
+    dir_snapshot: Option<std::sync::Arc<Vec<ListEntry>>>,
+}
+
+fn cached_dir_snapshot(context_id: u64) -> Option<std::sync::Arc<Vec<ListEntry>>> {
+    if context_id == 0 {
+        return None;
+    }
+    let mut guard = lock_tables();
+    let tables = guard.get_or_insert_with(ContextTables::default);
+    tables
+        .contexts
+        .get(&context_id)
+        .and_then(|shared| shared.dir_snapshot.clone())
+}
+
+fn store_dir_snapshot(context_id: u64, snapshot: std::sync::Arc<Vec<ListEntry>>) {
+    if context_id == 0 {
+        return;
+    }
+    let mut guard = lock_tables();
+    let tables = guard.get_or_insert_with(ContextTables::default);
+    if let Some(shared) = tables.contexts.get_mut(&context_id) {
+        shared.dir_snapshot = Some(snapshot);
+    }
 }
 
 #[derive(Default)]
@@ -693,7 +736,14 @@ pub fn stale_release_count() -> usize {
 fn register_locked(tables: &mut ContextTables, entry: EntryContext) -> u64 {
     ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let id = NEXT_CONTEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    tables.contexts.insert(id, Shared { entry, refs: 1 });
+    tables.contexts.insert(
+        id,
+        Shared {
+            entry,
+            refs: 1,
+            dir_snapshot: None,
+        },
+    );
     tables.by_file.insert(entry.file_id, id);
     id
 }

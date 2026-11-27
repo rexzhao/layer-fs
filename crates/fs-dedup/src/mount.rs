@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::store::DedupStore;
 use fs_winfsp::abi::VolumeInfo;
 use fs_winfsp::loader::default_library;
-use fs_winfsp::mounted::mount_serving;
+use fs_winfsp::mounted::mount_serving_with_timeout;
 use fs_winfsp::ops::DynOps;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -23,6 +23,8 @@ pub struct MountOptions {
     pub dedup_interval_secs: u64,
     /// Minimum idle time in seconds before a closed overlay file is eligible for background dedup.
     pub dedup_idle_secs: u64,
+    /// WinFsp kernel `FileInfoTimeout` in milliseconds (`1000` default for fast `git status` / IDE stat sweeps).
+    pub info_timeout_ms: u32,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -110,12 +112,13 @@ pub fn run_mount(
     let rec_path = record_path(mount_point);
     let store_path_str = store.root().display().to_string();
 
-    let report = mount_serving(
+    let report = mount_serving_with_timeout(
         &library,
         mount_point,
         dyn_backend,
         volume_info(total_size),
         Some(capacity),
+        opts.info_timeout_ms,
         move |mounted| {
             let adapter = mounted.adapter();
 

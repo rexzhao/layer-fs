@@ -44,7 +44,8 @@ pub struct CachedInode {
     pub written_ns: i64,
     pub changed_ns: i64,
     pub storage_mode: u8,
-    pub entries: Arc<[ManifestEntry]>,
+    /// Decoded chunk manifest (`None` when prefetched by `read_dir` without reading `manifest` BLOBs).
+    pub entries: Option<Arc<[ManifestEntry]>>,
 }
 
 impl CachedInode {
@@ -65,7 +66,7 @@ impl CachedInode {
             written_ns: row.written_ns,
             changed_ns: row.changed_ns,
             storage_mode: row.storage_mode,
-            entries,
+            entries: Some(entries),
         })
     }
 }

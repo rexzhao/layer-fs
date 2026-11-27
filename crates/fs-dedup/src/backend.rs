@@ -33,7 +33,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const MAX_RO_CONNS: usize = 16;
-const MAX_DENTRY_CACHE: usize = 262_144;
+const DENTRY_SHARDS: usize = 16;
+const MAX_DENTRY_PER_SHARD: usize = 32_768; // 524k total across 16 shards
 
 /// Pool of read-only WAL SQLite connections returned automatically on drop.
 struct RoConnPool {
@@ -88,6 +89,7 @@ impl RoConnPool {
 }
 
 type DentryVal = (u64, u8, Vec<u8>);
+type DentryShard = RwLock<HashMap<(u64, Vec<u8>), DentryVal>>;
 
 /// WinFsp `WorkspaceOps` backend serving one workspace of a `DedupStore`.
 pub struct DedupWorkspaceBackend {
@@ -98,8 +100,8 @@ pub struct DedupWorkspaceBackend {
     write_conn: Mutex<Connection>,
     /// Concurrent read-only WAL SQLite connection pool (used for all read/stat/list/open paths).
     ro_pool: RoConnPool,
-    /// Positive `(parent_id, folded_name) -> (child_id, kind, display_name)` cache.
-    dentry_cache: RwLock<HashMap<(u64, Vec<u8>), DentryVal>>,
+    /// Sharded positive `(parent_id, folded_name) -> (child_id, kind, display_name)` cache.
+    dentry_cache: Vec<DentryShard>,
     next_inode: AtomicU64,
 }
 
@@ -114,13 +116,16 @@ impl DedupWorkspaceBackend {
             |r| r.get(0),
         )?;
         let ro_pool = RoConnPool::new(Arc::clone(&store));
+        let dentry_cache = (0..DENTRY_SHARDS)
+            .map(|_| RwLock::new(HashMap::with_capacity(512)))
+            .collect();
         Ok(Self {
             store,
             ws_id,
             ws_name: ws_name.to_owned(),
             write_conn: Mutex::new(conn),
             ro_pool,
-            dentry_cache: RwLock::new(HashMap::with_capacity(4096)),
+            dentry_cache,
             next_inode: AtomicU64::new(next_inode.max((ROOT_INODE + 1) as i64) as u64),
         })
     }
@@ -147,16 +152,21 @@ impl DedupWorkspaceBackend {
         Ok(id)
     }
 
+    #[inline]
+    fn dentry_shard(&self, parent_id: u64) -> &RwLock<HashMap<(u64, Vec<u8>), DentryVal>> {
+        &self.dentry_cache[(parent_id as usize) & (DENTRY_SHARDS - 1)]
+    }
+
     fn cache_dentry(&self, parent_id: u64, folded: Vec<u8>, val: DentryVal) {
-        let mut guard = self.dentry_cache.write().unwrap();
-        if guard.len() >= MAX_DENTRY_CACHE {
+        let mut guard = self.dentry_shard(parent_id).write().unwrap();
+        if guard.len() >= MAX_DENTRY_PER_SHARD {
             guard.clear();
         }
         guard.insert((parent_id, folded), val);
     }
 
     fn invalidate_dentry(&self, parent_id: u64, folded: &[u8]) {
-        self.dentry_cache
+        self.dentry_shard(parent_id)
             .write()
             .unwrap()
             .remove(&(parent_id, folded.to_vec()));
@@ -170,7 +180,7 @@ impl DedupWorkspaceBackend {
         folded: &[u8],
     ) -> OpsResult<Option<DentryVal>> {
         {
-            let guard = self.dentry_cache.read().unwrap();
+            let guard = self.dentry_shard(parent_id).read().unwrap();
             if let Some(hit) = guard.get(&(parent_id, folded.to_vec())) {
                 return Ok(Some(hit.clone()));
             }
@@ -499,7 +509,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                         written_ns: ts,
                         changed_ns: ts,
                         storage_mode: STORAGE_OVERLAY,
-                        entries: Arc::from(Vec::new().into_boxed_slice()),
+                        entries: Some(Arc::from(Vec::new().into_boxed_slice())),
                     }),
                 );
 
@@ -641,7 +651,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                 written_ns: ts,
                 changed_ns: ts,
                 storage_mode: STORAGE_CHUNKS,
-                entries: Arc::from(Vec::new().into_boxed_slice()),
+                entries: Some(Arc::from(Vec::new().into_boxed_slice())),
             }),
         );
         Ok(inode_id)
@@ -685,12 +695,18 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         // `.pack` disk read or Zstd/LZ4 decompression!
         let plan = {
             let _lock = self.store.lock_inode(self.ws_id, file_id);
+            let mut ro_conn: Option<RoConnGuard<'_>> = None;
             let cached = match self.store.get_cached_inode(self.ws_id, file_id) {
-                Some(hit) => hit,
-                None => {
-                    let conn = self.ro_pool.get()?;
-                    self.load_inode_cached(&conn, file_id)?
-                        .ok_or(OpsError::NotFound)?
+                Some(hit) if hit.storage_mode == STORAGE_OVERLAY || hit.entries.is_some() => hit,
+                _ => {
+                    // Load full row including `manifest` BLOB lazily on first actual file read.
+                    let conn = ro_conn.insert(self.ro_pool.get()?);
+                    let Some(row) = load_inode(conn, self.ws_id, file_id).map_err(map_err)? else {
+                        return Err(OpsError::NotFound);
+                    };
+                    let full = Arc::new(CachedInode::from_row(&row).map_err(map_err)?);
+                    self.store.put_cached_inode(self.ws_id, Arc::clone(&full));
+                    full
                 }
             };
             if cached.kind == KIND_DIR {
@@ -714,9 +730,9 @@ impl WorkspaceOps for DedupWorkspaceBackend {
             let end = offset + to_read as u64;
             let mut cursor = 0u64;
             let mut spans = Vec::new();
-            let mut ro_conn: Option<RoConnGuard<'_>> = None;
+            let entries = cached.entries.as_deref().unwrap_or(&[]);
 
-            for entry in cached.entries.iter() {
+            for entry in entries {
                 let chunk_len = u64::from(entry.raw_len);
                 let chunk_end = cursor + chunk_len;
                 if chunk_end <= offset {
@@ -843,13 +859,14 @@ impl WorkspaceOps for DedupWorkspaceBackend {
             return Err(OpsError::NotADirectory);
         }
 
-        // Single JOIN query loads ALL children + their inode metadata + manifests in one shot
-        // and warms both `DentryCache` and `InodeCache`, eliminating N+1 cold B-tree seeks!
+        // Single JOIN query loads ALL children + their metadata WITHOUT reading `manifest` BLOBs
+        // (avoiding SQLite overflow pages & manifest decoding during `git status` / Explorer scans!),
+        // and warms both `DentryCache` and `InodeCache`.
         let mut stmt = conn
             .prepare_cached(
                 "SELECT d.folded_name, d.display_name, d.kind, d.child_id,
                         i.size, i.attributes, i.created_ns, i.accessed_ns, i.written_ns, i.changed_ns,
-                        i.storage_mode, i.manifest
+                        i.storage_mode
                  FROM dentries d
                  JOIN inodes i ON i.ws_id = d.ws_id AND i.inode_id = d.child_id
                  WHERE d.ws_id = ?1 AND d.parent_id = ?2",
@@ -869,7 +886,6 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                     r.get::<_, i64>(8)?,
                     r.get::<_, i64>(9)?,
                     r.get::<_, i64>(10)? as u8,
-                    r.get::<_, Vec<u8>>(11)?,
                 ))
             })
             .map_err(map_sql)?;
@@ -889,17 +905,13 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                 written_ns,
                 changed_ns,
                 storage_mode,
-                manifest,
             ) = row.map_err(map_sql)?;
 
-            let entries = if storage_mode == STORAGE_CHUNKS && !manifest.is_empty() {
-                match crate::meta::decode_manifest(&manifest) {
-                    Ok(v) => Arc::from(v.into_boxed_slice()),
-                    Err(_) => Arc::from(Vec::new().into_boxed_slice()),
-                }
-            } else {
-                Arc::from(Vec::new().into_boxed_slice())
-            };
+            // Preserve any already-decoded manifest in cache if present.
+            let existing_entries = self
+                .store
+                .get_cached_inode(self.ws_id, child_id)
+                .and_then(|c| c.entries.clone());
             self.store.put_cached_inode(
                 self.ws_id,
                 Arc::new(CachedInode {
@@ -912,7 +924,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                     written_ns,
                     changed_ns,
                     storage_mode,
-                    entries,
+                    entries: existing_entries,
                 }),
             );
             new_dentries.push((folded, (child_id, kind_u8, name.clone())));
@@ -927,8 +939,8 @@ impl WorkspaceOps for DedupWorkspaceBackend {
             });
         }
         if !new_dentries.is_empty() {
-            let mut guard = self.dentry_cache.write().unwrap();
-            if guard.len().saturating_add(new_dentries.len()) >= MAX_DENTRY_CACHE {
+            let mut guard = self.dentry_shard(dir_id).write().unwrap();
+            if guard.len().saturating_add(new_dentries.len()) >= MAX_DENTRY_PER_SHARD {
                 guard.clear();
             }
             for (folded, val) in new_dentries {

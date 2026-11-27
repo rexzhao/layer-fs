@@ -93,7 +93,7 @@ fn print_help() {
            dedupfs stats\n  \
            dedupfs dedup [ws] [--idle 0]\n  \
            dedupfs gc [--threshold 30]\n  \
-           dedupfs mount <ws> <mount_point> [--cache 256M] [--dedup-interval 60] [--dedup-idle 30]\n  \
+           dedupfs mount <ws> <mount_point> [--cache 256M] [--dedup-interval 60] [--dedup-idle 30] [--info-timeout 1000]\n  \
            dedupfs umount <mount_point> [--force]"
     );
 }
@@ -594,6 +594,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 cache_bytes: DEFAULT_CACHE_BYTES,
                 dedup_interval_secs: 60,
                 dedup_idle_secs: 30,
+                info_timeout_ms: 1000,
             };
             let mut pos: Vec<String> = Vec::new();
             let mut i = 1;
@@ -614,6 +615,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             args.get(i + 1).ok_or("--dedup-idle requires seconds")?.parse()?;
                         i += 2;
                     }
+                    "--info-timeout" => {
+                        opts.info_timeout_ms = args
+                            .get(i + 1)
+                            .ok_or("--info-timeout requires milliseconds")?
+                            .parse()?;
+                        i += 2;
+                    }
                     other if other.starts_with('-') => {
                         return Err(format!("unknown option {other:?}").into());
                     }
@@ -625,7 +633,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if pos.len() != 2 {
                 return Err(
-                    "usage: dedupfs [--store <dir>] mount <ws> <mount_point> [--cache 256M] [--dedup-interval 60] [--dedup-idle 30]"
+                    "usage: dedupfs [--store <dir>] mount <ws> <mount_point> [--cache 256M] [--dedup-interval 60] [--dedup-idle 30] [--info-timeout 1000]"
                         .into(),
                 );
             }

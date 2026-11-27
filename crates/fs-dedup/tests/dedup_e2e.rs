@@ -611,3 +611,44 @@ fn directory_filters_exclude_on_import_and_skip_dedup_at_runtime() {
         .iter()
         .any(|p| p == "Logs"));
 }
+
+#[test]
+fn read_dir_prefetches_metadata_without_manifest_and_read_lazy_loads_bytes() {
+    let tmp = TempDir::new("lazy_manifest");
+    let store_dir = tmp.0.join("store");
+    let src = tmp.0.join("src");
+    std::fs::create_dir_all(src.join("dir")).unwrap();
+    let payload_a = b"hello-from-pack-file-A".repeat(1000);
+    let payload_b = b"hello-from-pack-file-B".repeat(500);
+    std::fs::write(src.join("dir").join("a.bin"), &payload_a).unwrap();
+    std::fs::write(src.join("dir").join("b.bin"), &payload_b).unwrap();
+
+    let store = DedupStore::init(&store_dir, StoreConfig::default()).unwrap();
+    store.import_dir(&src, "ws", 2, None).unwrap();
+
+    // Fresh backend with empty inode/dentry caches (cold start).
+    let backend = DedupWorkspaceBackend::open(store, "ws").unwrap();
+    let dir_id = backend.open_dir(&OpsPath::new(b"/dir")).unwrap();
+    let entries = backend.read_dir(dir_id).unwrap();
+    assert_eq!(entries.len(), 2);
+
+    // Metadata (`get_info`) is already hot from `read_dir` prefetch.
+    let a_id = entries
+        .iter()
+        .find(|e| e.name.as_slice() == b"a.bin")
+        .unwrap()
+        .file_id;
+    let b_id = entries
+        .iter()
+        .find(|e| e.name.as_slice() == b"b.bin")
+        .unwrap()
+        .file_id;
+    assert_eq!(backend.get_info(a_id).unwrap().size, payload_a.len() as u64);
+    assert_eq!(backend.get_info(b_id).unwrap().size, payload_b.len() as u64);
+
+    // `read()` must transparently lazy-load the manifest BLOB from SQLite and return exact bytes.
+    let got_a = backend.read(a_id, 0, payload_a.len()).unwrap();
+    assert_eq!(got_a, payload_a);
+    let got_b = backend.read(b_id, 0, payload_b.len()).unwrap();
+    assert_eq!(got_b, payload_b);
+}
