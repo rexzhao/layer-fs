@@ -7,7 +7,8 @@
 
 use fs_dedup::{
     request_umount, run_mount, Codec, DedupStore, ImportProgress, MountOptions, StoreConfig,
-    DEFAULT_CACHE_BYTES, DEFAULT_PACK_TARGET_BYTES,
+    DEFAULT_CACHE_BYTES, DEFAULT_PACK_TARGET_BYTES, UNITY_IMPORT_EXCLUDE_PRESET,
+    UNITY_NO_DEDUP_PRESET,
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -82,8 +83,9 @@ fn print_help() {
            2. Current directory or nearest ancestor store\n  \
            3. `DEDUPFS_STORE` environment variable\n\n\
          COMMANDS:\n  \
-           dedupfs init [dir] [--codec zstd1|lz4|none] [--pack-size 128M]\n  \
-           dedupfs import <source_dir> [--name <ws>] [--update] [--threads N]\n  \
+           dedupfs init [dir] [--codec zstd1|lz4|none] [--pack-size 128M] [--exclude <pat>] [--no-dedup <pat>] [--unity-preset]\n  \
+           dedupfs config [--add-exclude <pat>] [--rm-exclude <pat>] [--add-no-dedup <pat>] [--rm-no-dedup <pat>] [--unity-preset]\n  \
+           dedupfs import <source_dir> [--name <ws>] [--update] [--exclude <pat>] [--threads N]\n  \
            dedupfs create <ws>\n  \
            dedupfs clone <src_ws> <new_ws>\n  \
            dedupfs rm <ws>\n  \
@@ -140,6 +142,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         cfg.pack_target_bytes = parse_size(raw)?;
                         i += 2;
                     }
+                    "--exclude" => {
+                        let raw = args.get(i + 1).ok_or("--exclude requires a pattern")?;
+                        push_unique(&mut cfg.import_exclude, raw);
+                        i += 2;
+                    }
+                    "--no-dedup" => {
+                        let raw = args.get(i + 1).ok_or("--no-dedup requires a pattern")?;
+                        push_unique(&mut cfg.no_dedup, raw);
+                        i += 2;
+                    }
+                    "--unity-preset" => {
+                        for &p in UNITY_IMPORT_EXCLUDE_PRESET {
+                            push_unique(&mut cfg.import_exclude, p);
+                        }
+                        for &p in UNITY_NO_DEDUP_PRESET {
+                            push_unique(&mut cfg.no_dedup, p);
+                        }
+                        i += 1;
+                    }
                     other if other.starts_with('-') => {
                         return Err(format!("unknown option {other:?}").into());
                     }
@@ -151,7 +172,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if pos.len() > 1 {
                 return Err(
-                    "usage: dedupfs init [dir] [--codec zstd1|lz4|none] [--pack-size 128M]".into(),
+                    "usage: dedupfs init [dir] [--codec zstd1|lz4|none] [--pack-size 128M] [--exclude <pat>] [--no-dedup <pat>] [--unity-preset]"
+                        .into(),
                 );
             }
             let store_dir = pos
@@ -161,11 +183,107 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| PathBuf::from("."));
             let store = DedupStore::init(&store_dir, cfg)?;
             println!(
-                "initialized dedup store at {} (codec={}, pack_size={})",
+                "initialized dedup store at {} (codec={}, pack_size={}, import_exclude={}, no_dedup={})",
                 store.root().display(),
                 store.config().codec.as_str(),
                 fmt_bytes(store.config().pack_target_bytes),
+                store.config().import_exclude.len(),
+                store.config().no_dedup.len(),
             );
+        }
+        "config" => {
+            let mut add_exclude: Vec<String> = Vec::new();
+            let mut rm_exclude: Vec<String> = Vec::new();
+            let mut add_no_dedup: Vec<String> = Vec::new();
+            let mut rm_no_dedup: Vec<String> = Vec::new();
+            let mut unity_preset = false;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--show" => {
+                        i += 1;
+                    }
+                    "--add-exclude" => {
+                        add_exclude.push(
+                            args.get(i + 1)
+                                .ok_or("--add-exclude requires a pattern")?
+                                .clone(),
+                        );
+                        i += 2;
+                    }
+                    "--rm-exclude" => {
+                        rm_exclude.push(
+                            args.get(i + 1)
+                                .ok_or("--rm-exclude requires a pattern")?
+                                .clone(),
+                        );
+                        i += 2;
+                    }
+                    "--add-no-dedup" => {
+                        add_no_dedup.push(
+                            args.get(i + 1)
+                                .ok_or("--add-no-dedup requires a pattern")?
+                                .clone(),
+                        );
+                        i += 2;
+                    }
+                    "--rm-no-dedup" => {
+                        rm_no_dedup.push(
+                            args.get(i + 1)
+                                .ok_or("--rm-no-dedup requires a pattern")?
+                                .clone(),
+                        );
+                        i += 2;
+                    }
+                    "--unity-preset" => {
+                        unity_preset = true;
+                        i += 1;
+                    }
+                    other => {
+                        return Err(format!(
+                            "unknown option {other:?}; usage: dedupfs [--store <dir>] config [--add-exclude <pat>] [--rm-exclude <pat>] [--add-no-dedup <pat>] [--rm-no-dedup <pat>] [--unity-preset]"
+                        )
+                        .into());
+                    }
+                }
+            }
+            let store_dir = discover_store(explicit_store.as_deref())?;
+            let modified = !add_exclude.is_empty()
+                || !rm_exclude.is_empty()
+                || !add_no_dedup.is_empty()
+                || !rm_no_dedup.is_empty()
+                || unity_preset;
+            let cfg = if modified {
+                DedupStore::update_config(&store_dir, |cfg| {
+                    if unity_preset {
+                        for &p in UNITY_IMPORT_EXCLUDE_PRESET {
+                            push_unique(&mut cfg.import_exclude, p);
+                        }
+                        for &p in UNITY_NO_DEDUP_PRESET {
+                            push_unique(&mut cfg.no_dedup, p);
+                        }
+                    }
+                    for p in &add_exclude {
+                        push_unique(&mut cfg.import_exclude, p);
+                    }
+                    for p in &rm_exclude {
+                        cfg.import_exclude.retain(|x| !x.eq_ignore_ascii_case(p));
+                    }
+                    for p in &add_no_dedup {
+                        push_unique(&mut cfg.no_dedup, p);
+                    }
+                    for p in &rm_no_dedup {
+                        cfg.no_dedup.retain(|x| !x.eq_ignore_ascii_case(p));
+                    }
+                })?
+            } else {
+                DedupStore::open(&store_dir)?.config().clone()
+            };
+            println!("store          : {}", store_dir.display());
+            println!("codec          : {}", cfg.codec.as_str());
+            println!("pack_target    : {}", fmt_bytes(cfg.pack_target_bytes));
+            println!("import_exclude : {:?}", cfg.import_exclude);
+            println!("no_dedup       : {:?}", cfg.no_dedup);
         }
         "create" => {
             if args.len() != 2 {
@@ -180,6 +298,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "import" => {
             let mut ws_name: Option<String> = None;
             let mut update = false;
+            let mut extra_excludes: Vec<String> = Vec::new();
             let mut threads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(8);
@@ -194,6 +313,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "--update" | "-u" => {
                         update = true;
                         i += 1;
+                    }
+                    "--exclude" => {
+                        extra_excludes.push(
+                            args.get(i + 1)
+                                .ok_or("--exclude requires a pattern")?
+                                .clone(),
+                        );
+                        i += 2;
                     }
                     "--threads" => {
                         let raw = args.get(i + 1).ok_or("--threads requires a value")?;
@@ -211,7 +338,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if pos.len() != 1 {
                 return Err(
-                    "usage: dedupfs [--store <dir>] import <source_dir> [--name <ws>] [--update] [--threads N]"
+                    "usage: dedupfs [--store <dir>] import <source_dir> [--name <ws>] [--update] [--exclude <pat>] [--threads N]"
                         .into(),
                 );
             }
@@ -230,12 +357,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mb_s = p.logical_bytes as f64 / (1024.0 * 1024.0) / secs;
                 if update {
                     eprintln!(
-                        "  [{:>5.0}s] {:>9} files (unchanged={}, updated={}, removed={}), {} logical -> {} new unique ({} stored), {:.0} MB/s",
+                        "  [{:>5.0}s] {:>9} files (unchanged={}, updated={}, removed={}, excluded={}), {} logical -> {} new unique ({} stored), {:.0} MB/s",
                         secs,
                         p.files,
                         p.unchanged_files,
                         p.updated_files,
                         p.removed_entries,
+                        p.excluded_entries,
                         fmt_bytes(p.logical_bytes),
                         fmt_bytes(p.new_unique_bytes),
                         fmt_bytes(p.stored_bytes),
@@ -243,9 +371,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 } else {
                     eprintln!(
-                        "  [{:>5.0}s] {:>9} files, {} logical -> {} new unique ({} stored), {:.0} MB/s",
+                        "  [{:>5.0}s] {:>9} files (excluded={}), {} logical -> {} new unique ({} stored), {:.0} MB/s",
                         secs,
                         p.files,
+                        p.excluded_entries,
                         fmt_bytes(p.logical_bytes),
                         fmt_bytes(p.new_unique_bytes),
                         fmt_bytes(p.stored_bytes),
@@ -253,14 +382,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             });
-            let sum = if update {
-                store.import_dir_update(&src_path, &ws, threads, Some(cb))?
-            } else {
-                store.import_dir(&src_path, &ws, threads, Some(cb))?
-            };
+            let sum = store.import_dir_with_options(
+                &src_path,
+                &ws,
+                threads,
+                &extra_excludes,
+                update,
+                Some(cb),
+            )?;
             if update {
                 println!(
-                    "updated `{}` (ws_id={}): {} files (unchanged={}, updated={}, added={}, removed={}), {} dirs, {} logical -> {} new unique ({} stored, {} hot-DB pinned, {} errors) in {:.1}s",
+                    "updated `{}` (ws_id={}): {} files (unchanged={}, updated={}, added={}, removed={}, excluded={}), {} dirs, {} logical -> {} new unique ({} stored, {} hot-DB pinned, {} errors) in {:.1}s",
                     sum.workspace,
                     sum.ws_id,
                     sum.files,
@@ -268,6 +400,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     sum.updated_files,
                     sum.files.saturating_sub(sum.unchanged_files + sum.updated_files),
                     sum.removed_entries,
+                    sum.excluded_entries,
                     sum.dirs,
                     fmt_bytes(sum.logical_bytes),
                     fmt_bytes(sum.new_unique_bytes),
@@ -278,10 +411,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             } else {
                 println!(
-                    "imported `{}` (ws_id={}): {} files, {} dirs, {} logical -> {} new unique ({} stored, {} hot-DB pinned, {} errors) in {:.1}s ({:.0} MB/s)",
+                    "imported `{}` (ws_id={}): {} files (excluded={}), {} dirs, {} logical -> {} new unique ({} stored, {} hot-DB pinned, {} errors) in {:.1}s ({:.0} MB/s)",
                     sum.workspace,
                     sum.ws_id,
                     sum.files,
+                    sum.excluded_entries,
                     sum.dirs,
                     fmt_bytes(sum.logical_bytes),
                     fmt_bytes(sum.new_unique_bytes),
@@ -511,6 +645,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         other => return Err(format!("unknown command {other:?}; run `dedupfs --help`").into()),
     }
     Ok(())
+}
+
+fn push_unique(list: &mut Vec<String>, pat: &str) {
+    if !list.iter().any(|x| x.eq_ignore_ascii_case(pat)) {
+        list.push(pat.to_owned());
+    }
 }
 
 fn main() {

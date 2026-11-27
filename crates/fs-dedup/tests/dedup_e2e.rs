@@ -494,3 +494,96 @@ fn cli_auto_discovers_store_from_cwd_and_env() {
     );
     assert!(flag_stats.contains("workspaces     : 1"));
 }
+
+#[test]
+fn directory_filters_exclude_on_import_and_skip_dedup_at_runtime() {
+    let tmp = TempDir::new("dir_filters");
+    let store_dir = tmp.0.join("store");
+    let src = tmp.0.join("src");
+    std::fs::create_dir_all(src.join("Assets")).unwrap();
+    std::fs::create_dir_all(src.join("Temp")).unwrap();
+    std::fs::create_dir_all(src.join("Library").join("ShaderCache")).unwrap();
+    std::fs::create_dir_all(src.join("Library").join("Artifacts")).unwrap();
+    std::fs::write(src.join("Assets").join("hero.txt"), b"keep-hero").unwrap();
+    std::fs::write(src.join("Temp").join("UnityLockfile"), b"ephemeral-temp").unwrap();
+    std::fs::write(
+        src.join("Library").join("ShaderCache").join("s.bin"),
+        b"shader-cache",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("Library").join("Artifacts").join("a.bin"),
+        b"artifact-data",
+    )
+    .unwrap();
+
+    let cfg = StoreConfig {
+        import_exclude: vec!["Temp".to_owned(), "Library/ShaderCache".to_owned()],
+        no_dedup: vec!["Temp".to_owned(), "Logs".to_owned()],
+        ..StoreConfig::default()
+    };
+    let store = DedupStore::init(&store_dir, cfg).unwrap();
+
+    // 1. Import skips Temp/ and Library/ShaderCache/, keeps Assets/ and Library/Artifacts/.
+    let sum = store.import_dir(&src, "unity", 2, None).unwrap();
+    assert_eq!(sum.files, 2, "only hero.txt and Artifacts/a.bin imported");
+    assert_eq!(sum.excluded_entries, 2, "Temp and Library/ShaderCache excluded");
+
+    let backend = DedupWorkspaceBackend::open(store.clone(), "unity").unwrap();
+    assert!(backend
+        .open_dir(&OpsPath::new(b"/Temp"))
+        .is_err());
+    assert!(backend
+        .open_dir(&OpsPath::new(b"/Library/ShaderCache"))
+        .is_err());
+    assert!(backend
+        .create_or_open(&OpsPath::new(b"/Assets/hero.txt"), Disposition::Open)
+        .is_ok());
+
+    // 2. At runtime (e.g. Unity opens project), Unity creates `/Temp/runtime.tmp` and `/Assets/new.txt`.
+    //    `dedup_workspace` must deduplicate `/Assets/new.txt` into packs, while keeping `/Temp/runtime.tmp`
+    //    in the local loose overlay (skipped via `no_dedup`)!
+    backend.mkdir(&OpsPath::new(b"/Temp")).unwrap();
+    let f_temp = backend
+        .create_or_open(&OpsPath::new(b"/Temp/runtime.tmp"), Disposition::Create)
+        .unwrap();
+    backend.write(f_temp.file_id, 0, b"unity-temp-scratch").unwrap();
+
+    let f_new = backend
+        .create_or_open(&OpsPath::new(b"/Assets/new.txt"), Disposition::Create)
+        .unwrap();
+    backend.write(f_new.file_id, 0, b"real-asset-change").unwrap();
+
+    let dsum = store
+        .dedup_workspace(Some("unity"), 0, |_, _| false)
+        .unwrap();
+    assert_eq!(dsum.deduped_files, 1, "Assets/new.txt should be deduped");
+    assert_eq!(dsum.skipped_filtered, 1, "Temp/runtime.tmp must skip dedup");
+    assert!(
+        store
+            .overlay()
+            .file_path(backend.ws_id(), f_temp.file_id)
+            .exists(),
+        "Temp/runtime.tmp stays as local loose overlay file"
+    );
+    assert!(
+        !store
+            .overlay()
+            .file_path(backend.ws_id(), f_new.file_id)
+            .exists(),
+        "Assets/new.txt overlay file reclaimed after dedup"
+    );
+
+    // 3. `DedupStore::update_config` persists config updates cleanly to `store.json`.
+    let updated = DedupStore::update_config(&store_dir, |c| {
+        c.import_exclude.push("Logs".to_owned());
+    })
+    .unwrap();
+    assert!(updated.import_exclude.iter().any(|p| p == "Logs"));
+    let reopened = DedupStore::open(&store_dir).unwrap();
+    assert!(reopened
+        .config()
+        .import_exclude
+        .iter()
+        .any(|p| p == "Logs"));
+}

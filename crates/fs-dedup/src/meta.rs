@@ -27,6 +27,15 @@ pub struct StoreConfig {
     pub codec: Codec,
     pub pack_target_bytes: u64,
     pub volume_size_bytes: u64,
+    /// Directory/file patterns skipped during `import` and `import --update`
+    /// (e.g. `"Temp"`, `"Logs"`, `"Library/ShaderCache"`).
+    #[serde(default)]
+    pub import_exclude: Vec<String>,
+    /// Directory/file patterns kept in local NTFS sparse overlay (never moved to pack CAS
+    /// by background `dedup`), so Unity/IDE ephemeral folders stay native-speed without
+    /// creating dead pack churn.
+    #[serde(default)]
+    pub no_dedup: Vec<String>,
 }
 
 impl Default for StoreConfig {
@@ -36,6 +45,8 @@ impl Default for StoreConfig {
             codec: Codec::Zstd1,
             pack_target_bytes: DEFAULT_PACK_TARGET_BYTES,
             volume_size_bytes: 2 * 1024 * 1024 * 1024 * 1024, // 2 TiB reported virtual volume
+            import_exclude: Vec::new(),
+            no_dedup: Vec::new(),
         }
     }
 }

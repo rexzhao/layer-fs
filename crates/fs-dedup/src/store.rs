@@ -3,6 +3,7 @@
 
 use crate::chunker::{blake3_hash, chunk_bytes, chunk_reader, compress_chunk, Codec, Hash32};
 use crate::error::{Error, Result};
+use crate::filter;
 use crate::meta::{
     create_empty_workspace, decode_manifest, encode_manifest, find_workspace_id, get_chunk_loc,
     is_hot_db_name, load_inode, next_pack_id, now_ns, open_meta_connection,
@@ -34,6 +35,7 @@ pub struct ImportProgress {
     pub unchanged_files: u64,
     pub updated_files: u64,
     pub removed_entries: u64,
+    pub excluded_entries: u64,
     pub dirs: u64,
     pub logical_bytes: u64,
     pub new_unique_bytes: u64,
@@ -51,6 +53,7 @@ pub struct ImportSummary {
     pub unchanged_files: u64,
     pub updated_files: u64,
     pub removed_entries: u64,
+    pub excluded_entries: u64,
     pub dirs: u64,
     pub logical_bytes: u64,
     pub new_unique_chunks: u64,
@@ -68,6 +71,7 @@ pub struct DedupSummary {
     pub deduped_files: u64,
     pub skipped_busy: u64,
     pub skipped_changed: u64,
+    pub skipped_filtered: u64,
     pub raw_bytes: u64,
     pub new_unique_bytes: u64,
     pub stored_bytes: u64,
@@ -202,6 +206,31 @@ impl DedupStore {
             overlay,
             inode_locks,
         }))
+    }
+
+    /// Updates `<store>/store.json` atomically via `mutate` and returns the saved config.
+    pub fn update_config(
+        dir: impl AsRef<Path>,
+        mutate: impl FnOnce(&mut StoreConfig),
+    ) -> Result<StoreConfig> {
+        let root = fs::canonicalize(dir.as_ref()).unwrap_or_else(|_| dir.as_ref().to_path_buf());
+        let config_path = root.join("store.json");
+        if !config_path.exists() {
+            return Err(Error::NotFound(format!(
+                "no dedup store found at {}",
+                root.display()
+            )));
+        }
+        let raw_cfg = fs::read_to_string(&config_path)?;
+        let mut config: StoreConfig = serde_json::from_str(&raw_cfg)
+            .map_err(|e| Error::Corrupt(format!("invalid store.json: {e}")))?;
+        mutate(&mut config);
+        let json = serde_json::to_string_pretty(&config)
+            .map_err(|e| Error::Other(format!("serialize store.json: {e}")))?;
+        let tmp_path = root.join("store.json.tmp");
+        fs::write(&tmp_path, json)?;
+        fs::rename(&tmp_path, &config_path)?;
+        Ok(config)
     }
 
     pub fn root(&self) -> &Path {
@@ -508,30 +537,7 @@ impl DedupStore {
         threads: usize,
         progress_cb: Option<Box<dyn Fn(ImportProgress) + Send + Sync>>,
     ) -> Result<ImportSummary> {
-        let start = Instant::now();
-        let canon_src = self.validate_import_source(source.as_ref())?;
-        let ws_id = self.create_workspace(ws_name)?;
-        let result = self.import_dir_inner(
-            ws_id,
-            ROOT_INODE + 1,
-            false,
-            &canon_src,
-            threads.max(1),
-            progress_cb,
-        );
-        match result {
-            Ok(mut summary) => {
-                summary.workspace = ws_name.to_owned();
-                summary.ws_id = ws_id;
-                summary.elapsed_secs = start.elapsed().as_secs_f64();
-                Ok(summary)
-            }
-            Err(err) => {
-                // Clean up partial workspace on fresh import failure.
-                let _ = self.remove_workspace(ws_name);
-                Err(err)
-            }
-        }
+        self.import_dir_with_options(source, ws_name, threads, &[], false, progress_cb)
     }
 
     /// Incrementally updates an existing workspace from `source` (or creates it if absent).
@@ -547,32 +553,78 @@ impl DedupStore {
         threads: usize,
         progress_cb: Option<Box<dyn Fn(ImportProgress) + Send + Sync>>,
     ) -> Result<ImportSummary> {
-        let existing = {
-            let conn = self.meta.lock().unwrap();
-            conn.query_row(
-                "SELECT ws_id, next_inode FROM workspaces WHERE name = ?1",
-                params![ws_name],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-            )
-            .optional()?
-        };
-        let Some((ws_id, initial_next_inode)) = existing else {
-            return self.import_dir(source, ws_name, threads, progress_cb);
-        };
+        self.import_dir_with_options(source, ws_name, threads, &[], true, progress_cb)
+    }
+
+    /// Full-featured import/update entry point supporting additional one-shot `--exclude` patterns
+    /// merged with `store.json`'s `import_exclude` rules.
+    pub fn import_dir_with_options(
+        self: &Arc<Self>,
+        source: impl AsRef<Path>,
+        ws_name: &str,
+        threads: usize,
+        extra_excludes: &[String],
+        update: bool,
+        progress_cb: Option<Box<dyn Fn(ImportProgress) + Send + Sync>>,
+    ) -> Result<ImportSummary> {
+        let mut excludes = self.config.import_exclude.clone();
+        for pat in extra_excludes {
+            if !excludes.iter().any(|e| e.eq_ignore_ascii_case(pat)) {
+                excludes.push(pat.clone());
+            }
+        }
         let start = Instant::now();
         let canon_src = self.validate_import_source(source.as_ref())?;
-        let mut summary = self.import_dir_inner(
+
+        if update {
+            let existing = {
+                let conn = self.meta.lock().unwrap();
+                conn.query_row(
+                    "SELECT ws_id, next_inode FROM workspaces WHERE name = ?1",
+                    params![ws_name],
+                    |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+                )
+                .optional()?
+            };
+            if let Some((ws_id, initial_next_inode)) = existing {
+                let mut summary = self.import_dir_inner(
+                    ws_id,
+                    initial_next_inode.max(ROOT_INODE + 1),
+                    true,
+                    &canon_src,
+                    &excludes,
+                    threads.max(1),
+                    progress_cb,
+                )?;
+                summary.workspace = ws_name.to_owned();
+                summary.ws_id = ws_id;
+                summary.elapsed_secs = start.elapsed().as_secs_f64();
+                return Ok(summary);
+            }
+        }
+
+        let ws_id = self.create_workspace(ws_name)?;
+        let result = self.import_dir_inner(
             ws_id,
-            initial_next_inode.max(ROOT_INODE + 1),
-            true,
+            ROOT_INODE + 1,
+            false,
             &canon_src,
+            &excludes,
             threads.max(1),
             progress_cb,
-        )?;
-        summary.workspace = ws_name.to_owned();
-        summary.ws_id = ws_id;
-        summary.elapsed_secs = start.elapsed().as_secs_f64();
-        Ok(summary)
+        );
+        match result {
+            Ok(mut summary) => {
+                summary.workspace = ws_name.to_owned();
+                summary.ws_id = ws_id;
+                summary.elapsed_secs = start.elapsed().as_secs_f64();
+                Ok(summary)
+            }
+            Err(err) => {
+                let _ = self.remove_workspace(ws_name);
+                Err(err)
+            }
+        }
     }
 
     fn validate_import_source(&self, source: &Path) -> Result<PathBuf> {
@@ -649,12 +701,14 @@ impl DedupStore {
         Ok(removed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn import_dir_inner(
         self: &Arc<Self>,
         ws_id: u64,
         initial_next_inode: u64,
         is_update: bool,
         canon_src: &Path,
+        excludes: &[String],
         threads: usize,
         progress_cb: Option<Box<dyn Fn(ImportProgress) + Send + Sync>>,
     ) -> Result<ImportSummary> {
@@ -718,6 +772,7 @@ impl DedupStore {
         let unchanged_done = Arc::new(AtomicU64::new(0));
         let updated_done = Arc::new(AtomicU64::new(0));
         let removed_done = Arc::new(AtomicU64::new(0));
+        let excluded_done = Arc::new(AtomicU64::new(0));
         let dirs_done = Arc::new(AtomicU64::new(1)); // root dir
         let logical_done = Arc::new(AtomicU64::new(0));
         let unique_done = Arc::new(AtomicU64::new(0));
@@ -743,6 +798,7 @@ impl DedupStore {
             let unc = Arc::clone(&unchanged_done);
             let upd = Arc::clone(&updated_done);
             let rem = Arc::clone(&removed_done);
+            let exc = Arc::clone(&excluded_done);
             let d = Arc::clone(&dirs_done);
             let l = Arc::clone(&logical_done);
             let u = Arc::clone(&unique_done);
@@ -760,6 +816,7 @@ impl DedupStore {
                         unchanged_files: unc.load(Ordering::Relaxed),
                         updated_files: upd.load(Ordering::Relaxed),
                         removed_entries: rem.load(Ordering::Relaxed),
+                        excluded_entries: exc.load(Ordering::Relaxed),
                         dirs: d.load(Ordering::Relaxed),
                         logical_bytes: l.load(Ordering::Relaxed),
                         new_unique_bytes: u.load(Ordering::Relaxed),
@@ -1076,7 +1133,8 @@ impl DedupStore {
 
         type PendingDir = (u64, u64, Vec<u8>, Vec<u8>, i64, i64);
         // Walk source directory tree, batch-inserting directories and feeding file jobs to workers.
-        let mut dir_stack: Vec<(PathBuf, u64)> = vec![(canon_src.to_path_buf(), ROOT_INODE)];
+        let mut dir_stack: Vec<(PathBuf, u64, String)> =
+            vec![(canon_src.to_path_buf(), ROOT_INODE, String::new())];
         let mut pending_dirs: Vec<PendingDir> = Vec::with_capacity(1024);
 
         let flush_dirs = |pending: &mut Vec<PendingDir>| -> Result<()> {
@@ -1118,7 +1176,7 @@ impl DedupStore {
             Ok(())
         };
 
-        while let Some((dir_path, parent_id)) = dir_stack.pop() {
+        while let Some((dir_path, parent_id, rel_dir)) = dir_stack.pop() {
             // In `--update` mode, load existing children of this directory once so unchanged files
             // are skipped with zero file opens and deleted entries are detected cleanly.
             let mut existing_children: HashMap<Vec<u8>, ExistingChild> = if is_update {
@@ -1207,6 +1265,15 @@ impl DedupStore {
                     }
                     continue;
                 };
+                let rel_path = if rel_dir.is_empty() {
+                    name_str.to_owned()
+                } else {
+                    format!("{rel_dir}/{name_str}")
+                };
+                if !excludes.is_empty() && filter::matches_any(&rel_path, excludes) {
+                    excluded_done.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let display_name = name_str.as_bytes().to_vec();
                 let folded_name = fold_bytes(&display_name);
                 let created_ns = meta
@@ -1237,7 +1304,7 @@ impl DedupStore {
                                     params![display_name.as_slice(), ws_id as i64, parent_id as i64, folded_name.as_slice()],
                                 )?;
                             }
-                            dir_stack.push((child_path, p.inode_id));
+                            dir_stack.push((child_path, p.inode_id, rel_path));
                             continue;
                         }
                         // Previously a file, now a directory: remove the old file first.
@@ -1274,14 +1341,16 @@ impl DedupStore {
                     if pending_dirs.len() >= 1024 {
                         flush_dirs(&mut pending_dirs)?;
                     }
-                    dir_stack.push((child_path, inode_id));
+                    dir_stack.push((child_path, inode_id, rel_path));
                 } else if ft.is_file() {
                     let attrs = if meta.permissions().readonly() {
                         0x01u32
                     } else {
                         0u32
                     };
-                    let pinned = is_hot_db_name(name_str);
+                    let pinned = is_hot_db_name(name_str)
+                        || (!self.config.no_dedup.is_empty()
+                            && filter::matches_any(&rel_path, &self.config.no_dedup));
                     let mut replacing_mode = None;
                     let inode_id = if let Some(p) = prev {
                         if p.kind == KIND_FILE {
@@ -1410,6 +1479,7 @@ impl DedupStore {
             unchanged_files: unchanged_done.load(Ordering::Relaxed),
             updated_files: updated_done.load(Ordering::Relaxed),
             removed_entries: removed_done.load(Ordering::Relaxed),
+            excluded_entries: excluded_done.load(Ordering::Relaxed),
             dirs: dirs_done.load(Ordering::Relaxed),
             logical_bytes: logical_done.load(Ordering::Relaxed),
             new_unique_chunks: unique_chunks_done.load(Ordering::Relaxed),
@@ -1499,7 +1569,39 @@ impl DedupStore {
             ..Default::default()
         };
 
+        // Reconstruct relative path for each candidate when `no_dedup` directory rules are configured.
+        let resolve_rel_path = |ws_id: u64, mut node_id: u64| -> Option<String> {
+            let conn = self.meta.lock().unwrap();
+            let mut parts: Vec<String> = Vec::new();
+            let mut depth = 0usize;
+            while node_id != ROOT_INODE && depth < 512 {
+                let row: Option<(i64, Vec<u8>)> = conn
+                    .query_row(
+                        "SELECT parent_id, display_name FROM dentries WHERE ws_id = ?1 AND child_id = ?2 LIMIT 1",
+                        params![ws_id as i64, node_id as i64],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                let (parent_id, name_bytes) = row?;
+                parts.push(String::from_utf8_lossy(&name_bytes).into_owned());
+                node_id = parent_id as u64;
+                depth += 1;
+            }
+            parts.reverse();
+            Some(parts.join("/"))
+        };
+
         for (ws_id, inode_id, expected_size, expected_written_ns) in candidates {
+            if !self.config.no_dedup.is_empty() {
+                if let Some(rel) = resolve_rel_path(ws_id, inode_id) {
+                    if filter::matches_any(&rel, &self.config.no_dedup) {
+                        summary.skipped_filtered += 1;
+                        continue;
+                    }
+                }
+            }
             if is_busy(ws_id, inode_id) {
                 summary.skipped_busy += 1;
                 continue;
