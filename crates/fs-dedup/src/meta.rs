@@ -233,6 +233,11 @@ CREATE TABLE IF NOT EXISTS dentries (
 
 CREATE INDEX IF NOT EXISTS idx_dentries_child
     ON dentries(ws_id, child_id);
+
+CREATE TABLE IF NOT EXISTS pending_chunk_releases (
+    hash        BLOB PRIMARY KEY,
+    count       INTEGER NOT NULL
+) WITHOUT ROWID;
 "#;
 
 /// Opens and configures `meta.sqlite` with fast WAL settings tuned for metadata-only workloads.
@@ -303,6 +308,87 @@ pub fn get_chunk_loc(conn: &Connection, hash: &Hash32) -> Result<Option<ChunkLoc
         })),
         None => Ok(None),
     }
+}
+
+/// Records deferred chunk refcount decrements durably inside the same SQLite transaction
+/// as manifest updates/deletes so a crash or mid-import failure never loses refcount releases.
+pub fn enqueue_pending_chunk_release(
+    tx: &rusqlite::Transaction<'_>,
+    hash: &Hash32,
+    count: u64,
+) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare_cached(
+        "INSERT INTO pending_chunk_releases (hash, count) VALUES (?1, ?2)
+         ON CONFLICT(hash) DO UPDATE SET count = count + excluded.count",
+    )?;
+    stmt.execute(params![hash.as_slice(), count as i64])?;
+    Ok(())
+}
+
+/// Cancels up to `add_refs` against any durably queued release for `hash` inside `tx`,
+/// returning the number of refs cancelled (which therefore need neither decrement nor increment).
+pub fn cancel_pending_chunk_release(
+    tx: &rusqlite::Transaction<'_>,
+    hash: &Hash32,
+    add_refs: u64,
+) -> Result<u64> {
+    if add_refs == 0 {
+        return Ok(0);
+    }
+    let mut sel =
+        tx.prepare_cached("SELECT count FROM pending_chunk_releases WHERE hash = ?1")?;
+    let existing: Option<i64> = sel
+        .query_row(params![hash.as_slice()], |r| r.get(0))
+        .optional()?;
+    let Some(cur) = existing else {
+        return Ok(0);
+    };
+    let cur_u64 = cur.max(0) as u64;
+    let cancel = add_refs.min(cur_u64);
+    let rem = cur_u64 - cancel;
+    if rem == 0 {
+        let mut del = tx.prepare_cached("DELETE FROM pending_chunk_releases WHERE hash = ?1")?;
+        del.execute(params![hash.as_slice()])?;
+    } else {
+        let mut upd = tx.prepare_cached(
+            "UPDATE pending_chunk_releases SET count = ?1 WHERE hash = ?2",
+        )?;
+        upd.execute(params![rem as i64, hash.as_slice()])?;
+    }
+    Ok(cancel)
+}
+
+/// Applies and clears all durably queued `pending_chunk_releases` inside `tx`, returning the
+/// list of chunk hashes whose refcount dropped to 0 and were removed from `chunks`.
+pub fn replay_pending_chunk_releases(tx: &rusqlite::Transaction<'_>) -> Result<Vec<Hash32>> {
+    let mut rows_to_apply: Vec<(Hash32, u64)> = Vec::new();
+    {
+        let mut stmt = tx.prepare("SELECT hash, count FROM pending_chunk_releases")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (h_bytes, count) = row?;
+            if h_bytes.len() == 32 && count > 0 {
+                let hash: Hash32 = h_bytes.try_into().unwrap();
+                rows_to_apply.push((hash, count as u64));
+            }
+        }
+    }
+    if rows_to_apply.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut deleted = Vec::new();
+    for (hash, count) in rows_to_apply {
+        if decrement_chunk_refs(tx, &hash, count)? {
+            deleted.push(hash);
+        }
+    }
+    tx.execute("DELETE FROM pending_chunk_releases", [])?;
+    Ok(deleted)
 }
 
 /// Decrements a chunk's refcount by `dec_refs`; if refcount reaches `<= 0`, deletes the row

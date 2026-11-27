@@ -5,11 +5,12 @@ use crate::chunker::{blake3_hash, chunk_bytes, chunk_reader, compress_chunk, Cod
 use crate::error::{Error, Result};
 use crate::filter;
 use crate::meta::{
-    create_empty_workspace, decode_manifest, decrement_chunk_refs, encode_manifest,
-    find_workspace_id, get_chunk_loc, is_hot_db_name, load_inode, next_pack_id, now_ns,
-    open_meta_connection, open_readonly_meta_connection, release_manifest_chunks,
-    upsert_chunk_ref, upsert_pack_updates, InodeRow, ManifestEntry, StoreConfig, StoreStats,
-    WorkspaceInfo, KIND_DIR, KIND_FILE, ROOT_INODE, STORAGE_CHUNKS, STORAGE_OVERLAY,
+    cancel_pending_chunk_release, create_empty_workspace, decode_manifest, encode_manifest,
+    enqueue_pending_chunk_release, find_workspace_id, get_chunk_loc, is_hot_db_name, load_inode,
+    next_pack_id, now_ns, open_meta_connection, open_readonly_meta_connection,
+    release_manifest_chunks, replay_pending_chunk_releases, upsert_chunk_ref, upsert_pack_updates,
+    InodeRow, ManifestEntry, StoreConfig, StoreStats, WorkspaceInfo, KIND_DIR, KIND_FILE,
+    ROOT_INODE, STORAGE_CHUNKS, STORAGE_OVERLAY,
 };
 use crate::overlay::OverlayStore;
 use crate::pack::{ChunkLoc, PackStore, DEFAULT_CACHE_BYTES, RECORD_HEADER_BYTES};
@@ -288,36 +289,82 @@ fn clock_evict_quarter_inodes(
     }
 }
 
+struct ByteBudgetState {
+    used: usize,
+    cancelled: bool,
+}
+
 /// Byte-level backpressure semaphore bounding total in-flight chunk payload memory between
-/// parallel import workers and the sequential pack committer.
+/// parallel import workers and the sequential pack committer, with RAII permits and cancellation.
 struct ByteBudget {
     max: usize,
-    used: Mutex<usize>,
+    state: Mutex<ByteBudgetState>,
     cvar: Condvar,
+}
+
+/// RAII permit returning reserved bytes to [`ByteBudget`] automatically on drop (including early
+/// `?` returns, channel teardown, or panics).
+struct BudgetPermit {
+    budget: Arc<ByteBudget>,
+    bytes: usize,
+}
+
+impl Drop for BudgetPermit {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            let mut st = self.budget.state.lock().unwrap();
+            st.used = st.used.saturating_sub(self.bytes);
+            self.budget.cvar.notify_all();
+        }
+    }
+}
+
+/// RAII guard that cancels a [`ByteBudget`] when the consumer thread exits (on error, panic, or return).
+struct CancelOnExit(Arc<ByteBudget>);
+
+impl Drop for CancelOnExit {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 impl ByteBudget {
     fn new(max: usize) -> Self {
         Self {
             max: max.max(1),
-            used: Mutex::new(0),
+            state: Mutex::new(ByteBudgetState {
+                used: 0,
+                cancelled: false,
+            }),
             cvar: Condvar::new(),
         }
     }
 
-    fn acquire(&self, bytes: usize) {
-        let mut used = self.used.lock().unwrap();
+    /// Acquires an RAII permit for `bytes`, returning `None` immediately if the pipeline was cancelled.
+    fn acquire(self: &Arc<Self>, bytes: usize) -> Option<BudgetPermit> {
+        let mut st = self.state.lock().unwrap();
         // Allow progress when `used == 0` even if a single chunk exceeds `max`.
-        while *used > 0 && used.saturating_add(bytes) > self.max {
-            used = self.cvar.wait(used).unwrap();
+        while !st.cancelled && st.used > 0 && st.used.saturating_add(bytes) > self.max {
+            st = self.cvar.wait(st).unwrap();
         }
-        *used = used.saturating_add(bytes);
+        if st.cancelled {
+            return None;
+        }
+        st.used = st.used.saturating_add(bytes);
+        Some(BudgetPermit {
+            budget: Arc::clone(self),
+            bytes,
+        })
     }
 
-    fn release(&self, bytes: usize) {
-        let mut used = self.used.lock().unwrap();
-        *used = used.saturating_sub(bytes);
+    fn cancel(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.cancelled = true;
         self.cvar.notify_all();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.state.lock().unwrap().cancelled
     }
 }
 
@@ -409,7 +456,7 @@ impl DedupStore {
         let inode_cache = (0..META_CACHE_SHARDS)
             .map(|_| RwLock::new(HashMap::new()))
             .collect();
-        Ok(Arc::new(Self {
+        let store = Arc::new(Self {
             root,
             config,
             meta_path,
@@ -419,7 +466,10 @@ impl DedupStore {
             inode_locks,
             chunk_loc_cache,
             inode_cache,
-        }))
+        });
+        // Recover any durable `pending_chunk_releases` left over from an interrupted/failed update.
+        store.recover_pending_releases_if_idle()?;
+        Ok(store)
     }
 
     /// Updates `<store>/store.json` atomically via `mutate` and returns the saved config.
@@ -595,6 +645,75 @@ impl DedupStore {
             .remove(&(ws_id, inode_id));
     }
 
+    /// Non-blocking attempt to acquire `pack.lock` (returns `Ok(None)` if another writer holds it).
+    fn try_acquire_pack_write_lock(&self) -> Result<Option<PackWriteGuard<'_>>> {
+        let lock_path = self.root.join("pack.lock");
+        let mut opts = OpenOptions::new();
+        opts.create(true).read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            opts.share_mode(0);
+        }
+        let lock_file = match opts.open(&lock_path) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        self.sync_pack_writer_from_db()?;
+        Ok(Some(PackWriteGuard {
+            store: self,
+            _lock_file: lock_file,
+        }))
+    }
+
+    fn sync_pack_writer_from_db(&self) -> Result<()> {
+        let (db_next, unsealed) = {
+            let conn = self.meta.lock().unwrap();
+            let next_id = next_pack_id(&conn)?;
+            let unsealed: Option<(u64, u64)> = conn
+                .query_row(
+                    "SELECT pack_id, size_bytes FROM packs WHERE sealed = 0 ORDER BY pack_id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+                )
+                .optional()?;
+            (next_id, unsealed)
+        };
+        self.packs.writer().sync_from_db(db_next, unsealed)
+    }
+
+    /// Replays any durably queued `pending_chunk_releases` when no active writer holds `pack.lock`.
+    fn recover_pending_releases_if_idle(&self) -> Result<()> {
+        let has_pending: bool = {
+            let conn = self.meta.lock().unwrap();
+            conn.query_row("SELECT 1 FROM pending_chunk_releases LIMIT 1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .is_some()
+        };
+        if !has_pending {
+            return Ok(());
+        }
+        let Some(_guard) = self.try_acquire_pack_write_lock()? else {
+            return Ok(());
+        };
+        self.replay_pending_releases_locked()
+    }
+
+    /// Applies and clears all rows in `pending_chunk_releases` (caller MUST hold `pack.lock`).
+    fn replay_pending_releases_locked(&self) -> Result<()> {
+        let deleted = {
+            let mut conn = self.meta.lock().unwrap();
+            let tx = conn.transaction()?;
+            let deleted = replay_pending_chunk_releases(&tx)?;
+            tx.commit()?;
+            deleted
+        };
+        self.invalidate_chunk_locs(&deleted);
+        Ok(())
+    }
+
     /// Acquires the exclusive `<store>/pack.lock` file and synchronizes `PackWriter`'s
     /// `next_pack_id` and active unsealed pack directly from `meta.sqlite`.
     /// Prevents independent `DedupStore` handles / processes from colliding on pack IDs.
@@ -624,19 +743,7 @@ impl DedupStore {
             }
         };
 
-        let (db_next, unsealed) = {
-            let conn = self.meta.lock().unwrap();
-            let next_id = next_pack_id(&conn)?;
-            let unsealed: Option<(u64, u64)> = conn
-                .query_row(
-                    "SELECT pack_id, size_bytes FROM packs WHERE sealed = 0 ORDER BY pack_id DESC LIMIT 1",
-                    [],
-                    |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-                )
-                .optional()?;
-            (next_id, unsealed)
-        };
-        self.packs.writer().sync_from_db(db_next, unsealed)?;
+        self.sync_pack_writer_from_db()?;
         Ok(PackWriteGuard {
             store: self,
             _lock_file: lock_file,
@@ -1052,7 +1159,6 @@ impl DedupStore {
         Ok(canon_src)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn delete_subtree(
         tx: &rusqlite::Transaction<'_>,
         ws_id: u64,
@@ -1061,7 +1167,6 @@ impl DedupStore {
         root_child_id: u64,
         root_kind: u8,
         overlay_to_delete: &mut Vec<u64>,
-        deferred_manifests: &mut Vec<Vec<u8>>,
     ) -> Result<u64> {
         let mut removed = 0u64;
         // Remove the entry binding in parent first.
@@ -1095,7 +1200,11 @@ impl DedupStore {
             if let Some(row) = load_inode(tx, ws_id, node_id)? {
                 if row.kind == KIND_FILE {
                     if row.storage_mode == STORAGE_CHUNKS && !row.manifest.is_empty() {
-                        deferred_manifests.push(row.manifest);
+                        // Persist deferred chunk releases atomically inside the same transaction
+                        // as the inode delete so a crash/failure never drifts refcounts.
+                        for e in decode_manifest(&row.manifest)? {
+                            enqueue_pending_chunk_release(tx, &e.hash, 1)?;
+                        }
                     } else if row.storage_mode == STORAGE_OVERLAY {
                         overlay_to_delete.push(node_id);
                     }
@@ -1121,6 +1230,8 @@ impl DedupStore {
         progress_cb: Option<Box<dyn Fn(ImportProgress) + Send + Sync>>,
     ) -> Result<ImportSummary> {
         let _pack_guard = self.acquire_pack_write_lock()?;
+        // Complete any pending releases from a previously interrupted import before starting.
+        self.replay_pending_releases_locked()?;
 
         struct ExistingChild {
             display_name: Vec<u8>,
@@ -1152,6 +1263,7 @@ impl DedupStore {
             codec: Codec,
             raw_len: u32,
             stored: Vec<u8>,
+            _permit: BudgetPermit,
         }
 
         struct PreparedFile {
@@ -1257,10 +1369,16 @@ impl DedupStore {
                 let mut file_buf = Vec::new();
                 let mut cached_known: Option<Arc<KnownChunks>> = None;
                 loop {
+                    if budget_w.is_cancelled() {
+                        break;
+                    }
                     let job = { rx.lock().unwrap().recv() };
                     let Ok(job) = job else {
                         break;
                     };
+                    if budget_w.is_cancelled() {
+                        break;
+                    }
                     if job.pinned_overlay {
                         // Copy hot DB file directly into the workspace's local sparse overlay.
                         let copy_res = (|| -> Result<u64> {
@@ -1334,25 +1452,31 @@ impl DedupStore {
                         let mut file_seen: HashSet<Hash32> = HashSet::new();
 
                         // Stream each newly compressed chunk immediately to the committer under
-                        // `ByteBudget` backpressure so peak RAM stays O(1) even for multi-GiB files!
+                        // RAII `ByteBudget` backpressure so peak RAM stays O(1) and failures wake
+                        // all waiters immediately without deadlocking!
                         let mut handle_chunk = |chunk: &[u8]| -> Result<()> {
+                            if budget_w.is_cancelled() {
+                                return Err(Error::Other("import cancelled".into()));
+                            }
                             let hash = blake3_hash(chunk);
                             let raw_len = chunk.len() as u32;
                             entries.push(ManifestEntry { hash, raw_len });
                             if !known.contains(&hash) && file_seen.insert(hash) {
                                 let (actual_codec, stored) = compress_chunk(codec, chunk)?;
                                 let charge = stored.len().max(1);
-                                budget_w.acquire(charge);
+                                let Some(permit) = budget_w.acquire(charge) else {
+                                    return Err(Error::Other("import cancelled".into()));
+                                };
                                 if tx
                                     .send(ImportMsg::Chunk(NewChunkBlob {
                                         hash,
                                         codec: actual_codec,
                                         raw_len,
                                         stored,
+                                        _permit: permit,
                                     }))
                                     .is_err()
                                 {
-                                    budget_w.release(charge);
                                     return Err(Error::Other("import committer disconnected".into()));
                                 }
                             }
@@ -1404,6 +1528,9 @@ impl DedupStore {
                             }));
                         }
                         Err(err) => {
+                            if budget_w.is_cancelled() {
+                                break;
+                            }
                             let n = errs.fetch_add(1, Ordering::Relaxed);
                             if n < 50 {
                                 eprintln!("  [import error] read {}: {err}", job.path.display());
@@ -1427,14 +1554,15 @@ impl DedupStore {
         let s_c = Arc::clone(&stored_done);
         let p_c = Arc::clone(&pinned_done);
         let committer = std::thread::spawn(move || -> Result<()> {
+            // Ensure ANY exit from committer (including `?` I/O errors or panics) immediately
+            // cancels `ByteBudget` and wakes all blocked workers so `import_dir` never hangs!
+            let _cancel_on_exit = CancelOnExit(Arc::clone(&budget_c));
             let mut batch: Vec<PreparedFile> = Vec::with_capacity(256);
             let mut pending_written_locs: HashMap<Hash32, ChunkLoc> = HashMap::new();
-            let mut deferred_releases: HashMap<Hash32, u64> = HashMap::new();
             let mut batch_pack_bytes: u64 = 0;
 
             let flush_batch = |batch: &mut Vec<PreparedFile>,
                                pending_written_locs: &mut HashMap<Hash32, ChunkLoc>,
-                               deferred_releases: &mut HashMap<Hash32, u64>,
                                batch_pack_bytes: &mut u64|
              -> Result<()> {
                 if batch.is_empty() {
@@ -1447,7 +1575,8 @@ impl DedupStore {
                     pw.take_pack_updates()
                 };
 
-                // Batch-commit chunks, pack sizes, inodes, and dentries in one SQLite txn.
+                // Batch-commit chunks, pack sizes, inodes, dentries, and durable
+                // `pending_chunk_releases` in ONE atomic SQLite transaction!
                 let mut overlays_to_remove: Vec<u64> = Vec::new();
                 let mut committed_hashes: Vec<Hash32> = Vec::new();
                 {
@@ -1486,8 +1615,8 @@ impl DedupStore {
                     }
 
                     // Compute NET refcount deltas: reused chunks cancel out before touching SQLite,
-                    // and net decrements are deferred until all workers finish so no chunk in
-                    // `KnownChunks` is ever deleted mid-import!
+                    // and any net decrements are recorded DURABLY in `pending_chunk_releases` inside
+                    // this same transaction so crash/failure recovery is always exact!
                     for (hash, mut add) in new_refs {
                         if let Some(old_cnt) = old_refs.get_mut(&hash) {
                             let cancel = add.min(*old_cnt);
@@ -1495,14 +1624,8 @@ impl DedupStore {
                             *old_cnt -= cancel;
                         }
                         if add > 0 {
-                            if let Some(def_cnt) = deferred_releases.get_mut(&hash) {
-                                let cancel = add.min(*def_cnt);
-                                add -= cancel;
-                                *def_cnt -= cancel;
-                                if *def_cnt == 0 {
-                                    deferred_releases.remove(&hash);
-                                }
-                            }
+                            let cancelled = cancel_pending_chunk_release(&tx, &hash, add)?;
+                            add -= cancelled;
                         }
                         if add > 0 {
                             let loc = pending_written_locs.remove(&hash);
@@ -1514,7 +1637,7 @@ impl DedupStore {
                     }
                     for (hash, dec) in old_refs {
                         if dec > 0 {
-                            *deferred_releases.entry(hash).or_insert(0) += dec;
+                            enqueue_pending_chunk_release(&tx, &hash, dec)?;
                         }
                     }
 
@@ -1590,7 +1713,6 @@ impl DedupStore {
             while let Ok(msg) = prep_rx.recv() {
                 match msg {
                     ImportMsg::Chunk(chunk) => {
-                        let charge = chunk.stored.len().max(1);
                         let known_opt = known_c.lock().unwrap().clone();
                         let already_present = pending_written_locs.contains_key(&chunk.hash)
                             || known_opt.as_ref().is_some_and(|k| k.contains(&chunk.hash));
@@ -1608,8 +1730,8 @@ impl DedupStore {
                             batch_pack_bytes =
                                 batch_pack_bytes.saturating_add(chunk.stored.len() as u64);
                         }
+                        // Dropping `chunk` automatically releases its RAII `BudgetPermit`.
                         drop(chunk);
-                        budget_c.release(charge);
                     }
                     ImportMsg::File(item) => {
                         batch.push(item);
@@ -1619,7 +1741,6 @@ impl DedupStore {
                             flush_batch(
                                 &mut batch,
                                 &mut pending_written_locs,
-                                &mut deferred_releases,
                                 &mut batch_pack_bytes,
                             )?;
                         }
@@ -1629,30 +1750,15 @@ impl DedupStore {
             flush_batch(
                 &mut batch,
                 &mut pending_written_locs,
-                &mut deferred_releases,
                 &mut batch_pack_bytes,
             )?;
 
-            // All workers have exited: safely apply any remaining deferred refcount decrements.
-            if !deferred_releases.is_empty() {
-                let mut deleted_hashes = Vec::new();
-                {
-                    let mut conn = store_c.meta.lock().unwrap();
-                    let tx = conn.transaction()?;
-                    for (hash, dec) in deferred_releases {
-                        if decrement_chunk_refs(&tx, &hash, dec)? {
-                            deleted_hashes.push(hash);
-                        }
-                    }
-                    tx.commit()?;
-                }
-                store_c.invalidate_chunk_locs(&deleted_hashes);
-            }
+            // All workers have exited: apply and clear all durably queued `pending_chunk_releases`.
+            store_c.replay_pending_releases_locked()?;
             Ok(())
         });
 
         type PendingDir = (u64, u64, Vec<u8>, Vec<u8>, i64, i64);
-        let mut deferred_deleted_manifests: Vec<Vec<u8>> = Vec::new();
         // Walk source directory tree, batch-inserting directories and feeding file jobs to workers.
         let mut dir_stack: Vec<(PathBuf, u64, String)> =
             vec![(canon_src.to_path_buf(), ROOT_INODE, String::new())];
@@ -1698,6 +1804,9 @@ impl DedupStore {
         };
 
         while let Some((dir_path, parent_id, rel_dir)) = dir_stack.pop() {
+            if budget.is_cancelled() {
+                break;
+            }
             // In `--update` mode, load existing children of this directory once so unchanged files
             // are skipped with zero file opens and deleted entries are detected cleanly.
             let mut existing_children: HashMap<Vec<u8>, ExistingChild> = if is_update {
@@ -1855,7 +1964,6 @@ impl DedupStore {
                                 p.inode_id,
                                 p.kind,
                                 &mut ov,
-                                &mut deferred_deleted_manifests,
                             )?;
                             removed_done.fetch_add(n, Ordering::Relaxed);
                             tx.commit()?;
@@ -1923,7 +2031,6 @@ impl DedupStore {
                                     p.inode_id,
                                     p.kind,
                                     &mut ov,
-                                    &mut deferred_deleted_manifests,
                                 )?;
                                 removed_done.fetch_add(n, Ordering::Relaxed);
                                 tx.commit()?;
@@ -1937,6 +2044,9 @@ impl DedupStore {
                         next_inode.fetch_add(1, Ordering::Relaxed)
                     };
 
+                    if budget.is_cancelled() {
+                        break;
+                    }
                     if job_tx
                         .send(ImportFileJob {
                             parent_id,
@@ -1959,7 +2069,7 @@ impl DedupStore {
             }
 
             // In `--update` mode, remove any children that no longer exist on the host.
-            if is_update && !existing_children.is_empty() {
+            if is_update && !budget.is_cancelled() && !existing_children.is_empty() {
                 let mut ov = Vec::new();
                 {
                     let mut conn = self.meta.lock().unwrap();
@@ -1973,7 +2083,6 @@ impl DedupStore {
                             child.inode_id,
                             child.kind,
                             &mut ov,
-                            &mut deferred_deleted_manifests,
                         )?;
                         removed_done.fetch_add(n, Ordering::Relaxed);
                     }
@@ -1984,31 +2093,35 @@ impl DedupStore {
                 }
             }
         }
-        flush_dirs(&mut pending_dirs)?;
+        if !budget.is_cancelled() {
+            if let Err(err) = flush_dirs(&mut pending_dirs) {
+                budget.cancel();
+                drop(job_tx);
+                for w in workers {
+                    let _ = w.join();
+                }
+                let _ = committer.join();
+                stop_progress.store(true, Ordering::Relaxed);
+                if let Some(h) = progress_handle {
+                    let _ = h.join();
+                }
+                return Err(err);
+            }
+        }
         drop(job_tx);
 
         for w in workers {
             w.join()
                 .map_err(|_| Error::Other("import worker panicked".into()))?;
         }
-        committer
+        let commit_res = committer
             .join()
-            .map_err(|_| Error::Other("import committer panicked".into()))??;
-
-        // Release chunk refs for any entries deleted during `--update` AFTER all workers and
-        // committer batches have committed (safe across file moves/renames!).
-        if !deferred_deleted_manifests.is_empty() {
-            let mut deleted_chunks = Vec::new();
-            {
-                let mut conn = self.meta.lock().unwrap();
-                let tx = conn.transaction()?;
-                for m in &deferred_deleted_manifests {
-                    deleted_chunks.extend(release_manifest_chunks(&tx, m)?);
-                }
-                tx.commit()?;
-            }
-            self.invalidate_chunk_locs(&deleted_chunks);
+            .map_err(|_| Error::Other("import committer panicked".into()))?;
+        stop_progress.store(true, Ordering::Relaxed);
+        if let Some(h) = progress_handle {
+            let _ = h.join();
         }
+        commit_res?;
 
         // Update workspace's `next_inode` counter to the final allocated value.
         let final_next = next_inode.load(Ordering::Relaxed);
@@ -2018,11 +2131,6 @@ impl DedupStore {
                 "UPDATE workspaces SET next_inode = MAX(next_inode, ?1) WHERE ws_id = ?2",
                 params![final_next as i64, ws_id as i64],
             )?;
-        }
-
-        stop_progress.store(true, Ordering::Relaxed);
-        if let Some(h) = progress_handle {
-            let _ = h.join();
         }
 
         Ok(ImportSummary {
@@ -2158,6 +2266,40 @@ impl DedupStore {
             Some(parts.join("/"))
         };
 
+        // Persists any speculative pack spills from a skipped/aborted dedup candidate into
+        // `packs` with their exact `dead_bytes` so `gc()` can always reclaim them cleanly.
+        let record_aborted_spills = |written_locs: &HashMap<Hash32, ChunkLoc>,
+                                     pack_updates: &mut Vec<(u64, u64, bool)>|
+         -> Result<()> {
+            if written_locs.is_empty() && pack_updates.is_empty() {
+                return Ok(());
+            }
+            {
+                let mut pw = self.packs.writer();
+                pw.flush()?;
+                pack_updates.extend(pw.take_pack_updates());
+            }
+            let mut dead_by_pack: HashMap<u64, u64> = HashMap::new();
+            for loc in written_locs.values() {
+                let rec = RECORD_HEADER_BYTES as u64 + u64::from(loc.stored_len);
+                *dead_by_pack.entry(loc.pack_id).or_insert(0) += rec;
+            }
+            let mut conn = self.meta.lock().unwrap();
+            let tx = conn.transaction()?;
+            upsert_pack_updates(&tx, pack_updates)?;
+            {
+                let mut add_dead = tx.prepare_cached(
+                    "UPDATE packs SET dead_bytes = dead_bytes + ?1 WHERE pack_id = ?2",
+                )?;
+                for (pid, dead) in dead_by_pack {
+                    add_dead.execute(params![dead as i64, pid as i64])?;
+                }
+            }
+            tx.commit()?;
+            pack_updates.clear();
+            Ok(())
+        };
+
         for (ws_id, inode_id, expected_size, expected_written_ns) in candidates {
             if !self.config.no_dedup.is_empty() {
                 if let Some(rel) = resolve_rel_path(ws_id, inode_id) {
@@ -2225,6 +2367,7 @@ impl DedupStore {
                 match read_res {
                     Ok(len) => actual_len = len,
                     Err(_) => {
+                        record_aborted_spills(&written_locs, &mut pack_updates)?;
                         summary.skipped_changed += 1;
                         continue;
                     }
@@ -2234,6 +2377,7 @@ impl DedupStore {
             // Acquire per-inode stripe lock for atomic check-and-swap.
             let _guard = self.lock_inode(ws_id, inode_id);
             if is_busy(ws_id, inode_id) {
+                record_aborted_spills(&written_locs, &mut pack_updates)?;
                 summary.skipped_busy += 1;
                 continue;
             }
@@ -2244,6 +2388,7 @@ impl DedupStore {
                 load_inode(&conn, ws_id, inode_id)?
             };
             let Some(cur) = current else {
+                record_aborted_spills(&written_locs, &mut pack_updates)?;
                 summary.skipped_changed += 1;
                 continue;
             };
@@ -2253,6 +2398,7 @@ impl DedupStore {
                 || cur.written_ns != expected_written_ns
                 || cur.size != actual_len
             {
+                record_aborted_spills(&written_locs, &mut pack_updates)?;
                 summary.skipped_changed += 1;
                 continue;
             }
@@ -2346,6 +2492,8 @@ impl DedupStore {
     ///   new pack(s) without re-compressing, then the old pack file is deleted.
     pub fn gc(&self, dead_threshold_pct: u8) -> Result<GcSummary> {
         let _pack_guard = self.acquire_pack_write_lock()?;
+        // Apply any pending deferred releases before scanning live/dead pack accounting.
+        self.replay_pending_releases_locked()?;
         // Seal any active writer pack first so pack boundaries stay clean.
         {
             let mut pw = self.packs.writer();
@@ -2480,6 +2628,42 @@ impl DedupStore {
             summary.reclaimed_disk_bytes += dead_bytes;
         }
 
+        // Sweep any untracked orphan `.pack` files on disk (e.g. from a hard crash mid-write
+        // before SQLite commit) while holding the exclusive `pack.lock`.
+        {
+            let tracked_ids: HashSet<u64> = {
+                let conn = self.meta.lock().unwrap();
+                let mut stmt = conn.prepare("SELECT pack_id FROM packs")?;
+                let rows = stmt.query_map([], |r| Ok(r.get::<_, i64>(0)? as u64))?;
+                let mut set = HashSet::new();
+                for r in rows {
+                    set.insert(r?);
+                }
+                set
+            };
+            if let Ok(rd) = fs::read_dir(self.root.join("packs")) {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) != Some("pack") {
+                        continue;
+                    }
+                    if let Some(pid) = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        if !tracked_ids.contains(&pid) {
+                            let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                            if self.packs.delete_pack_file(pid).is_ok() {
+                                summary.deleted_empty_packs += 1;
+                                summary.reclaimed_disk_bytes += sz;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Flush WAL checkpoint so meta.sqlite stays tidy after GC.
         {
             let conn = self.meta.lock().unwrap();
@@ -2502,7 +2686,9 @@ impl DedupStore {
                     "refusing `fsck --fix` while store is actively mounted at {mp}; unmount first"
                 )));
             }
-            Some(self.acquire_pack_write_lock()?)
+            let guard = self.acquire_pack_write_lock()?;
+            self.replay_pending_releases_locked()?;
+            Some(guard)
         } else {
             None
         };
