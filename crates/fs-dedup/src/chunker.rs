@@ -11,15 +11,22 @@ use std::sync::OnceLock;
 pub type Hash32 = [u8; 32];
 
 /// Fast identity hasher for `Hash32` keys: BLAKE3 hashes are already uniformly distributed,
-/// so reading the first 8 bytes avoids SipHash overhead on every cache & dedup map lookup.
+/// so XOR-folding `bytes[8..32]` avoids SipHash overhead while staying completely independent
+/// of `hash[0]` used for shard routing (`hash[0] & (SHARDS - 1)`), preventing hashbrown bucket
+/// clustering inside sharded maps/sets (N5).
 #[derive(Default)]
 pub struct Hash32Hasher(u64);
 
 impl std::hash::Hasher for Hash32Hasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        if bytes.len() >= 8 {
-            self.0 = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+        if bytes.len() >= 32 {
+            let a = u64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+            let b = u64::from_ne_bytes(bytes[16..24].try_into().unwrap());
+            let c = u64::from_ne_bytes(bytes[24..32].try_into().unwrap());
+            self.0 = a ^ b.rotate_left(17) ^ c.rotate_left(35);
+        } else if bytes.len() >= 8 {
+            self.0 = u64::from_ne_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
         } else {
             let mut acc = 0u64;
             for &b in bytes {
@@ -361,6 +368,24 @@ pub fn decompress_chunk(codec: Codec, stored: &[u8], raw_len: usize) -> Result<V
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn hash32_hasher_independent_of_shard_prefix_byte() {
+        use std::hash::{BuildHasher, Hasher};
+        let bh = Hash32BuildHasher::default();
+        let mut h1 = [0u8; 32];
+        let mut h2 = [0u8; 32];
+        // Identical first 8 bytes (same shard `hash[0] & 63`), differing only in bytes[8..32].
+        h1[0..8].copy_from_slice(&[0x2A; 8]);
+        h2[0..8].copy_from_slice(&[0x2A; 8]);
+        h1[8] = 1;
+        h2[8] = 2;
+        let mut s1 = bh.build_hasher();
+        s1.write(&h1);
+        let mut s2 = bh.build_hasher();
+        s2.write(&h2);
+        assert_ne!(s1.finish(), s2.finish());
+    }
 
     #[test]
     fn compress_decompress_roundtrip_all_codecs() {

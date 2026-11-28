@@ -2350,6 +2350,274 @@ impl DedupStore {
             Ok(())
         };
 
+        // N2: Batch candidates so we call `pw.sync_data()` ONCE and commit ONE `synchronous = FULL`
+        // SQLite transaction per batch (up to 64 files / 16 MiB), keeping foreground `meta` stalls
+        // rare and doing ALL disk reads, compression, and pack writes outside `self.meta.lock()`.
+        const DEDUP_BATCH_MAX_FILES: usize = 64;
+        const DEDUP_BATCH_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+        struct PreparedDedup {
+            ws_id: u64,
+            inode_id: u64,
+            expected_size: u64,
+            expected_written_ns: i64,
+            actual_len: u64,
+            loose_path: PathBuf,
+            entries: Vec<ManifestEntry>,
+            entry_first_span: HashMap<Hash32, (u64, u32)>,
+            new_blobs: Vec<(Hash32, Codec, u32, Vec<u8>)>,
+            written_locs: HashMap<Hash32, ChunkLoc>,
+            pack_updates: Vec<(u64, u64, bool)>,
+            added_unique: u64,
+            added_stored: u64,
+        }
+
+        let flush_dedup_batch = |batch: &mut Vec<PreparedDedup>,
+                                 summary: &mut DedupSummary|
+         -> Result<()> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+
+            // Acquire all needed per-inode stripe locks in strictly ascending stripe index order
+            // so batch locking is deadlock-free against single-stripe foreground threads.
+            let mut stripe_indices: Vec<usize> = batch
+                .iter()
+                .map(|c| {
+                    ((c.ws_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ c.inode_id) as usize)
+                        & (INODE_LOCK_STRIPES - 1)
+                })
+                .collect();
+            stripe_indices.sort_unstable();
+            stripe_indices.dedup();
+            let _stripe_guards: Vec<std::sync::RwLockWriteGuard<'_, ()>> = stripe_indices
+                .iter()
+                .map(|&idx| self.inode_locks[idx].write().unwrap())
+                .collect();
+
+            // Filter busy or changed candidates BEFORE writing packs / touching `self.meta`.
+            let mut survivors: Vec<PreparedDedup> = Vec::with_capacity(batch.len());
+            let mut aborted_locs: HashMap<Hash32, ChunkLoc> = HashMap::new();
+            let mut aborted_pack_updates: Vec<(u64, u64, bool)> = Vec::new();
+            for item in batch.drain(..) {
+                if is_busy(item.ws_id, item.inode_id) {
+                    aborted_locs.extend(item.written_locs);
+                    aborted_pack_updates.extend(item.pack_updates);
+                    summary.skipped_busy += 1;
+                    continue;
+                }
+                let current = load_inode(&ro_conn, item.ws_id, item.inode_id)?;
+                let valid = current.as_ref().is_some_and(|cur| {
+                    cur.storage_mode == STORAGE_OVERLAY
+                        && !cur.pinned_overlay
+                        && cur.size == item.expected_size
+                        && cur.written_ns == item.expected_written_ns
+                        && cur.size == item.actual_len
+                });
+                if !valid {
+                    aborted_locs.extend(item.written_locs);
+                    aborted_pack_updates.extend(item.pack_updates);
+                    summary.skipped_changed += 1;
+                    continue;
+                }
+                survivors.push(item);
+            }
+
+            if !aborted_locs.is_empty() || !aborted_pack_updates.is_empty() {
+                record_aborted_spills(&aborted_locs, &mut aborted_pack_updates)?;
+            }
+            if survivors.is_empty() {
+                return Ok(());
+            }
+
+            // Consolidate written chunk locations and pack updates across the whole batch,
+            // deduplicating newly compressed chunks shared by multiple files in the same batch.
+            let mut batch_written_locs: HashMap<Hash32, ChunkLoc> = HashMap::new();
+            let mut batch_pack_updates: Vec<(u64, u64, bool)> = Vec::new();
+            let mut any_new_blobs = false;
+            for item in &mut survivors {
+                for (h, loc) in item.written_locs.drain() {
+                    batch_written_locs.entry(h).or_insert(loc);
+                }
+                batch_pack_updates.append(&mut item.pack_updates);
+                if !item.new_blobs.is_empty() {
+                    any_new_blobs = true;
+                }
+            }
+
+            // Append all remaining buffered chunks for the batch & `sync_data()` ONCE outside `meta`.
+            if any_new_blobs || !batch_written_locs.is_empty() {
+                let mut pw = self.packs.writer();
+                for item in &mut survivors {
+                    for (hash, codec, raw_len, stored) in item.new_blobs.drain(..) {
+                        if batch_written_locs.contains_key(&hash) {
+                            continue;
+                        }
+                        let loc = pw.append(&hash, codec, raw_len, &stored)?;
+                        batch_written_locs.insert(hash, loc);
+                        item.added_unique += u64::from(raw_len);
+                        item.added_stored += stored.len() as u64;
+                    }
+                }
+                pw.sync_data()?;
+                batch_pack_updates.extend(pw.take_pack_updates());
+            }
+
+            // Pre-encode manifests & build per-hash recovery spans outside `self.meta.lock()`.
+            let manifests: Vec<Vec<u8>> = survivors
+                .iter()
+                .map(|item| encode_manifest(&item.entries))
+                .collect();
+
+            // Commit the entire batch in ONE `PRAGMA synchronous = FULL` SQLite transaction.
+            // If any reused chunk was concurrently deleted before `meta` was locked, drop `meta`
+            // FIRST, re-read/compress/append/sync outside `meta`, and retry!
+            let committed_indices: Vec<usize> = loop {
+                let mut missing_to_recover: Vec<(Hash32, usize, u64, u32)> = Vec::new();
+                let mut committed_out: Vec<usize> = Vec::new();
+                let mut extra_aborted_locs: HashMap<Hash32, ChunkLoc> = HashMap::new();
+                let mut retry_needed = false;
+
+                {
+                    let mut conn = self.meta.lock().unwrap();
+                    let _ = conn.execute_batch("PRAGMA synchronous = FULL;");
+                    let tx_res: Result<()> = (|| {
+                        let tx = conn.transaction()?;
+
+                        // Authoritative re-check of each survivor inside the write transaction.
+                        let mut valid_idx: Vec<usize> = Vec::with_capacity(survivors.len());
+                        for (i, item) in survivors.iter().enumerate() {
+                            let cur = load_inode(&tx, item.ws_id, item.inode_id)?;
+                            let ok = cur.as_ref().is_some_and(|c| {
+                                c.storage_mode == STORAGE_OVERLAY
+                                    && !c.pinned_overlay
+                                    && c.size == item.expected_size
+                                    && c.written_ns == item.expected_written_ns
+                                    && c.size == item.actual_len
+                            });
+                            if ok {
+                                valid_idx.push(i);
+                            } else {
+                                summary.skipped_changed += 1;
+                            }
+                        }
+
+                        let mut ref_adds: HashMap<Hash32, u64> = HashMap::new();
+                        for &i in &valid_idx {
+                            for e in &survivors[i].entries {
+                                *ref_adds.entry(e.hash).or_insert(0) += 1;
+                            }
+                        }
+
+                        // Detect any missing chunk whose refcount hit 0 between phase 1 and tx.
+                        for &hash in ref_adds.keys() {
+                            if !batch_written_locs.contains_key(&hash)
+                                && get_chunk_loc(&tx, &hash)?.is_none()
+                            {
+                                if let Some((idx, (off, rlen))) = valid_idx.iter().find_map(|&i| {
+                                    survivors[i]
+                                        .entry_first_span
+                                        .get(&hash)
+                                        .map(|&span| (i, span))
+                                }) {
+                                    missing_to_recover.push((hash, idx, off, rlen));
+                                }
+                            }
+                        }
+
+                        if !missing_to_recover.is_empty() {
+                            retry_needed = true;
+                            return Ok(());
+                        }
+
+                        upsert_pack_updates(&tx, &batch_pack_updates)?;
+                        for (hash, add) in ref_adds {
+                            let loc = batch_written_locs.remove(&hash);
+                            upsert_chunk_ref(&tx, &hash, loc, add)?;
+                        }
+                        // Any leftover `batch_written_locs` belonging to dropped survivors become dead_bytes.
+                        for (h, loc) in batch_written_locs.drain() {
+                            extra_aborted_locs.insert(h, loc);
+                        }
+                        if !extra_aborted_locs.is_empty() {
+                            let mut dead_by_pack: HashMap<u64, u64> = HashMap::new();
+                            for loc in extra_aborted_locs.values() {
+                                let rec = RECORD_HEADER_BYTES as u64 + u64::from(loc.stored_len);
+                                *dead_by_pack.entry(loc.pack_id).or_insert(0) += rec;
+                            }
+                            let mut add_dead = tx.prepare_cached(
+                                "UPDATE packs SET dead_bytes = dead_bytes + ?1 WHERE pack_id = ?2",
+                            )?;
+                            for (pid, dead) in dead_by_pack {
+                                add_dead.execute(params![dead as i64, pid as i64])?;
+                            }
+                        }
+
+                        {
+                            let mut upd = tx.prepare_cached(
+                                "UPDATE inodes SET storage_mode = ?1, manifest = ?2, dirty_since_ns = 0
+                                 WHERE ws_id = ?3 AND inode_id = ?4",
+                            )?;
+                            for &i in &valid_idx {
+                                let item = &survivors[i];
+                                upd.execute(params![
+                                    i64::from(STORAGE_CHUNKS),
+                                    manifests[i].as_slice(),
+                                    item.ws_id as i64,
+                                    item.inode_id as i64,
+                                ])?;
+                            }
+                        }
+
+                        tx.commit()?;
+                        committed_out = valid_idx;
+                        Ok(())
+                    })();
+                    let _ = conn.execute_batch("PRAGMA synchronous = NORMAL;");
+                    tx_res?;
+                }
+
+                if retry_needed {
+                    // Recover missing chunks completely OUTSIDE `self.meta.lock()`!
+                    let mut pw = self.packs.writer();
+                    for (hash, idx, off, rlen) in missing_to_recover {
+                        if batch_written_locs.contains_key(&hash) {
+                            continue;
+                        }
+                        let ov_file = File::open(&survivors[idx].loose_path)?;
+                        let mut raw = vec![0u8; rlen as usize];
+                        crate::pack::read_exact_at(&ov_file, off, &mut raw)?;
+                        let (codec, stored) = compress_chunk(self.config.codec, &raw)?;
+                        let loc = pw.append(&hash, codec, rlen, &stored)?;
+                        batch_written_locs.insert(hash, loc);
+                        survivors[idx].added_unique += u64::from(rlen);
+                        survivors[idx].added_stored += stored.len() as u64;
+                    }
+                    pw.sync_data()?;
+                    batch_pack_updates.extend(pw.take_pack_updates());
+                    continue;
+                }
+
+                break committed_out;
+            };
+
+            // Delete loose overlay files & invalidate cached inodes ONLY AFTER durable FULL commit!
+            for idx in committed_indices {
+                let item = &survivors[idx];
+                let _ = self.overlay.remove_file(item.ws_id, item.inode_id);
+                self.invalidate_inode(item.ws_id, item.inode_id);
+                summary.deduped_files += 1;
+                summary.raw_bytes += item.actual_len;
+                summary.new_unique_bytes += item.added_unique;
+                summary.stored_bytes += item.added_stored;
+                summary.reclaimed_overlay_bytes += item.actual_len;
+            }
+            Ok(())
+        };
+
+        let mut pending_batch: Vec<PreparedDedup> = Vec::with_capacity(DEDUP_BATCH_MAX_FILES);
+        let mut pending_batch_bytes: u64 = 0;
+
         for (ws_id, inode_id, expected_size, expected_written_ns) in candidates {
             if !self.no_dedup_filter.is_empty() {
                 if let Some(rel) = resolve_rel_path(ws_id, inode_id) {
@@ -2385,7 +2653,8 @@ impl DedupStore {
                 // Check authoritative SQLite `get_chunk_loc` (NEVER `chunk_loc_cache`) and spill
                 // buffered compressed chunks to `PackWriter` at `DEDUP_MAX_BUFFER_BYTES` (4 MiB)
                 // so deduping multi-GiB files stays strictly memory-bounded.
-                let mut chunk_hashes_seen: HashSet<Hash32> = HashSet::new();
+                let mut chunk_hashes_seen: HashSet<Hash32, Hash32BuildHasher> =
+                    HashSet::with_hasher(Hash32BuildHasher::default());
                 let mut file_cursor = 0u64;
                 let read_res = chunk_reader(&mut file, |chunk| {
                     let hash = blake3_hash(chunk);
@@ -2424,120 +2693,32 @@ impl DedupStore {
                 }
             }
 
-            // Acquire per-inode stripe lock for atomic check-and-swap.
-            let _guard = self.lock_inode(ws_id, inode_id);
-            if is_busy(ws_id, inode_id) {
-                record_aborted_spills(&written_locs, &mut pack_updates)?;
-                summary.skipped_busy += 1;
-                continue;
-            }
+            pending_batch_bytes = pending_batch_bytes.saturating_add(actual_len);
+            pending_batch.push(PreparedDedup {
+                ws_id,
+                inode_id,
+                expected_size,
+                expected_written_ns,
+                actual_len,
+                loose_path,
+                entries,
+                entry_first_span,
+                new_blobs,
+                written_locs,
+                pack_updates,
+                added_unique,
+                added_stored,
+            });
 
-            // Verify inode metadata hasn't changed while we were chunking.
-            let current = {
-                let conn = self.meta.lock().unwrap();
-                load_inode(&conn, ws_id, inode_id)?
-            };
-            let Some(cur) = current else {
-                record_aborted_spills(&written_locs, &mut pack_updates)?;
-                summary.skipped_changed += 1;
-                continue;
-            };
-            if cur.storage_mode != STORAGE_OVERLAY
-                || cur.pinned_overlay
-                || cur.size != expected_size
-                || cur.written_ns != expected_written_ns
-                || cur.size != actual_len
+            if pending_batch.len() >= DEDUP_BATCH_MAX_FILES
+                || pending_batch_bytes >= DEDUP_BATCH_MAX_BYTES
             {
-                record_aborted_spills(&written_locs, &mut pack_updates)?;
-                summary.skipped_changed += 1;
-                continue;
+                flush_dedup_batch(&mut pending_batch, &mut summary)?;
+                pending_batch_bytes = 0;
             }
-
-            // Append any remaining buffered new unique chunks to pack store and fsync pack data
-            // BEFORE committing SQLite & deleting the sole overlay copy (power-loss durability!).
-            if !new_blobs.is_empty() || !written_locs.is_empty() {
-                let mut pw = self.packs.writer();
-                for (hash, codec, raw_len, stored) in new_blobs.drain(..) {
-                    let loc = pw.append(&hash, codec, raw_len, &stored)?;
-                    written_locs.insert(hash, loc);
-                    added_unique += u64::from(raw_len);
-                    added_stored += stored.len() as u64;
-                }
-                pw.sync_data()?;
-                pack_updates.extend(pw.take_pack_updates());
-            }
-
-            // Commit chunk refcounts + flip inode from Overlay -> Chunks atomically with
-            // `PRAGMA synchronous = FULL` so both pack bytes AND SQLite WAL are durably synced
-            // on disk BEFORE deleting the loose overlay file!
-            let manifest_blob = encode_manifest(&entries);
-            {
-                let mut conn = self.meta.lock().unwrap();
-                let _ = conn.execute_batch("PRAGMA synchronous = FULL;");
-                let commit_res: Result<()> = (|| {
-                    let tx = conn.transaction()?;
-                    let mut ref_adds: HashMap<Hash32, u64> = HashMap::new();
-                    for e in &entries {
-                        *ref_adds.entry(e.hash).or_insert(0) += 1;
-                    }
-
-                    // Check for any chunk concurrently deleted between phase 1 and commit tx.
-                    let mut missing_hashes: Vec<Hash32> = Vec::new();
-                    for hash in ref_adds.keys() {
-                        if !written_locs.contains_key(hash) && get_chunk_loc(&tx, hash)?.is_none() {
-                            missing_hashes.push(*hash);
-                        }
-                    }
-                    if !missing_hashes.is_empty() {
-                        let mut ov_file = File::open(&loose_path)?;
-                        let mut pw = self.packs.writer();
-                        for hash in missing_hashes {
-                            let (off, rlen) = entry_first_span[&hash];
-                            let mut raw = vec![0u8; rlen as usize];
-                            crate::pack::read_exact_at(&ov_file, off, &mut raw)?;
-                            let (codec, stored) = compress_chunk(self.config.codec, &raw)?;
-                            let loc = pw.append(&hash, codec, rlen, &stored)?;
-                            written_locs.insert(hash, loc);
-                            added_unique += u64::from(rlen);
-                            added_stored += stored.len() as u64;
-                        }
-                        pw.sync_data()?;
-                        pack_updates.extend(pw.take_pack_updates());
-                        let _ = &mut ov_file;
-                    }
-
-                    upsert_pack_updates(&tx, &pack_updates)?;
-                    for (hash, add) in ref_adds {
-                        let loc = written_locs.remove(&hash);
-                        upsert_chunk_ref(&tx, &hash, loc, add)?;
-                    }
-                    tx.execute(
-                        "UPDATE inodes SET storage_mode = ?1, manifest = ?2, dirty_since_ns = 0
-                         WHERE ws_id = ?3 AND inode_id = ?4",
-                        params![
-                            i64::from(STORAGE_CHUNKS),
-                            manifest_blob.as_slice(),
-                            ws_id as i64,
-                            inode_id as i64
-                        ],
-                    )?;
-                    tx.commit()?;
-                    Ok(())
-                })();
-                let _ = conn.execute_batch("PRAGMA synchronous = NORMAL;");
-                commit_res?;
-            }
-
-            // Delete loose overlay file to immediately free host disk space, and evict cached inode!
-            let _ = self.overlay.remove_file(ws_id, inode_id);
-            self.invalidate_inode(ws_id, inode_id);
-
-            summary.deduped_files += 1;
-            summary.raw_bytes += actual_len;
-            summary.new_unique_bytes += added_unique;
-            summary.stored_bytes += added_stored;
-            summary.reclaimed_overlay_bytes += actual_len;
         }
+
+        flush_dedup_batch(&mut pending_batch, &mut summary)?;
 
         Ok(summary)
     }

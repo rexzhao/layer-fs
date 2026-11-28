@@ -175,6 +175,11 @@ pub struct DedupWorkspaceBackend {
     ws_name: String,
     /// Concurrent read-only WAL SQLite connection pool (used for all read/stat/list/open paths).
     ro_pool: RoConnPool,
+    /// Dedicated background WAL checkpoint connection (N1): never acquires `store.lock_meta()` so
+    /// periodic `wal_checkpoint(PASSIVE)` / idle `TRUNCATE` fsyncs never stall foreground writes.
+    checkpoint_conn: Mutex<Option<Connection>>,
+    /// Counter of periodic `checkpoint_wal()` calls for scheduling occasional idle `TRUNCATE`.
+    checkpoint_ticks: AtomicU64,
     /// Sharded positive & negative `(parent_id -> {folded_name -> DentryVal, complete, generation})` cache.
     dentry_cache: Vec<DentryShard>,
     /// Authoritative buffered overlay `(size, written_ns)` updates not yet persisted to SQLite.
@@ -278,6 +283,8 @@ impl DedupWorkspaceBackend {
             ws_id,
             ws_name: ws_name.to_owned(),
             ro_pool,
+            checkpoint_conn: Mutex::new(None),
+            checkpoint_ticks: AtomicU64::new(0),
             dentry_cache,
             dirty_inodes: Mutex::new(HashMap::new()),
             dirty_count: AtomicUsize::new(0),
@@ -1996,8 +2003,29 @@ impl WorkspaceOps for DedupWorkspaceBackend {
     }
 
     fn checkpoint_wal(&self) -> OpsResult<()> {
-        let conn = self.store.lock_meta();
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        // N1: Run WAL checkpoint on a dedicated connection OUTSIDE `store.lock_meta()` so
+        // foreground metadata mutations never stall behind checkpoint fsyncs.
+        let mut slot = self.checkpoint_conn.lock().unwrap();
+        if slot.is_none() {
+            let conn = self.store.open_conn().map_err(map_err)?;
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(200));
+            let _ = conn.execute_batch(
+                "PRAGMA wal_autocheckpoint = 0;\
+                 PRAGMA cache_size = -4096;\
+                 PRAGMA journal_size_limit = 67108864;",
+            );
+            *slot = Some(conn);
+        }
+        let conn = slot.as_ref().unwrap();
+        let tick = self.checkpoint_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        // Periodically reclaim WAL file size with `TRUNCATE` when idle; fall back to `PASSIVE` if busy.
+        if tick % 10 == 0 && self.dirty_count.load(Ordering::Relaxed) == 0 {
+            if conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").is_err() {
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+            }
+        } else {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        }
         Ok(())
     }
 

@@ -251,6 +251,7 @@ pub fn open_meta_connection(path: &Path) -> Result<Connection> {
          PRAGMA cache_size = -262144;\
          PRAGMA mmap_size = 4294967296;\
          PRAGMA wal_autocheckpoint = 16384;\
+         PRAGMA journal_size_limit = 67108864;\
          PRAGMA temp_store = MEMORY;\
          PRAGMA foreign_keys = OFF;",
     )?;

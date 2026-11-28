@@ -1466,3 +1466,61 @@ fn r4_n3_n12_cow_overlay_sync_and_durable_import() {
         .unwrap();
     assert_eq!(backend2.read(db.file_id, 0, 21).unwrap(), b"sqlite-hot-db-payload");
 }
+
+#[test]
+fn r4_n1_n2_batched_dedup_and_nonblocking_wal_checkpoint() {
+    let tmp = TempDir::new("r4_n1_n2_batch_dedup");
+    let store = DedupStore::init(tmp.0.join("store"), StoreConfig::default()).unwrap();
+    store.create_workspace("ws").unwrap();
+    let backend = DedupWorkspaceBackend::open(store.clone(), "ws").unwrap();
+
+    // Create 80 files (> DEDUP_BATCH_MAX_FILES=64) including duplicates across batches + busy file.
+    let shared = b"SHARED-BATCH-DEDUP-BLOCK-0123456789ABCDEF".repeat(512);
+    let mut busy_id = 0u64;
+    for i in 0..80usize {
+        let p = format!("/f_{i:03}.bin");
+        let f = backend
+            .create_or_open(&OpsPath::new(p.as_bytes()), Disposition::Create)
+            .unwrap();
+        let data = if i % 3 == 0 {
+            shared.clone()
+        } else {
+            format!("unique-payload-{i:03}-{}", "X".repeat(2048)).into_bytes()
+        };
+        backend.write(f.file_id, 0, &data).unwrap();
+        if i == 10 {
+            busy_id = f.file_id;
+        }
+    }
+    backend.flush().unwrap();
+
+    // Run 12 checkpoints (crossing the 10-tick idle TRUNCATE threshold) without blocking `lock_meta`.
+    for _ in 0..12 {
+        backend.checkpoint_wal().unwrap();
+    }
+
+    // Batched dedup skips `busy_id` and commits remaining 79 files cleanly across 2 batches.
+    let dsum = store
+        .dedup_workspace(Some("ws"), 0, |_, id| id == busy_id)
+        .unwrap();
+    assert_eq!(dsum.deduped_files, 79);
+    assert_eq!(dsum.skipped_busy, 1);
+
+    // Verify all 80 files read back identically and fsck reports zero drift.
+    for i in 0..80usize {
+        let p = format!("/f_{i:03}.bin");
+        let f = backend
+            .create_or_open(&OpsPath::new(p.as_bytes()), Disposition::Open)
+            .unwrap();
+        let expected = if i % 3 == 0 {
+            shared.clone()
+        } else {
+            format!("unique-payload-{i:03}-{}", "X".repeat(2048)).into_bytes()
+        };
+        assert_eq!(backend.read(f.file_id, 0, expected.len()).unwrap(), expected);
+    }
+    let check = store.fsck(false).unwrap();
+    assert_eq!(check.missing_chunks, 0);
+    assert_eq!(check.mismatched_refcounts, 0);
+    assert_eq!(check.orphan_chunks, 0);
+}
