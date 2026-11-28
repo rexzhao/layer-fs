@@ -1023,8 +1023,11 @@ fn r2_3_r2_4_r2_5_dirty_authority_dedup_guard_cleanup_flush_and_mount_reconcile(
     assert_eq!(skipped.skipped_busy, 1);
     assert_eq!(skipped.deduped_files, 0);
 
-    // Simulating WinFsp Cleanup flushes the dirty inode immediately.
+    // `on_cleanup` keeps small-file closes off synchronous SQLite transactions; background `flush()`
+    // (or explicit `flush_file`) persists dirty metadata before dedup sweeps run.
     backend.on_cleanup(f.file_id).unwrap();
+    assert!(backend.is_file_dirty(f.file_id));
+    backend.flush_file(f.file_id).unwrap();
     assert!(!backend.is_file_dirty(f.file_id));
 
     let deduped = store

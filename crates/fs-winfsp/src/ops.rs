@@ -595,6 +595,23 @@ pub trait WorkspaceOps {
         }
     }
 
+    /// Single-entry directory lookup by `(parent_dir_id, child_name)` for WinFsp `GetDirInfoByName`
+    /// (`PassQueryDirectoryFileName`), returning `(exact_stored_name, NodeInfo)` in O(1) without
+    /// enumerating the entire parent directory.
+    ///
+    /// # Errors
+    ///
+    /// [`OpsError::NotFound`] when no child matches `name` (case-insensitively).
+    fn lookup_child_info(&self, parent_id: u64, name: &[u8]) -> OpsResult<(Vec<u8>, NodeInfo)> {
+        let folded = fs_semantics::name::fold_bytes(name);
+        for (stored, info) in self.read_dir_with_info(parent_id)? {
+            if fs_semantics::name::fold_bytes(&stored) == folded {
+                return Ok((stored, info));
+            }
+        }
+        Err(OpsError::NotFound)
+    }
+
     /// Returns a pre-encoded, UTF-16-sorted directory listing (including `.` and `..` for non-root
     /// directories). Backends may cache the `Arc` across repeated `ReadDirectory` opens (N7).
     ///
@@ -770,6 +787,10 @@ impl WorkspaceOps for Box<dyn WorkspaceOps + Send + Sync> {
 
     fn lookup_info(&self, path: &Path<'_>) -> OpsResult<NodeInfo> {
         (**self).lookup_info(path)
+    }
+
+    fn lookup_child_info(&self, parent_id: u64, name: &[u8]) -> OpsResult<(Vec<u8>, NodeInfo)> {
+        (**self).lookup_child_info(parent_id, name)
     }
 
     fn read_dir_utf16_cached(&self, dir_id: u64) -> OpsResult<DirListingUtf16> {

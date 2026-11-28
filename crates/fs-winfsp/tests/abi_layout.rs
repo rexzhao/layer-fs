@@ -208,6 +208,18 @@ fn volume_params_v1_timeout_offsets_match_sdk() {
     assert_eq!(u32::from_ne_bytes([b[464], b[465], b[466], b[467]]), 3000);
     assert_eq!(u32::from_ne_bytes([b[468], b[469], b[470], b[471]]), 60_000);
     assert!(b[472..].iter().all(|byte| *byte == 0));
+
+    // PassQueryDirectoryFileName is bit 13 of offset 36 (`fsctl.h:220`) and slot 24 is GetDirInfoByName.
+    params.set_name_flags();
+    params.set_pass_query_directory_file_name();
+    let flags = u32::from_ne_bytes([
+        params.as_bytes()[36],
+        params.as_bytes()[37],
+        params.as_bytes()[38],
+        params.as_bytes()[39],
+    ]);
+    assert_ne!(flags & (1 << 13), 0);
+    assert_eq!(fs_winfsp::abi::slot::GET_DIR_INFO_BY_NAME, 24);
 }
 
 /// The `FSP_FSCTL_DIR_INFO` record: fixed header, 8-alignment, and the name at the end.

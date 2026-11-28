@@ -124,6 +124,73 @@ fn list_entries(adapter: &crate::DynAdapter, dir_id: u64) -> std::sync::Arc<Vec<
         .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()))
 }
 
+/// The `GetDirInfoByName` **shell** (`winfsp.h:852`, slot 24): resolves a single child name inside
+/// an open parent directory in O(1) without enumerating the directory.
+///
+/// # Safety
+///
+/// `context` is an opaque handle id; `file_name` is a NUL-terminated UTF-16 component name;
+/// `dir_info_out` points to a WinFsp `FSP_FSCTL_DIR_INFO` buffer with room for up to 255 UTF-16
+/// code units after the 104-byte fixed header.
+pub unsafe fn get_dir_info_by_name_shell(
+    adapter: Option<&crate::DynAdapter>,
+    context: *const c_void,
+    file_name: *const u16,
+    dir_info_out: *mut c_void,
+) -> i32 {
+    if context.is_null() || file_name.is_null() || dir_info_out.is_null() {
+        return OURS_INVALID_PARAMETER;
+    }
+    let Some(entry) = entry_of(context) else {
+        return NOT_IMPLEMENTED;
+    };
+    let Some(adapter) = adapter else {
+        return NOT_IMPLEMENTED;
+    };
+    // SAFETY: `file_name` is NUL-terminated per WinFsp's contract.
+    let units = unsafe { crate::boundary::utf16_len(file_name) };
+    // SAFETY: bounded by the NUL terminator.
+    let slice = unsafe { std::slice::from_raw_parts(file_name, units) };
+    let Ok(name_utf8) = crate::boundary::utf16_to_utf8(slice) else {
+        return OURS_OBJECT_NAME_NOT_FOUND;
+    };
+    let (stored_name, node) = match adapter
+        .backend()
+        .lookup_child_info(entry.file_id, name_utf8.as_bytes())
+    {
+        Ok(pair) => pair,
+        Err(crate::ops::OpsError::NotFound) => return OURS_OBJECT_NAME_NOT_FOUND,
+        Err(err) => return crate::error::to_status_of(&err).code() as i32,
+    };
+    let Ok(record) = crate::file_info::file_info(&node) else {
+        return NOT_IMPLEMENTED;
+    };
+    let name_units: Vec<u16> = String::from_utf8_lossy(&stored_name)
+        .encode_utf16()
+        .take(255)
+        .collect();
+    let rec_size = crate::abi::dir_info::record_size(name_units.len());
+    let Ok(size_u16) = u16::try_from(rec_size) else {
+        return OURS_INVALID_PARAMETER;
+    };
+    // SAFETY: WinFsp supplies a `FSP_FSCTL_DIR_INFO` + `MAX_PATH` buffer (`104 + 260 * 2` bytes).
+    unsafe {
+        let base = dir_info_out.cast::<u8>();
+        std::ptr::write_bytes(base, 0, crate::abi::dir_info::HEADER);
+        std::ptr::copy_nonoverlapping(size_u16.to_ne_bytes().as_ptr(), base, 2);
+        std::ptr::write(
+            base.add(crate::abi::dir_info::FILE_INFO_AT).cast::<FileInfo>(),
+            record,
+        );
+        std::ptr::copy_nonoverlapping(
+            name_units.as_ptr().cast::<u8>(),
+            base.add(crate::abi::dir_info::NAME_AT),
+            name_units.len() * 2,
+        );
+    }
+    0
+}
+
 /// The `ReadDirectory` body with the entries handed in — the resume, the framing and the count are all here.
 ///
 /// # Safety
@@ -629,14 +696,51 @@ fn debug_handles_enabled() -> bool {
     *DEBUG_HANDLES.get_or_init(|| std::env::var_os("LAYERFS_DEBUG_HANDLES").is_some())
 }
 
+/// Number of independent shards for the global `FileContext` table (power of two).
+/// The shard index (`file_id & (CONTEXT_SHARDS - 1)`) is encoded into the low 5 bits of every
+/// issued context id so `entry_of`, `acquire_context`, `release_context`, and `dir_snapshot`
+/// touch ONLY 1 of 32 shard locks instead of contending on a single global `RwLock`.
+const CONTEXT_SHARDS: usize = 32;
+const CONTEXT_SHARD_BITS: u32 = 5;
+const CONTEXT_SHARD_MASK: u64 = (CONTEXT_SHARDS as u64) - 1;
+const MAX_CLOSED_CONTEXT_IDS_PER_SHARD: usize = MAX_CLOSED_CONTEXT_IDS / CONTEXT_SHARDS;
+
+#[inline]
+fn shard_index_for_file(file_id: u64) -> usize {
+    (file_id & CONTEXT_SHARD_MASK) as usize
+}
+
+#[inline]
+fn shard_index_for_id(id: u64) -> usize {
+    (id & CONTEXT_SHARD_MASK) as usize
+}
+
+fn context_shards() -> &'static [std::sync::RwLock<ContextTables>; CONTEXT_SHARDS] {
+    static SHARDS: std::sync::OnceLock<[std::sync::RwLock<ContextTables>; CONTEXT_SHARDS]> =
+        std::sync::OnceLock::new();
+    SHARDS.get_or_init(|| std::array::from_fn(|_| std::sync::RwLock::new(ContextTables::default())))
+}
+
+fn read_shard(idx: usize) -> std::sync::RwLockReadGuard<'static, ContextTables> {
+    context_shards()[idx]
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write_shard(idx: usize) -> std::sync::RwLockWriteGuard<'static, ContextTables> {
+    context_shards()[idx]
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn cached_dir_snapshot(context_id: u64) -> Option<std::sync::Arc<Vec<ListEntry>>> {
     if context_id == 0 {
         return None;
     }
-    let guard = read_tables();
+    let guard = read_shard(shard_index_for_id(context_id));
     guard
-        .as_ref()
-        .and_then(|tables| tables.contexts.get(&context_id))
+        .contexts
+        .get(&context_id)
         .and_then(|shared| shared.dir_snapshot.clone())
 }
 
@@ -644,9 +748,8 @@ fn store_dir_snapshot(context_id: u64, snapshot: std::sync::Arc<Vec<ListEntry>>)
     if context_id == 0 {
         return;
     }
-    let mut guard = write_tables();
-    let tables = guard.get_or_insert_with(ContextTables::default);
-    if let Some(shared) = tables.contexts.get_mut(&context_id) {
+    let mut guard = write_shard(shard_index_for_id(context_id));
+    if let Some(shared) = guard.contexts.get_mut(&context_id) {
         shared.dir_snapshot = Some(snapshot);
     }
 }
@@ -663,7 +766,7 @@ impl ContextTables {
     fn record_closed(&mut self, id: u64) {
         if self.closed.insert(id) {
             self.closed_order.push_back(id);
-            while self.closed_order.len() > MAX_CLOSED_CONTEXT_IDS {
+            while self.closed_order.len() > MAX_CLOSED_CONTEXT_IDS_PER_SHARD {
                 if let Some(old) = self.closed_order.pop_front() {
                     self.closed.remove(&old);
                 }
@@ -672,21 +775,8 @@ impl ContextTables {
     }
 }
 
-static CONTEXT_TABLES: std::sync::RwLock<Option<ContextTables>> = std::sync::RwLock::new(None);
-
-fn read_tables() -> std::sync::RwLockReadGuard<'static, Option<ContextTables>> {
-    CONTEXT_TABLES
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn write_tables() -> std::sync::RwLockWriteGuard<'static, Option<ContextTables>> {
-    CONTEXT_TABLES
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// The next id to hand out. Never reused, so a stale id can never be mistaken for a fresh one.
+/// The next sequence number to hand out. Never reused, shifted left by `CONTEXT_SHARD_BITS` so
+/// the low 5 bits always carry the shard index while every issued id stays strictly non-zero.
 static NEXT_CONTEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// How many acquisitions were made (a fresh context or a `refs + 1`), next to how many releases happened.
@@ -707,25 +797,26 @@ pub fn acquire_release_counts() -> (usize, usize) {
 /// The table as `(id, refs)` pairs: the reading that says whether a zero-reference entry was left behind.
 #[must_use]
 pub fn context_table() -> Vec<(u64, usize)> {
-    let guard = read_tables();
-    guard.as_ref().map_or_else(Vec::new, |tables| {
-        let mut pairs: Vec<(u64, usize)> = tables
-            .contexts
-            .iter()
-            .map(|(id, shared)| (*id, shared.refs))
-            .collect();
-        pairs.sort_unstable_by_key(|(id, _)| *id);
-        pairs
-    })
+    let mut pairs = Vec::new();
+    for idx in 0..CONTEXT_SHARDS {
+        let guard = read_shard(idx);
+        for (id, shared) in &guard.contexts {
+            pairs.push((*id, shared.refs));
+        }
+    }
+    pairs.sort_unstable_by_key(|(id, _)| *id);
+    pairs
 }
 
 /// How many live references the table currently carries (the sum of every `refs`).
 #[must_use]
 pub fn live_reference_count() -> usize {
-    let guard = read_tables();
-    guard
-        .as_ref()
-        .map_or(0, |tables| tables.contexts.values().map(|s| s.refs).sum())
+    let mut total = 0usize;
+    for idx in 0..CONTEXT_SHARDS {
+        let guard = read_shard(idx);
+        total += guard.contexts.values().map(|s| s.refs).sum::<usize>();
+    }
+    total
 }
 
 /// How many releases arrived for an id that was never handed out.
@@ -740,10 +831,11 @@ pub fn stale_release_count() -> usize {
     STALE_RELEASES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Stores a context under an already-held table lock and returns its id.
-fn register_locked(tables: &mut ContextTables, entry: EntryContext) -> u64 {
+/// Stores a context under an already-held shard lock and returns its shard-tagged id.
+fn register_locked(tables: &mut ContextTables, shard_idx: usize, entry: EntryContext) -> u64 {
     ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let id = NEXT_CONTEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let seq = NEXT_CONTEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = (seq << CONTEXT_SHARD_BITS) | (shard_idx as u64);
     tables.contexts.insert(
         id,
         Shared {
@@ -758,9 +850,9 @@ fn register_locked(tables: &mut ContextTables, entry: EntryContext) -> u64 {
 
 /// Stores a context and returns the id the OS will carry for it.
 fn register_context(entry: EntryContext) -> u64 {
-    let mut guard = write_tables();
-    let tables = guard.get_or_insert_with(ContextTables::default);
-    register_locked(tables, entry)
+    let shard_idx = shard_index_for_file(entry.file_id);
+    let mut guard = write_shard(shard_idx);
+    register_locked(&mut guard, shard_idx, entry)
 }
 
 /// The id for `entry`, **reusing the one already handed out for that entry** and bumping its reference count.
@@ -768,10 +860,10 @@ fn register_context(entry: EntryContext) -> u64 {
 /// This is the shape the FSD expects (one context per entry, one close per file object); the key is the entry's `file_id`, which is already the
 /// fold-insensitive identity the rest of this layer uses.
 fn acquire_context(entry: EntryContext) -> u64 {
-    let mut guard = write_tables();
-    let tables = guard.get_or_insert_with(ContextTables::default);
-    if let Some(&id) = tables.by_file.get(&entry.file_id) {
-        if let Some(shared) = tables.contexts.get_mut(&id) {
+    let shard_idx = shard_index_for_file(entry.file_id);
+    let mut guard = write_shard(shard_idx);
+    if let Some(&id) = guard.by_file.get(&entry.file_id) {
+        if let Some(shared) = guard.contexts.get_mut(&id) {
             shared.refs += 1;
             ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if debug_handles_enabled() && ACQUIRES.load(std::sync::atomic::Ordering::Relaxed) <= 40
@@ -784,7 +876,7 @@ fn acquire_context(entry: EntryContext) -> u64 {
             return id;
         }
     }
-    register_locked(tables, entry)
+    register_locked(&mut guard, shard_idx, entry)
 }
 
 /// The context behind `context`, if the id was really handed out.
@@ -795,11 +887,8 @@ fn entry_of(context: *const c_void) -> Option<EntryContext> {
     if id == 0 {
         return None;
     }
-    let guard = read_tables();
-    guard
-        .as_ref()
-        .and_then(|tables| tables.contexts.get(&id))
-        .map(|shared| shared.entry)
+    let guard = read_shard(shard_index_for_id(id));
+    guard.contexts.get(&id).map(|shared| shared.entry)
 }
 
 /// Releases a context from the direct tests, through the same table `close_shell` uses.
@@ -823,12 +912,13 @@ pub fn register_context_for_test(entry: EntryContext) -> *mut c_void {
 /// The table is process-wide (the callbacks have no place to keep a per-mount one), so without this a mount that leaves contexts behind would
 /// make the next mount start with them. Clearing at teardown is what keeps the residue **bounded by one mount** instead of accumulating.
 pub fn clear_contexts() {
-    let mut guard = write_tables();
-    let tables = guard.get_or_insert_with(ContextTables::default);
-    tables.contexts.clear();
-    tables.by_file.clear();
-    tables.closed.clear();
-    tables.closed_order.clear();
+    for idx in 0..CONTEXT_SHARDS {
+        let mut guard = write_shard(idx);
+        guard.contexts.clear();
+        guard.by_file.clear();
+        guard.closed.clear();
+        guard.closed_order.clear();
+    }
 }
 
 /// The **one** place WinFsp's path bytes are turned into the bytes the backends parse (517/518).
@@ -859,10 +949,8 @@ fn is_closed(context: *const c_void) -> bool {
     if id == 0 {
         return false;
     }
-    let guard = read_tables();
-    guard
-        .as_ref()
-        .is_some_and(|tables| tables.closed.contains(&id))
+    let guard = read_shard(shard_index_for_id(id));
+    guard.closed.contains(&id)
 }
 
 /// Removes the context behind `context`, or `None` when the id was never handed out (a stale close).
@@ -889,9 +977,8 @@ fn release_context(context: *const c_void) -> Release {
     if id == 0 {
         return Release::Unknown;
     }
-    let mut guard = write_tables();
-    let tables = guard.get_or_insert_with(ContextTables::default);
-    let (remaining, shared_entry) = match tables.contexts.get_mut(&id) {
+    let mut guard = write_shard(shard_index_for_id(id));
+    let (remaining, shared_entry) = match guard.contexts.get_mut(&id) {
         Some(shared) => {
             shared.refs -= 1;
             (shared.refs, shared.entry)
@@ -904,15 +991,15 @@ fn release_context(context: *const c_void) -> Release {
         }
         return Release::StillShared(shared_entry);
     }
-    let entry = tables
+    let entry = guard
         .contexts
         .remove(&id)
         .map(|shared| shared.entry)
         .expect("a context that reached zero references must still be in the table");
-    if tables.by_file.get(&entry.file_id) == Some(&id) {
-        tables.by_file.remove(&entry.file_id);
+    if guard.by_file.get(&entry.file_id) == Some(&id) {
+        guard.by_file.remove(&entry.file_id);
     }
-    tables.record_closed(id);
+    guard.record_closed(id);
     Release::Freed(entry)
 }
 

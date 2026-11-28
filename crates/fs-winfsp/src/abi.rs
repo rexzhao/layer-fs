@@ -181,6 +181,8 @@ pub mod slot {
     pub const GET_SECURITY: usize = 16;
     /// `ReadDirectory` — `winfsp.h:703` (index 18; `GetSecurity`/`SetSecurity` occupy 16/17).
     pub const READ_DIRECTORY: usize = 18;
+    /// `GetDirInfoByName` — `winfsp.h:852` (index 24; slots 19..23 are reparse/stream ops).
+    pub const GET_DIR_INFO_BY_NAME: usize = 24;
 
     /// How many named (non-reserved) entries the SDK declares; the rest are `Reserved[31]` plus padding to 64.
     pub const NAMED: usize = 33;
@@ -272,7 +274,15 @@ impl VolumeParams {
         const UNICODE_ON_DISK: u32 = 1 << 2;
         const PERSISTENT_ACLS: u32 = 1 << 3;
         let flags = CASE_PRESERVED_NAMES | UNICODE_ON_DISK | PERSISTENT_ACLS;
-        self.bytes[36..40].copy_from_slice(&flags.to_ne_bytes());
+        self.or_u32(36, flags);
+    }
+
+    /// `PassQueryDirectoryFileName:1` (`fsctl.h:220`, bit 13 at offset 36): tells WinFsp to call
+    /// `GetDirInfoByName` (slot 24) for single-file `FindFirstFile` lookups instead of enumerating
+    /// the entire parent directory via `ReadDirectory`.
+    pub fn set_pass_query_directory_file_name(&mut self) {
+        const PASS_QUERY_DIRECTORY_FILE_NAME: u32 = 1 << 13;
+        self.or_u32(36, PASS_QUERY_DIRECTORY_FILE_NAME);
     }
 
     /// `UINT32 FileInfoTimeout` — `fsctl.h:204`. Zero disables metadata caching, which is what a workspace wants: the overlay is the only source

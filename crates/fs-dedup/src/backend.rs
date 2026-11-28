@@ -2035,10 +2035,14 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         self.is_dirty(file_id)
     }
 
-    fn on_cleanup(&self, file_id: u64) -> OpsResult<()> {
-        if self.is_dirty(file_id) {
-            let _lock = self.store.lock_inode(self.ws_id, file_id);
-            self.flush_dirty_inode(file_id)?;
+    fn on_cleanup(&self, _file_id: u64) -> OpsResult<()> {
+        // Avoid triggering a synchronous SQLite write transaction on every handle close during
+        // small-file storms: dirty overlay metadata is batched and flushed at `DIRTY_FLUSH_THRESHOLD`
+        // (256 files), every 2s by the background maintenance thread, on explicit `FlushFileBuffers`
+        // (`flush_file`), and on unmount (`Drop`). `is_file_dirty` keeps unflushed files protected
+        // from background dedup in the meantime.
+        if self.dirty_count.load(Ordering::Acquire) >= DIRTY_FLUSH_THRESHOLD {
+            self.flush_all_dirty()?;
         }
         Ok(())
     }
@@ -2086,6 +2090,20 @@ impl WorkspaceOps for DedupWorkspaceBackend {
             .load_inode_cached(&conn, child_id)?
             .ok_or(OpsError::NotFound)?;
         Ok(cached_to_node_info(&row))
+    }
+
+    fn lookup_child_info(&self, parent_id: u64, name: &[u8]) -> OpsResult<(Vec<u8>, NodeInfo)> {
+        let conn = self.ro_pool.get()?;
+        let folded = fold_bytes(name);
+        let Some((child_id, _, stored_name)) =
+            self.lookup_child_cached(&conn, parent_id, &folded)?
+        else {
+            return Err(OpsError::NotFound);
+        };
+        let row = self
+            .load_inode_cached(&conn, child_id)?
+            .ok_or(OpsError::NotFound)?;
+        Ok((stored_name, cached_to_node_info(&row)))
     }
 
     fn open_entry(

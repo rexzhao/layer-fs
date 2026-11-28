@@ -309,6 +309,26 @@ mod platform {
         }
     }
 
+    /// `GetDirInfoByName`: `(FSP_FILE_SYSTEM*, PVOID FileContext, PWSTR FileName, FSP_FSCTL_DIR_INFO*)` — `winfsp.h:852`, slot **24**.
+    unsafe extern "system" fn get_dir_info_by_name_trampoline(
+        file_system: *mut c_void,
+        file_context: *mut c_void,
+        file_name: *const u16,
+        dir_info_out: *mut c_void,
+    ) -> i32 {
+        let adapter = crate::registry::mounts().get(file_system as usize);
+        // SAFETY: WinFsp's contract — `file_context` is ours, `file_name` is NUL-terminated, and
+        // `dir_info_out` is WinFsp's `FSP_FSCTL_DIR_INFO` + `MAX_PATH` output buffer.
+        unsafe {
+            crate::callbacks::get_dir_info_by_name_shell(
+                adapter.as_deref(),
+                file_context,
+                file_name,
+                dir_info_out,
+            )
+        }
+    }
+
     /// `Open`: `(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess, PVOID *PFileContext,
     /// FSP_FSCTL_FILE_INFO *FileInfo)` — `winfsp.h:322`.
     unsafe extern "system" fn open_trampoline(
@@ -803,6 +823,22 @@ mod platform {
                 ) -> i32,
                 unsafe extern "C" fn() -> i32,
             >(listing));
+            // `GetDirInfoByName` — slot **24** (`winfsp.h:852`): O(1) single-file `FindFirstFile` lookup.
+            let dir_info_by_name: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                *const u16,
+                *mut c_void,
+            ) -> i32 = get_dir_info_by_name_trampoline;
+            interface.slots[slot::GET_DIR_INFO_BY_NAME] = Some(std::mem::transmute::<
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *const u16,
+                    *mut c_void,
+                ) -> i32,
+                unsafe extern "C" fn() -> i32,
+            >(dir_info_by_name));
             interface.slots[slot::GET_FILE_INFO] = Some(std::mem::transmute::<
                 unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32,
                 unsafe extern "C" fn() -> i32,
@@ -920,6 +956,7 @@ mod platform {
             params.set_sectors_per_allocation_unit(1);
             params.set_max_component_length(255);
             params.set_name_flags();
+            params.set_pass_query_directory_file_name();
             params.set_file_info_timeout(file_info_timeout_ms);
             if file_info_timeout_ms > 0 {
                 // V1 per-class kernel timeouts (`Version == 504`): enable kernel DirInfo caching,

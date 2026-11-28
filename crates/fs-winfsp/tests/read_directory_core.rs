@@ -461,3 +461,66 @@ fn read_shell_past_eof_returns_status_end_of_file_and_flush_populates_file_info(
 
     fs_winfsp::callbacks::release_context_for_test(context);
 }
+
+#[test]
+fn get_dir_info_by_name_shell_returns_case_preserved_entry_and_not_found() {
+    use fs_semantics::disposition::Disposition;
+    use fs_winfsp::abi::FileInfo;
+    use fs_winfsp::callbacks::get_dir_info_by_name_shell;
+    use fs_winfsp::ops::{Path as OpsPath, WorkspaceOps};
+
+    let mock = fs_winfsp::MockBackend::new();
+    let dir_id = mock.mkdir(&OpsPath::new(b"/Assets")).unwrap();
+    let f = mock
+        .create_or_open(&OpsPath::new(b"/Assets/Player.prefab"), Disposition::Create)
+        .unwrap();
+    mock.write(f.file_id, 0, b"prefab-bytes").unwrap();
+
+    let adapter = fs_winfsp::DynAdapter::new(Box::new(mock));
+    let context = fs_winfsp::callbacks::register_context_for_test(
+        fs_winfsp::callbacks::EntryContext {
+            file_id: dir_id,
+            handle: fs_winfsp::handles::HandleId::from_raw(202),
+        },
+    );
+
+    // Case-insensitive query `"player.prefab"` must return exact stored `"Player.prefab"` + size 12.
+    let mut query: Vec<u16> = "player.prefab".encode_utf16().collect();
+    query.push(0);
+    let mut out = vec![0u8; 104 + 260 * 2];
+    let st = unsafe {
+        get_dir_info_by_name_shell(
+            Some(&adapter),
+            context,
+            query.as_ptr(),
+            out.as_mut_ptr().cast::<c_void>(),
+        )
+    };
+    assert_eq!(st, 0);
+    let rec_size = u16::from_ne_bytes([out[0], out[1]]) as usize;
+    assert_eq!(rec_size, 104 + "Player.prefab".len() * 2);
+    let fi = unsafe { std::ptr::read_unaligned(out.as_ptr().add(8).cast::<FileInfo>()) };
+    assert_eq!(fi.file_size, 12);
+    let name = String::from_utf16_lossy(
+        &out[104..rec_size]
+            .chunks_exact(2)
+            .map(|p| u16::from_ne_bytes([p[0], p[1]]))
+            .collect::<Vec<u16>>(),
+    );
+    assert_eq!(name, "Player.prefab");
+
+    // Missing child must return STATUS_OBJECT_NAME_NOT_FOUND (`0xC0000034`).
+    let mut missing: Vec<u16> = "nope.prefab".encode_utf16().collect();
+    missing.push(0);
+    let st_miss = unsafe {
+        get_dir_info_by_name_shell(
+            Some(&adapter),
+            context,
+            missing.as_ptr(),
+            out.as_mut_ptr().cast::<c_void>(),
+        )
+    };
+    assert_eq!(st_miss, 0xC000_0034u32 as i32);
+
+    fs_winfsp::callbacks::release_context_for_test(context);
+}

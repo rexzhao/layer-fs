@@ -1240,6 +1240,22 @@ impl WorkspaceOps for WinFspBackend {
         })
     }
 
+    fn lookup_child_info(&self, parent_id: u64, name: &[u8]) -> OpsResult<(Vec<u8>, NodeInfo)> {
+        self.with_read_view(|op, view| {
+            let parent_serial = to_serial(view, parent_id);
+            let folded = fold_bytes(name);
+            let Some((stored, serial)) = self
+                .get_dir_table(op, view, parent_serial)?
+                .get(&folded)
+                .cloned()
+            else {
+                return Err(OpsError::NotFound);
+            };
+            let stat = view.stat(op.overlay(), serial).map_err(map_workspace_err)?;
+            Ok((stored, node_info_of(view, &stat)))
+        })
+    }
+
     fn open_entry(
         &self,
         path: &Path<'_>,

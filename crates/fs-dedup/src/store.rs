@@ -321,12 +321,32 @@ impl Drop for BudgetPermit {
     }
 }
 
-/// RAII guard that cancels a [`ByteBudget`] when the consumer thread exits (on error, panic, or return).
-struct CancelOnExit(Arc<ByteBudget>);
+/// RAII guard that cancels a [`ByteBudget`] when the owning stage exits abnormally (on error or
+/// panic). Call [`Self::disarm`] right before a normal `Ok(())` exit so downstream stages finish
+/// draining queued batches without being cancelled!
+struct CancelOnExit {
+    budget: Arc<ByteBudget>,
+    armed: bool,
+}
+
+impl CancelOnExit {
+    fn new(budget: Arc<ByteBudget>) -> Self {
+        Self {
+            budget,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
 
 impl Drop for CancelOnExit {
     fn drop(&mut self) {
-        self.0.cancel();
+        if self.armed {
+            self.budget.cancel();
+        }
     }
 }
 
@@ -1327,8 +1347,12 @@ impl DedupStore {
         let job_rx = Arc::new(Mutex::new(job_rx));
 
         // Streaming chunk/file channel: workers -> committer, strictly byte-bounded by `budget`.
-        let (prep_tx, prep_rx) = mpsc::sync_channel::<ImportMsg>(256);
-        let budget = Arc::new(ByteBudget::new(IMPORT_INFLIGHT_BYTE_BUDGET));
+        let (prep_tx, prep_rx) = mpsc::sync_channel::<ImportMsg>(512);
+        // Scale in-flight chunk byte budget with worker parallelism (4 MiB for 2 threads so small
+        // imports stay tightly memory-bounded, up to 32 MiB for 16-core saturation).
+        let budget_bytes = (threads.saturating_mul(2 * 1024 * 1024))
+            .clamp(IMPORT_INFLIGHT_BYTE_BUDGET, 32 * 1024 * 1024);
+        let budget = Arc::new(ByteBudget::new(budget_bytes));
 
         // Progress reporter thread (optional).
         let stop_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1559,51 +1583,149 @@ impl DedupStore {
         drop(job_rx);
         drop(prep_tx);
 
-        // Spawn single sequential pack-writer & SQLite metadata committer thread.
-        let store_c = Arc::clone(self);
-        let known_c = Arc::clone(&lazy_known);
-        let budget_c = Arc::clone(&budget);
-        let f_c = Arc::clone(&files_done);
-        let upd_c = Arc::clone(&updated_done);
-        let l_c = Arc::clone(&logical_done);
-        let u_c = Arc::clone(&unique_done);
-        let uc_c = Arc::clone(&unique_chunks_done);
-        let s_c = Arc::clone(&stored_done);
-        let p_c = Arc::clone(&pinned_done);
-        let committer = std::thread::spawn(move || -> Result<()> {
-            // Ensure ANY exit from committer (including `?` I/O errors or panics) immediately
-            // cancels `ByteBudget` and wakes all blocked workers so `import_dir` never hangs!
-            let _cancel_on_exit = CancelOnExit(Arc::clone(&budget_c));
+        // Split import commit into two pipelined stages so pack appends & worker permits keep
+        // flowing while SQLite commits the previous batch:
+        //   Stage 2 (`pack_writer`): appends new unique chunks to `.pack`, flushes, and hands off
+        //                            a `CommitBatch` over `commit_tx`.
+        //   Stage 3 (`sql_committer`): commits `CommitBatch`es in SQLite, publishes `KnownChunks`,
+        //                              cleans replaced overlays, and replays `pending_chunk_releases`.
+        struct CommitBatch {
+            files: Vec<PreparedFile>,
+            written_locs: HashMap<Hash32, ChunkLoc>,
+            pack_updates: Vec<(u64, u64, bool)>,
+        }
+
+        let (commit_tx, commit_rx) = mpsc::sync_channel::<CommitBatch>(4);
+        let inflight_commit_hashes: Arc<Mutex<HashSet<Hash32, Hash32BuildHasher>>> =
+            Arc::new(Mutex::new(HashSet::with_hasher(Hash32BuildHasher::default())));
+
+        // Stage 2: sequential pack writer thread.
+        let store_pw = Arc::clone(self);
+        let known_pw = Arc::clone(&lazy_known);
+        let budget_pw = Arc::clone(&budget);
+        let inflight_pw = Arc::clone(&inflight_commit_hashes);
+        let u_pw = Arc::clone(&unique_done);
+        let uc_pw = Arc::clone(&unique_chunks_done);
+        let s_pw = Arc::clone(&stored_done);
+        let pack_writer = std::thread::spawn(move || -> Result<()> {
+            let mut cancel_on_exit = CancelOnExit::new(Arc::clone(&budget_pw));
             let mut batch: Vec<PreparedFile> = Vec::with_capacity(256);
             let mut pending_written_locs: HashMap<Hash32, ChunkLoc> = HashMap::new();
             let mut batch_pack_bytes: u64 = 0;
 
-            let flush_batch = |batch: &mut Vec<PreparedFile>,
-                               pending_written_locs: &mut HashMap<Hash32, ChunkLoc>,
-                               batch_pack_bytes: &mut u64|
+            let send_batch = |batch: &mut Vec<PreparedFile>,
+                              pending_written_locs: &mut HashMap<Hash32, ChunkLoc>,
+                              batch_pack_bytes: &mut u64|
              -> Result<()> {
                 if batch.is_empty() {
                     return Ok(());
                 }
-                let known_opt = known_c.lock().unwrap().clone();
                 let pack_updates = {
-                    let mut pw = store_c.packs.writer();
+                    let mut pw = store_pw.packs.writer();
                     pw.flush()?;
                     pw.take_pack_updates()
                 };
+                let written_locs = std::mem::take(pending_written_locs);
+                if !written_locs.is_empty() {
+                    let mut inf = inflight_pw.lock().unwrap();
+                    for &h in written_locs.keys() {
+                        inf.insert(h);
+                    }
+                }
+                let files = std::mem::replace(batch, Vec::with_capacity(256));
+                *batch_pack_bytes = 0;
+                commit_tx
+                    .send(CommitBatch {
+                        files,
+                        written_locs,
+                        pack_updates,
+                    })
+                    .map_err(|_| Error::Other("import SQLite committer disconnected".into()))
+            };
 
-                // Batch-commit chunks, pack sizes, inodes, dentries, and durable
-                // `pending_chunk_releases` in ONE atomic SQLite transaction!
+            while let Ok(msg) = prep_rx.recv() {
+                if budget_pw.is_cancelled() {
+                    break;
+                }
+                match msg {
+                    ImportMsg::Chunk(chunk) => {
+                        let known_opt = known_pw.lock().unwrap().clone();
+                        let already_present = pending_written_locs.contains_key(&chunk.hash)
+                            || known_opt.as_ref().is_some_and(|k| k.contains(&chunk.hash))
+                            || inflight_pw.lock().unwrap().contains(&chunk.hash);
+                        if !already_present {
+                            let loc = store_pw.packs.writer().append(
+                                &chunk.hash,
+                                chunk.codec,
+                                chunk.raw_len,
+                                &chunk.stored,
+                            )?;
+                            pending_written_locs.insert(chunk.hash, loc);
+                            uc_pw.fetch_add(1, Ordering::Relaxed);
+                            u_pw.fetch_add(u64::from(chunk.raw_len), Ordering::Relaxed);
+                            s_pw.fetch_add(chunk.stored.len() as u64, Ordering::Relaxed);
+                            batch_pack_bytes =
+                                batch_pack_bytes.saturating_add(chunk.stored.len() as u64);
+                        }
+                        // Dropping `chunk` immediately releases its RAII `BudgetPermit` before SQLite commits!
+                        drop(chunk);
+                    }
+                    ImportMsg::File(item) => {
+                        batch.push(item);
+                        if batch.len() >= IMPORT_COMMIT_BATCH
+                            || batch_pack_bytes >= IMPORT_COMMIT_MAX_BYTES
+                        {
+                            send_batch(
+                                &mut batch,
+                                &mut pending_written_locs,
+                                &mut batch_pack_bytes,
+                            )?;
+                        }
+                    }
+                }
+            }
+            if budget_pw.is_cancelled() {
+                return Ok(());
+            }
+            send_batch(&mut batch, &mut pending_written_locs, &mut batch_pack_bytes)?;
+            drop(commit_tx);
+            cancel_on_exit.disarm();
+            Ok(())
+        });
+
+        // Stage 3: sequential SQLite metadata committer thread.
+        let store_c = Arc::clone(self);
+        let known_c = Arc::clone(&lazy_known);
+        let budget_c = Arc::clone(&budget);
+        let inflight_c = Arc::clone(&inflight_commit_hashes);
+        let f_c = Arc::clone(&files_done);
+        let upd_c = Arc::clone(&updated_done);
+        let l_c = Arc::clone(&logical_done);
+        let p_c = Arc::clone(&pinned_done);
+        let committer = std::thread::spawn(move || -> Result<()> {
+            // Ensure ANY abnormal exit from committer (including `?` SQL errors or panics)
+            // immediately cancels `ByteBudget` and wakes all blocked workers/pack_writer!
+            let mut cancel_on_exit = CancelOnExit::new(Arc::clone(&budget_c));
+            // Chunks written to `.pack` by `pack_writer` whose owning worker file hasn't arrived
+            // in a batch yet stay here across batches until their `PreparedFile` commits.
+            let mut unclaimed_locs: HashMap<Hash32, ChunkLoc> = HashMap::new();
+
+            while let Ok(cb) = commit_rx.recv() {
+                if budget_c.is_cancelled() {
+                    break;
+                }
+                unclaimed_locs.extend(cb.written_locs);
+                let known_opt = known_c.lock().unwrap().clone();
                 let mut overlays_to_remove: Vec<u64> = Vec::new();
                 let mut committed_hashes: Vec<Hash32> = Vec::new();
                 {
                     let mut conn = store_c.meta.lock().unwrap();
                     let tx = conn.transaction()?;
-                    upsert_pack_updates(&tx, &pack_updates)?;
+                    upsert_pack_updates(&tx, &cb.pack_updates)?;
 
                     // Collect old chunk refs from modified files being replaced in place.
                     let mut old_refs: HashMap<Hash32, u64> = HashMap::new();
-                    for item in batch.iter() {
+                    for item in &cb.files {
                         if let Some(old_mode) = item.replacing_mode {
                             if old_mode == STORAGE_CHUNKS {
                                 if let Some(old_row) = load_inode(&tx, ws_id, item.inode_id)? {
@@ -1623,7 +1745,7 @@ impl DedupStore {
 
                     // Aggregate new refcount additions directly from `item.entries`.
                     let mut new_refs: HashMap<Hash32, u64> = HashMap::new();
-                    for item in batch.iter() {
+                    for item in &cb.files {
                         if item.storage_mode == STORAGE_CHUNKS {
                             for e in &item.entries {
                                 *new_refs.entry(e.hash).or_insert(0) += 1;
@@ -1645,7 +1767,7 @@ impl DedupStore {
                             add -= cancelled;
                         }
                         if add > 0 {
-                            let loc = pending_written_locs.remove(&hash);
+                            let loc = unclaimed_locs.remove(&hash);
                             if loc.is_some() {
                                 committed_hashes.push(hash);
                             }
@@ -1667,7 +1789,7 @@ impl DedupStore {
                             "INSERT OR REPLACE INTO dentries (ws_id, parent_id, folded_name, display_name, child_id, kind)
                              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         )?;
-                        for item in batch.iter() {
+                        for item in &cb.files {
                             let dirty_since = if item.storage_mode == STORAGE_OVERLAY {
                                 item.written_ns
                             } else {
@@ -1713,71 +1835,28 @@ impl DedupStore {
                     }
                     tx.commit()?;
                 }
-                // Publish committed chunk hashes to `KnownChunks` only AFTER SQLite commit succeeds.
+                // Publish committed chunk hashes to `KnownChunks` BEFORE clearing them from
+                // `inflight_commit_hashes` (unclaimed chunks from in-progress files stay protected!).
                 if !committed_hashes.is_empty() {
                     if let Some(known) = known_opt {
-                        known.insert_batch(committed_hashes);
+                        known.insert_batch(committed_hashes.iter().copied());
+                    }
+                    let mut inf = inflight_c.lock().unwrap();
+                    for h in committed_hashes {
+                        inf.remove(&h);
                     }
                 }
                 for old_id in overlays_to_remove {
                     let _ = store_c.overlay.remove_file(ws_id, old_id);
                 }
-                batch.clear();
-                *batch_pack_bytes = 0;
-                Ok(())
-            };
-
-            while let Ok(msg) = prep_rx.recv() {
-                if budget_c.is_cancelled() {
-                    break;
-                }
-                match msg {
-                    ImportMsg::Chunk(chunk) => {
-                        let known_opt = known_c.lock().unwrap().clone();
-                        let already_present = pending_written_locs.contains_key(&chunk.hash)
-                            || known_opt.as_ref().is_some_and(|k| k.contains(&chunk.hash));
-                        if !already_present {
-                            let loc = store_c.packs.writer().append(
-                                &chunk.hash,
-                                chunk.codec,
-                                chunk.raw_len,
-                                &chunk.stored,
-                            )?;
-                            pending_written_locs.insert(chunk.hash, loc);
-                            uc_c.fetch_add(1, Ordering::Relaxed);
-                            u_c.fetch_add(u64::from(chunk.raw_len), Ordering::Relaxed);
-                            s_c.fetch_add(chunk.stored.len() as u64, Ordering::Relaxed);
-                            batch_pack_bytes =
-                                batch_pack_bytes.saturating_add(chunk.stored.len() as u64);
-                        }
-                        // Dropping `chunk` automatically releases its RAII `BudgetPermit`.
-                        drop(chunk);
-                    }
-                    ImportMsg::File(item) => {
-                        batch.push(item);
-                        if batch.len() >= IMPORT_COMMIT_BATCH
-                            || batch_pack_bytes >= IMPORT_COMMIT_MAX_BYTES
-                        {
-                            flush_batch(
-                                &mut batch,
-                                &mut pending_written_locs,
-                                &mut batch_pack_bytes,
-                            )?;
-                        }
-                    }
-                }
             }
             if budget_c.is_cancelled() {
                 return Ok(());
             }
-            flush_batch(
-                &mut batch,
-                &mut pending_written_locs,
-                &mut batch_pack_bytes,
-            )?;
 
-            // All workers have exited: apply and clear all durably queued `pending_chunk_releases`.
+            // All workers & pack_writer have exited: apply and clear all durably queued `pending_chunk_releases`.
             store_c.replay_pending_releases_locked()?;
+            cancel_on_exit.disarm();
             Ok(())
         });
 
@@ -2147,6 +2226,7 @@ impl DedupStore {
                 worker_panicked = true;
             }
         }
+        let pack_join = pack_writer.join();
         let commit_join = committer.join();
         stop_progress.store(true, Ordering::Relaxed);
         if let Some(h) = progress_handle {
@@ -2157,7 +2237,11 @@ impl DedupStore {
         if worker_panicked {
             return Err(Error::Other("import worker panicked".into()));
         }
-        commit_join.map_err(|_| Error::Other("import committer panicked".into()))??;
+        let commit_res = commit_join.map_err(|_| Error::Other("import committer panicked".into()))?;
+        let pack_res = pack_join.map_err(|_| Error::Other("import pack writer panicked".into()))?;
+        // Report SQLite commit error ahead of downstream `commit_tx` disconnect error.
+        commit_res?;
+        pack_res?;
 
         // Power-loss durability (N12): durably sync the active pack file (all previously rolled
         // packs were already synced in `seal_active()`) BEFORE committing the final workspace
