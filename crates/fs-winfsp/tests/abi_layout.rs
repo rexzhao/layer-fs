@@ -187,6 +187,29 @@ fn volume_params_is_an_opaque_504_byte_block() {
     );
 }
 
+/// V1 `FSP_FSCTL_VOLUME_PARAMS` timeout fields (`fsctl.h:239-267`) sit right after the 456-byte V0 prefix.
+#[test]
+fn volume_params_v1_timeout_offsets_match_sdk() {
+    use fs_winfsp::abi::VolumeParams;
+
+    let mut params = VolumeParams::zeroed();
+    params.set_version_size();
+    params.set_file_info_timeout(1000);
+    params.set_volume_info_timeout(2000);
+    params.set_dir_info_timeout(3000);
+    params.set_security_timeout(60_000);
+
+    let b = params.as_bytes();
+    assert_eq!(u16::from_ne_bytes([b[0], b[1]]), 504);
+    assert_eq!(u32::from_ne_bytes([b[32], b[33], b[34], b[35]]), 1000);
+    // Offset 456: V1 valid bitmask: VolumeInfoTimeoutValid (1<<0) | DirInfoTimeoutValid (1<<1) | SecurityTimeoutValid (1<<2) = 0b111.
+    assert_eq!(u32::from_ne_bytes([b[456], b[457], b[458], b[459]]), 0b111);
+    assert_eq!(u32::from_ne_bytes([b[460], b[461], b[462], b[463]]), 2000);
+    assert_eq!(u32::from_ne_bytes([b[464], b[465], b[466], b[467]]), 3000);
+    assert_eq!(u32::from_ne_bytes([b[468], b[469], b[470], b[471]]), 60_000);
+    assert!(b[472..].iter().all(|byte| *byte == 0));
+}
+
 /// The `FSP_FSCTL_DIR_INFO` record: fixed header, 8-alignment, and the name at the end.
 ///
 /// A wrong header size or a missing alignment does not fail loudly — the OS reads the name out of the middle of the next

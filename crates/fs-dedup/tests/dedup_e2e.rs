@@ -1274,3 +1274,126 @@ fn r3_clean_marker_cached_read_dir_noop_basic_info_and_wal_checkpoint() {
     assert_eq!(check.mismatched_refcounts, 0);
     assert_eq!(check.orphan_chunks, 0);
 }
+
+#[test]
+fn r4_single_write_conn_concurrent_foreground_and_dedup_plus_single_pass_open_entry() {
+    use fs_winfsp::ops::{Kind, OpenTarget, OpsError};
+
+    let tmp = TempDir::new("r4_single_conn_open_entry");
+    let store = DedupStore::init(tmp.0.join("store"), StoreConfig::default()).unwrap();
+    store.create_workspace("ws").unwrap();
+    let backend = std::sync::Arc::new(DedupWorkspaceBackend::open(store.clone(), "ws").unwrap());
+
+    // 1. Single-pass `open_entry` and `lookup_info` for root, dirs, files, and OpenTarget rules.
+    let root_info = backend.lookup_info(&OpsPath::new(b"/")).unwrap();
+    assert_eq!(root_info.kind, Kind::Directory);
+    let root_open = backend
+        .open_entry(&OpsPath::new(b"/"), Disposition::Open, OpenTarget::Any)
+        .unwrap();
+    assert_eq!(root_open.kind, Kind::Directory);
+    assert!(root_open.binding.1.is_empty());
+
+    let dir_out = backend
+        .open_entry(
+            &OpsPath::new(b"/Assets"),
+            Disposition::Create,
+            OpenTarget::DirOnly,
+        )
+        .unwrap();
+    assert_eq!(dir_out.kind, Kind::Directory);
+    assert_eq!(dir_out.binding.1, b"Assets");
+
+    // Re-opening existing dir with OpenIf + DirOnly returns same id; FileOnly must return IsADirectory.
+    let dir_again = backend
+        .open_entry(
+            &OpsPath::new(b"/assets"),
+            Disposition::OpenIf,
+            OpenTarget::DirOnly,
+        )
+        .unwrap();
+    assert_eq!(dir_again.file_id, dir_out.file_id);
+    assert_eq!(
+        backend
+            .open_entry(
+                &OpsPath::new(b"/assets"),
+                Disposition::OpenIf,
+                OpenTarget::FileOnly,
+            )
+            .unwrap_err(),
+        OpsError::IsADirectory
+    );
+
+    let file_out = backend
+        .open_entry(
+            &OpsPath::new(b"/Assets/Scene.unity"),
+            Disposition::Create,
+            OpenTarget::FileOnly,
+        )
+        .unwrap();
+    assert_eq!(file_out.kind, Kind::File);
+    assert_eq!(
+        backend
+            .open_entry(
+                &OpsPath::new(b"/Assets/Scene.unity"),
+                Disposition::Open,
+                OpenTarget::DirOnly,
+            )
+            .unwrap_err(),
+        OpsError::NotADirectory
+    );
+    assert_eq!(
+        backend
+            .lookup_info(&OpsPath::new(b"/assets/scene.unity"))
+            .unwrap()
+            .file_id,
+        file_out.file_id
+    );
+
+    // 2. Concurrent foreground writes + flushes + checkpoint_wal + background dedup sharing the
+    //    single unified `DedupStore::meta` write connection (zero SQLITE_BUSY, zero deadlock).
+    let stop2 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::scope(|s| {
+        let mut writers = Vec::new();
+        for tid in 0..4usize {
+            let b = backend.clone();
+            writers.push(s.spawn(move || {
+                let payload = vec![(tid as u8).wrapping_add(0x60); 8192];
+                for i in 0..30usize {
+                    let p = format!("/Assets/g_{tid}_{i}.bin");
+                    let out = b
+                        .open_entry(
+                            &OpsPath::new(p.as_bytes()),
+                            Disposition::Create,
+                            OpenTarget::FileOnly,
+                        )
+                        .unwrap();
+                    b.write(out.file_id, 0, &payload).unwrap();
+                    b.on_cleanup(out.file_id).unwrap();
+                }
+            }));
+        }
+        let bg_stop = stop2.clone();
+        let bg_store = store.clone();
+        let bg_backend = backend.clone();
+        let bg = s.spawn(move || {
+            while !bg_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                bg_backend.flush().unwrap();
+                bg_backend.checkpoint_wal().unwrap();
+                bg_store
+                    .dedup_workspace(Some("ws"), 0, |_, id| bg_backend.is_file_dirty(id))
+                    .unwrap();
+            }
+        });
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop2.store(true, std::sync::atomic::Ordering::Relaxed);
+        bg.join().unwrap();
+    });
+
+    backend.flush().unwrap();
+    let check = store.fsck(false).unwrap();
+    assert_eq!(check.missing_chunks, 0);
+    assert_eq!(check.mismatched_refcounts, 0);
+    assert_eq!(check.orphan_chunks, 0);
+}

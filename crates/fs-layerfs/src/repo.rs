@@ -1280,6 +1280,8 @@ impl WorkspaceHandle {
             .gate
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Release the persistent cached `SourceView` before capturing/installing a new base root.
+        self.backend.release_cached_view();
         let options = CommitOptions {
             force,
             message: message.map(str::to_owned),
@@ -1350,6 +1352,7 @@ impl WorkspaceHandle {
 
     /// Cleanly closes the workspace and retires its overlay namespace (releasing files/locks).
     pub fn close(self) -> Result<()> {
+        self.backend.release_cached_view();
         let route = self.workspace.route();
         self.workspace
             .close()

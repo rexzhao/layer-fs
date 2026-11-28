@@ -12,10 +12,13 @@ use std::time::{Duration, Instant};
 use fs_layerfs::{Error as LayerError, Repo, WorkspaceHandle};
 use fs_winfsp::abi::VolumeInfo;
 use fs_winfsp::loader::default_library;
-use fs_winfsp::mounted::mount_serving;
+use fs_winfsp::mounted::mount_serving_with_timeout;
 use fs_winfsp::ops::DynOps;
 
 pub type Error = Box<dyn std::error::Error>;
+
+/// Default WinFsp kernel metadata/dir/volume cache timeout for `layerfs mount` (1000 ms).
+const DEFAULT_INFO_TIMEOUT_MS: u32 = 1000;
 
 const UNMOUNT_WAIT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(50);
@@ -487,12 +490,13 @@ fn mount_foreground(
             })
         };
 
-        report = mount_serving(
+        report = mount_serving_with_timeout(
             &library,
             mount_point,
             backend,
             volume(),
             Some(capacity),
+            DEFAULT_INFO_TIMEOUT_MS,
             |mounted: &fs_winfsp::mounted::Mounted| {
                 // Replace the active adapter on EVERY mount/remount (fixes hot-switch OnceLock bug).
                 *adapter_slot

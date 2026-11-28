@@ -542,6 +542,14 @@ impl DedupStore {
         open_meta_connection(&self.meta_path)
     }
 
+    /// Acquires the single shared SQLite write connection for this store so foreground workspace
+    /// mutations and background `dedup`/`gc`/maintenance never contend on SQLite file write locks.
+    ///
+    /// Global lock order: `_pack_guard` -> `lock_inode` -> `lock_meta`.
+    pub(crate) fn lock_meta(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.meta.lock().unwrap()
+    }
+
     /// Opens a fast read-only WAL SQLite connection (`PRAGMA query_only = ON`, 4 GiB mmap).
     pub fn open_readonly_conn(&self) -> Result<Connection> {
         open_readonly_meta_connection(&self.meta_path)

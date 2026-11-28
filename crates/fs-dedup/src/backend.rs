@@ -23,8 +23,8 @@ use fs_semantics::attributes::{report as report_attributes, validate as validate
 use fs_semantics::disposition::{decide, Action, Disposition, Exists, Failure, Outcome};
 use fs_semantics::name::fold_bytes;
 use fs_winfsp::ops::{
-    Attributes, DirEntry, DirOutcome, Kind, NodeInfo, OpenOutcome, OpsError, OpsResult, Path,
-    RenameOutcome, Times, WorkspaceOps,
+    Attributes, DirEntry, DirOutcome, Kind, NodeInfo, OpenOutcome, OpenTarget, OpsError, OpsResult,
+    Path, RenameOutcome, Times, WorkspaceOps,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -165,13 +165,14 @@ const DIRTY_FLUSH_THRESHOLD: usize = 256;
 const INODE_ALLOC_BATCH: u64 = 256;
 
 /// WinFsp `WorkspaceOps` backend serving one workspace of a `DedupStore`.
+///
+/// All metadata writes share `DedupStore`'s single SQLite write connection (`store.lock_meta()`)
+/// so foreground WinFsp mutations never contend on SQLite file write locks with background
+/// `dedup_workspace` or `checkpoint_wal`.
 pub struct DedupWorkspaceBackend {
     store: Arc<DedupStore>,
     ws_id: u64,
     ws_name: String,
-    /// Writer SQLite connection (used ONLY for mutations; auto-checkpoint disabled so foreground
-    /// threads never stall on WAL checkpoint fsyncs).
-    write_conn: Mutex<Connection>,
     /// Concurrent read-only WAL SQLite connection pool (used for all read/stat/list/open paths).
     ro_pool: RoConnPool,
     /// Sharded positive & negative `(parent_id -> {folded_name -> DentryVal, complete, generation})` cache.
@@ -241,29 +242,33 @@ impl DedupWorkspaceBackend {
     /// Opens `ws_name` in `store` for live WinFsp serving, reconciling any un-flushed overlay
     /// file sizes left over from a prior unclean shutdown and pre-creating the 256 overlay shards.
     pub fn open(store: Arc<DedupStore>, ws_name: &str) -> crate::Result<Self> {
-        let mut conn = store.open_conn()?;
-        // Disable foreground WAL auto-checkpoint so dispatcher threads never stall on a
-        // multi-hundred-millisecond checkpoint fsync; the background maintenance thread runs
-        // `checkpoint_wal()` periodically instead.
-        let _ = conn.execute_batch("PRAGMA wal_autocheckpoint = 0;");
-        let ws_id = find_workspace_id(&conn, ws_name)?;
+        let (ws_id, start_inode) = {
+            let mut conn = store.lock_meta();
+            // Disable foreground WAL auto-checkpoint on the shared write connection so dispatcher
+            // threads never stall on a multi-hundred-millisecond checkpoint fsync; the background
+            // maintenance thread runs `checkpoint_wal()` periodically instead.
+            let _ = conn.execute_batch("PRAGMA wal_autocheckpoint = 0;");
+            let ws_id = find_workspace_id(&conn, ws_name)?;
 
-        // Check clean-shutdown marker: skip per-overlay stat sweep when previous session exited cleanly.
-        let marker = store.overlay().clean_marker_path(ws_id);
-        let was_clean = marker.exists();
-        let _ = std::fs::remove_file(&marker);
-        if !was_clean {
-            reconcile_overlay_sizes(&mut conn, &store, ws_id)?;
-        }
+            // Check clean-shutdown marker: skip per-overlay stat sweep when previous session exited cleanly.
+            let marker = store.overlay().clean_marker_path(ws_id);
+            let was_clean = marker.exists();
+            let _ = std::fs::remove_file(&marker);
+            if !was_clean {
+                reconcile_overlay_sizes(&mut conn, &store, ws_id)?;
+            }
+
+            let next_inode: i64 = conn.query_row(
+                "SELECT next_inode FROM workspaces WHERE ws_id = ?1",
+                params![ws_id as i64],
+                |r| r.get(0),
+            )?;
+            let start_inode = next_inode.max((ROOT_INODE + 1) as i64) as u64;
+            (ws_id, start_inode)
+        };
         // Pre-create all 256 hex shard directories once so file creations avoid per-file `create_dir_all`.
         store.overlay().precreate_shards(ws_id);
 
-        let next_inode: i64 = conn.query_row(
-            "SELECT next_inode FROM workspaces WHERE ws_id = ?1",
-            params![ws_id as i64],
-            |r| r.get(0),
-        )?;
-        let start_inode = next_inode.max((ROOT_INODE + 1) as i64) as u64;
         let ro_pool = RoConnPool::new(Arc::clone(&store));
         let dentry_cache = (0..DENTRY_SHARDS)
             .map(|_| RwLock::new(DentryShardMap::default()))
@@ -272,7 +277,6 @@ impl DedupWorkspaceBackend {
             store,
             ws_id,
             ws_name: ws_name.to_owned(),
-            write_conn: Mutex::new(conn),
             ro_pool,
             dentry_cache,
             dirty_inodes: Mutex::new(HashMap::new()),
@@ -489,7 +493,7 @@ impl DedupWorkspaceBackend {
             return Ok(());
         };
         {
-            let conn = self.write_conn.lock().unwrap();
+            let conn = self.store.lock_meta();
             let mut stmt = conn
                 .prepare_cached(
                     "UPDATE inodes SET size = ?1, written_ns = ?2, changed_ns = ?2, dirty_since_ns = ?2
@@ -536,7 +540,7 @@ impl DedupWorkspaceBackend {
             guard.iter().map(|(&id, &v)| (id, v)).collect()
         };
         {
-            let mut conn = self.write_conn.lock().unwrap();
+            let mut conn = self.store.lock_meta();
             let tx = conn.transaction().map_err(map_sql)?;
             {
                 let mut stmt = tx
@@ -683,7 +687,7 @@ impl DedupWorkspaceBackend {
     /// Commits the `STORAGE_CHUNKS -> STORAGE_OVERLAY` metadata flip inside a brief `write_conn` txn.
     fn commit_overlay_flip(&self, inode: &mut InodeRow, new_size: u64, ts: i64) -> OpsResult<()> {
         let deleted_chunks = {
-            let mut conn = self.write_conn.lock().unwrap();
+            let mut conn = self.store.lock_meta();
             let tx = conn.transaction().map_err(map_sql)?;
             let deleted = release_manifest_chunks(&tx, &inode.manifest).map_err(map_err)?;
             tx.execute(
@@ -1154,7 +1158,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
 
         loop {
             let _inode_lock = pre_lock_id.map(|id| self.store.lock_inode(self.ws_id, id));
-            let mut conn = self.write_conn.lock().unwrap();
+            let mut conn = self.store.lock_meta();
             let Some((parent_id, leaf_disp, leaf_fold)) = self.resolve_parent(&conn, path)? else {
                 return match decide(disposition, Exists::Directory) {
                     Outcome::Failed(fail) => Err(map_failure(fail)),
@@ -1352,61 +1356,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
     }
 
     fn mkdir(&self, path: &Path<'_>) -> OpsResult<u64> {
-        let mut conn = self.write_conn.lock().unwrap();
-        let Some((parent_id, leaf_disp, leaf_fold)) = self.resolve_parent(&conn, path)? else {
-            return Err(OpsError::NameCollision);
-        };
-        if self.lookup_child_db(&conn, parent_id, &leaf_fold)?.is_some() {
-            return Err(OpsError::NameCollision);
-        }
-        let ts = now_ns();
-        let tx = conn.transaction().map_err(map_sql)?;
-        let inode_id = self.alloc_inode(&tx)?;
-        tx.execute(
-            "INSERT INTO inodes (ws_id, inode_id, kind, size, attributes, created_ns, accessed_ns, written_ns, changed_ns, storage_mode, manifest, dirty_since_ns, pinned_overlay)
-             VALUES (?1, ?2, ?3, 0, 0, ?4, ?4, ?4, ?4, ?5, X'', 0, 0)",
-            params![
-                self.ws_id as i64,
-                inode_id as i64,
-                i64::from(KIND_DIR),
-                ts,
-                i64::from(STORAGE_CHUNKS),
-            ],
-        )
-        .map_err(map_sql)?;
-        tx.execute(
-            "INSERT INTO dentries (ws_id, parent_id, folded_name, display_name, child_id, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                self.ws_id as i64,
-                parent_id as i64,
-                leaf_fold.as_slice(),
-                leaf_disp.as_slice(),
-                inode_id as i64,
-                i64::from(KIND_DIR),
-            ],
-        )
-        .map_err(map_sql)?;
-        tx.commit().map_err(map_sql)?;
-        self.cache_dentry_mutation(parent_id, leaf_fold, (inode_id, KIND_DIR, leaf_disp));
-        self.store.put_cached_inode(
-            self.ws_id,
-            Arc::new(CachedInode {
-                inode_id,
-                kind: KIND_DIR,
-                size: 0,
-                attributes: 0,
-                created_ns: ts,
-                accessed_ns: ts,
-                written_ns: ts,
-                changed_ns: ts,
-                storage_mode: STORAGE_CHUNKS,
-                entries: Some(Arc::from(Vec::new().into_boxed_slice())),
-                chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
-                dirty: false,
-            }),
-        );
-        Ok(inode_id)
+        Ok(self.mkdir_outcome(path, false)?.file_id)
     }
 
     fn open_dir(&self, path: &Path<'_>) -> OpsResult<u64> {
@@ -1597,7 +1547,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                     .overlay()
                     .set_len(self.ws_id, file_id, len)
                     .map_err(map_err)?;
-                let conn = self.write_conn.lock().unwrap();
+                let conn = self.store.lock_meta();
                 let mut stmt = conn
                     .prepare_cached(
                         "UPDATE inodes SET size = ?1, written_ns = ?2, changed_ns = ?2, dirty_since_ns = ?2
@@ -1709,7 +1659,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
             }
         }
         self.flush_dirty_inode(file_id)?;
-        let conn = self.write_conn.lock().unwrap();
+        let conn = self.store.lock_meta();
         let mut stmt = conn
             .prepare_cached(
                 "UPDATE inodes
@@ -1765,7 +1715,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         }
         self.flush_dirty_inode(file_id)?;
         let ts = now_ns();
-        let conn = self.write_conn.lock().unwrap();
+        let conn = self.store.lock_meta();
         let mut stmt = conn
             .prepare_cached(
                 "UPDATE inodes SET attributes = ?1, changed_ns = ?2 WHERE ws_id = ?3 AND inode_id = ?4",
@@ -1806,7 +1756,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
 
     fn rename(&self, from: &Path<'_>, to: &Path<'_>, replace: bool) -> OpsResult<RenameOutcome> {
         self.flush_all_dirty()?;
-        let mut conn = self.write_conn.lock().unwrap();
+        let mut conn = self.store.lock_meta();
         let Some((src_parent, _, src_fold)) = self.resolve_parent(&conn, from)? else {
             return Err(OpsError::InvalidParameter);
         };
@@ -1949,7 +1899,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
 
     fn remove_at(&self, parent: u64, name: &[u8], expected_id: u64) -> OpsResult<()> {
         let _lock = self.store.lock_inode(self.ws_id, expected_id);
-        let mut conn = self.write_conn.lock().unwrap();
+        let mut conn = self.store.lock_meta();
         let folded = fold_bytes(name);
         let Some((child_id, kind, _)) = self.lookup_child_db(&conn, parent, &folded)? else {
             let still_live = load_inode(&conn, self.ws_id, expected_id)
@@ -2036,8 +1986,206 @@ impl WorkspaceOps for DedupWorkspaceBackend {
     }
 
     fn checkpoint_wal(&self) -> OpsResult<()> {
-        let conn = self.write_conn.lock().unwrap();
+        let conn = self.store.lock_meta();
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
         Ok(())
+    }
+
+    fn lookup_info(&self, path: &Path<'_>) -> OpsResult<NodeInfo> {
+        let conn = self.ro_pool.get()?;
+        let child_id = match self.resolve_parent(&conn, path)? {
+            None => ROOT_INODE,
+            Some((parent_id, _, leaf_fold)) => {
+                let Some((cid, _, _)) = self.lookup_child_cached(&conn, parent_id, &leaf_fold)?
+                else {
+                    return Err(OpsError::NotFound);
+                };
+                cid
+            }
+        };
+        let row = self
+            .load_inode_cached(&conn, child_id)?
+            .ok_or(OpsError::NotFound)?;
+        Ok(cached_to_node_info(&row))
+    }
+
+    fn open_entry(
+        &self,
+        path: &Path<'_>,
+        disposition: Disposition,
+        target: OpenTarget,
+    ) -> OpsResult<OpenOutcome> {
+        // Fast concurrent RO path for `Open` and already-existing `OpenIf` (handles files, dirs,
+        // and root in ONE path walk with ZERO write-lock contention).
+        if matches!(disposition, Disposition::Open | Disposition::OpenIf) {
+            let conn = self.ro_pool.get()?;
+            let resolved = match self.resolve_parent(&conn, path) {
+                Ok(None) => Some((ROOT_INODE, KIND_DIR, ROOT_INODE, Vec::new())),
+                Ok(Some((parent_id, _, leaf_fold))) => self
+                    .lookup_child_cached(&conn, parent_id, &leaf_fold)?
+                    .map(|(cid, kind, stored)| (cid, kind, parent_id, stored)),
+                Err(OpsError::NotFound) if disposition == Disposition::OpenIf => {
+                    return Err(OpsError::NotFound);
+                }
+                Err(err) => return Err(err),
+            };
+            if let Some((child_id, kind, parent_id, stored_name)) = resolved {
+                if target == OpenTarget::FileOnly && kind == KIND_DIR {
+                    return Err(OpsError::IsADirectory);
+                }
+                if target == OpenTarget::DirOnly && kind != KIND_DIR {
+                    return Err(OpsError::NotADirectory);
+                }
+                let row = self
+                    .load_inode_cached(&conn, child_id)?
+                    .ok_or(OpsError::NotFound)?;
+                let info = cached_to_node_info(&row);
+                return Ok(OpenOutcome {
+                    file_id: info.file_id,
+                    kind: info.kind,
+                    action: Action::Open,
+                    size: info.size,
+                    times: info.times,
+                    attributes: info.attributes,
+                    binding: (parent_id, stored_name),
+                    replaced: None,
+                });
+            }
+            if disposition == Disposition::Open {
+                return Err(OpsError::NotFound);
+            }
+        }
+
+        match target {
+            OpenTarget::DirOnly => match disposition {
+                Disposition::Create => self.mkdir_outcome(path, false),
+                Disposition::OpenIf => self.mkdir_outcome(path, true),
+                other => match self.create_or_open(path, other) {
+                    Ok(out) if out.kind == Kind::Directory => Ok(out),
+                    Ok(_) => Err(OpsError::NotADirectory),
+                    Err(err) => Err(err),
+                },
+            },
+            OpenTarget::FileOnly => match self.create_or_open(path, disposition) {
+                Ok(out) if out.kind == Kind::Directory => Err(OpsError::IsADirectory),
+                Ok(out) => Ok(out),
+                Err(OpsError::NotADirectory) => Err(OpsError::IsADirectory),
+                Err(err) => Err(err),
+            },
+            OpenTarget::Any => self.create_or_open(path, disposition),
+        }
+    }
+}
+
+impl DedupWorkspaceBackend {
+    /// Single-transaction directory creation returning the full `OpenOutcome` (id, binding, and
+    /// `NodeInfo`), avoiding follow-up `get_info` + `dir_binding` walks.
+    fn mkdir_outcome(&self, path: &Path<'_>, allow_existing_dir: bool) -> OpsResult<OpenOutcome> {
+        let mut conn = self.store.lock_meta();
+        let Some((parent_id, leaf_disp, leaf_fold)) = self.resolve_parent(&conn, path)? else {
+            if allow_existing_dir {
+                let row = self
+                    .load_inode_cached(&conn, ROOT_INODE)?
+                    .ok_or(OpsError::NotFound)?;
+                let info = cached_to_node_info(&row);
+                return Ok(OpenOutcome {
+                    file_id: info.file_id,
+                    kind: info.kind,
+                    action: Action::Open,
+                    size: info.size,
+                    times: info.times,
+                    attributes: info.attributes,
+                    binding: (ROOT_INODE, Vec::new()),
+                    replaced: None,
+                });
+            }
+            return Err(OpsError::NameCollision);
+        };
+        if let Some((child_id, kind, stored_name)) =
+            self.lookup_child_db(&conn, parent_id, &leaf_fold)?
+        {
+            if allow_existing_dir {
+                if kind != KIND_DIR {
+                    return Err(OpsError::NotADirectory);
+                }
+                let row = self
+                    .load_inode_cached(&conn, child_id)?
+                    .ok_or(OpsError::NotFound)?;
+                let info = cached_to_node_info(&row);
+                return Ok(OpenOutcome {
+                    file_id: info.file_id,
+                    kind: info.kind,
+                    action: Action::Open,
+                    size: info.size,
+                    times: info.times,
+                    attributes: info.attributes,
+                    binding: (parent_id, stored_name),
+                    replaced: None,
+                });
+            }
+            return Err(OpsError::NameCollision);
+        }
+        let ts = now_ns();
+        let tx = conn.transaction().map_err(map_sql)?;
+        let inode_id = self.alloc_inode(&tx)?;
+        tx.execute(
+            "INSERT INTO inodes (ws_id, inode_id, kind, size, attributes, created_ns, accessed_ns, written_ns, changed_ns, storage_mode, manifest, dirty_since_ns, pinned_overlay)
+             VALUES (?1, ?2, ?3, 0, 0, ?4, ?4, ?4, ?4, ?5, X'', 0, 0)",
+            params![
+                self.ws_id as i64,
+                inode_id as i64,
+                i64::from(KIND_DIR),
+                ts,
+                i64::from(STORAGE_CHUNKS),
+            ],
+        )
+        .map_err(map_sql)?;
+        tx.execute(
+            "INSERT INTO dentries (ws_id, parent_id, folded_name, display_name, child_id, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                self.ws_id as i64,
+                parent_id as i64,
+                leaf_fold.as_slice(),
+                leaf_disp.as_slice(),
+                inode_id as i64,
+                i64::from(KIND_DIR),
+            ],
+        )
+        .map_err(map_sql)?;
+        tx.commit().map_err(map_sql)?;
+        self.cache_dentry_mutation(parent_id, leaf_fold, (inode_id, KIND_DIR, leaf_disp.clone()));
+        self.store.put_cached_inode(
+            self.ws_id,
+            Arc::new(CachedInode {
+                inode_id,
+                kind: KIND_DIR,
+                size: 0,
+                attributes: 0,
+                created_ns: ts,
+                accessed_ns: ts,
+                written_ns: ts,
+                changed_ns: ts,
+                storage_mode: STORAGE_CHUNKS,
+                entries: Some(Arc::from(Vec::new().into_boxed_slice())),
+                chunk_offsets: Some(Arc::from(Vec::new().into_boxed_slice())),
+                dirty: false,
+            }),
+        );
+        Ok(OpenOutcome {
+            file_id: inode_id,
+            kind: Kind::Directory,
+            action: Action::CreateNew,
+            size: 0,
+            times: Times {
+                created: ts,
+                accessed: ts,
+                written: ts,
+                changed: ts,
+            },
+            attributes: Attributes(report_attributes(true, 0)),
+            binding: (parent_id, leaf_disp),
+            replaced: None,
+        })
     }
 }

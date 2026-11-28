@@ -920,8 +920,14 @@ mod platform {
             params.set_sectors_per_allocation_unit(1);
             params.set_max_component_length(255);
             params.set_name_flags();
-            // No caching: the workspace is the only source of truth, and a cached FileInfo would hide another handle's write.
             params.set_file_info_timeout(file_info_timeout_ms);
+            if file_info_timeout_ms > 0 {
+                // V1 per-class kernel timeouts (`Version == 504`): enable kernel DirInfo caching,
+                // VolumeInfo caching, and long-lived Security caching (our volume SDDL is static).
+                params.set_dir_info_timeout(file_info_timeout_ms);
+                params.set_volume_info_timeout(file_info_timeout_ms);
+                params.set_security_timeout(file_info_timeout_ms.max(60_000));
+            }
             // **A directory mount has no name of its own**, unlike a drive letter, so the volume must carry one. Applied only for
             // that shape: a drive-letter volume should not advertise a UNC prefix it will never be reached by.
             // **No `Prefix` for a directory mount.** It is the UNC form (`\server\share`); a volume whose name looks like a

@@ -11,7 +11,7 @@
 //! adapter called `fs-api` directly, the mock would have to fake `fs-api`'s shape instead of the semantics the adapter
 //! actually needs, and every test would then be a test of the fake.
 
-use fs_semantics::disposition::Disposition;
+use fs_semantics::disposition::{Action, Disposition};
 
 /// A path crossing the ops boundary: **the key to match by** and **the bytes to hand back** (443/470/473).
 ///
@@ -253,6 +253,18 @@ pub struct DirOutcome {
     pub binding: (u64, Vec<u8>),
 }
 
+/// Target node kind requested by an `open_entry` call (derived from WinFsp `FILE_DIRECTORY_FILE` /
+/// `FILE_NON_DIRECTORY_FILE` create options).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenTarget {
+    /// Caller did not constrain whether the target is a file or directory.
+    Any,
+    /// Caller passed `FILE_NON_DIRECTORY_FILE`: target must be a regular file.
+    FileOnly,
+    /// Caller passed `FILE_DIRECTORY_FILE`: target must be a directory.
+    DirOnly,
+}
+
 /// Everything the adapter needs from the core.
 ///
 /// Implementors: `mock::MockBackend` (this card) and the real `fs-api` adapter (P3-3b). The contract tests are generic
@@ -486,6 +498,107 @@ pub trait WorkspaceOps {
     fn checkpoint_wal(&self) -> OpsResult<()> {
         Ok(())
     }
+
+    /// Single-pass open/create handling both files and directories in one path traversal, returning
+    /// the entry's full metadata and `(parent_id, stored_name)` binding (with empty name for root).
+    ///
+    /// Real backends override this to avoid redundant `open_dir` + `dir_binding` + `get_info` calls.
+    ///
+    /// # Errors
+    ///
+    /// Same error mapping as [`create_or_open`], [`mkdir`], and [`open_dir`].
+    fn open_entry(
+        &self,
+        path: &Path<'_>,
+        disposition: Disposition,
+        target: OpenTarget,
+    ) -> OpsResult<OpenOutcome> {
+        let dir_outcome = |id: u64, action: Action| -> OpsResult<OpenOutcome> {
+            let info = self.get_info(id)?;
+            let binding = self
+                .dir_binding(path)
+                .map_or((0, Vec::new()), |d| d.binding);
+            Ok(OpenOutcome {
+                file_id: info.file_id,
+                kind: info.kind,
+                action,
+                size: info.size,
+                times: info.times,
+                attributes: info.attributes,
+                binding,
+                replaced: None,
+            })
+        };
+        match target {
+            OpenTarget::DirOnly => match disposition {
+                Disposition::Create => {
+                    let id = self.mkdir(path)?;
+                    dir_outcome(id, Action::CreateNew)
+                }
+                Disposition::Open => {
+                    let id = self.open_dir(path)?;
+                    dir_outcome(id, Action::Open)
+                }
+                Disposition::OpenIf => match self.open_dir(path) {
+                    Ok(id) => dir_outcome(id, Action::Open),
+                    Err(OpsError::NotFound) => {
+                        let id = self.mkdir(path)?;
+                        dir_outcome(id, Action::CreateNew)
+                    }
+                    Err(err) => Err(err),
+                },
+                other => {
+                    let out = self.create_or_open(path, other)?;
+                    if out.kind != Kind::Directory {
+                        return Err(OpsError::NotADirectory);
+                    }
+                    Ok(out)
+                }
+            },
+            OpenTarget::FileOnly => {
+                if disposition != Disposition::Open && self.open_dir(path).is_ok() {
+                    return Err(OpsError::IsADirectory);
+                }
+                match self.create_or_open(path, disposition) {
+                    Ok(out) if out.kind == Kind::Directory => Err(OpsError::IsADirectory),
+                    Ok(out) => Ok(out),
+                    Err(OpsError::NotADirectory) => Err(OpsError::IsADirectory),
+                    Err(err) => Err(err),
+                }
+            }
+            OpenTarget::Any => match self.create_or_open(path, disposition) {
+                Ok(out) => Ok(out),
+                Err(OpsError::NotADirectory) => {
+                    let id = self.open_dir(path)?;
+                    dir_outcome(id, Action::Open)
+                }
+                Err(err) => Err(err),
+            },
+        }
+    }
+
+    /// Single-pass metadata lookup by path for either a file or a directory (used by
+    /// `GetSecurityByName`), avoiding the 2-3x `create_or_open -> open_dir -> get_info` fallback.
+    ///
+    /// # Errors
+    ///
+    /// [`OpsError::NotFound`] when the path does not exist.
+    fn lookup_info(&self, path: &Path<'_>) -> OpsResult<NodeInfo> {
+        match self.create_or_open(path, Disposition::Open) {
+            Ok(outcome) => Ok(NodeInfo {
+                file_id: outcome.file_id,
+                kind: outcome.kind,
+                size: outcome.size,
+                times: outcome.times,
+                attributes: outcome.attributes,
+            }),
+            Err(OpsError::NotADirectory) => {
+                let id = self.open_dir(path)?;
+                self.get_info(id)
+            }
+            Err(err) => Err(err),
+        }
+    }
 }
 
 /// A boxed backend is a backend: the mount entry point does not know which concrete type it was given, and saying so once here
@@ -594,6 +707,19 @@ impl WorkspaceOps for Box<dyn WorkspaceOps + Send + Sync> {
 
     fn checkpoint_wal(&self) -> OpsResult<()> {
         (**self).checkpoint_wal()
+    }
+
+    fn open_entry(
+        &self,
+        path: &Path<'_>,
+        disposition: Disposition,
+        target: OpenTarget,
+    ) -> OpsResult<OpenOutcome> {
+        (**self).open_entry(path, disposition, target)
+    }
+
+    fn lookup_info(&self, path: &Path<'_>) -> OpsResult<NodeInfo> {
+        (**self).lookup_info(path)
     }
 }
 

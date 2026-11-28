@@ -1095,155 +1095,29 @@ unsafe fn open_like(
         Ok(ticket) => ticket,
         Err(status) => return status,
     };
-    // The disposition is passed through **unchanged** for a file: whether it creates or opens is the backend's decision, and the
-    // promise that `Open` does not create lives there (asserted in `open_shell_criterion`).
-    // A **directory** is different: `mkdir` is the only verb that can make one, so the decision is taken here and said out loud.
-    // The caller said "a file" (`FILE_NON_DIRECTORY_FILE`): if the name is a **directory**, that is `FILE_IS_A_DIRECTORY` before anything else is
-    // attempted. Checking it here (rather than only after the file door answers) is what makes the refusal independent of what the backend does with
-    // a directory name — and it is the check whose absence let a file replace a directory in the real trace.
-    if expects_file
-        && disposition != fs_semantics::disposition::Disposition::Open
-        && adapter
-            .backend()
-            .open_dir(&crate::ops::Path::new(path.as_bytes()))
-            .is_ok()
-    {
-        return OURS_IS_A_DIRECTORY;
-    }
-    let outcome = match make_verb(disposition, wants_directory) {
-        MakeVerb::Directory => match adapter
-            .backend()
-            .mkdir(&crate::ops::Path::new(path.as_bytes()))
-        {
-            // **The directory handle gets a binding too.** `dir_binding` is the parent segment the doors already walked, so the two-phase
-            // deletion covers directories exactly as it covers files — without it a directory's `set_delete`/`close` have no name to remove and
-            // the failure is invisible (measured: `rmdir` on a non-empty directory succeeded).
-            Ok(file_id) => adapter
-                .backend()
-                .get_info(file_id)
-                .map(|node| {
-                    let found = adapter
-                        .backend()
-                        .dir_binding(&crate::ops::Path::new(path.as_bytes()));
-                    // The id the door answered and the id the binding resolves to are the **same question twice**; answering them in one value is
-                    // what makes a disagreement observable. The door's id wins (it is the one already handed out), so a mismatch is reported, not
-                    // silently preferred.
-                    if let Some(ref outcome) = found {
-                        if outcome.id != file_id {
-                            eprintln!(
-                                "create: dir_binding id {} disagrees with the door's {file_id}",
-                                outcome.id
-                            );
-                        }
-                    }
-                    (file_id, found, Some(node))
-                })
-                .map_err(|err| crate::error::to_status_of(&err).code() as i32),
-            Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
-        },
-        MakeVerb::OpenDirectory => match adapter
-            .backend()
-            .open_dir(&crate::ops::Path::new(path.as_bytes()))
-        {
-            Ok(file_id) => {
-                let found = adapter
-                    .backend()
-                    .dir_binding(&crate::ops::Path::new(path.as_bytes()));
-                if let Some(ref outcome) = found {
-                    if outcome.id != file_id {
-                        eprintln!(
-                            "open: dir_binding id {} disagrees with the door's {file_id}",
-                            outcome.id
-                        );
-                    }
-                }
-                Ok((file_id, found, None))
-            }
-            // Windows opens a directory with `FILE_OPEN_IF`, which means "open it, or make it": the make half is `mkdir`, and doing it here is
-            // what keeps the 2x2 from needing a fifth verb.
-            Err(crate::ops::OpsError::NotFound)
-                if disposition == fs_semantics::disposition::Disposition::OpenIf =>
-            {
-                match adapter
-                    .backend()
-                    .mkdir(&crate::ops::Path::new(path.as_bytes()))
-                {
-                    Ok(file_id) => {
-                        let found = adapter
-                            .backend()
-                            .dir_binding(&crate::ops::Path::new(path.as_bytes()));
-                        Ok((file_id, found, None))
-                    }
-                    Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
-                }
-            }
-            Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
-        },
-        MakeVerb::File => match adapter
-            .backend()
-            .create_or_open(&crate::ops::Path::new(path.as_bytes()), disposition)
-        {
-            // The backend's own answer carries both the binding and the full `NodeInfo` metadata!
-            Ok(outcome) => Ok((
-                outcome.file_id,
-                Some(crate::ops::DirOutcome {
-                    id: outcome.file_id,
-                    binding: outcome.binding,
-                }),
-                Some(NodeInfo {
-                    file_id: outcome.file_id,
-                    kind: outcome.kind,
-                    size: outcome.size,
-                    times: outcome.times,
-                    attributes: outcome.attributes,
-                }),
-            )),
-            // **A directory opened without `FILE_DIRECTORY_FILE`.** Windows does open directories with a plain `FILE_OPEN`,
-            // and the file door refuses it with `NotADirectory` — so if caller demanded a non-directory file, refuse immediately
-            // with `OURS_IS_A_DIRECTORY`; otherwise try the directory door.
-            Err(crate::ops::OpsError::NotADirectory) if expects_file => Err(OURS_IS_A_DIRECTORY),
-            Err(crate::ops::OpsError::NotADirectory) => {
-                match adapter
-                    .backend()
-                    .open_dir(&crate::ops::Path::new(path.as_bytes()))
-                {
-                    Ok(file_id) => {
-                        let found = adapter
-                            .backend()
-                            .dir_binding(&crate::ops::Path::new(path.as_bytes()));
-                        if let Some(ref outcome) = found {
-                            if outcome.id != file_id {
-                                eprintln!(
-                                    "create: dir_binding id {} disagrees with the fallback door's {file_id}",
-                                    outcome.id
-                                );
-                            }
-                        }
-                        Ok((file_id, found, None))
-                    }
-                    Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
-                }
-            }
-            Err(err) => Err(crate::error::to_status_of(&err).code() as i32),
-        },
+    let target = match (wants_directory, expects_file) {
+        (true, true) => return OURS_INVALID_PARAMETER,
+        (true, false) => crate::ops::OpenTarget::DirOnly,
+        (false, true) => crate::ops::OpenTarget::FileOnly,
+        (false, false) => crate::ops::OpenTarget::Any,
     };
-    let (file_id, binding, known_node) = match outcome {
-        Ok(triple) => triple,
-        Err(status) => {
+    let outcome = match adapter
+        .backend()
+        .open_entry(&crate::ops::Path::new(path.as_bytes()), disposition, target)
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
             OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return status;
+            return crate::error::to_status_of(&err).code() as i32;
         }
     };
-    // Reuse `NodeInfo` from `create_or_open` when available, avoiding a second `get_info` call.
-    let node = match known_node {
-        Some(node) => node,
-        None => match adapter.backend().get_info(file_id) {
-            Ok(node) => node,
-            Err(err) => {
-                OPEN_EXITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return crate::error::to_status_of(&err).code() as i32;
-            }
-        },
+    let file_id = outcome.file_id;
+    let node = NodeInfo {
+        file_id: outcome.file_id,
+        kind: outcome.kind,
+        size: outcome.size,
+        times: outcome.times,
+        attributes: outcome.attributes,
     };
     let is_directory = node.kind == crate::ops::Kind::Directory;
     if wants_directory && !is_directory {
@@ -1252,6 +1126,7 @@ unsafe fn open_like(
     if expects_file && is_directory {
         return OURS_IS_A_DIRECTORY;
     }
+    let binding = (!outcome.binding.1.is_empty()).then_some(outcome.binding);
     let _ = disposition;
     let Ok(record) = crate::file_info::file_info(&node) else {
         OPEN_EXITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1259,13 +1134,7 @@ unsafe fn open_like(
     };
     // Register the handle **after** the record is built: a refused open must not leave a handle behind, and the table is the thing
     // `Cleanup`/`Close` will act on. Coming last also means the earlier refusal paths need no undo.
-    // The binding travels as a pair from here on: `open_handle` and `remove_at` both take `(parent, name)`, and the identity half has already
-    // been checked against the door's answer above.
-    let Ok(handle) = adapter.open_handle(
-        file_id,
-        binding.map(|outcome| outcome.binding),
-        node.kind == crate::ops::Kind::Directory,
-    ) else {
+    let Ok(handle) = adapter.open_handle(file_id, binding, is_directory) else {
         OPEN_EXITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return NOT_IMPLEMENTED;
     };
@@ -1322,42 +1191,6 @@ pub unsafe fn create_shell(
             context_out,
             info_out,
         )
-    }
-}
-
-/// Which verb to use for a create request.
-///
-/// A directory is made with `mkdir` and nothing else — `create_or_open` has **no kind argument**, because the file door is the only
-/// place a name becomes an id. That split is the reason `FILE_DIRECTORY_FILE` had to be extracted from the low 24 bits at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MakeVerb {
-    /// `create_or_open(path, disposition)` — a file, opened or created by the disposition.
-    File,
-    /// `mkdir(path)` — a **new** directory (the disposition asked for creation).
-    Directory,
-    /// `open_dir(path)` — an **existing** directory. Without this arm the second open of a directory
-    /// (`FILE_OPEN + FILE_DIRECTORY_FILE`) fell into the file door and was refused, after `mkdir` had already answered success.
-    OpenDirectory,
-}
-
-/// The decision, as a function: `FILE_DIRECTORY_FILE` + a creating disposition ⇒ `mkdir`.
-///
-/// Opening an existing directory keeps going through `create_or_open(Open)`, because that is the only path→id door the trait has;
-///
-/// **a directory's id is not reachable any other way** (finding recorded when this was written).
-#[must_use]
-fn make_verb(
-    disposition: fs_semantics::disposition::Disposition,
-    wants_directory: bool,
-) -> MakeVerb {
-    use fs_semantics::disposition::Disposition;
-    match (wants_directory, disposition) {
-        // The 2x2, flat in the dispatcher:
-        //   (directory, Create) => mkdir          (directory, Open) => open_dir
-        //   (file,      any)    => create_or_open (which carries the disposition)
-        (true, Disposition::Create) => MakeVerb::Directory,
-        (true, Disposition::Open | Disposition::OpenIf) => MakeVerb::OpenDirectory,
-        _ => MakeVerb::File,
     }
 }
 
@@ -2166,35 +1999,12 @@ pub unsafe fn get_security_by_name_shell(
         Ok(ticket) => ticket,
         Err(status) => return status,
     };
-    // `Open` is the read-only disposition that **does not create** — the right question for "does this name exist".
-    //
-    // **A directory answers `NotADirectory` to the file door**, and reporting that as "name not found" is how a *parent segment* came to look
-    // missing: Windows then mapped the whole operation to `ERROR_PATH_NOT_FOUND` (`os error 3`), and every child under a perfectly good directory
-    // failed. So the directory door gets the second attempt here too — the same fallback `open_like` uses, for the same reason.
-    let node = match adapter.backend().create_or_open(
-        &crate::ops::Path::new(path.as_bytes()),
-        fs_semantics::disposition::Disposition::Open,
-    ) {
-        Ok(outcome) => NodeInfo {
-            file_id: outcome.file_id,
-            kind: outcome.kind,
-            size: outcome.size,
-            times: outcome.times,
-            attributes: outcome.attributes,
-        },
-        Err(crate::ops::OpsError::NotADirectory) => {
-            let Ok(file_id) = adapter
-                .backend()
-                .open_dir(&crate::ops::Path::new(path.as_bytes()))
-            else {
-                return OURS_OBJECT_NAME_NOT_FOUND;
-            };
-            let Ok(node) = adapter.backend().get_info(file_id) else {
-                return OURS_OBJECT_NAME_NOT_FOUND;
-            };
-            node
-        }
-        Err(_) => return OURS_OBJECT_NAME_NOT_FOUND,
+    // Single-pass metadata lookup for both files and directories (1 path walk instead of 3).
+    let Ok(node) = adapter
+        .backend()
+        .lookup_info(&crate::ops::Path::new(path.as_bytes()))
+    else {
+        return OURS_OBJECT_NAME_NOT_FOUND;
     };
     // SAFETY: the caller's contract covers all three out-pointers.
     unsafe { write_security_answer(attributes_out, descriptor_out, descriptor_size_out, &node) }

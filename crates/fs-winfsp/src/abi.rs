@@ -285,6 +285,30 @@ impl VolumeParams {
         self.write_u32(32, millis);
     }
 
+    /// V1 `VolumeInfoTimeout` (`fsctl.h:241, 247`): sets `VolumeInfoTimeoutValid` (bit 0 at offset 456)
+    /// and writes `VolumeInfoTimeout` at offset 460. Requires `set_version_size()` (`Version == 504`).
+    pub fn set_volume_info_timeout(&mut self, millis: u32) {
+        const VALID: u32 = 1 << 0;
+        self.or_u32(456, VALID);
+        self.write_u32(460, millis);
+    }
+
+    /// V1 `DirInfoTimeout` (`fsctl.h:242, 248`): sets `DirInfoTimeoutValid` (bit 1 at offset 456)
+    /// and writes `DirInfoTimeout` at offset 464. Requires `set_version_size()` (`Version == 504`).
+    pub fn set_dir_info_timeout(&mut self, millis: u32) {
+        const VALID: u32 = 1 << 1;
+        self.or_u32(456, VALID);
+        self.write_u32(464, millis);
+    }
+
+    /// V1 `SecurityTimeout` (`fsctl.h:243, 249`): sets `SecurityTimeoutValid` (bit 2 at offset 456)
+    /// and writes `SecurityTimeout` at offset 468. Requires `set_version_size()` (`Version == 504`).
+    pub fn set_security_timeout(&mut self, millis: u32) {
+        const VALID: u32 = 1 << 2;
+        self.or_u32(456, VALID);
+        self.write_u32(468, millis);
+    }
+
     /// The raw bytes, for the FFI call.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; Self::SIZE] {
@@ -297,6 +321,16 @@ impl VolumeParams {
 
     fn write_u32(&mut self, at: usize, value: u32) {
         self.bytes[at..at + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn or_u32(&mut self, at: usize, bits: u32) {
+        let cur = u32::from_ne_bytes([
+            self.bytes[at],
+            self.bytes[at + 1],
+            self.bytes[at + 2],
+            self.bytes[at + 3],
+        ]);
+        self.write_u32(at, cur | bits);
     }
 }
 

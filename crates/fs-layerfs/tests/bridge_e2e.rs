@@ -559,3 +559,91 @@ fn init_from_imports_windows_reserved_device_names_and_long_paths() {
     );
     ws.close().unwrap();
 }
+
+#[test]
+fn persistent_source_view_concurrent_io_commit_and_single_pass_open_entry() {
+    use fs_winfsp::ops::{Kind, OpenTarget, OpsError};
+
+    let dir = TempDir::new("persistent_source_view");
+    let repo = Repo::init(
+        dir.0.join("repo"),
+        PersistenceProfile::Disposable,
+        DEFAULT_VOLUME_SIZE_BYTES,
+    )
+    .unwrap();
+    let ws = repo.open_workspace("work").unwrap();
+    let ops = ws.backend();
+
+    // 1. Single-pass `open_entry` & `lookup_info` for root, dirs, files, and OpenTarget rules.
+    assert_eq!(
+        ops.lookup_info(&Path::new(b"/")).unwrap().kind,
+        Kind::Directory
+    );
+    let d = ops
+        .open_entry(&Path::new(b"/SubDir"), Disposition::Create, OpenTarget::DirOnly)
+        .unwrap();
+    assert_eq!(d.kind, Kind::Directory);
+    assert_eq!(d.binding.1, b"SubDir");
+    assert_eq!(
+        ops.open_entry(&Path::new(b"/subdir"), Disposition::OpenIf, OpenTarget::DirOnly)
+            .unwrap()
+            .file_id,
+        d.file_id
+    );
+    assert_eq!(
+        ops.open_entry(&Path::new(b"/subdir"), Disposition::Open, OpenTarget::FileOnly)
+            .unwrap_err(),
+        OpsError::IsADirectory
+    );
+
+    let f = ops
+        .open_entry(
+            &Path::new(b"/SubDir/Data.bin"),
+            Disposition::Create,
+            OpenTarget::FileOnly,
+        )
+        .unwrap();
+    assert_eq!(f.kind, Kind::File);
+    let payload = b"persistent-source-view-payload-0123456789".repeat(256);
+    ops.write(f.file_id, 0, &payload).unwrap();
+    assert_eq!(
+        ops.lookup_info(&Path::new(b"/subdir/data.bin")).unwrap().size,
+        payload.len() as u64
+    );
+
+    // 2. Concurrent readers sharing the persistent cached `SourceView`.
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            let b = ops.clone();
+            let p = &payload;
+            let fid = f.file_id;
+            s.spawn(move || {
+                for _ in 0..40 {
+                    let mut buf = vec![0u8; p.len()];
+                    let n = b.read_into(fid, 0, &mut buf).unwrap();
+                    assert_eq!(n, p.len());
+                    assert_eq!(buf.as_slice(), p.as_slice());
+                }
+            });
+        }
+    });
+
+    // 3. `commit()` MUST release the cached `SourceView` cleanly before `commit_captured` so it
+    //    never fails with Busy/InFlight, and subsequent reads/writes lazily re-acquire a fresh view!
+    let c1 = ws.commit(Some("first commit"), false).unwrap();
+    assert_eq!(c1.kind, "Committed");
+
+    // Read & mutate after commit (re-acquires fresh persistent SourceView against new base root).
+    let reopened = ops
+        .open_entry(&Path::new(b"/subdir/data.bin"), Disposition::Open, OpenTarget::Any)
+        .unwrap();
+    let mut after = vec![0u8; payload.len()];
+    assert_eq!(ops.read_into(reopened.file_id, 0, &mut after).unwrap(), payload.len());
+    assert_eq!(after, payload);
+
+    ops.write(reopened.file_id, 0, b"UPDATED!").unwrap();
+    let c2 = ws.commit(Some("second commit"), false).unwrap();
+    assert_eq!(c2.kind, "Committed");
+
+    ws.close().unwrap();
+}
