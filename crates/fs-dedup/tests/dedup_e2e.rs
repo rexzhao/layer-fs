@@ -1397,3 +1397,72 @@ fn r4_single_write_conn_concurrent_foreground_and_dedup_plus_single_pass_open_en
     assert_eq!(check.mismatched_refcounts, 0);
     assert_eq!(check.orphan_chunks, 0);
 }
+
+#[test]
+fn r4_n3_n12_cow_overlay_sync_and_durable_import() {
+    let tmp = TempDir::new("r4_n3_n12_durability");
+    let store_dir = tmp.0.join("store");
+    let src = tmp.0.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // Include both pack-backed files AND a pinned overlay hot DB file (`ArtifactDB`).
+    let pack_payload = b"DURABLE-IMPORT-CHUNK-0123456789ABCDEF".repeat(2000);
+    std::fs::write(src.join("asset.bin"), &pack_payload).unwrap();
+    std::fs::write(src.join("trunc.bin"), &pack_payload).unwrap();
+    std::fs::write(src.join("ArtifactDB"), b"sqlite-hot-db-payload").unwrap();
+
+    let store = DedupStore::init(&store_dir, StoreConfig::default()).unwrap();
+    let sum = store.import_dir(&src, "ws", 4, None).unwrap();
+    assert_eq!(sum.files, 3);
+    assert_eq!(sum.overlay_pinned_files, 1);
+
+    // N12: `PRAGMA synchronous` must be restored to NORMAL (1) after the final FULL commit.
+    {
+        let conn = store.open_conn().unwrap();
+        let sync_mode: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(sync_mode, 1);
+    }
+
+    // N3: CoW write & CoW set_size sync overlay before releasing old chunks.
+    {
+        let backend = DedupWorkspaceBackend::open(store.clone(), "ws").unwrap();
+        let f1 = backend
+            .create_or_open(&OpsPath::new(b"/asset.bin"), Disposition::Open)
+            .unwrap();
+        backend.write(f1.file_id, 0, b"PATCHED!").unwrap();
+
+        let f2 = backend
+            .create_or_open(&OpsPath::new(b"/trunc.bin"), Disposition::Open)
+            .unwrap();
+        backend.set_size(f2.file_id, 4096).unwrap();
+    }
+
+    // GC must reclaim dead pack space without losing either CoW overlay file.
+    let _ = store.gc(0).unwrap();
+    drop(store);
+
+    let reopened = DedupStore::open(&store_dir).unwrap();
+    let check = reopened.fsck(false).unwrap();
+    assert_eq!(check.missing_chunks, 0);
+    assert_eq!(check.mismatched_refcounts, 0);
+    assert_eq!(check.orphan_chunks, 0);
+
+    let backend2 = DedupWorkspaceBackend::open(reopened, "ws").unwrap();
+    let f1 = backend2
+        .create_or_open(&OpsPath::new(b"/asset.bin"), Disposition::Open)
+        .unwrap();
+    assert_eq!(backend2.read(f1.file_id, 0, 8).unwrap(), b"PATCHED!");
+    assert_eq!(
+        backend2.read(f1.file_id, 8, 32).unwrap(),
+        &pack_payload[8..40]
+    );
+    let f2 = backend2
+        .create_or_open(&OpsPath::new(b"/trunc.bin"), Disposition::Open)
+        .unwrap();
+    assert_eq!(backend2.get_info(f2.file_id).unwrap().size, 4096);
+    assert_eq!(backend2.read(f2.file_id, 0, 4096).unwrap(), &pack_payload[..4096]);
+    let db = backend2
+        .create_or_open(&OpsPath::new(b"/ArtifactDB"), Disposition::Open)
+        .unwrap();
+    assert_eq!(backend2.read(db.file_id, 0, 21).unwrap(), b"sqlite-hot-db-payload");
+}

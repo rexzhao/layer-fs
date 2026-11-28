@@ -1402,6 +1402,7 @@ impl DedupStore {
                             let copied = fs::copy(&job.path, &dst)?;
                             if let Ok(f) = fs::OpenOptions::new().write(true).open(&dst) {
                                 let _ = layerfs_win32_host::set_sparse_file(&f);
+                                f.sync_data()?;
                             }
                             Ok(copied)
                         })();
@@ -2158,14 +2159,28 @@ impl DedupStore {
         }
         commit_join.map_err(|_| Error::Other("import committer panicked".into()))??;
 
-        // Update workspace's `next_inode` counter to the final allocated value.
+        // Power-loss durability (N12): durably sync the active pack file (all previously rolled
+        // packs were already synced in `seal_active()`) BEFORE committing the final workspace
+        // metadata under `PRAGMA synchronous = FULL` (which fsyncs the entire WAL to disk).
+        self.packs.writer().sync_data()?;
+
+        // Update workspace's `next_inode` counter under `synchronous = FULL` so both pack bytes
+        // and all imported SQLite WAL frames survive power loss before `import` returns.
         let final_next = next_inode.load(Ordering::Relaxed);
         {
-            let conn = self.meta.lock().unwrap();
-            conn.execute(
-                "UPDATE workspaces SET next_inode = MAX(next_inode, ?1) WHERE ws_id = ?2",
-                params![final_next as i64, ws_id as i64],
-            )?;
+            let mut conn = self.meta.lock().unwrap();
+            let _ = conn.execute_batch("PRAGMA synchronous = FULL;");
+            let commit_res: Result<()> = (|| {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "UPDATE workspaces SET next_inode = MAX(next_inode, ?1) WHERE ws_id = ?2",
+                    params![final_next as i64, ws_id as i64],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })();
+            let _ = conn.execute_batch("PRAGMA synchronous = NORMAL;");
+            commit_res?;
         }
 
         Ok(ImportSummary {

@@ -1230,6 +1230,13 @@ pub struct WorkspaceHandle {
     logical_cache: Mutex<Option<(Instant, u64)>>,
 }
 
+impl Drop for WorkspaceHandle {
+    fn drop(&mut self) {
+        // Always release any retained `BaseSource` even if caller drops without calling `.close()`.
+        self.backend.release_cached_view();
+    }
+}
+
 impl std::fmt::Debug for WorkspaceHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkspaceHandle")

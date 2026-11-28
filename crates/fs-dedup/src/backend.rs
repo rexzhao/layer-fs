@@ -684,8 +684,18 @@ impl DedupWorkspaceBackend {
         Ok(())
     }
 
-    /// Commits the `STORAGE_CHUNKS -> STORAGE_OVERLAY` metadata flip inside a brief `write_conn` txn.
+    /// Commits the `STORAGE_CHUNKS -> STORAGE_OVERLAY` metadata flip inside a brief `lock_meta` txn.
+    ///
+    /// Power-loss safety (N3): durably `sync_data`s the materialized overlay file BEFORE acquiring
+    /// `lock_meta()` and releasing the old chunk references in SQLite, so a crash or subsequent GC
+    /// can never lose the sole copy of the file's data.
     fn commit_overlay_flip(&self, inode: &mut InodeRow, new_size: u64, ts: i64) -> OpsResult<()> {
+        if new_size > 0 {
+            self.store
+                .overlay()
+                .sync_data(self.ws_id, inode.inode_id)
+                .map_err(map_err)?;
+        }
         let deleted_chunks = {
             let mut conn = self.store.lock_meta();
             let tx = conn.transaction().map_err(map_sql)?;

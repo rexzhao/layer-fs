@@ -163,36 +163,69 @@ impl WinFspBackend {
 
     /// Runs `body` against the persistent cached `(StoreOperation, SourceView)`, lazily
     /// acquiring it once under `cached_view.write()` on cold start or after `commit()`.
+    ///
+    /// Self-healing (N4): if the retained `BaseSource` ever becomes `Stale` or `BaseChanged`
+    /// (e.g. external base install), drops the stale `CachedView` + `dir_cache`, re-acquires a
+    /// fresh view, and retries `body` once so the backend never gets permanently wedged.
     fn run_with_cached_view<T>(
         &self,
-        body: impl FnOnce(&StoreOperation, &SourceView) -> OpsResult<T>,
+        mut body: impl FnMut(&StoreOperation, &SourceView) -> OpsResult<T>,
     ) -> OpsResult<T> {
-        {
-            let guard = self
-                .cached_view
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(ref cv) = *guard {
-                return body(&cv.op, &cv.view);
+        for attempt in 0..2 {
+            let outcome = {
+                let guard = self
+                    .cached_view
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard
+                    .as_ref()
+                    .map(|cv| (cv.view.source(), body(&cv.op, &cv.view)))
+            };
+            let (used_source, res) = match outcome {
+                Some(pair) => pair,
+                None => {
+                    {
+                        let mut slot = self
+                            .cached_view
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if slot.is_none() {
+                            *slot = Some(self.acquire_cached_view()?);
+                        }
+                    }
+                    let guard = self
+                        .cached_view
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let cv = guard.as_ref().ok_or_else(|| {
+                        OpsError::Other("cached view cleared unexpectedly".to_owned())
+                    })?;
+                    (cv.view.source(), body(&cv.op, &cv.view))
+                }
+            };
+            match res {
+                Ok(val) => return Ok(val),
+                Err(err) if attempt == 0 && is_stale_view_err(&err) => {
+                    {
+                        let mut slot = self
+                            .cached_view
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if slot.as_ref().is_some_and(|cv| cv.view.source() == used_source) {
+                            *slot = None;
+                        }
+                    }
+                    let mut cache = self
+                        .dir_cache
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    cache.mut_gen = cache.mut_gen.wrapping_add(1);
+                    cache.dirs.clear();
+                }
+                Err(err) => return Err(err),
             }
         }
-        {
-            let mut slot = self
-                .cached_view
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if slot.is_none() {
-                *slot = Some(self.acquire_cached_view()?);
-            }
-        }
-        let guard = self
-            .cached_view
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cv = guard
-            .as_ref()
-            .ok_or_else(|| OpsError::Other("cached view cleared unexpectedly".to_owned()))?;
-        body(&cv.op, &cv.view)
+        unreachable!("loop returns on attempt 1")
     }
 
     /// Runs a **concurrent read-only** closure against the persistent cached `SourceView`
@@ -200,7 +233,7 @@ impl WinFspBackend {
     /// with zero per-call overlay source acquisition overhead.
     fn with_read_view<T>(
         &self,
-        body: impl FnOnce(&StoreOperation, &SourceView) -> OpsResult<T>,
+        body: impl FnMut(&StoreOperation, &SourceView) -> OpsResult<T>,
     ) -> OpsResult<T> {
         let _read_gate = self
             .gate
@@ -213,7 +246,7 @@ impl WinFspBackend {
     /// persistent cached `SourceView`.
     fn with_write_view<T>(
         &self,
-        body: impl FnOnce(&StoreOperation, &SourceView) -> OpsResult<T>,
+        body: impl FnMut(&StoreOperation, &SourceView) -> OpsResult<T>,
     ) -> OpsResult<T> {
         let _read_gate = self
             .gate
@@ -498,8 +531,28 @@ fn node_info_of(view: &SourceView, stat: &ViewStat) -> NodeInfo {
     }
 }
 
+const STALE_VIEW_PREFIX: &str = "stale cached view: ";
+
+fn is_stale_view_err(err: &OpsError) -> bool {
+    matches!(err, OpsError::Other(msg) if msg.starts_with(STALE_VIEW_PREFIX)
+        || msg.contains("Overlay(Stale)")
+        || msg.contains("BaseChanged"))
+}
+
 fn map_workspace_err(err: WorkspaceError) -> OpsError {
     match err {
+        WorkspaceError::Overlay(layerfs_overlay::OverlayError::Stale)
+        | WorkspaceError::BaseChanged { .. } => {
+            OpsError::Other(format!("{STALE_VIEW_PREFIX}{err}"))
+        }
+        WorkspaceError::Service(ref inner) => {
+            let msg = format!("{inner:?}");
+            if msg.contains("Stale") || msg.contains("BaseChanged") {
+                OpsError::Other(format!("{STALE_VIEW_PREFIX}{err}"))
+            } else {
+                OpsError::Other(err.to_string())
+            }
+        }
         WorkspaceError::Refused(refusal) => match refusal {
             Refusal::Exists => OpsError::NameCollision,
             Refusal::Missing => OpsError::NotFound,
@@ -1324,5 +1377,103 @@ impl WorkspaceOps for WinFspBackend {
             },
             OpenTarget::Any => self.create_or_open(path, disposition),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PersistenceProfile, Repo, DEFAULT_VOLUME_SIZE_BYTES};
+    use std::path::PathBuf;
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let p = std::env::temp_dir().join(format!(
+                "layerfs_n4_{tag}_{}_{}",
+                std::process::id(),
+                nanos
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn n4_stale_cached_view_recovers_automatically_and_never_blocks_commit_or_close() {
+        let tmp = TempDir::new("stale_recovery");
+        let repo = Repo::init(
+            tmp.0.join("repo"),
+            PersistenceProfile::Disposable,
+            DEFAULT_VOLUME_SIZE_BYTES,
+        )
+        .unwrap();
+        let ws = repo.open_workspace("work").unwrap();
+        let ops = ws.backend();
+
+        let created = ops
+            .create_or_open(&Path::new(b"/file.txt"), Disposition::Create)
+            .unwrap();
+        ops.write(created.file_id, 0, b"hello-v1").unwrap();
+        assert_eq!(ops.read(created.file_id, 0, 8).unwrap(), b"hello-v1");
+
+        // Sabotage the retained `BaseSource` behind the backend's back so the cached `SourceView`
+        // becomes `OverlayError::Stale` on the next overlay read/write!
+        let stale_source = {
+            let guard = ops.cached_view.read().unwrap();
+            let cv = guard.as_ref().expect("cached view must be populated");
+            cv.op
+                .overlay()
+                .release_base_source(cv.route, cv.view.source())
+                .expect("force-release retained source to simulate Stale");
+            cv.view.source()
+        };
+
+        // Read path MUST self-heal (drop stale view, re-acquire a fresh BaseSource, retry once).
+        let info = ops
+            .get_info(created.file_id)
+            .expect("get_info must recover from Stale CachedView");
+        assert_eq!(info.size, 8);
+        assert_eq!(ops.read(created.file_id, 0, 8).unwrap(), b"hello-v1");
+
+        // Confirm a brand-new `BaseSource` was acquired.
+        let fresh_source = ops
+            .cached_view
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .view
+            .source();
+        assert_ne!(fresh_source, stale_source);
+
+        // Repeat sabotage before a WRITE path to verify `with_write_view` also self-heals.
+        {
+            let guard = ops.cached_view.read().unwrap();
+            let cv = guard.as_ref().unwrap();
+            cv.op
+                .overlay()
+                .release_base_source(cv.route, cv.view.source())
+                .unwrap();
+        }
+        ops.write(created.file_id, 0, b"hello-v2")
+            .expect("write must recover from Stale CachedView");
+        assert_eq!(ops.read(created.file_id, 0, 8).unwrap(), b"hello-v2");
+
+        // Commit & close must release the retained BaseSource cleanly without BaseSourcesPending.
+        let c = ws.commit(Some("after stale recovery"), false).unwrap();
+        assert_eq!(c.kind, "Committed");
+        assert_eq!(ops.read(created.file_id, 0, 8).unwrap(), b"hello-v2");
+        ws.close().unwrap();
     }
 }
