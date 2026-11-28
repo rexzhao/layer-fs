@@ -405,7 +405,9 @@ impl PackStore {
     pub fn read_chunk(&self, hash: &Hash32, loc: ChunkLoc) -> Result<Arc<[u8]>> {
         let shard_idx = (hash[0] as usize) & (CACHE_SHARDS - 1);
         let leader_slot = {
-            let mut shard = self.cache[shard_idx].lock().unwrap();
+            let mut shard = self.cache[shard_idx]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(hit) = shard.get(hash) {
                 return Ok(hit);
             }
@@ -413,9 +415,13 @@ impl PackStore {
                 let wait_slot = Arc::clone(existing);
                 drop(shard);
                 let (lock, cvar) = &*wait_slot;
-                let mut res = lock.lock().unwrap();
+                let mut res = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 while res.is_none() {
-                    res = cvar.wait(res).unwrap();
+                    res = cvar
+                        .wait(res)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
                 return match res.as_ref().unwrap() {
                     Ok(arc) => Ok(Arc::clone(arc)),
@@ -427,25 +433,67 @@ impl PackStore {
             slot
         };
 
-        // Leader executes parallel overlapped read + direct-to-Arc decompression, then publishes
-        // the result (or error) and wakes any waiting threads even on early `?` failure.
-        let outcome = self.read_chunk_uncached(hash, loc);
-        let pub_outcome: SingleFlightOutcome = match &outcome {
-            Ok(arc) => Ok(Arc::clone(arc)),
-            Err(err) => Err(err.to_string()),
-        };
-        {
-            let mut shard = self.cache[shard_idx].lock().unwrap();
-            if let Ok(arc) = &outcome {
-                shard.insert(*hash, Arc::clone(arc));
+        // RAII guard (N6): guarantees `in_flight` removal and waiter wakeup even if the leader
+        // panics mid-read/decompress so waiting threads can never hang indefinitely.
+        struct InFlightGuard<'a> {
+            shard: &'a Mutex<CacheShard>,
+            hash: Hash32,
+            slot: SingleFlightSlot,
+            completed: bool,
+        }
+        impl InFlightGuard<'_> {
+            fn complete(mut self, outcome: &Result<Arc<[u8]>>) {
+                self.completed = true;
+                let pub_outcome: SingleFlightOutcome = match outcome {
+                    Ok(arc) => Ok(Arc::clone(arc)),
+                    Err(err) => Err(err.to_string()),
+                };
+                {
+                    let mut shard = self
+                        .shard
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Ok(arc) = outcome {
+                        shard.insert(self.hash, Arc::clone(arc));
+                    }
+                    shard.in_flight.remove(&self.hash);
+                }
+                let (lock, cvar) = &*self.slot;
+                *lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pub_outcome);
+                cvar.notify_all();
             }
-            shard.in_flight.remove(hash);
         }
-        {
-            let (lock, cvar) = &*leader_slot;
-            *lock.lock().unwrap() = Some(pub_outcome);
-            cvar.notify_all();
+        impl Drop for InFlightGuard<'_> {
+            fn drop(&mut self) {
+                if !self.completed {
+                    {
+                        let mut shard = self
+                            .shard
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        shard.in_flight.remove(&self.hash);
+                    }
+                    let (lock, cvar) = &*self.slot;
+                    *lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(Err("single-flight chunk reader panicked".to_owned()));
+                    cvar.notify_all();
+                }
+            }
         }
+
+        let guard = InFlightGuard {
+            shard: &self.cache[shard_idx],
+            hash: *hash,
+            slot: leader_slot,
+            completed: false,
+        };
+
+        let outcome = self.read_chunk_uncached(hash, loc);
+        guard.complete(&outcome);
         outcome
     }
 
@@ -499,5 +547,47 @@ impl PackStore {
             fs::remove_file(path)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn n6_single_flight_waiters_never_hang_when_leader_fails() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "dedupfs_n6_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(PackStore::open(dir.clone(), 16 * 1024 * 1024, 1, 1024 * 1024));
+        let hash = [0x5Au8; 32];
+        let bad_loc = ChunkLoc {
+            pack_id: 9999, // missing pack file triggers error on leader
+            offset: 16,
+            raw_len: 128,
+            stored_len: 128,
+            codec: Codec::None,
+        };
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let st = Arc::clone(&store);
+                let bar = Arc::clone(&barrier);
+                s.spawn(move || {
+                    bar.wait();
+                    let err = st.read_chunk(&hash, bad_loc);
+                    assert!(err.is_err(), "missing pack must return Err to leader & all waiters");
+                });
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

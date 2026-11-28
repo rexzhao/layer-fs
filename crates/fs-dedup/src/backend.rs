@@ -89,6 +89,8 @@ impl RoConnPool {
 
 type DentryVal = (u64, u8, Vec<u8>);
 
+type CachedUtf16Listing = Arc<Vec<(Vec<u16>, NodeInfo)>>;
+
 #[derive(Default)]
 struct CachedDir {
     entries: HashMap<Box<[u8]>, DentryVal>,
@@ -98,6 +100,8 @@ struct CachedDir {
     /// Monotonic generation bumped on every mutation to this directory so concurrent `read_dir`
     /// never overwrites newer mutations or sets `complete = true` from a stale snapshot.
     generation: u64,
+    /// Cached final sorted UTF-16 `ReadDirectory` listing `(meta_version, Arc<Vec<...>>)` (N7).
+    utf16_listing: Option<(u64, CachedUtf16Listing)>,
     /// CLOCK reference bit so hot directories (`/`, `Assets/`) survive partial shard eviction.
     referenced: AtomicBool,
 }
@@ -186,6 +190,9 @@ pub struct DedupWorkspaceBackend {
     dirty_inodes: Mutex<HashMap<u64, (u64, i64)>>,
     /// Lock-free count of entries in `dirty_inodes` so clean read paths avoid locking the mutex.
     dirty_count: AtomicUsize,
+    /// Monotonic workspace metadata version bumped on every file/dir mutation to validate O(1)
+    /// cached UTF-16 `ReadDirectory` snapshots (N7).
+    meta_version: AtomicU64,
     next_inode: AtomicU64,
     /// High-water mark already persisted to `workspaces.next_inode` so `alloc_inode` batches
     /// SQLite updates to 1 per `INODE_ALLOC_BATCH` creations.
@@ -194,9 +201,25 @@ pub struct DedupWorkspaceBackend {
 
 impl Drop for DedupWorkspaceBackend {
     fn drop(&mut self) {
-        if self.flush_all_dirty().is_ok() {
-            let marker = self.store.overlay().clean_marker_path(self.ws_id);
-            let _ = std::fs::write(marker, b"clean");
+        // N11: Flush dirty overlay sizes AND checkpoint/truncate WAL into `meta.sqlite` BEFORE
+        // writing and `sync_all()`-ing `.clean`, so a power loss can never leave `.clean` on disk
+        // while SQLite metadata is still un-synced in the WAL.
+        if self.flush_all_dirty().is_err() {
+            return;
+        }
+        let checkpoint_ok = {
+            let conn = self.store.lock_meta();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").is_ok()
+        };
+        if !checkpoint_ok {
+            return;
+        }
+        let marker = self.store.overlay().clean_marker_path(self.ws_id);
+        if let Ok(mut file) = std::fs::File::create(&marker) {
+            use std::io::Write as _;
+            if file.write_all(b"clean").is_ok() {
+                let _ = file.sync_all();
+            }
         }
     }
 }
@@ -288,6 +311,7 @@ impl DedupWorkspaceBackend {
             dentry_cache,
             dirty_inodes: Mutex::new(HashMap::new()),
             dirty_count: AtomicUsize::new(0),
+            meta_version: AtomicU64::new(1),
             next_inode: AtomicU64::new(start_inode),
             reserved_inode_end: AtomicU64::new(start_inode),
         })
@@ -324,6 +348,11 @@ impl DedupWorkspaceBackend {
     }
 
     #[inline]
+    fn bump_meta_version(&self) {
+        self.meta_version.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
     fn dentry_shard(&self, parent_id: u64) -> &DentryShard {
         &self.dentry_cache[(parent_id as usize) & (DENTRY_SHARDS - 1)]
     }
@@ -332,6 +361,7 @@ impl DedupWorkspaceBackend {
     /// and bumps both the shard and directory generation counters so any in-flight `read_dir`
     /// cannot clobber this mutation or mark a stale snapshot `complete = true`.
     fn cache_dentry_mutation(&self, parent_id: u64, folded: Vec<u8>, val: DentryVal) {
+        self.bump_meta_version();
         let mut guard = self.dentry_shard(parent_id).write().unwrap();
         if guard.total >= MAX_DENTRY_PER_SHARD {
             guard.evict_quarter(parent_id);
@@ -341,6 +371,7 @@ impl DedupWorkspaceBackend {
         let added = {
             let dir = guard.dirs.entry(parent_id).or_default();
             dir.generation = new_gen;
+            dir.utf16_listing = None;
             dir.referenced.store(true, Ordering::Relaxed);
             dir.entries.insert(folded.into_boxed_slice(), val).is_none()
         };
@@ -376,6 +407,7 @@ impl DedupWorkspaceBackend {
                 entries: HashMap::new(),
                 complete: false,
                 generation: gen,
+                utf16_listing: None,
                 referenced: AtomicBool::new(true),
             });
             dir.referenced.store(true, Ordering::Relaxed);
@@ -387,11 +419,13 @@ impl DedupWorkspaceBackend {
     }
 
     fn invalidate_dentry(&self, parent_id: u64, folded: &[u8]) {
+        self.bump_meta_version();
         let mut guard = self.dentry_shard(parent_id).write().unwrap();
         guard.mut_gen = guard.mut_gen.wrapping_add(1);
         let new_gen = guard.mut_gen;
         let removed = if let Some(dir) = guard.dirs.get_mut(&parent_id) {
             dir.generation = new_gen;
+            dir.utf16_listing = None;
             dir.entries.remove(folded).is_some()
         } else {
             false
@@ -924,6 +958,7 @@ impl DedupWorkspaceBackend {
                         entries: map,
                         complete: true,
                         generation: start_dir_gen.unwrap_or(start_shard_gen),
+                        utf16_listing: None,
                         referenced: AtomicBool::new(true),
                     },
                 );
@@ -970,6 +1005,7 @@ impl DedupWorkspaceBackend {
                     }),
                 );
                 let dirty_len = self.set_dirty(file_id, new_len, ts);
+                self.bump_meta_version();
                 if dirty_len >= DIRTY_FLUSH_THRESHOLD {
                     let _ = self.flush_all_dirty();
                 }
@@ -1009,6 +1045,7 @@ impl DedupWorkspaceBackend {
         if was_chunks {
             self.commit_overlay_flip(&mut row, new_len, ts)?;
             self.clear_dirty(file_id);
+            self.bump_meta_version();
             self.store.put_cached_inode(
                 self.ws_id,
                 Arc::new(CachedInode {
@@ -1334,6 +1371,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
                         .create_empty(self.ws_id, child_id)
                         .map_err(map_err)?;
                     self.clear_dirty(child_id);
+                    self.bump_meta_version();
                     self.store.put_cached_inode(
                         self.ws_id,
                         Arc::new(CachedInode {
@@ -1593,6 +1631,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
             }),
         );
         self.clear_dirty(file_id);
+        self.bump_meta_version();
         Ok(())
     }
 
@@ -1700,6 +1739,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         if updated == 0 {
             return Err(OpsError::NotFound);
         }
+        self.bump_meta_version();
         if let Some(prev) = self.store.get_cached_inode(self.ws_id, file_id) {
             self.store.put_cached_inode(
                 self.ws_id,
@@ -1749,6 +1789,7 @@ impl WorkspaceOps for DedupWorkspaceBackend {
         if updated == 0 {
             return Err(OpsError::NotFound);
         }
+        self.bump_meta_version();
         if let Some(prev) = self.store.get_cached_inode(self.ws_id, file_id) {
             self.store.put_cached_inode(
                 self.ws_id,
@@ -2107,11 +2148,99 @@ impl WorkspaceOps for DedupWorkspaceBackend {
             OpenTarget::FileOnly => match self.create_or_open(path, disposition) {
                 Ok(out) if out.kind == Kind::Directory => Err(OpsError::IsADirectory),
                 Ok(out) => Ok(out),
+                // N10: `FileOnly` targeting an existing directory (including `Supersede` which
+                // maps to `AccessDenied` in `decide`) must report `IsADirectory`.
                 Err(OpsError::NotADirectory) => Err(OpsError::IsADirectory),
+                Err(OpsError::AccessDenied)
+                    if disposition == Disposition::Supersede
+                        && self.open_dir(path).is_ok() =>
+                {
+                    Err(OpsError::IsADirectory)
+                }
                 Err(err) => Err(err),
             },
-            OpenTarget::Any => self.create_or_open(path, disposition),
+            OpenTarget::Any => match self.create_or_open(path, disposition) {
+                Ok(out) => Ok(out),
+                // N10: `Overwrite` / `OverwriteIf` / `Supersede` targeting a directory without an
+                // explicit file/dir flag must report `IsADirectory` rather than `NotADirectory`.
+                Err(OpsError::NotADirectory)
+                    if matches!(
+                        disposition,
+                        Disposition::Overwrite | Disposition::OverwriteIf | Disposition::Supersede
+                    ) =>
+                {
+                    Err(OpsError::IsADirectory)
+                }
+                Err(OpsError::AccessDenied)
+                    if disposition == Disposition::Supersede
+                        && self.open_dir(path).is_ok() =>
+                {
+                    Err(OpsError::IsADirectory)
+                }
+                Err(err) => Err(err),
+            },
         }
+    }
+
+    fn read_dir_utf16_cached(&self, dir_id: u64) -> OpsResult<fs_winfsp::ops::DirListingUtf16> {
+        // N7: O(1) cached UTF-16 sorted directory listing validated by `meta_version`.
+        let start_ver = self.meta_version.load(Ordering::Acquire);
+        let start_gen = {
+            let guard = self.dentry_shard(dir_id).read().unwrap();
+            if let Some(dir) = guard.dirs.get(&dir_id) {
+                if dir.complete {
+                    if let Some((cached_ver, ref listing)) = dir.utf16_listing {
+                        if cached_ver == start_ver {
+                            dir.referenced.store(true, Ordering::Relaxed);
+                            return Ok(Arc::clone(listing));
+                        }
+                    }
+                }
+                Some(dir.generation)
+            } else {
+                None
+            }
+        };
+
+        let items = self.read_dir_inner(dir_id)?;
+        let mut children: Vec<(Vec<u16>, NodeInfo)> = items
+            .into_iter()
+            .map(|(name, _, info)| {
+                (
+                    String::from_utf8_lossy(&name)
+                        .encode_utf16()
+                        .collect::<Vec<u16>>(),
+                    info,
+                )
+            })
+            .collect();
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let entries = if dir_id != ROOT_INODE {
+            if let Ok(self_info) = self.get_info(dir_id) {
+                let mut out = Vec::with_capacity(children.len() + 2);
+                out.push((vec![u16::from(b'.')], self_info.clone()));
+                out.push((vec![u16::from(b'.'), u16::from(b'.')], self_info));
+                out.extend(children);
+                out
+            } else {
+                children
+            }
+        } else {
+            children
+        };
+        let arc = Arc::new(entries);
+
+        // Publish cached listing only if no metadata or directory mutations raced while building.
+        if self.meta_version.load(Ordering::Acquire) == start_ver {
+            let mut guard = self.dentry_shard(dir_id).write().unwrap();
+            if let Some(dir) = guard.dirs.get_mut(&dir_id) {
+                if dir.complete && (start_gen.is_none() || Some(dir.generation) == start_gen) {
+                    dir.utf16_listing = Some((start_ver, Arc::clone(&arc)));
+                }
+            }
+        }
+        Ok(arc)
     }
 }
 

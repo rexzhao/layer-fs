@@ -1524,3 +1524,80 @@ fn r4_n1_n2_batched_dedup_and_nonblocking_wal_checkpoint() {
     assert_eq!(check.mismatched_refcounts, 0);
     assert_eq!(check.orphan_chunks, 0);
 }
+
+#[test]
+fn r4_n7_n9_n10_n11_cached_utf16_listing_sparse_once_dir_error_codes_and_clean_truncate() {
+    use fs_winfsp::ops::{OpenTarget, OpsError};
+
+    let tmp = TempDir::new("r4_n7_n9_n10_n11");
+    let store_dir = tmp.0.join("store");
+    let store = DedupStore::init(&store_dir, StoreConfig::default()).unwrap();
+    store.create_workspace("ws").unwrap();
+
+    let ws_id = {
+        let backend = DedupWorkspaceBackend::open(store.clone(), "ws").unwrap();
+        let ws_id = backend.ws_id();
+
+        let dir = backend
+            .open_entry(&OpsPath::new(b"/Sub"), Disposition::Create, OpenTarget::DirOnly)
+            .unwrap();
+        let f = backend
+            .open_entry(&OpsPath::new(b"/Sub/a.txt"), Disposition::Create, OpenTarget::FileOnly)
+            .unwrap();
+        backend.write(f.file_id, 0, b"hello").unwrap();
+
+        // N7: Second `read_dir_utf16_cached` returns the exact same `Arc` pointer (O(1) cache hit!).
+        let l1 = backend.read_dir_utf16_cached(dir.file_id).unwrap();
+        let l2 = backend.read_dir_utf16_cached(dir.file_id).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&l1, &l2),
+            "repeated read_dir_utf16_cached with no mutations must return cached Arc"
+        );
+        // Includes `.` and `..` plus `a.txt`.
+        assert_eq!(l1.len(), 3);
+
+        // Mutating file size bumps `meta_version` and invalidates the cached UTF-16 listing!
+        backend.write(f.file_id, 5, b"-world").unwrap();
+        let l3 = backend.read_dir_utf16_cached(dir.file_id).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&l1, &l3));
+        let a_entry = l3
+            .iter()
+            .find(|(name, _)| String::from_utf16_lossy(name) == "a.txt")
+            .unwrap();
+        assert_eq!(a_entry.1.size, 11);
+
+        // N9: Large sparse `set_size` extensions work cleanly.
+        backend.set_size(f.file_id, 128 * 1024).unwrap();
+        backend.set_size(f.file_id, 256 * 1024).unwrap();
+        assert_eq!(backend.get_info(f.file_id).unwrap().size, 256 * 1024);
+
+        // N10: Targeting an existing directory with Supersede/Overwrite/OverwriteIf returns IsADirectory!
+        for target in [OpenTarget::FileOnly, OpenTarget::Any] {
+            for disp in [
+                Disposition::Supersede,
+                Disposition::Overwrite,
+                Disposition::OverwriteIf,
+            ] {
+                assert_eq!(
+                    backend
+                        .open_entry(&OpsPath::new(b"/Sub"), disp, target)
+                        .unwrap_err(),
+                    OpsError::IsADirectory,
+                    "target={target:?} disp={disp:?} on directory must return IsADirectory"
+                );
+            }
+        }
+        ws_id
+    };
+
+    // N11: After clean Drop, `.clean` marker exists AND WAL was truncated to 0 bytes.
+    assert!(store.overlay().clean_marker_path(ws_id).exists());
+    let wal_path = store_dir.join("meta.sqlite-wal");
+    if wal_path.exists() {
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            0,
+            "WAL must be truncated before writing .clean marker"
+        );
+    }
+}

@@ -304,10 +304,10 @@ impl OverlayStore {
     }
 
     /// Resizes an overlay file (truncating or sparse zero-extending).
-    /// Enables NTFS sparse attribute only when extending to non-zero length.
+    /// Enables NTFS sparse attribute at most once per handle and only for >= 64 KiB extensions (N9).
     pub fn set_len(&self, ws_id: u64, inode_id: u64, new_len: u64) -> Result<()> {
         let file = self.get_cached_rw(ws_id, inode_id)?;
-        if new_len > 0 {
+        if new_len >= 64 * 1024 {
             file.set_sparse();
         }
         file.set_len(new_len)?;

@@ -99,12 +99,12 @@ pub unsafe fn read_directory_shell(
                 if let Some(cached) = cached_dir_snapshot(context_id) {
                     cached
                 } else {
-                    let fresh = std::sync::Arc::new(list_entries(adapter, entry.file_id));
+                    let fresh = list_entries(adapter, entry.file_id);
                     store_dir_snapshot(context_id, std::sync::Arc::clone(&fresh));
                     fresh
                 }
             } else {
-                let fresh = std::sync::Arc::new(list_entries(adapter, entry.file_id));
+                let fresh = list_entries(adapter, entry.file_id);
                 store_dir_snapshot(context_id, std::sync::Arc::clone(&fresh));
                 fresh
             }
@@ -116,40 +116,12 @@ pub unsafe fn read_directory_shell(
     unsafe { read_directory_from(&entries, buffer, marker, length, bytes_transferred) }
 }
 
-/// One directory as `ListEntry`s, taken from the mount's own backend.
-///
-/// A name that the backend cannot answer metadata for is **left out** rather than listed with invented numbers: a dirent record
-/// with a made-up size/timestamp is worse than a missing row, because nothing downstream can tell the difference.
-fn list_entries(adapter: &crate::DynAdapter, dir_id: u64) -> Vec<ListEntry> {
-    let Ok(items) = adapter.backend().read_dir_with_info(dir_id) else {
-        return Vec::new();
-    };
-    let mut children: Vec<ListEntry> = items
-        .into_iter()
-        .map(|(name, info)| {
-            (
-                String::from_utf8_lossy(&name)
-                    .encode_utf16()
-                    .collect::<Vec<u16>>(),
-                info,
-            )
-        })
-        .collect();
-    children.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // Windows NTFS / WinFsp contract: every non-root directory must report `.` and `..`
-    // before its children. Without them, `FindFirstFileW("empty_dir\\*")` (used by Git
-    // for Windows `mingw_opendir`) receives zero entries -> `ERROR_FILE_NOT_FOUND` (ENOENT).
-    if dir_id != crate::ROOT {
-        if let Ok(self_info) = adapter.backend().get_info(dir_id) {
-            let mut entries = Vec::with_capacity(children.len() + 2);
-            entries.push((vec![u16::from(b'.')], self_info.clone()));
-            entries.push((vec![u16::from(b'.'), u16::from(b'.')], self_info));
-            entries.extend(children);
-            return entries;
-        }
-    }
-    children
+/// One directory as `Arc<Vec<ListEntry>>`, fetched via the backend's cached UTF-16 listing (N7).
+fn list_entries(adapter: &crate::DynAdapter, dir_id: u64) -> std::sync::Arc<Vec<ListEntry>> {
+    adapter
+        .backend()
+        .read_dir_utf16_cached(dir_id)
+        .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()))
 }
 
 /// The `ReadDirectory` body with the entries handed in — the resume, the framing and the count are all here.

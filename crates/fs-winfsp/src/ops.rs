@@ -253,6 +253,9 @@ pub struct DirOutcome {
     pub binding: (u64, Vec<u8>),
 }
 
+/// Pre-encoded, UTF-16-sorted directory listing snapshot (including `.` and `..` for non-root dirs).
+pub type DirListingUtf16 = std::sync::Arc<Vec<(Vec<u16>, NodeInfo)>>;
+
 /// Target node kind requested by an `open_entry` call (derived from WinFsp `FILE_DIRECTORY_FILE` /
 /// `FILE_NON_DIRECTORY_FILE` create options).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -568,13 +571,60 @@ pub trait WorkspaceOps {
             }
             OpenTarget::Any => match self.create_or_open(path, disposition) {
                 Ok(out) => Ok(out),
-                Err(OpsError::NotADirectory) => {
+                Err(OpsError::NotADirectory)
+                    if matches!(disposition, Disposition::Open | Disposition::OpenIf) =>
+                {
                     let id = self.open_dir(path)?;
                     dir_outcome(id, Action::Open)
+                }
+                Err(OpsError::NotADirectory)
+                    if matches!(
+                        disposition,
+                        Disposition::Overwrite | Disposition::OverwriteIf | Disposition::Supersede
+                    ) =>
+                {
+                    Err(OpsError::IsADirectory)
+                }
+                Err(OpsError::AccessDenied)
+                    if disposition == Disposition::Supersede && self.open_dir(path).is_ok() =>
+                {
+                    Err(OpsError::IsADirectory)
                 }
                 Err(err) => Err(err),
             },
         }
+    }
+
+    /// Returns a pre-encoded, UTF-16-sorted directory listing (including `.` and `..` for non-root
+    /// directories). Backends may cache the `Arc` across repeated `ReadDirectory` opens (N7).
+    ///
+    /// # Errors
+    ///
+    /// [`OpsError::NotFound`] or [`OpsError::NotADirectory`].
+    fn read_dir_utf16_cached(&self, dir_id: u64) -> OpsResult<DirListingUtf16> {
+        let items = self.read_dir_with_info(dir_id)?;
+        let mut children: Vec<(Vec<u16>, NodeInfo)> = items
+            .into_iter()
+            .map(|(name, info)| {
+                (
+                    String::from_utf8_lossy(&name)
+                        .encode_utf16()
+                        .collect::<Vec<u16>>(),
+                    info,
+                )
+            })
+            .collect();
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+        if dir_id != crate::ROOT {
+            if let Ok(self_info) = self.get_info(dir_id) {
+                let mut entries = Vec::with_capacity(children.len() + 2);
+                entries.push((vec![u16::from(b'.')], self_info.clone()));
+                entries.push((vec![u16::from(b'.'), u16::from(b'.')], self_info));
+                entries.extend(children);
+                return Ok(std::sync::Arc::new(entries));
+            }
+        }
+        Ok(std::sync::Arc::new(children))
     }
 
     /// Single-pass metadata lookup by path for either a file or a directory (used by
@@ -720,6 +770,10 @@ impl WorkspaceOps for Box<dyn WorkspaceOps + Send + Sync> {
 
     fn lookup_info(&self, path: &Path<'_>) -> OpsResult<NodeInfo> {
         (**self).lookup_info(path)
+    }
+
+    fn read_dir_utf16_cached(&self, dir_id: u64) -> OpsResult<DirListingUtf16> {
+        (**self).read_dir_utf16_cached(dir_id)
     }
 }
 

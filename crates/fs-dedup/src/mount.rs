@@ -109,12 +109,13 @@ pub fn active_mount_for_store(store_root: &Path) -> Option<String> {
     active_mount_info_for_store(store_root).map(|(mp, _, _)| mp)
 }
 
-/// Triggers a safe online `dedup` sweep through a running mount's control pipe so active handles
-/// and dirty overlay metadata are respected.
-pub fn trigger_live_dedup(pipe_name: &str) -> Result<String> {
+/// Triggers a safe online `dedup` sweep through a running mount's control pipe so active handles,
+/// dirty overlay metadata, and `--idle <idle_secs>` are all respected (N8).
+pub fn trigger_live_dedup(pipe_name: &str, idle_secs: u64) -> Result<String> {
     #[cfg(windows)]
     {
-        let reply = win_pipe::send_command(pipe_name, "dedup")?;
+        let cmd = format!("dedup {idle_secs}");
+        let reply = win_pipe::send_command(pipe_name, &cmd)?;
         if let Some(err_msg) = reply.strip_prefix("ERR ") {
             return Err(Error::Other(err_msg.trim().to_owned()));
         }
@@ -122,7 +123,7 @@ pub fn trigger_live_dedup(pipe_name: &str) -> Result<String> {
     }
     #[cfg(not(windows))]
     {
-        let _ = pipe_name;
+        let _ = (pipe_name, idle_secs);
         Err(Error::Other("mount control pipe is Windows-only".into()))
     }
 }
@@ -432,29 +433,58 @@ mod win_pipe {
                 continue;
             }
             let mut line = String::new();
-            let mut reader = BufReader::new(&pipe_file);
-            let _ = reader.read_line(&mut line);
+            {
+                let mut reader = BufReader::new(&pipe_file);
+                let _ = reader.read_line(&mut line);
+            }
             let cmd = line.trim();
+
+            // N8: Run `dedup [idle_secs]` on a dedicated thread so the control pipe stays
+            // immediately responsive to `umount`, `ping`, and `status` while dedup is running!
+            if cmd == "dedup" || cmd.starts_with("dedup ") {
+                let idle_secs: u64 = cmd
+                    .strip_prefix("dedup")
+                    .unwrap_or("")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+                let d_store = Arc::clone(store);
+                let d_adapter = Arc::clone(adapter);
+                let d_ws = ws_name.to_owned();
+                let raw_usize = raw as usize;
+                std::thread::spawn(move || {
+                    let _ = d_adapter.backend().flush();
+                    let response = match d_store.dedup_workspace(
+                        Some(&d_ws),
+                        idle_secs,
+                        |w, inode| {
+                            w == ws_id
+                                && (d_adapter.has_open_handles(inode)
+                                    || d_adapter.backend().is_file_dirty(inode))
+                        },
+                    ) {
+                        Ok(s) => format!(
+                            "OK deduped_files={} reclaimed_bytes={} idle_secs={}\n",
+                            s.deduped_files, s.reclaimed_overlay_bytes, idle_secs
+                        ),
+                        Err(e) => format!("ERR {e}\n"),
+                    };
+                    let _ = pipe_file.write_all(response.as_bytes());
+                    let _ = pipe_file.flush();
+                    unsafe {
+                        let h = raw_usize as *mut c_void;
+                        FlushFileBuffers(h);
+                        DisconnectNamedPipe(h);
+                    }
+                });
+                continue;
+            }
 
             let response = match cmd {
                 "ping" => "OK pong\n".to_owned(),
                 "status" => {
                     let (files, dirs) = adapter.open_handle_kinds();
                     format!("OK workspace={ws_name} open_files={files} open_dirs={dirs}\n")
-                }
-                "dedup" => {
-                    let _ = adapter.backend().flush();
-                    match store.dedup_workspace(Some(ws_name), 0, |w, inode| {
-                        w == ws_id
-                            && (adapter.has_open_handles(inode)
-                                || adapter.backend().is_file_dirty(inode))
-                    }) {
-                        Ok(s) => format!(
-                            "OK deduped_files={} reclaimed_bytes={}\n",
-                            s.deduped_files, s.reclaimed_overlay_bytes
-                        ),
-                        Err(e) => format!("ERR {e}\n"),
-                    }
                 }
                 "umount" | "umount-force" => {
                     let force = cmd == "umount-force";

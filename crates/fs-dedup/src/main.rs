@@ -554,7 +554,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 fs_dedup::mount::active_mount_info_for_store(&store_dir)
             {
                 if ws.is_none() || ws == Some(mounted_ws.as_str()) {
-                    let reply = fs_dedup::mount::trigger_live_dedup(&pipe)?;
+                    let reply = fs_dedup::mount::trigger_live_dedup(&pipe, idle_secs)?;
                     println!("forwarded dedup to active mount at {mp} ({mounted_ws}): {reply}");
                     return Ok(());
                 }

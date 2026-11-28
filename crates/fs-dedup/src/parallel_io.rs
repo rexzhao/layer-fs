@@ -17,21 +17,29 @@ use crate::error::{Error, Result};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A file handle that executes genuinely parallel positional reads/writes across threads.
 pub struct ParallelFile {
     file: File,
+    /// Tracks whether `FSCTL_SET_SPARSE` has already been issued on this handle (N9).
+    sparse_marked: AtomicBool,
 }
 
 impl ParallelFile {
+    fn wrap(file: File) -> Self {
+        Self {
+            file,
+            sparse_marked: AtomicBool::new(false),
+        }
+    }
+
     /// Opens an existing file read-only for parallel positional reads.
     pub fn open_read(path: &Path) -> io::Result<Self> {
         let mut opts = OpenOptions::new();
         opts.read(true);
         configure_overlapped(&mut opts);
-        Ok(Self {
-            file: opts.open(path)?,
-        })
+        Ok(Self::wrap(opts.open(path)?))
     }
 
     /// Opens an existing file read/write for parallel positional I/O (does not create).
@@ -39,9 +47,7 @@ impl ParallelFile {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true);
         configure_overlapped(&mut opts);
-        Ok(Self {
-            file: opts.open(path)?,
-        })
+        Ok(Self::wrap(opts.open(path)?))
     }
 
     /// Creates or truncates a file for parallel read/write positional I/O.
@@ -49,9 +55,7 @@ impl ParallelFile {
         let mut opts = OpenOptions::new();
         opts.create(true).truncate(true).read(true).write(true);
         configure_overlapped(&mut opts);
-        Ok(Self {
-            file: opts.open(path)?,
-        })
+        Ok(Self::wrap(opts.open(path)?))
     }
 
     /// Opens an existing file or creates it without truncating for parallel read/write I/O.
@@ -59,14 +63,14 @@ impl ParallelFile {
         let mut opts = OpenOptions::new();
         opts.create(true).truncate(false).read(true).write(true);
         configure_overlapped(&mut opts);
-        Ok(Self {
-            file: opts.open(path)?,
-        })
+        Ok(Self::wrap(opts.open(path)?))
     }
 
-    /// Marks the underlying file as an NTFS sparse file (best-effort no-op on non-Windows).
+    /// Marks the underlying file as an NTFS sparse file at most once per handle (N9).
     pub fn set_sparse(&self) {
-        let _ = layerfs_win32_host::set_sparse_file(&self.file);
+        if !self.sparse_marked.swap(true, Ordering::Relaxed) {
+            let _ = layerfs_win32_host::set_sparse_file(&self.file);
+        }
     }
 
     /// Returns the file's logical byte length.

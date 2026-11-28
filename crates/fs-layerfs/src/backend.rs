@@ -1373,9 +1373,32 @@ impl WorkspaceOps for WinFspBackend {
                 Ok(out) if out.kind == Kind::Directory => Err(OpsError::IsADirectory),
                 Ok(out) => Ok(out),
                 Err(OpsError::NotADirectory) => Err(OpsError::IsADirectory),
+                Err(OpsError::AccessDenied)
+                    if disposition == Disposition::Supersede
+                        && self.open_dir(path).is_ok() =>
+                {
+                    Err(OpsError::IsADirectory)
+                }
                 Err(err) => Err(err),
             },
-            OpenTarget::Any => self.create_or_open(path, disposition),
+            OpenTarget::Any => match self.create_or_open(path, disposition) {
+                Ok(out) => Ok(out),
+                Err(OpsError::NotADirectory)
+                    if matches!(
+                        disposition,
+                        Disposition::Overwrite | Disposition::OverwriteIf | Disposition::Supersede
+                    ) =>
+                {
+                    Err(OpsError::IsADirectory)
+                }
+                Err(OpsError::AccessDenied)
+                    if disposition == Disposition::Supersede
+                        && self.open_dir(path).is_ok() =>
+                {
+                    Err(OpsError::IsADirectory)
+                }
+                Err(err) => Err(err),
+            },
         }
     }
 }
